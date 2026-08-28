@@ -72,3 +72,10 @@ reports/
 .hf_home/
 hf_cache/
 data/
+
+# Two readme files that left by Vastai
+AGENTS.md
+CLAUDE.md
+
+# General all ignore
+.*
