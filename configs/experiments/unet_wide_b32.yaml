@@ -1,0 +1,67 @@
+# Configuration: Wide UNet with Batch Size 32
+# Features: [128, 256, 512, 1024] (2x wider channel capacity across all stages)
+# Dataset budget: 5,000 train samples / epoch, 1,000 val samples
+
+project:
+  name: "sid_unet_wide_b32"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/exp_unet_wide_b32"
+
+data:
+  dataset_name: "saberzl/SID_Set"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  shuffle_buffer_size: 2000
+  train_split: "train"
+  val_split: "validation"
+  train_samples_per_epoch: 5000  # Bounded sample count per epoch (not whole dataset)
+  val_samples: 1000              # Bounded validation evaluation count
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+
+model:
+  name: "unet"
+  in_channels: 3
+  out_channels: 1
+  features: [128, 256, 512, 1024]  # Wide channel representation
+  bilinear: true
+  dropout: 0.15
+  aux_classifier: true
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 15
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
+  amp: true
+  save_best: true
+  save_latest: true
+  eval_interval: 1
+  early_stopping_patience: 5
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 25
+  use_tensorboard: true
+  tensorboard_dir: "outputs/exp_unet_wide_b32/runs"
+  save_sample_images: true
+  num_sample_images: 4

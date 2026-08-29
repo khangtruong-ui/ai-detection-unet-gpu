@@ -1,0 +1,67 @@
+# Configuration: High-Throughput Large Batch Size (B=64) UNet
+# Batch size: 64 (4x default), scaled learning rate with warmup
+# Dataset budget: 6,400 train samples / epoch (100 batches), 1,280 val samples (20 batches)
+
+project:
+  name: "sid_unet_large_batch_b64"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/exp_unet_large_batch_b64"
+
+data:
+  dataset_name: "saberzl/SID_Set"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 64               # Large batch size for maximum GPU throughput
+  num_workers: 4
+  pin_memory: true
+  shuffle_buffer_size: 3000
+  train_split: "train"
+  val_split: "validation"
+  train_samples_per_epoch: 6400 # Exactly 100 optimization steps per epoch
+  val_samples: 1280             # Exactly 20 validation steps per epoch
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+
+model:
+  name: "unet"
+  in_channels: 3
+  out_channels: 1
+  features: [64, 128, 256, 512]
+  bilinear: true
+  dropout: 0.1
+  aux_classifier: true
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 20
+  learning_rate: 0.0015         # Scaled learning rate for B=64
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 2
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
+  amp: true
+  save_best: true
+  save_latest: true
+  eval_interval: 1
+  early_stopping_patience: 6
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20
+  use_tensorboard: true
+  tensorboard_dir: "outputs/exp_unet_large_batch_b64/runs"
+  save_sample_images: true
+  num_sample_images: 4

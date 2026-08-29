@@ -42,3 +42,37 @@ def test_test_configs_loading():
     assert quick_cfg.loss.mask_loss_type == "dice"
     assert quick_cfg.model.aux_classifier is False
 
+
+def test_all_experiment_configs_validity():
+    import glob
+    import torch
+    from sid_unet.models.unet import build_model
+    from sid_unet.losses.auxiliary import build_loss
+
+    exp_configs = glob.glob("configs/experiments/*.yaml")
+    assert len(exp_configs) >= 8, f"Expected at least 8 experiment configs, found {len(exp_configs)}"
+
+    for cfg_file in exp_configs:
+        cfg = load_config(cfg_file)
+        assert cfg.data.batch_size >= 16
+        # Ensure sample budgets are strictly bounded (not full dataset passes)
+        assert cfg.data.train_samples_per_epoch > 0
+        assert cfg.data.val_samples > 0
+
+        # Verify model and loss build cleanly
+        model = build_model(cfg)
+        loss_fn = build_loss(cfg)
+
+        # Test forward pass with small batch
+        h, w = cfg.data.image_size
+        x = torch.randn(2, 3, h, w)
+        out = model(x)
+        if cfg.model.aux_classifier:
+            assert isinstance(out, tuple)
+            mask_out, cls_out = out
+            assert mask_out.shape == (2, 1, h, w)
+            assert cls_out.shape == (2, cfg.model.num_classes)
+        else:
+            assert out.shape == (2, 1, h, w)
+
+

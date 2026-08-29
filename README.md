@@ -132,7 +132,16 @@ pip install -e ".[dev]"
 │   ├── train_non_streaming.yaml  # Config for downloaded / map datasets
 │   ├── evaluate.yaml             # Dedicated evaluation settings
 │   ├── test_smoke.yaml           # Ultra-fast smoke test config
-│   └── test_quick.yaml           # Quick alternative loss test config
+│   ├── test_quick.yaml           # Quick alternative loss test config
+│   └── experiments/              # Scaled models, large batch sizes & specialized losses
+│       ├── unet_wide_b32.yaml
+│       ├── unet_deep_5stage_b32.yaml
+│       ├── unet_large_batch_b64.yaml
+│       ├── unet_highres_512_b16.yaml
+│       ├── unet_heavy_wide_deep_b32.yaml
+│       ├── unet_focal_hard_mining_b32.yaml
+│       ├── unet_convtranspose_learned_up_b32.yaml
+│       └── unet_non_streaming_b32.yaml
 ├── sid_unet/
 │   ├── __init__.py
 │   ├── dataset/
