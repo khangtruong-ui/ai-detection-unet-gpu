@@ -1,0 +1,31 @@
+project:
+  name: "sid_unet_eval"
+  device: "auto"
+  output_dir: "outputs/eval_results"
+
+data:
+  dataset_name: "saberzl/SID_Set"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 16
+  num_workers: 2
+  pin_memory: true
+  val_split: "validation"
+  val_samples: 1000
+
+model:
+  name: "unet"
+  in_channels: 3
+  out_channels: 1
+  features: [64, 128, 256, 512]
+  bilinear: true
+  dropout: 0.0
+  aux_classifier: true
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2

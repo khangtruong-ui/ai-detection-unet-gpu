@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sid-unet"
+version = "0.1.0"
+description = "Config-driven UNet for AI-generated synthetic image segmentation and classification on saberzl/SID_Set"
+readme = "README.md"
+authors = [{ name = "AI Research Team" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "datasets>=2.14.0",
+    "numpy>=1.22.0",
+    "pillow>=9.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "scikit-learn>=1.0.0",
+    "tabulate>=0.9.0",
+    "tensorboard>=2.10.0",
+    "matplotlib>=3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+sid-train = "sid_unet.train:cli_main"
+sid-eval = "sid_unet.evaluate:cli_main"
+sid-predict = "sid_unet.predict:cli_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sid_unet*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
