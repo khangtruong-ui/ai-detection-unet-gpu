@@ -142,7 +142,16 @@ def main():
     headers = ["Image", "Synthetic Area Ratio", "Pred Label (Confidence)", "Saved Mask"]
     print("\n" + tabulate(results_table, headers=headers, tablefmt="github"))
     print(f"\nAll outputs saved to '{args.output_dir}'")
+    return results_table
+
+
+def cli_main():
+    import sys
+    main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()

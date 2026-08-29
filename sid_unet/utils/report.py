@@ -117,7 +117,7 @@ def generate_evaluation_report(
             lbl_key = label_names.get(lbl, f"Label {lbl}")
             report_dict["per_label_metrics"][lbl_key] = stats
 
-    if confusion_matrix is not None:
+    if confusion_matrix is not None and len(confusion_matrix) > 0:
         report_dict["auxiliary_classification_confusion_matrix"] = confusion_matrix
 
     if config:
@@ -149,12 +149,18 @@ def generate_evaluation_report(
         md_lines.append(tabulate(per_label_rows, headers=per_label_headers, tablefmt="github"))
         md_lines.append("\n")
 
-    if confusion_matrix is not None:
+    if confusion_matrix is not None and len(confusion_matrix) > 0:
         md_lines.append("### Auxiliary Classification Confusion Matrix (Rows: Ground Truth, Cols: Predicted)\n")
-        cm_headers = ["Actual \\ Pred", "Class 0 (Real)", "Class 1 (Synthetic)", "Class 2 (Tampered)"]
+        num_classes = len(confusion_matrix)
+        default_class_names = ["Class 0 (Real)", "Class 1 (Synthetic)", "Class 2 (Tampered)"]
+        cm_headers = ["Actual \\ Pred"] + [
+            default_class_names[i] if i < len(default_class_names) else f"Class {i}"
+            for i in range(num_classes)
+        ]
         cm_rows = []
         for i, row in enumerate(confusion_matrix):
-            cm_rows.append([f"Class {i}", *row])
+            row_label = default_class_names[i] if i < len(default_class_names) else f"Class {i}"
+            cm_rows.append([row_label, *row])
         md_lines.append(tabulate(cm_rows, headers=cm_headers, tablefmt="github"))
         md_lines.append("\n")
 
@@ -203,7 +209,7 @@ def generate_multi_experiment_report(
         val_iou = metrics.get("val_iou")
         val_dice = metrics.get("val_dice")
         val_pixel_acc = metrics.get("val_pixel_acc")
-        val_acc = metrics.get("val_accuracy")
+        val_acc = metrics.get("val_aux_accuracy", metrics.get("val_accuracy"))
 
         row = [
             exp_name,

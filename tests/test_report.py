@@ -71,6 +71,21 @@ def test_generate_evaluation_report():
         assert os.path.exists(os.path.join(tmpdir, "test_report.md"))
         assert os.path.exists(os.path.join(tmpdir, "test_report.json"))
         assert "Overall Segmentation & Classification Metrics" in res["markdown"]
+        # Ensure confusion matrix table header is NOT rendered when confusion_matrix is None or empty
+        assert "Auxiliary Classification Confusion Matrix" not in res["markdown"]
+
+        # Test with non-empty confusion matrix
+        cm = [[5, 1, 0], [0, 6, 0], [1, 0, 4]]
+        res_with_cm = generate_evaluation_report(
+            overall_metrics=overall,
+            confusion_matrix=cm,
+            config=cfg,
+            output_dir=tmpdir,
+            report_name="test_report_with_cm",
+        )
+        assert "Auxiliary Classification Confusion Matrix" in res_with_cm["markdown"]
+        assert "Class 0 (Real)" in res_with_cm["markdown"]
+        assert "Class 1 (Synthetic)" in res_with_cm["markdown"]
 
 
 def test_generate_multi_experiment_report():

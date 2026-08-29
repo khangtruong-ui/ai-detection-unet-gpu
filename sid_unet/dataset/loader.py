@@ -7,6 +7,7 @@ robust handling of label 0 (black mask), label 1 (white mask), and label 2 (prov
 from __future__ import annotations
 
 import itertools
+import os
 from typing import Any, Dict, Iterator, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
@@ -132,16 +133,24 @@ class SIDStreamingDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         stream = self._get_stream()
-        for raw_sample in stream:
-            try:
-                yield process_raw_sample(
-                    raw_sample,
-                    transform=self.transform,
-                    target_image_size=self.target_image_size,
-                )
-            except Exception as e:
-                # Silently skip corrupted samples in stream
-                continue
+        try:
+            for raw_sample in stream:
+                try:
+                    yield process_raw_sample(
+                        raw_sample,
+                        transform=self.transform,
+                        target_image_size=self.target_image_size,
+                    )
+                except Exception:
+                    # Silently skip corrupted samples in stream
+                    continue
+        finally:
+            if hasattr(stream, "close") and callable(getattr(stream, "close", None)):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            del stream
 
 
 class SIDMapDataset(Dataset):
@@ -227,6 +236,8 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
     train_transform = get_transforms(image_size=image_size, is_train=True, augment_config=augment_config)
     val_transform = get_transforms(image_size=image_size, is_train=False)
 
+    mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
+
     if streaming:
         train_dataset = SIDStreamingDataset(
             dataset_name=dataset_name,
@@ -252,12 +263,14 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            multiprocessing_context=mp_context,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            multiprocessing_context=mp_context,
         )
     else:
         train_dataset = SIDMapDataset(
@@ -281,6 +294,7 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            multiprocessing_context=mp_context,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -288,6 +302,7 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            multiprocessing_context=mp_context,
         )
 
     return train_loader, val_loader

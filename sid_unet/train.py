@@ -182,5 +182,13 @@ def main():
     return all_results
 
 
-if __name__ == "__main__":
+def cli_main():
+    import sys
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    cli_main()

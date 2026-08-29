@@ -31,9 +31,9 @@ class ClassificationMetricTracker:
         self.all_preds.extend(preds)
         self.all_targets.extend(targets)
 
-    def compute(self) -> Tuple[Dict[str, float], List[List[int]]]:
+    def compute(self) -> Tuple[Dict[str, float], Optional[List[List[int]]]]:
         if not self.all_targets:
-            return {"aux_accuracy": 0.0, "aux_macro_f1": 0.0}, []
+            return {}, None
 
         y_true = np.array(self.all_targets)
         y_pred = np.array(self.all_preds)

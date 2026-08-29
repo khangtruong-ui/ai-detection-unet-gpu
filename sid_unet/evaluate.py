@@ -154,7 +154,16 @@ def main():
 
     logger.info("\n" + report_result["markdown"])
     logger.info(f"Reports saved to: {output_dir}")
+    return report_result
+
+
+def cli_main():
+    import sys
+    main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()

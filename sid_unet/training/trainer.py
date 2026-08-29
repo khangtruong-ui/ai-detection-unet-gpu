@@ -123,42 +123,46 @@ class Trainer:
         metric_logger = MetricLogger()
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.epochs} [Train]", leave=False)
 
-        for batch in pbar:
-            images = batch["image"].to(self.device, non_blocking=True)
-            masks = batch["mask"].to(self.device, non_blocking=True)
-            labels = batch.get("label")
-            if labels is not None:
-                labels = labels.to(self.device, non_blocking=True)
+        try:
+            for batch in pbar:
+                images = batch["image"].to(self.device, non_blocking=True)
+                masks = batch["mask"].to(self.device, non_blocking=True)
+                labels = batch.get("label")
+                if labels is not None:
+                    labels = labels.to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-                outputs = self.model(images)
-                loss, loss_dict = self.loss_fn(outputs, masks, labels)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    outputs = self.model(images)
+                    loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
-            self.scaler.scale(loss).backward()
+                self.scaler.scale(loss).backward()
 
-            if self.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                if self.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
-            batch_size = images.size(0)
-            metric_logger.update_dict(loss_dict, n=batch_size)
-            self.global_step += 1
+                batch_size = images.size(0)
+                metric_logger.update_dict(loss_dict, n=batch_size)
+                self.global_step += 1
 
-            if self.global_step % self.log_interval == 0:
-                for k, v in loss_dict.items():
-                    self.tb_logger.log_scalar(f"Train/{k}", v, self.global_step)
-                self.tb_logger.log_scalar("Train/LearningRate", self.optimizer.param_groups[0]["lr"], self.global_step)
+                if self.global_step % self.log_interval == 0:
+                    for k, v in loss_dict.items():
+                        self.tb_logger.log_scalar(f"Train/{k}", v, self.global_step)
+                    self.tb_logger.log_scalar("Train/LearningRate", self.optimizer.param_groups[0]["lr"], self.global_step)
 
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "mask_loss": f"{loss_dict.get('mask_loss', 0.0):.4f}",
-                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
-            })
+                pbar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "mask_loss": f"{loss_dict.get('mask_loss', 0.0):.4f}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                })
+        finally:
+            pbar.close()
+            del pbar
 
         averages = metric_logger.averages()
         return averages
@@ -177,36 +181,40 @@ class Trainer:
 
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.epochs} [Val]", leave=False)
 
-        for i, batch in enumerate(pbar):
-            images = batch["image"].to(self.device, non_blocking=True)
-            masks = batch["mask"].to(self.device, non_blocking=True)
-            labels = batch.get("label")
-            if labels is not None:
-                labels = labels.to(self.device, non_blocking=True)
+        try:
+            for i, batch in enumerate(pbar):
+                images = batch["image"].to(self.device, non_blocking=True)
+                masks = batch["mask"].to(self.device, non_blocking=True)
+                labels = batch.get("label")
+                if labels is not None:
+                    labels = labels.to(self.device, non_blocking=True)
 
-            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-                outputs = self.model(images)
-                loss, loss_dict = self.loss_fn(outputs, masks, labels)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    outputs = self.model(images)
+                    loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
-            metric_logger.update_dict(loss_dict, n=images.size(0))
+                metric_logger.update_dict(loss_dict, n=images.size(0))
 
-            if isinstance(outputs, tuple):
-                mask_logits, class_logits = outputs
-            else:
-                mask_logits, class_logits = outputs, None
+                if isinstance(outputs, tuple):
+                    mask_logits, class_logits = outputs
+                else:
+                    mask_logits, class_logits = outputs, None
 
-            # Update segmentation tracker
-            seg_tracker.update(mask_logits, masks, labels)
+                # Update segmentation tracker
+                seg_tracker.update(mask_logits, masks, labels)
 
-            # Update classification tracker
-            if class_logits is not None and labels is not None:
-                cls_tracker.update(class_logits, labels)
+                # Update classification tracker
+                if class_logits is not None and labels is not None:
+                    cls_tracker.update(class_logits, labels)
 
-            # Save first batch for visualization
-            if i == 0:
-                first_batch_images = images
-                first_batch_targets = masks
-                first_batch_preds = torch.sigmoid(mask_logits)
+                # Save first batch for visualization
+                if i == 0:
+                    first_batch_images = images
+                    first_batch_targets = masks
+                    first_batch_preds = torch.sigmoid(mask_logits)
+        finally:
+            pbar.close()
+            del pbar
 
         # Compute metrics
         overall_seg_metrics, per_label_seg_metrics = seg_tracker.compute()
@@ -304,6 +312,8 @@ class Trainer:
         )
         self.logger.info(f"\n{report_data['markdown']}")
         self.tb_logger.close()
+        import gc
+        gc.collect()
 
         return {
             "run_name": self.config.project.get("name", "sid_unet"),
