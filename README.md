@@ -130,7 +130,9 @@ pip install -e ".[dev]"
 │   ├── default.yaml              # Default configuration
 │   ├── train_streaming.yaml      # Config tailored for SID_Set streaming
 │   ├── train_non_streaming.yaml  # Config for downloaded / map datasets
-│   └── evaluate.yaml             # Dedicated evaluation settings
+│   ├── evaluate.yaml             # Dedicated evaluation settings
+│   ├── test_smoke.yaml           # Ultra-fast smoke test config
+│   └── test_quick.yaml           # Quick alternative loss test config
 ├── sid_unet/
 │   ├── __init__.py
 │   ├── dataset/
@@ -162,16 +164,18 @@ pip install -e ".[dev]"
 │   │   ├── config.py             # YAML loading, deep merge, and CLI overrides
 │   │   ├── logger.py             # Console, file, and TensorBoard logger
 │   │   └── report.py             # Markdown, JSON, and ASCII report formatting
-│   ├── train.py                  # CLI training entrypoint
+│   ├── train.py                  # CLI training entrypoint (single & multi-run)
 │   ├── evaluate.py               # CLI evaluation entrypoint
 │   └── predict.py                # CLI inference entrypoint
 ├── tests/
+│   ├── test_cli.py               # Single and multi-config CLI tests
 │   ├── test_config.py            # Config parsing & override tests
-│   ├── test_dataset.py           # Dataset sample processing tests
+│   ├── test_dataset.py           # Dataset sample & sample-limit tests
 │   ├── test_losses.py            # Loss functions unit tests
 │   ├── test_mask_utils.py        # Mask synthesis logic tests
 │   ├── test_metrics.py           # Metric calculation tests
 │   ├── test_models.py            # Forward/backward gradient & shape tests
+│   ├── test_report.py            # Single & multi-experiment report tests
 │   ├── test_trainer_integration.py # End-to-end integration test
 │   └── test_transforms.py        # Preprocessing & augmentation tests
 ├── pyproject.toml                # Pip package specification
@@ -241,7 +245,8 @@ training:
 
 ### 1. Training
 
-Run training with default streaming config:
+#### A. Single Experiment Training
+Run training with a configuration file:
 ```bash
 # Using installed CLI command:
 sid-train --config configs/train_streaming.yaml
@@ -250,11 +255,35 @@ sid-train --config configs/train_streaming.yaml
 python -m sid_unet.train --config configs/train_streaming.yaml
 ```
 
-**Override parameters via CLI:**
+**Fast Smoke Testing:**
+Run minimal 1-epoch / small-step test configurations:
+```bash
+# Ultra-fast smoke test:
+sid-train --config configs/test_smoke.yaml
+
+# Quick alternative loss test:
+sid-train --config configs/test_quick.yaml
+```
+
+#### B. Multi-Experiment Suite (Run Multiple Configs in One Command)
+You can pass multiple configuration files to execute a series of experiments sequentially. Each run gets an isolated output directory, and a consolidated markdown & JSON comparative benchmark report is generated automatically:
+```bash
+sid-train --configs configs/test_smoke.yaml configs/test_quick.yaml
+```
+
+**Override parameters via CLI across runs:**
 ```bash
 python -m sid_unet.train \
   --config configs/train_streaming.yaml \
   --override data.batch_size=32 training.learning_rate=5e-4 data.image_size=[256,256]
+```
+
+**Full Dataset Passes (Run Until Dataset Depletes):**
+Set `data.train_samples_per_epoch: -1` (or `steps_per_epoch: -1`) to stream or iterate through the entire dataset until depletion rather than truncating to fixed epoch sample counts:
+```bash
+python -m sid_unet.train \
+  --config configs/train_streaming.yaml \
+  --override data.train_samples_per_epoch=-1 data.val_samples=-1
 ```
 
 **Resume from a checkpoint:**

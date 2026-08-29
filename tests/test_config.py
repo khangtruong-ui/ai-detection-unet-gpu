@@ -29,3 +29,16 @@ def test_save_and_load_config():
         loaded_cfg = load_config(config_path)
         assert loaded_cfg.project.name == "custom_experiment"
         assert loaded_cfg.model.name == "unet"
+
+
+def test_test_configs_loading():
+    smoke_cfg = load_config("configs/test_smoke.yaml")
+    assert smoke_cfg.project.name == "sid_unet_smoke_test"
+    assert smoke_cfg.data.train_samples_per_epoch == 4
+    assert smoke_cfg.data.val_samples == 2
+
+    quick_cfg = load_config("configs/test_quick.yaml")
+    assert quick_cfg.project.name == "sid_unet_quick_test"
+    assert quick_cfg.loss.mask_loss_type == "dice"
+    assert quick_cfg.model.aux_classifier is False
+

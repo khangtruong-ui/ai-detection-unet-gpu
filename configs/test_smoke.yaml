@@ -1,0 +1,52 @@
+project:
+  name: "sid_unet_smoke_test"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/smoke_test"
+
+data:
+  dataset_name: "saberzl/SID_Set"
+  streaming: true
+  image_size: [128, 128]
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  train_samples_per_epoch: 4
+  val_samples: 2
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.0
+
+model:
+  name: "unet"
+  in_channels: 3
+  out_channels: 1
+  features: [16, 32, 64]
+  bilinear: true
+  dropout: 0.0
+  aux_classifier: true
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 1
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: false
+  early_stopping_patience: 2
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 1
+  use_tensorboard: false
+  save_sample_images: false

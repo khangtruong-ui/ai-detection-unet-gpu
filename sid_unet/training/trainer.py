@@ -306,8 +306,14 @@ class Trainer:
         self.tb_logger.close()
 
         return {
+            "run_name": self.config.project.get("name", "sid_unet"),
             "best_score": self.ckpt_manager.best_score,
             "best_epoch": self.ckpt_manager.best_epoch,
             "final_metrics": final_val_summary,
+            "per_label_metrics": final_per_label,
+            "confusion_matrix": final_cm,
             "report_path": os.path.join(self.report_dir, "training_final_report.md"),
+            "report_json_path": os.path.join(self.report_dir, "training_final_report.json"),
+            "config": self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+            "report_data": report_data,
         }

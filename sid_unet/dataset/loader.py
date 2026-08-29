@@ -57,10 +57,36 @@ def process_raw_sample(
     }
 
 
+def resolve_sample_limit(
+    samples_val: Optional[Any],
+    steps_val: Optional[Any],
+    batch_size: int,
+    default_samples: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Resolve sample count limit.
+    If steps or samples <= 0 (e.g. -1), returns None (meaning run until dataset is depleted).
+    """
+    if steps_val is not None:
+        steps_int = int(steps_val)
+        if steps_int <= 0:
+            return None
+        return steps_int * batch_size
+
+    if samples_val is not None:
+        samples_int = int(samples_val)
+        if samples_int <= 0:
+            return None
+        return samples_int
+
+    return default_samples
+
+
 class SIDStreamingDataset(IterableDataset):
     """
     Streaming PyTorch Dataset wrapping HuggingFace IterableDataset.
     Ideal for massive datasets without downloading everything to disk.
+    When max_samples is None or <= 0, streams all samples until dataset depletion.
     """
 
     def __init__(
@@ -78,7 +104,7 @@ class SIDStreamingDataset(IterableDataset):
         self.split = split
         self.transform = transform
         self.shuffle_buffer_size = shuffle_buffer_size
-        self.max_samples = max_samples
+        self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
         self.seed = seed
         self.target_image_size = target_image_size
 
@@ -99,7 +125,7 @@ class SIDStreamingDataset(IterableDataset):
         else:
             stream_iter = iter(hf_ds)
 
-        if self.max_samples is not None:
+        if self.max_samples is not None and self.max_samples > 0:
             stream_iter = itertools.islice(stream_iter, self.max_samples)
 
         return stream_iter
@@ -121,6 +147,7 @@ class SIDStreamingDataset(IterableDataset):
 class SIDMapDataset(Dataset):
     """
     Standard Indexable PyTorch Dataset when streaming = False.
+    When max_samples is None or <= 0, uses the full dataset until depletion.
     """
 
     def __init__(
@@ -134,9 +161,10 @@ class SIDMapDataset(Dataset):
         super().__init__()
         self.transform = transform
         self.target_image_size = target_image_size
+        self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
         hf_ds = hf_load_dataset(dataset_name, split=split, streaming=False)
-        if max_samples is not None and max_samples < len(hf_ds):
-            hf_ds = hf_ds.select(range(max_samples))
+        if self.max_samples is not None and 0 < self.max_samples < len(hf_ds):
+            hf_ds = hf_ds.select(range(self.max_samples))
         self.data = hf_ds
 
     def __len__(self) -> int:
@@ -155,6 +183,8 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
     """
     Create training and validation DataLoaders based on configuration.
     Supports both streaming = True and streaming = False.
+    Handles -1 or negative train_samples_per_epoch / steps_per_epoch / val_samples to run
+    until dataset depletion.
     """
     dataset_name = config.data.get("dataset_name", "saberzl/SID_Set")
     streaming = bool(config.data.get("streaming", True))
@@ -168,8 +198,30 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
     train_split = config.data.get("train_split", "train")
     val_split = config.data.get("val_split", "validation")
 
-    train_samples_per_epoch = config.data.get("train_samples_per_epoch", 2000)
-    val_samples = config.data.get("val_samples", 400)
+    train_samples_cfg = config.data.get("train_samples_per_epoch", 2000)
+    steps_per_epoch_cfg = config.data.get(
+        "steps_per_epoch",
+        config.training.get("steps_per_epoch", None) if hasattr(config, "training") else None,
+    )
+    train_max_samples = resolve_sample_limit(
+        samples_val=train_samples_cfg,
+        steps_val=steps_per_epoch_cfg,
+        batch_size=batch_size,
+        default_samples=2000,
+    )
+
+    val_samples_cfg = config.data.get("val_samples", 400)
+    val_steps_cfg = config.data.get(
+        "val_steps",
+        config.training.get("val_steps", None) if hasattr(config, "training") else None,
+    )
+    val_max_samples = resolve_sample_limit(
+        samples_val=val_samples_cfg,
+        steps_val=val_steps_cfg,
+        batch_size=batch_size,
+        default_samples=400,
+    )
+
     augment_config = config.data.get("augmentations", {})
 
     train_transform = get_transforms(image_size=image_size, is_train=True, augment_config=augment_config)
@@ -181,7 +233,7 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
             split=train_split,
             transform=train_transform,
             shuffle_buffer_size=shuffle_buffer,
-            max_samples=train_samples_per_epoch,
+            max_samples=train_max_samples,
             seed=seed,
             target_image_size=image_size,
         )
@@ -190,7 +242,7 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
             split=val_split,
             transform=val_transform,
             shuffle_buffer_size=0,
-            max_samples=val_samples,
+            max_samples=val_max_samples,
             seed=seed,
             target_image_size=image_size,
         )
@@ -212,14 +264,14 @@ def create_dataloaders(config: Any) -> Tuple[DataLoader, DataLoader]:
             dataset_name=dataset_name,
             split=train_split,
             transform=train_transform,
-            max_samples=train_samples_per_epoch,
+            max_samples=train_max_samples,
             target_image_size=image_size,
         )
         val_dataset = SIDMapDataset(
             dataset_name=dataset_name,
             split=val_split,
             transform=val_transform,
-            max_samples=val_samples,
+            max_samples=val_max_samples,
             target_image_size=image_size,
         )
 

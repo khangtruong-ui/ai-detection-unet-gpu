@@ -1,14 +1,72 @@
 """
 Report generation and formatting utilities for SID-UNet evaluation and benchmarking.
-Produces Markdown, JSON, and rich formatted terminal tables.
+Produces Markdown, JSON, and rich formatted terminal tables for single and multi-experiment runs.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from tabulate import tabulate
+
+
+def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract a flattened, human-readable dictionary of key hyperparameters from config."""
+    if not config:
+        return {}
+
+    project_cfg = config.get("project", {})
+    data_cfg = config.get("data", {})
+    model_cfg = config.get("model", {})
+    loss_cfg = config.get("loss", {})
+    train_cfg = config.get("training", {})
+
+    # Steps / samples representation
+    train_samples = data_cfg.get("train_samples_per_epoch")
+    steps_per_epoch = data_cfg.get("steps_per_epoch", train_cfg.get("steps_per_epoch"))
+    if steps_per_epoch is not None and int(steps_per_epoch) <= 0:
+        steps_repr = "Full Dataset (until depletion)"
+    elif steps_per_epoch is not None:
+        steps_repr = f"{steps_per_epoch} steps/epoch"
+    elif train_samples is not None and int(train_samples) <= 0:
+        steps_repr = "Full Dataset (until depletion)"
+    elif train_samples is not None:
+        steps_repr = f"{train_samples} samples/epoch"
+    else:
+        steps_repr = "Full Dataset"
+
+    loss_desc = loss_cfg.get("mask_loss_type", "combined")
+    if loss_desc == "combined":
+        loss_desc = f"Combined (BCE: {loss_cfg.get('bce_weight', 0.5)}, Dice: {loss_cfg.get('dice_weight', 0.5)})"
+
+    return {
+        "Project Name": project_cfg.get("name", "N/A"),
+        "Dataset": data_cfg.get("dataset_name", "N/A"),
+        "Streaming": data_cfg.get("streaming", True),
+        "Image Size": str(data_cfg.get("image_size", [256, 256])),
+        "Batch Size": data_cfg.get("batch_size", 16),
+        "Epoch Limit / Steps": steps_repr,
+        "Model": f"{model_cfg.get('name', 'unet')} (features={model_cfg.get('features')}, bilinear={model_cfg.get('bilinear', True)})",
+        "Aux Classifier": f"{model_cfg.get('aux_classifier', True)} (classes={model_cfg.get('num_classes', 3)})",
+        "Mask Loss": loss_desc,
+        "Aux Loss": f"{loss_cfg.get('aux_loss_type', 'cross_entropy')} (wt={loss_cfg.get('aux_weight', 0.2)})",
+        "Optimizer": f"{train_cfg.get('optimizer', 'adamw')} (lr={train_cfg.get('learning_rate', 1e-3)}, wd={train_cfg.get('weight_decay', 1e-4)})",
+        "Scheduler": train_cfg.get("scheduler", "cosine"),
+        "Epochs": train_cfg.get("epochs", 10),
+        "AMP": train_cfg.get("amp", True),
+    }
+
+
+def format_config_table(config: Dict[str, Any], title: str = "Configuration & Hyperparameters") -> str:
+    """Format configuration dictionary into a clean tabulated markdown table."""
+    params = extract_key_hyperparameters(config)
+    if not params:
+        return ""
+    headers = ["Hyperparameter / Setting", "Configured Value"]
+    rows = [[k, str(v)] for k, v in params.items()]
+    table_str = tabulate(rows, headers=headers, tablefmt="github")
+    return f"### {title}\n\n{table_str}\n"
 
 
 def format_metrics_table(metrics: Dict[str, Any], title: str = "Evaluation Metrics") -> str:
@@ -27,7 +85,8 @@ def format_metrics_table(metrics: Dict[str, Any], title: str = "Evaluation Metri
         rows.append([metric_name, formatted_val])
 
     table_str = tabulate(rows, headers=headers, tablefmt="github")
-    return f"### {title}\n\n{table_str}\n"
+    title_str = f"### {title}\n\n" if title else ""
+    return f"{title_str}{table_str}\n"
 
 
 def generate_evaluation_report(
@@ -39,10 +98,14 @@ def generate_evaluation_report(
     report_name: str = "evaluation_report",
 ) -> Dict[str, Any]:
     """
-    Generate comprehensive evaluation report with overall metrics, per-label stats,
-    and auxiliary classification details. Saves both JSON and Markdown formats.
+    Generate comprehensive evaluation report with configuration details, overall metrics,
+    per-label stats, and auxiliary classification details. Saves both JSON and Markdown formats.
     """
-    label_names = {0: "Label 0 (Real / Black Mask)", 1: "Label 1 (Synthetic / White Mask)", 2: "Label 2 (Tampered / Partial Mask)"}
+    label_names = {
+        0: "Label 0 (Real / Black Mask)",
+        1: "Label 1 (Synthetic / White Mask)",
+        2: "Label 2 (Tampered / Partial Mask)",
+    }
 
     report_dict: Dict[str, Any] = {
         "overall_metrics": overall_metrics,
@@ -58,15 +121,15 @@ def generate_evaluation_report(
         report_dict["auxiliary_classification_confusion_matrix"] = confusion_matrix
 
     if config:
-        report_dict["config_summary"] = {
-            "dataset": config.get("data", {}).get("dataset_name"),
-            "image_size": config.get("data", {}).get("image_size"),
-            "model": config.get("model", {}).get("name"),
-            "aux_classifier": config.get("model", {}).get("aux_classifier"),
-        }
+        report_dict["configuration"] = config
+        report_dict["hyperparameters"] = extract_key_hyperparameters(config)
 
     # Generate Markdown text
     md_lines = ["# SID-UNet Evaluation Report\n"]
+
+    if config:
+        md_lines.append(format_config_table(config, title="Run Configuration & Hyperparameters"))
+
     md_lines.append(format_metrics_table(overall_metrics, title="Overall Segmentation & Classification Metrics"))
 
     if per_label_metrics:
@@ -111,4 +174,124 @@ def generate_evaluation_report(
     return {
         "report_dict": report_dict,
         "markdown": markdown_content,
+    }
+
+
+def generate_multi_experiment_report(
+    experiment_results: List[Dict[str, Any]],
+    output_dir: Optional[str] = None,
+    report_name: str = "experiment_comparison",
+) -> Dict[str, Any]:
+    """
+    Generate comparison report for multiple experiment runs.
+    Presents side-by-side config hyperparameters and validation/test results.
+    """
+    comparison_data: List[Dict[str, Any]] = []
+    summary_rows = []
+
+    for exp in experiment_results:
+        exp_name = exp.get("run_name") or exp.get("name", "Unknown Run")
+        config = exp.get("config", {})
+        metrics = exp.get("final_metrics", {})
+        best_epoch = exp.get("best_epoch", "N/A")
+        best_score = exp.get("best_score")
+
+        hp = extract_key_hyperparameters(config)
+
+        # Pull key metric scores
+        val_loss = metrics.get("val_total_loss", metrics.get("val_loss"))
+        val_iou = metrics.get("val_iou")
+        val_dice = metrics.get("val_dice")
+        val_pixel_acc = metrics.get("val_pixel_acc")
+        val_acc = metrics.get("val_accuracy")
+
+        row = [
+            exp_name,
+            hp.get("Model", "UNet"),
+            hp.get("Mask Loss", "Combined"),
+            f"{config.get('training', {}).get('learning_rate', 'N/A')}",
+            f"{config.get('data', {}).get('batch_size', 'N/A')}",
+            f"{best_epoch}",
+            f"{val_loss:.4f}" if isinstance(val_loss, (int, float)) else "N/A",
+            f"{val_iou:.4f}" if isinstance(val_iou, (int, float)) else "N/A",
+            f"{val_dice:.4f}" if isinstance(val_dice, (int, float)) else "N/A",
+            f"{val_pixel_acc:.4f}" if isinstance(val_pixel_acc, (int, float)) else "N/A",
+            f"{val_acc:.4f}" if isinstance(val_acc, (int, float)) else "N/A",
+        ]
+        summary_rows.append(row)
+
+        comparison_data.append({
+            "run_name": exp_name,
+            "config_path": exp.get("config_path"),
+            "best_epoch": best_epoch,
+            "best_score": best_score,
+            "hyperparameters": hp,
+            "metrics": metrics,
+            "report_path": exp.get("report_path"),
+        })
+
+    summary_headers = [
+        "Experiment",
+        "Model",
+        "Loss",
+        "LR",
+        "Batch Size",
+        "Best Epoch",
+        "Val Loss",
+        "Val IoU",
+        "Val Dice",
+        "Pixel Acc",
+        "Class Acc",
+    ]
+    summary_table_md = tabulate(summary_rows, headers=summary_headers, tablefmt="github")
+
+    md_lines = [
+        "# Multi-Experiment Benchmarking & Comparison Report\n",
+        "## Summary Comparison\n",
+        summary_table_md,
+        "\n---\n",
+        "## Detailed Experiment Breakdown\n",
+    ]
+
+    for item in comparison_data:
+        md_lines.append(f"### Experiment: {item['run_name']}\n")
+        if item.get("config_path"):
+            md_lines.append(f"- **Config File**: `{item['config_path']}`")
+        if item.get("report_path"):
+            md_lines.append(f"- **Detailed Report**: `{item['report_path']}`")
+        if item.get("best_score") is not None:
+            md_lines.append(f"- **Best Epoch**: {item['best_epoch']} (Score: {item['best_score']:.4f})\n")
+        else:
+            md_lines.append(f"- **Best Epoch**: {item['best_epoch']}\n")
+
+        # Hyperparameters table
+        if item.get("hyperparameters"):
+            hp_rows = [[k, str(v)] for k, v in item["hyperparameters"].items()]
+            md_lines.append("#### Configuration Parameters\n")
+            md_lines.append(tabulate(hp_rows, headers=["Parameter", "Value"], tablefmt="github"))
+            md_lines.append("\n")
+
+        # Metrics table
+        if item.get("metrics"):
+            md_lines.append("#### Final Results\n")
+            md_lines.append(format_metrics_table(item["metrics"], title=""))
+            md_lines.append("\n")
+
+    markdown_content = "\n".join(md_lines)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        json_path = os.path.join(output_dir, f"{report_name}.json")
+        md_path = os.path.join(output_dir, f"{report_name}.md")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(comparison_data, f, indent=2)
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+
+    return {
+        "comparison_data": comparison_data,
+        "markdown": markdown_content,
+        "summary_table": summary_table_md,
     }

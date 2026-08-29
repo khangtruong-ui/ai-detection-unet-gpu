@@ -47,3 +47,23 @@ def test_process_raw_sample_labels():
     assert processed_2["label"].item() == 2
     assert processed_2["mask"].sum() > 0
     assert (processed_2["mask"] == 0.0).sum() > 0
+
+
+def test_resolve_sample_limit():
+    from sid_unet.dataset.loader import resolve_sample_limit
+
+    # Positive steps
+    assert resolve_sample_limit(samples_val=2000, steps_val=10, batch_size=4) == 40
+    # Negative steps -> None (deplete dataset)
+    assert resolve_sample_limit(samples_val=2000, steps_val=-1, batch_size=4) is None
+    assert resolve_sample_limit(samples_val=2000, steps_val=0, batch_size=4) is None
+
+    # No steps, positive samples
+    assert resolve_sample_limit(samples_val=500, steps_val=None, batch_size=4) == 500
+    # No steps, negative samples -> None (deplete dataset)
+    assert resolve_sample_limit(samples_val=-1, steps_val=None, batch_size=4) is None
+    assert resolve_sample_limit(samples_val=0, steps_val=None, batch_size=4) is None
+
+    # Fallback default
+    assert resolve_sample_limit(samples_val=None, steps_val=None, batch_size=4, default_samples=100) == 100
+
