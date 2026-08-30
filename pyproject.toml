@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Config-driven UNet for AI-generated synthetic image segmentation and classification on saberzl/SID_Set"
 readme = "README.md"
 authors = [{ name = "AI Research Team" }]
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.0.0",

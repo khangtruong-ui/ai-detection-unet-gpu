@@ -53,6 +53,7 @@ ENV/
 env.bak/
 venv.bak/
 /venv-backups
+uv.lock
 
 # IDEs
 .vscode/
