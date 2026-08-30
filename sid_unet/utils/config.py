@@ -108,8 +108,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "output_dir": "outputs",
     },
     "data": {
-        "dataset_name": "saberzl/SID_Set",
-        "streaming": True,
+        "dataset_name": "KhangTruong/IMD2020",
+        "streaming": False,
         "image_size": [256, 256],
         "batch_size": 16,
         "num_workers": 2,
@@ -117,8 +117,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "shuffle_buffer_size": 1000,
         "train_split": "train",
         "val_split": "validation",
-        "train_samples_per_epoch": 2000,  # For streaming dataset epoch delineation
-        "val_samples": 400,              # Max samples for validation pass
+        "train_samples_per_epoch": -1,  # Set to -1 to run until dataset is depleted
+        "val_samples": -1,              # Set to -1 to run until dataset is depleted
         "augmentations": {
             "horizontal_flip": 0.5,
             "vertical_flip": 0.2,

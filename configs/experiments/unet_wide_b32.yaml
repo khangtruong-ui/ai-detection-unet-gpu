@@ -9,17 +9,17 @@ project:
   output_dir: "outputs/exp_unet_wide_b32"
 
 data:
-  dataset_name: "saberzl/SID_Set"
-  streaming: true
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
   image_size: [256, 256]
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   pin_memory: true
   shuffle_buffer_size: 2000
   train_split: "train"
   val_split: "validation"
-  train_samples_per_epoch: 5000  # Bounded sample count per epoch (not whole dataset)
-  val_samples: 1000              # Bounded validation evaluation count
+  train_samples_per_epoch: -1  # Full dataset run
+  val_samples: -1              # Full dataset validation
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

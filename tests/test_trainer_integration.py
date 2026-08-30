@@ -64,6 +64,13 @@ def test_trainer_mini_run():
 
         results = trainer.train()
         assert "best_score" in results
+        assert "curves_plot_path" in results
         assert os.path.exists(os.path.join(tmpdir, "checkpoints", "checkpoint_latest.pt"))
         assert os.path.exists(os.path.join(tmpdir, "reports", "training_final_report.json"))
         assert os.path.exists(os.path.join(tmpdir, "reports", "training_final_report.md"))
+        assert os.path.exists(os.path.join(tmpdir, "reports", "training_curves.png"))
+        assert os.path.exists(os.path.join(tmpdir, "reports", "training_curves.pdf"))
+        assert os.path.exists(os.path.join(tmpdir, "reports", "training_curves.jpg"))
+        assert os.path.exists(os.path.join(tmpdir, "reports", "training_history.json"))
+        assert os.path.exists(os.path.join(tmpdir, "reports", "training_history.csv"))
+

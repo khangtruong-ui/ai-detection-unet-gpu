@@ -5,7 +5,7 @@ project:
   output_dir: "outputs/non_streaming_run"
 
 data:
-  dataset_name: "saberzl/SID_Set"
+  dataset_name: "KhangTruong/IMD2020"
   streaming: false
   image_size: [256, 256]
   batch_size: 16
@@ -13,8 +13,8 @@ data:
   pin_memory: true
   train_split: "train"
   val_split: "validation"
-  train_samples_per_epoch: 2000
-  val_samples: 400
+  train_samples_per_epoch: -1
+  val_samples: -1
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

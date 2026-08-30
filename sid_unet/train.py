@@ -24,7 +24,9 @@ from sid_unet.dataset.loader import create_dataloaders
 from sid_unet.training.trainer import Trainer
 from sid_unet.utils.config import load_config, save_config
 from sid_unet.utils.logger import setup_logger
+from sid_unet.utils.plotting import plot_multi_experiment_curves
 from sid_unet.utils.report import generate_multi_experiment_report
+
 
 
 def set_seed(seed: int = 42):
@@ -165,21 +167,40 @@ def main():
         )
         all_results.append(res)
 
+    # Collect experiment histories and plot multi-run comparison curves
+    histories_dict = {}
+    for r in all_results:
+        exp_name = r.get("run_name", "Run")
+        if r.get("history"):
+            histories_dict[exp_name] = r["history"]
+
+    multi_curves_path = None
+    if histories_dict:
+        multi_curves_path = os.path.join(parent_output_dir, "multi_experiment_curves.png")
+        plot_multi_experiment_curves(
+            experiment_histories=histories_dict,
+            output_path=multi_curves_path,
+        )
+
     # Generate and display multi-experiment comparison report
     multi_report = generate_multi_experiment_report(
         experiment_results=all_results,
         output_dir=parent_output_dir,
         report_name="multi_experiment_comparison",
+        multi_curves_path=multi_curves_path,
     )
 
     print("\n" + "=" * 70)
     print("⭐ ALL EXPERIMENTS COMPLETED - SUMMARY REPORT")
     print("=" * 70)
     print(multi_report["summary_table"])
+    if multi_curves_path and os.path.exists(multi_curves_path):
+        print(f"Multi-Experiment comparison curves plot: {multi_curves_path}")
     print(f"\nDetailed Markdown comparison: {os.path.join(parent_output_dir, 'multi_experiment_comparison.md')}")
     print(f"Detailed JSON comparison: {os.path.join(parent_output_dir, 'multi_experiment_comparison.json')}\n")
 
     return all_results
+
 
 
 def cli_main():

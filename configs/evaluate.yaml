@@ -4,14 +4,14 @@ project:
   output_dir: "outputs/eval_results"
 
 data:
-  dataset_name: "saberzl/SID_Set"
-  streaming: true
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
   image_size: [256, 256]
   batch_size: 16
   num_workers: 2
   pin_memory: true
   val_split: "validation"
-  val_samples: 1000
+  val_samples: -1
 
 model:
   name: "unet"

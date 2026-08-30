@@ -76,16 +76,29 @@ def test_generate_evaluation_report():
 
         # Test with non-empty confusion matrix
         cm = [[5, 1, 0], [0, 6, 0], [1, 0, 4]]
+        history = [
+            {"epoch": 1, "train_loss": 0.5, "val_loss": 0.4, "val_iou": 0.7, "val_dice": 0.8, "val_pixel_acc": 0.95, "lr": 1e-3},
+        ]
+        curves_path = os.path.join(tmpdir, "training_curves.png")
+        with open(curves_path, "w") as f:
+            f.write("fake_img")
+
         res_with_cm = generate_evaluation_report(
             overall_metrics=overall,
             confusion_matrix=cm,
             config=cfg,
             output_dir=tmpdir,
             report_name="test_report_with_cm",
+            history=history,
+            curves_path=curves_path,
         )
         assert "Auxiliary Classification Confusion Matrix" in res_with_cm["markdown"]
         assert "Class 0 (Real)" in res_with_cm["markdown"]
         assert "Class 1 (Synthetic)" in res_with_cm["markdown"]
+        assert "Training & Validation Curves" in res_with_cm["markdown"]
+        assert "training_curves.png" in res_with_cm["markdown"]
+        assert "Epoch-by-Epoch Training & Validation Progression" in res_with_cm["markdown"]
+
 
 
 def test_generate_multi_experiment_report():

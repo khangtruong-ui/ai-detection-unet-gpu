@@ -9,14 +9,18 @@ def test_default_config_loading():
     assert isinstance(cfg, ConfigDict)
     assert cfg.model.in_channels == 3
     assert cfg.model.out_channels == 1
-    assert cfg.data.streaming is True
+    assert cfg.data.dataset_name == "KhangTruong/IMD2020"
+    assert cfg.data.streaming is False
+    assert cfg.data.batch_size == 16
+    assert cfg.data.train_samples_per_epoch == -1
+    assert cfg.data.val_samples == -1
     assert cfg.model.aux_classifier is True
 
 
 def test_config_overrides():
-    cfg = load_config(overrides=["training.batch_size=32", "data.streaming=false", "model.dropout=0.25"])
+    cfg = load_config(overrides=["training.batch_size=32", "data.streaming=true", "model.dropout=0.25"])
     assert cfg.training.batch_size == 32
-    assert cfg.data.streaming is False
+    assert cfg.data.streaming is True
     assert cfg.model.dropout == 0.25
 
 
@@ -34,11 +38,13 @@ def test_save_and_load_config():
 def test_test_configs_loading():
     smoke_cfg = load_config("configs/test_smoke.yaml")
     assert smoke_cfg.project.name == "sid_unet_smoke_test"
+    assert smoke_cfg.data.dataset_name == "KhangTruong/IMD2020"
     assert smoke_cfg.data.train_samples_per_epoch == 4
     assert smoke_cfg.data.val_samples == 2
 
     quick_cfg = load_config("configs/test_quick.yaml")
     assert quick_cfg.project.name == "sid_unet_quick_test"
+    assert quick_cfg.data.dataset_name == "KhangTruong/IMD2020"
     assert quick_cfg.loss.mask_loss_type == "dice"
     assert quick_cfg.model.aux_classifier is False
 
@@ -54,10 +60,12 @@ def test_all_experiment_configs_validity():
 
     for cfg_file in exp_configs:
         cfg = load_config(cfg_file)
-        assert cfg.data.batch_size >= 16
-        # Ensure sample budgets are strictly bounded (not full dataset passes)
-        assert cfg.data.train_samples_per_epoch > 0
-        assert cfg.data.val_samples > 0
+        assert cfg.data.dataset_name == "KhangTruong/IMD2020"
+        assert cfg.data.streaming is False
+        assert cfg.data.batch_size == 16
+        # Ensure sample budgets are -1 for running all dataset
+        assert cfg.data.train_samples_per_epoch == -1
+        assert cfg.data.val_samples == -1
 
         # Verify model and loss build cleanly
         model = build_model(cfg)

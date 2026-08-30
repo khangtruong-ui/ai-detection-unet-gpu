@@ -20,7 +20,9 @@ from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.training.callbacks import CheckpointManager, EarlyStopping
 from sid_unet.utils.logger import MetricLogger, setup_logger
+from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
+
 
 
 class Trainer:
@@ -228,6 +230,28 @@ class Trainer:
             # Run validation
             val_summary, per_label_metrics, confusion_mat = self.validate(epoch)
 
+            # Record per-epoch history
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+            epoch_record = {
+                "epoch": epoch,
+                "lr": current_lr,
+                "train_loss": float(train_metrics.get("total_loss", 0.0)),
+                "train_mask_loss": float(train_metrics.get("mask_loss", 0.0)),
+                "train_aux_loss": float(train_metrics.get("aux_loss", 0.0)),
+                "val_loss": float(val_summary.get("val_total_loss", val_summary.get("val_loss", 0.0))),
+                "val_mask_loss": float(val_summary.get("val_mask_loss", 0.0)),
+                "val_aux_loss": float(val_summary.get("val_aux_loss", 0.0)),
+                "val_iou": float(val_summary.get("val_iou", 0.0)),
+                "val_dice": float(val_summary.get("val_dice", 0.0)),
+                "val_pixel_acc": float(val_summary.get("val_pixel_acc", 0.0)),
+                "val_precision": float(val_summary.get("val_precision", 0.0)),
+                "val_recall": float(val_summary.get("val_recall", 0.0)),
+                "val_aux_accuracy": float(val_summary.get("val_aux_accuracy", val_summary.get("val_accuracy", 0.0))),
+                "train_metrics": train_metrics,
+                "val_metrics": val_summary,
+            }
+            history.append(epoch_record)
+
             # Step scheduler
             if self.scheduler is not None:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -267,6 +291,21 @@ class Trainer:
         total_time = time.time() - start_time
         self.logger.info(f"Training completed in {total_time/60:.2f} minutes.")
 
+        # Save raw history data (JSON and CSV)
+        history_paths = save_history_data(history, output_dir=self.report_dir, prefix="training_history")
+        self.logger.info(f"Training history saved to {history_paths.get('json')} and {history_paths.get('csv')}")
+
+        # Generate publication-quality training curves graph (PNG, JPG, PDF)
+        curves_png_path = os.path.join(self.report_dir, "training_curves.png")
+        saved_curves = plot_training_curves(
+            history=history,
+            output_path=curves_png_path,
+            title_suffix=f"({self.config.project.get('name', 'UNet')})",
+            formats=["png", "pdf", "jpg"],
+        )
+        primary_curves_path = saved_curves[0] if saved_curves else curves_png_path
+        self.logger.info(f"📈 Training curves plotted and saved to: {primary_curves_path}")
+
         # Generate final evaluation report
         final_val_summary, final_per_label, final_cm = self.validate(epoch=self.epochs)
         report_data = generate_evaluation_report(
@@ -276,6 +315,8 @@ class Trainer:
             config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
             output_dir=self.report_dir,
             report_name="training_final_report",
+            history=history,
+            curves_path=primary_curves_path,
         )
         self.logger.info(f"\n{report_data['markdown']}")
         import gc
@@ -288,8 +329,14 @@ class Trainer:
             "final_metrics": final_val_summary,
             "per_label_metrics": final_per_label,
             "confusion_matrix": final_cm,
+            "history": history,
+            "curves_plot_path": primary_curves_path,
+            "all_curves_paths": saved_curves,
+            "history_json_path": history_paths.get("json"),
+            "history_csv_path": history_paths.get("csv"),
             "report_path": os.path.join(self.report_dir, "training_final_report.md"),
             "report_json_path": os.path.join(self.report_dir, "training_final_report.json"),
             "config": self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
             "report_data": report_data,
         }
+

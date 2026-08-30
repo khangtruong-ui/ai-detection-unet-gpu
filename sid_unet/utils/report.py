@@ -89,6 +89,35 @@ def format_metrics_table(metrics: Dict[str, Any], title: str = "Evaluation Metri
     return f"{title_str}{table_str}\n"
 
 
+def format_history_table(history: List[Dict[str, Any]]) -> str:
+    """Format epoch-by-epoch training and validation metrics into a clean tabulated table."""
+    if not history:
+        return ""
+    headers = ["Epoch", "Train Loss", "Val Loss", "Val IoU", "Val Dice", "Val Pixel Acc", "Learning Rate"]
+    rows = []
+    for h in history:
+        ep = h.get("epoch", "-")
+        tr_loss = h.get("train_loss", h.get("total_loss"))
+        v_loss = h.get("val_loss", h.get("val_total_loss"))
+        v_iou = h.get("val_iou", h.get("iou"))
+        v_dice = h.get("val_dice", h.get("dice"))
+        v_pacc = h.get("val_pixel_acc", h.get("pixel_acc"))
+        lr = h.get("lr", h.get("learning_rate"))
+
+        rows.append([
+            ep,
+            f"{tr_loss:.4f}" if isinstance(tr_loss, (int, float)) else "-",
+            f"{v_loss:.4f}" if isinstance(v_loss, (int, float)) else "-",
+            f"{v_iou:.4f}" if isinstance(v_iou, (int, float)) else "-",
+            f"{v_dice:.4f}" if isinstance(v_dice, (int, float)) else "-",
+            f"{v_pacc:.4f}" if isinstance(v_pacc, (int, float)) else "-",
+            f"{lr:.2e}" if isinstance(lr, (int, float)) else "-",
+        ])
+
+    table_str = tabulate(rows, headers=headers, tablefmt="github")
+    return f"### Epoch-by-Epoch Training & Validation Progression\n\n{table_str}\n"
+
+
 def generate_evaluation_report(
     overall_metrics: Dict[str, float],
     per_label_metrics: Optional[Dict[int, Dict[str, float]]] = None,
@@ -96,10 +125,12 @@ def generate_evaluation_report(
     config: Optional[Dict[str, Any]] = None,
     output_dir: Optional[str] = None,
     report_name: str = "evaluation_report",
+    history: Optional[List[Dict[str, Any]]] = None,
+    curves_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate comprehensive evaluation report with configuration details, overall metrics,
-    per-label stats, and auxiliary classification details. Saves both JSON and Markdown formats.
+    per-label stats, training curves plot links, and auxiliary classification details. Saves both JSON and Markdown formats.
     """
     label_names = {
         0: "Label 0 (Real / Black Mask)",
@@ -111,6 +142,12 @@ def generate_evaluation_report(
         "overall_metrics": overall_metrics,
         "per_label_metrics": {},
     }
+
+    if curves_path:
+        report_dict["curves_plot_path"] = curves_path
+
+    if history:
+        report_dict["training_history"] = history
 
     if per_label_metrics:
         for lbl, stats in per_label_metrics.items():
@@ -131,6 +168,14 @@ def generate_evaluation_report(
         md_lines.append(format_config_table(config, title="Run Configuration & Hyperparameters"))
 
     md_lines.append(format_metrics_table(overall_metrics, title="Overall Segmentation & Classification Metrics"))
+
+    if curves_path:
+        rel_curve_name = os.path.basename(curves_path)
+        md_lines.append("### Training & Validation Curves\n")
+        md_lines.append(f"![Training Curves]({rel_curve_name})\n")
+
+    if history:
+        md_lines.append(format_history_table(history))
 
     if per_label_metrics:
         md_lines.append("### Per-Subset Metrics Breakdown\n")
@@ -183,10 +228,12 @@ def generate_evaluation_report(
     }
 
 
+
 def generate_multi_experiment_report(
     experiment_results: List[Dict[str, Any]],
     output_dir: Optional[str] = None,
     report_name: str = "experiment_comparison",
+    multi_curves_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate comparison report for multiple experiment runs.
@@ -234,6 +281,7 @@ def generate_multi_experiment_report(
             "hyperparameters": hp,
             "metrics": metrics,
             "report_path": exp.get("report_path"),
+            "curves_plot_path": exp.get("curves_plot_path"),
         })
 
     summary_headers = [
@@ -255,9 +303,15 @@ def generate_multi_experiment_report(
         "# Multi-Experiment Benchmarking & Comparison Report\n",
         "## Summary Comparison\n",
         summary_table_md,
-        "\n---\n",
-        "## Detailed Experiment Breakdown\n",
+        "\n",
     ]
+
+    if multi_curves_path:
+        rel_curve_name = os.path.basename(multi_curves_path)
+        md_lines.append("### Comparative Training & Validation Curves\n")
+        md_lines.append(f"![Multi-Experiment Curves]({rel_curve_name})\n\n")
+
+    md_lines.append("---\n\n## Detailed Experiment Breakdown\n")
 
     for item in comparison_data:
         md_lines.append(f"### Experiment: {item['run_name']}\n")
@@ -265,6 +319,8 @@ def generate_multi_experiment_report(
             md_lines.append(f"- **Config File**: `{item['config_path']}`")
         if item.get("report_path"):
             md_lines.append(f"- **Detailed Report**: `{item['report_path']}`")
+        if item.get("curves_plot_path"):
+            md_lines.append(f"- **Curves Plot**: `{item['curves_plot_path']}`")
         if item.get("best_score") is not None:
             md_lines.append(f"- **Best Epoch**: {item['best_epoch']} (Score: {item['best_score']:.4f})\n")
         else:
@@ -301,3 +357,4 @@ def generate_multi_experiment_report(
         "markdown": markdown_content,
         "summary_table": summary_table_md,
     }
+

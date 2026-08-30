@@ -10,16 +10,16 @@ project:
   output_dir: "outputs/exp_unet_non_streaming_b32"
 
 data:
-  dataset_name: "saberzl/SID_Set"
+  dataset_name: "KhangTruong/IMD2020"
   streaming: false              # Indexable Map Dataset mode
   image_size: [256, 256]
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   pin_memory: true
   train_split: "train"
   val_split: "validation"
-  train_samples_per_epoch: 5000
-  val_samples: 1000
+  train_samples_per_epoch: -1
+  val_samples: -1
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

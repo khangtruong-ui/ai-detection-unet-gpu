@@ -5,8 +5,8 @@ project:
   output_dir: "outputs"
 
 data:
-  dataset_name: "saberzl/SID_Set"
-  streaming: true
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
   image_size: [256, 256]
   batch_size: 16
   num_workers: 2

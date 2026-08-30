@@ -5,10 +5,10 @@ project:
   output_dir: "outputs/quick_test"
 
 data:
-  dataset_name: "saberzl/SID_Set"
-  streaming: true
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
   image_size: [128, 128]
-  batch_size: 2
+  batch_size: 16
   num_workers: 0
   pin_memory: false
   train_samples_per_epoch: 6
