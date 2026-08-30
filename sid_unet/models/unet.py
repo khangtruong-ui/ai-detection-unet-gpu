@@ -144,6 +144,75 @@ class UNet(nn.Module):
         probs = torch.sigmoid(mask_logits)
         return (probs >= threshold).float()
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str,
+        device: Optional[Union[str, torch.device]] = None,
+        override_config: Optional[Union[Dict[str, Any], Any]] = None,
+        strict: bool = True,
+        return_config: bool = False,
+    ) -> Union[UNet, Tuple[UNet, Any]]:
+        """
+        Load a trained UNet model from a checkpoint file (.pt).
+        Automatically restores the model architecture hyperparameters
+        saved within the checkpoint's embedded configuration.
+
+        Args:
+            checkpoint_path: Path to checkpoint .pt file.
+            device: Target device to move the model to (e.g. 'cpu', 'cuda', 'auto', or torch.device).
+            override_config: Optional config dict or ConfigDict to override embedded config.
+            strict: Whether to strictly enforce that the keys in state_dict match model keys.
+            return_config: If True, returns a tuple (model, config_dict).
+
+        Returns:
+            UNet instance (eval mode by default), or (UNet, ConfigDict) if return_config=True.
+        """
+        import os
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+            saved_cfg = ckpt.get("config", {})
+        elif isinstance(ckpt, dict) and any(k.startswith(("inc.", "downs.", "bottleneck.")) for k in ckpt.keys()):
+            state_dict = ckpt
+            saved_cfg = {}
+        else:
+            raise ValueError(f"Unrecognized checkpoint format in '{checkpoint_path}'")
+
+        from sid_unet.utils.config import DEFAULT_CONFIG, ConfigDict, deep_merge
+        if isinstance(saved_cfg, ConfigDict):
+            saved_cfg_dict = saved_cfg.to_dict()
+        elif isinstance(saved_cfg, dict):
+            saved_cfg_dict = saved_cfg
+        else:
+            saved_cfg_dict = {}
+
+        merged = deep_merge(DEFAULT_CONFIG, saved_cfg_dict)
+        if override_config is not None:
+            override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
+            merged = deep_merge(merged, override_dict)
+
+        config = ConfigDict(merged)
+        model = build_model(config)
+        model.load_state_dict(state_dict, strict=strict)
+        model.eval()
+
+        if device is not None:
+            if isinstance(device, str):
+                if device == "auto":
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                else:
+                    device = torch.device(device)
+            model.to(device)
+
+        model.config = config
+        if return_config:
+            return model, config
+        return model
+
 
 def build_model(config: Any) -> UNet:
     """Build UNet model instance from configuration dict."""

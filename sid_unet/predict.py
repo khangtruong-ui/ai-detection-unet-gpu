@@ -19,13 +19,15 @@ import torch
 import torchvision.transforms.functional as TF
 from tabulate import tabulate
 
-from sid_unet.models.unet import build_model
-from sid_unet.utils.config import load_config, DEFAULT_CONFIG, deep_merge, ConfigDict
+from sid_unet.models.unet import UNet, build_model
+from sid_unet.utils.config import load_config, DEFAULT_CONFIG, deep_merge, ConfigDict, apply_overrides
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Predict AI-generated image mask using trained UNet")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint .pt file")
+    parser.add_argument("--config", type=str, default=None, help="Path to optional YAML config (defaults to embedded checkpoint config)")
+    parser.add_argument("--override", nargs="*", default=[], help="Config overrides in key.nested=value format")
     parser.add_argument("--image", type=str, default=None, help="Path to single input image")
     parser.add_argument("--input_dir", type=str, default=None, help="Directory of input images")
     parser.add_argument("--output_dir", type=str, default="predictions", help="Directory to save output masks")
@@ -36,16 +38,24 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model_for_inference(checkpoint_path: str, device: torch.device):
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    saved_cfg = ckpt.get("config", {})
-    merged = deep_merge(DEFAULT_CONFIG, saved_cfg)
-    config = ConfigDict(merged)
+def load_model_for_inference(
+    checkpoint_path: str,
+    device: torch.device,
+    config_path: Optional[str] = None,
+    overrides: Optional[List[str]] = None,
+):
+    override_cfg = None
+    if config_path:
+        override_cfg = load_config(config_path, overrides=overrides)
+    elif overrides:
+        override_cfg = ConfigDict(apply_overrides({}, overrides))
 
-    model = build_model(config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    return model, config
+    return UNet.from_checkpoint(
+        checkpoint_path,
+        device=device,
+        override_config=override_cfg,
+        return_config=True,
+    )
 
 
 def preprocess_image(image_path: str, target_size: Tuple[int, int]) -> Tuple[torch.Tensor, Image.Image]:
@@ -85,7 +95,12 @@ def main():
     else:
         device = torch.device(dev_str)
 
-    model, config = load_model_for_inference(args.checkpoint, device)
+    model, config = load_model_for_inference(
+        args.checkpoint,
+        device,
+        config_path=args.config,
+        overrides=args.override,
+    )
     target_size = (args.image_size[0], args.image_size[1])
 
     image_paths: List[str] = []

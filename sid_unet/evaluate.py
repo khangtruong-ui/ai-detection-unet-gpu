@@ -16,7 +16,7 @@ from sid_unet.dataset.loader import create_dataloaders
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
-from sid_unet.models.unet import build_model
+from sid_unet.models.unet import UNet, build_model
 from sid_unet.utils.config import load_config
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.report import generate_evaluation_report
@@ -63,20 +63,20 @@ def main():
     if not os.path.exists(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
 
-    # Load checkpoint
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    saved_cfg = ckpt.get("config", {})
-
+    # Load model and config from checkpoint with optional overrides
     if args.config:
-        config = load_config(args.config, overrides=args.override)
-    elif saved_cfg:
-        from sid_unet.utils.config import ConfigDict, apply_overrides, deep_merge, DEFAULT_CONFIG
-        merged = deep_merge(DEFAULT_CONFIG, saved_cfg)
-        if args.override:
-            merged = apply_overrides(merged, args.override)
-        config = ConfigDict(merged)
+        override_cfg = load_config(args.config, overrides=args.override)
+    elif args.override:
+        from sid_unet.utils.config import apply_overrides, ConfigDict
+        override_cfg = ConfigDict(apply_overrides({}, args.override))
     else:
-        config = load_config("configs/evaluate.yaml", overrides=args.override)
+        override_cfg = None
+
+    model, config = UNet.from_checkpoint(
+        args.checkpoint,
+        override_config=override_cfg,
+        return_config=True,
+    )
 
     output_dir = args.output_dir or os.path.join(config.project.get("output_dir", "outputs"), "eval_reports")
     os.makedirs(output_dir, exist_ok=True)
@@ -92,9 +92,7 @@ def main():
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) or device_str == "cuda" else "cpu")
     logger.info(f"Evaluation device: {device}")
 
-    # Build model & load weights
-    model = build_model(config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
     model.eval()
 
     loss_fn = build_loss(config).to(device)

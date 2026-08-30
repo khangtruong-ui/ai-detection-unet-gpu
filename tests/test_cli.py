@@ -96,6 +96,7 @@ def test_cli_train_eval_predict_pipeline(monkeypatch):
             "--image_size", "32", "32",
             "--save_overlay",
             "--device", "cpu",
+            "--override", "model.dropout=0.0",
         ]
         monkeypatch.setattr(sys, "argv", test_pred_args)
         predict_main()

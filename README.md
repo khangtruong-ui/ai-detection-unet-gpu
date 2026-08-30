@@ -385,6 +385,20 @@ python -m sid_unet.predict \
 - `<image_name>_mask.png`: Binary mask ($0$ = Authentic background, $255$ = AI-generated).
 - `<image_name>_overlay.png`: Semi-transparent red highlight over detected AI regions on the original image.
 
+**Python API Usage:**
+```python
+import torch
+from sid_unet.models import UNet
+
+# Load model directly from checkpoint (architecture and weights restored automatically)
+model = UNet.from_checkpoint("outputs/checkpoints/checkpoint_best.pt", device="cuda")
+
+# Run inference
+# x: (B, 3, H, W) normalized tensor
+with torch.no_grad():
+    binary_mask = model.predict_mask(x, threshold=0.5)  # (B, 1, H, W)
+```
+
 ---
 
 ## Loss Functions & Metrics

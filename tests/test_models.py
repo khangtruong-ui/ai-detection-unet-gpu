@@ -61,3 +61,61 @@ def test_unet_predict_mask():
     unique_vals = torch.unique(pred_mask).tolist()
     for v in unique_vals:
         assert v in (0.0, 1.0)
+
+
+def test_unet_from_checkpoint_with_embedded_config(tmp_path):
+    # Create a custom architecture model
+    original_model = UNet(
+        in_channels=3,
+        out_channels=1,
+        features=[8, 16, 32],
+        bilinear=False,
+        aux_classifier=False,
+    )
+    custom_cfg = {
+        "model": {
+            "name": "unet",
+            "in_channels": 3,
+            "out_channels": 1,
+            "features": [8, 16, 32],
+            "bilinear": False,
+            "aux_classifier": False,
+        }
+    }
+    ckpt_path = tmp_path / "checkpoint_custom.pt"
+    state = {
+        "epoch": 5,
+        "model_state_dict": original_model.state_dict(),
+        "config": custom_cfg,
+    }
+    torch.save(state, str(ckpt_path))
+
+    # Load via from_checkpoint
+    loaded_model, loaded_cfg = UNet.from_checkpoint(str(ckpt_path), return_config=True)
+
+    assert loaded_model.features == [8, 16, 32]
+    assert loaded_model.bilinear is False
+    assert loaded_model.aux_classifier is False
+    assert loaded_cfg.model.features == [8, 16, 32]
+
+    # Verify predictions match
+    original_model.eval()
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        out_orig = original_model(x)
+        out_loaded = loaded_model(x)
+    assert torch.allclose(out_orig, out_loaded, atol=1e-6)
+
+
+def test_unet_from_checkpoint_raw_state_dict(tmp_path):
+    model = UNet(in_channels=3, out_channels=1, features=[64, 128, 256, 512])
+    ckpt_path = tmp_path / "raw_weights.pt"
+    torch.save(model.state_dict(), str(ckpt_path))
+
+    loaded_model = UNet.from_checkpoint(str(ckpt_path))
+    assert loaded_model.features == [64, 128, 256, 512]
+
+
+def test_unet_from_checkpoint_file_not_found():
+    with pytest.raises(FileNotFoundError):
+        UNet.from_checkpoint("/nonexistent/checkpoint.pt")

@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
+from sid_unet.utils.config import save_config
+
 
 class CheckpointManager:
     """Manages saving and loading model checkpoints (best, latest, and periodic)."""
@@ -61,6 +63,8 @@ class CheckpointManager:
         if self.save_latest:
             latest_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
             torch.save(state, latest_path)
+            latest_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml")
+            save_config(config, latest_cfg_path)
             saved_paths["latest"] = latest_path
 
         current_score = metrics.get(self.metric_name, None)
@@ -70,6 +74,8 @@ class CheckpointManager:
             if self.save_best:
                 best_path = os.path.join(self.checkpoint_dir, "checkpoint_best.pt")
                 torch.save(state, best_path)
+                best_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_best_config.yaml")
+                save_config(config, best_cfg_path)
                 saved_paths["best"] = best_path
 
         return saved_paths
