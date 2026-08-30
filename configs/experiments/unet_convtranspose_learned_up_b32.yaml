@@ -62,7 +62,3 @@ training:
 
 logging:
   log_interval: 25
-  use_tensorboard: true
-  tensorboard_dir: "outputs/exp_unet_convtranspose_b32/runs"
-  save_sample_images: true
-  num_sample_images: 4

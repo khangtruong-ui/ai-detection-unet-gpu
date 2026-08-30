@@ -48,5 +48,4 @@ training:
 
 logging:
   log_interval: 1
-  use_tensorboard: false
-  save_sample_images: false
+

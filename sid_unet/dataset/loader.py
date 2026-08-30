@@ -1,7 +1,8 @@
 """
-Dataset loading pipeline for SID_Set.
+Dataset loading pipeline for SID_Set and common image manipulation datasets (e.g. KhangTruong/IMD2020).
 Supports both streaming (IterableDataset) and non-streaming (MapDataset) modes with
-robust handling of label 0 (black mask), label 1 (white mask), and label 2 (provided mask).
+robust handling of label 0 (black mask), label 1 (white mask), label 2 (provided mask),
+and 2-column image/mask datasets.
 """
 
 from __future__ import annotations
@@ -25,12 +26,13 @@ def process_raw_sample(
     target_image_size: Tuple[int, int] = (256, 256),
 ) -> Dict[str, Any]:
     """
-    Process a single raw sample from saberzl/SID_Set into model tensors.
+    Process a single raw sample from datasets such as KhangTruong/IMD2020 or saberzl/SID_Set into model tensors.
+    Handles 2-column format (image, mask) as well as labeled format (image, label, mask, img_id).
     """
     raw_img = sample.get("image")
-    label = int(sample.get("label", 0))
+    raw_label = sample.get("label", None)
     raw_mask = sample.get("mask", None)
-    img_id = str(sample.get("img_id", ""))
+    img_id = str(sample.get("img_id", sample.get("id", "")))
 
     # 1. Convert to RGB PIL Image
     pil_image = ensure_rgb_image(raw_img)
@@ -38,11 +40,25 @@ def process_raw_sample(
     # 2. Synthesize / extract mask based on label & provided mask
     mask_arr = process_sample_mask(
         mask_input=raw_mask,
-        label=label,
+        label=int(raw_label) if raw_label is not None else None,
         image_size=pil_image.size,  # (width, height)
     )
 
-    # 3. Apply joint transforms
+    # 3. Determine scalar class label (0: Real, 1: Fully Synthetic, 2: Partially Synthetic / Tampered)
+    if raw_label is not None:
+        label = int(raw_label)
+    else:
+        # Infer class label from mask for standard 2-column image/mask datasets like KhangTruong/IMD2020
+        mask_sum = float(mask_arr.sum())
+        total_pixels = float(mask_arr.size)
+        if mask_sum == 0.0:
+            label = 0  # Real / Untampered
+        elif mask_sum >= total_pixels:
+            label = 1  # Fully Synthetic
+        else:
+            label = 2  # Partially Synthetic / Tampered
+
+    # 4. Apply joint transforms
     if transform is not None:
         img_tensor, mask_tensor = transform(pil_image, mask_arr)
     else:
@@ -111,7 +127,10 @@ class SIDStreamingDataset(IterableDataset):
 
     def _get_stream(self) -> Iterator[Dict[str, Any]]:
         # Load streamed dataset from Hugging Face
-        hf_ds = hf_load_dataset(self.dataset_name, split=self.split, streaming=True)
+        try:
+            hf_ds = hf_load_dataset(self.dataset_name, split=self.split, streaming=True)
+        except Exception:
+            hf_ds = hf_load_dataset(self.dataset_name, split="train", streaming=True)
 
         if self.shuffle_buffer_size > 0 and self.split == "train":
             hf_ds = hf_ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
@@ -171,7 +190,10 @@ class SIDMapDataset(Dataset):
         self.transform = transform
         self.target_image_size = target_image_size
         self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
-        hf_ds = hf_load_dataset(dataset_name, split=split, streaming=False)
+        try:
+            hf_ds = hf_load_dataset(dataset_name, split=split, streaming=False)
+        except Exception:
+            hf_ds = hf_load_dataset(dataset_name, split="train", streaming=False)
         if self.max_samples is not None and 0 < self.max_samples < len(hf_ds):
             hf_ds = hf_ds.select(range(self.max_samples))
         self.data = hf_ds

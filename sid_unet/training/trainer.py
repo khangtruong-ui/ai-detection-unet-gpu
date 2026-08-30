@@ -1,7 +1,7 @@
 """
 Trainer for SID-UNet segmentation and classification.
 Supports mixed precision (AMP), step-based streaming epochs, learning rate scheduling,
-evaluation report generation, and TensorBoard metric logging.
+and evaluation report generation.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.training.callbacks import CheckpointManager, EarlyStopping
-from sid_unet.utils.logger import MetricLogger, TensorboardLogger, setup_logger
+from sid_unet.utils.logger import MetricLogger, setup_logger
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
 
 
@@ -57,10 +57,6 @@ class Trainer:
         self.logger = custom_logger or setup_logger(
             name="SID_Trainer",
             log_file=os.path.join(self.log_dir, "training.log"),
-        )
-        self.tb_logger = TensorboardLogger(
-            log_dir=config.logging.get("tensorboard_dir", os.path.join(self.output_dir, "runs")),
-            enabled=config.logging.get("use_tensorboard", True),
         )
 
         # 3. Model, Loss, DataLoaders
@@ -150,11 +146,6 @@ class Trainer:
                 metric_logger.update_dict(loss_dict, n=batch_size)
                 self.global_step += 1
 
-                if self.global_step % self.log_interval == 0:
-                    for k, v in loss_dict.items():
-                        self.tb_logger.log_scalar(f"Train/{k}", v, self.global_step)
-                    self.tb_logger.log_scalar("Train/LearningRate", self.optimizer.param_groups[0]["lr"], self.global_step)
-
                 pbar.set_postfix({
                     "loss": f"{loss.item():.4f}",
                     "mask_loss": f"{loss_dict.get('mask_loss', 0.0):.4f}",
@@ -175,14 +166,10 @@ class Trainer:
         cls_tracker = ClassificationMetricTracker(num_classes=self.config.model.get("num_classes", 3))
         metric_logger = MetricLogger()
 
-        first_batch_images = None
-        first_batch_targets = None
-        first_batch_preds = None
-
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.epochs} [Val]", leave=False)
 
         try:
-            for i, batch in enumerate(pbar):
+            for batch in pbar:
                 images = batch["image"].to(self.device, non_blocking=True)
                 masks = batch["mask"].to(self.device, non_blocking=True)
                 labels = batch.get("label")
@@ -206,12 +193,6 @@ class Trainer:
                 # Update classification tracker
                 if class_logits is not None and labels is not None:
                     cls_tracker.update(class_logits, labels)
-
-                # Save first batch for visualization
-                if i == 0:
-                    first_batch_images = images
-                    first_batch_targets = masks
-                    first_batch_preds = torch.sigmoid(mask_logits)
         finally:
             pbar.close()
             del pbar
@@ -228,20 +209,6 @@ class Trainer:
             val_summary[f"val_{k}"] = v
         for k, v in cls_metrics.items():
             val_summary[f"val_{k}"] = v
-
-        # TensorBoard logging
-        for k, v in val_summary.items():
-            self.tb_logger.log_scalar(f"Validation/{k}", v, epoch)
-
-        if first_batch_images is not None and self.config.logging.get("save_sample_images", True):
-            self.tb_logger.log_image_comparison(
-                tag="Validation/Sample_Masks",
-                images=first_batch_images,
-                targets=first_batch_targets,
-                predictions=first_batch_preds,
-                step=epoch,
-                max_samples=int(self.config.logging.get("num_sample_images", 4)),
-            )
 
         return val_summary, per_label_seg_metrics, confusion_mat
 
@@ -311,7 +278,6 @@ class Trainer:
             report_name="training_final_report",
         )
         self.logger.info(f"\n{report_data['markdown']}")
-        self.tb_logger.close()
         import gc
         gc.collect()
 

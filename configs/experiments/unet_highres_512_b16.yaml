@@ -62,7 +62,4 @@ training:
 
 logging:
   log_interval: 25
-  use_tensorboard: true
-  tensorboard_dir: "outputs/exp_unet_highres_512_b16/runs"
-  save_sample_images: true
-  num_sample_images: 4
+

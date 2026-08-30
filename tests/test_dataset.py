@@ -67,3 +67,43 @@ def test_resolve_sample_limit():
     # Fallback default
     assert resolve_sample_limit(samples_val=None, steps_val=None, batch_size=4, default_samples=100) == 100
 
+
+def test_two_column_dataset_processing():
+    """Test 2-column image/mask datasets such as KhangTruong/IMD2020."""
+    transform = get_transforms(image_size=(128, 128), is_train=False)
+
+    # 1. Authentic / Pristine image with black mask (no 'label' or 'img_id' column)
+    raw_sample_real = {
+        "image": Image.new("RGB", (200, 200), color=(100, 100, 100)),
+        "mask": Image.new("L", (200, 200), color=0),
+    }
+    processed_real = process_raw_sample(raw_sample_real, transform=transform, target_image_size=(128, 128))
+    assert processed_real["image"].shape == (3, 128, 128)
+    assert processed_real["mask"].shape == (1, 128, 128)
+    assert torch.all(processed_real["mask"] == 0.0)
+    assert processed_real["label"].item() == 0  # Inferred real (0)
+
+    # 2. Tampered / Inpainted image with region mask
+    mask_tampered = Image.new("L", (200, 200), color=0)
+    mask_tampered.paste(255, (40, 40, 160, 160))
+    raw_sample_tampered = {
+        "image": Image.new("RGB", (200, 200), color=(50, 150, 200)),
+        "mask": mask_tampered,
+    }
+    processed_tampered = process_raw_sample(raw_sample_tampered, transform=transform, target_image_size=(128, 128))
+    assert processed_tampered["mask"].shape == (1, 128, 128)
+    assert processed_tampered["label"].item() == 2  # Inferred partially tampered (2)
+    assert processed_tampered["mask"].sum() > 0
+    assert (processed_tampered["mask"] == 0.0).sum() > 0
+
+    # 3. Fully synthetic image with all-white mask
+    raw_sample_syn = {
+        "image": Image.new("RGB", (200, 200), color=(220, 80, 80)),
+        "mask": Image.new("L", (200, 200), color=255),
+    }
+    processed_syn = process_raw_sample(raw_sample_syn, transform=transform, target_image_size=(128, 128))
+    assert processed_syn["mask"].shape == (1, 128, 128)
+    assert torch.all(processed_syn["mask"] == 1.0)
+    assert processed_syn["label"].item() == 1  # Inferred fully synthetic (1)
+
+

@@ -5,9 +5,9 @@
 [![Datasets](https://img.shields.io/badge/HuggingFace-Datasets-orange.svg)](https://huggingface.co/datasets/saberzl/SID_Set)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A modular, config-driven PyTorch framework for detecting and segmenting AI-generated regions in images using a **UNet** architecture with an optional **3-class auxiliary classification head** (`Real`, `Fully AI`, `Partially AI / Inpainting`).
+A modular, config-driven PyTorch framework for detecting and segmenting AI-generated or tampered regions in images using a **UNet** architecture with an optional **3-class auxiliary classification head** (`Real`, `Fully AI`, `Partially AI / Inpainting`).
 
-Tailored for large-scale datasets such as [**saberzl/SID_Set**](https://huggingface.co/datasets/saberzl/SID_Set), featuring native **streaming dataset support** (`streaming = True`), flexible loss functions (BCE, Soft Dice, Focal, Combined), comprehensive metric tracking, rich Markdown/JSON evaluation reports, TensorBoard logging, and a complete unit/integration test suite.
+Supports large-scale streaming and local datasets including standard 2-column image/mask datasets like [**KhangTruong/IMD2020**](https://huggingface.co/datasets/KhangTruong/IMD2020) and multi-class datasets like [**saberzl/SID_Set**](https://huggingface.co/datasets/saberzl/SID_Set), featuring native **streaming dataset support** (`streaming = True`), flexible loss functions (BCE, Soft Dice, Focal, Combined), comprehensive metric tracking, rich Markdown/JSON evaluation reports, and a complete unit/integration test suite.
 
 ---
 
@@ -32,10 +32,12 @@ Tailored for large-scale datasets such as [**saberzl/SID_Set**](https://huggingf
 ## Key Features
 
 - **Streaming-First Dataset Pipeline**: Natively consumes massive Hugging Face datasets with `streaming = True` (or non-streaming if configured), preventing disk storage exhaustion.
-- **Robust Mask Synthesis**:
-  - **Label `0` (Real/Authentic)**: Generated target mask is **full black** (all $0$s).
-  - **Label `1` (Fully Synthetic)**: Generated target mask is **full white** (all $1$s).
-  - **Label `2` (Partially Synthetic / Tampered)**: Ground truth mask loaded from dataset, normalized, and binarized.
+- **Universal Dataset Support**:
+  - **Standard 2-Column Datasets ([KhangTruong/IMD2020](https://huggingface.co/datasets/KhangTruong/IMD2020))**: Contains `image` and `mask`. Masks are directly normalized and binarized, and classification labels are automatically derived.
+  - **3-Class Labeled Datasets ([saberzl/SID_Set](https://huggingface.co/datasets/saberzl/SID_Set))**:
+    - **Label `0` (Real/Authentic)**: Target mask is **full black** (all $0$s).
+    - **Label `1` (Fully Synthetic)**: Target mask is **full white** (all $1$s).
+    - **Label `2` (Partially Synthetic / Tampered)**: Ground truth mask loaded from dataset, normalized, and binarized.
 - **Modular UNet Backbone**: Configurable depth, channel counts, bilinear/transposed upsampling, and dropout.
 - **Auxiliary 3-Class Classifier**: Bottleneck head to jointly classify whole images as `0: Real`, `1: Fully Synthetic`, or `2: Partially Synthetic` alongside pixel-level masking.
 - **Flexible Losses**: BCE with Logits, Soft Dice Loss, Binary Focal Loss, and Hybrid/Combined loss weighting.
@@ -46,7 +48,14 @@ Tailored for large-scale datasets such as [**saberzl/SID_Set**](https://huggingf
 
 ## Dataset Specification
 
-The framework operates on [**`saberzl/SID_Set`**](https://huggingface.co/datasets/saberzl/SID_Set) which contains:
+The framework supports multiple dataset formats:
+
+### 1. Common / Regular 2-Column Format ([KhangTruong/IMD2020](https://huggingface.co/datasets/KhangTruong/IMD2020))
+- `image`: RGB image (PIL Image or tensor).
+- `mask`: Binary / grayscale segmentation mask for manipulated or inpainted regions.
+- When `label` is not provided in the dataset, class indicators are inferred automatically from pixel statistics ($0$: all-zero mask / authentic, $1$: all-one mask / fully synthetic, $2$: mixed mask / tampered).
+
+### 2. Multi-Class Labeled Format ([saberzl/SID_Set](https://huggingface.co/datasets/saberzl/SID_Set))
 - `image`: RGB image ($1024 \times 1024$ or variable resolutions).
 - `label`: Integer class indicator ($0, 1, 2$).
 - `mask`: Segmentation mask for tampered/inpainted regions.
@@ -171,7 +180,7 @@ pip install -e ".[dev]"
 │   ├── utils/
 │   │   ├── __init__.py
 │   │   ├── config.py             # YAML loading, deep merge, and CLI overrides
-│   │   ├── logger.py             # Console, file, and TensorBoard logger
+│   │   ├── logger.py             # Console and file logger
 │   │   └── report.py             # Markdown, JSON, and ASCII report formatting
 │   ├── train.py                  # CLI training entrypoint (single & multi-run)
 │   ├── evaluate.py               # CLI evaluation entrypoint

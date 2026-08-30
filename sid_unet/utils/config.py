@@ -164,10 +164,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "logging": {
         "log_interval": 20,           # Log training metrics every N steps
-        "use_tensorboard": True,
-        "tensorboard_dir": "runs",
-        "save_sample_images": True,
-        "num_sample_images": 4,
     },
 }
 

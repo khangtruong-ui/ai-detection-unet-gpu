@@ -51,7 +51,3 @@ training:
 
 logging:
   log_interval: 20
-  use_tensorboard: true
-  tensorboard_dir: "outputs/non_streaming_run/runs"
-  save_sample_images: true
-  num_sample_images: 4
