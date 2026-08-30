@@ -18,8 +18,10 @@ data:
   shuffle_buffer_size: 2000
   train_split: "train"
   val_split: "validation"
+  test_split: "test"
   train_samples_per_epoch: -1  # Full dataset run
   val_samples: -1              # Full dataset validation
+  test_samples: -1             # Full dataset test
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

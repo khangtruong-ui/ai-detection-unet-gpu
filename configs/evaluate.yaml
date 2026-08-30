@@ -11,7 +11,9 @@ data:
   num_workers: 2
   pin_memory: true
   val_split: "validation"
+  test_split: "test"
   val_samples: -1
+  test_samples: -1
 
 model:
   name: "unet"

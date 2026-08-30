@@ -35,6 +35,7 @@ class Trainer:
         loss_fn: Optional[SIDTotalLoss] = None,
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
+        test_loader: Optional[DataLoader] = None,
         custom_logger: Optional[Any] = None,
     ):
         self.config = config
@@ -66,6 +67,7 @@ class Trainer:
         self.loss_fn = (loss_fn or build_loss(config)).to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.test_loader = test_loader
 
         # 4. Optimizer & Scheduler
         self.lr = float(config.training.get("learning_rate", 1e-3))
@@ -161,14 +163,24 @@ class Trainer:
         return averages
 
     @torch.no_grad()
-    def validate(self, epoch: int = 0) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]], Optional[list]]:
-        """Run validation loop and compute comprehensive metrics."""
+    def validate(
+        self,
+        epoch: Optional[int] = None,
+        loader: Optional[DataLoader] = None,
+        split_name: str = "val",
+    ) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]], Optional[list]]:
+        """Run validation or evaluation loop and compute comprehensive metrics."""
         self.model.eval()
+        target_loader = loader if loader is not None else self.val_loader
+        if target_loader is None:
+            return {}, {}, None
+
         seg_tracker = SegmentationMetricTracker(threshold=0.5)
         cls_tracker = ClassificationMetricTracker(num_classes=self.config.model.get("num_classes", 3))
         metric_logger = MetricLogger()
 
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.epochs} [Val]", leave=False)
+        desc_str = f"Epoch {epoch}/{self.epochs} [{split_name.title()}]" if epoch is not None else f"Evaluating [{split_name.title()}]"
+        pbar = tqdm(target_loader, desc=desc_str, leave=False)
 
         try:
             for batch in pbar:
@@ -204,15 +216,27 @@ class Trainer:
         cls_metrics, confusion_mat = cls_tracker.compute()
 
         # Combine metrics
-        val_summary = {}
+        prefix = f"{split_name}_" if split_name else ""
+        summary = {}
         for k, v in metric_logger.averages().items():
-            val_summary[f"val_{k}"] = v
+            summary[f"{prefix}{k}"] = v
         for k, v in overall_seg_metrics.items():
-            val_summary[f"val_{k}"] = v
+            summary[f"{prefix}{k}"] = v
         for k, v in cls_metrics.items():
-            val_summary[f"val_{k}"] = v
+            summary[f"{prefix}{k}"] = v
 
-        return val_summary, per_label_seg_metrics, confusion_mat
+        return summary, per_label_seg_metrics, confusion_mat
+
+    def evaluate(
+        self,
+        loader: Optional[DataLoader] = None,
+        split_name: str = "test",
+    ) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]], Optional[list]]:
+        """Evaluate model on a specific DataLoader."""
+        target_loader = loader or self.test_loader or self.val_loader
+        if target_loader is None:
+            raise ValueError("No DataLoader provided for evaluation.")
+        return self.validate(epoch=None, loader=target_loader, split_name=split_name)
 
     def train(self) -> Dict[str, Any]:
         """Execute full training loop across all epochs."""
@@ -306,7 +330,7 @@ class Trainer:
         primary_curves_path = saved_curves[0] if saved_curves else curves_png_path
         self.logger.info(f"📈 Training curves plotted and saved to: {primary_curves_path}")
 
-        # Generate final evaluation report
+        # Generate final validation evaluation report
         final_val_summary, final_per_label, final_cm = self.validate(epoch=self.epochs)
         report_data = generate_evaluation_report(
             overall_metrics=final_val_summary,
@@ -319,6 +343,35 @@ class Trainer:
             curves_path=primary_curves_path,
         )
         self.logger.info(f"\n{report_data['markdown']}")
+
+        # Optional test evaluation on best checkpoint
+        test_results = None
+        test_report_path = None
+        if self.test_loader is not None:
+            best_ckpt = os.path.join(self.checkpoint_dir, "checkpoint_best.pt")
+            if os.path.exists(best_ckpt):
+                self.logger.info(f"Loading best checkpoint from '{best_ckpt}' for test set evaluation...")
+                self.ckpt_manager.load_checkpoint(best_ckpt, self.model)
+
+            self.logger.info("Running evaluation on test split...")
+            test_summary, test_per_label, test_cm = self.evaluate(loader=self.test_loader, split_name="test")
+            test_report_data = generate_evaluation_report(
+                overall_metrics=test_summary,
+                per_label_metrics=test_per_label,
+                confusion_matrix=test_cm,
+                config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                output_dir=self.report_dir,
+                report_name="test_evaluation_report",
+            )
+            test_report_path = os.path.join(self.report_dir, "test_evaluation_report.md")
+            self.logger.info(f"🧪 Test Set Evaluation Report:\n{test_report_data['markdown']}")
+            test_results = {
+                "metrics": test_summary,
+                "per_label_metrics": test_per_label,
+                "confusion_matrix": test_cm,
+                "report_path": test_report_path,
+            }
+
         import gc
         gc.collect()
 
@@ -329,6 +382,8 @@ class Trainer:
             "final_metrics": final_val_summary,
             "per_label_metrics": final_per_label,
             "confusion_matrix": final_cm,
+            "test_results": test_results,
+            "test_report_path": test_report_path,
             "history": history,
             "curves_plot_path": primary_curves_path,
             "all_curves_paths": saved_curves,

@@ -76,3 +76,39 @@ def test_trainer_mini_run():
         assert os.path.exists(os.path.join(tmpdir, "reports", "training_history.json"))
         assert os.path.exists(os.path.join(tmpdir, "reports", "training_history.csv"))
 
+
+def test_trainer_with_test_loader():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "logging.save_sample_images=false",
+            "training.amp=false",
+        ])
+
+        train_ds = SyntheticDataset(size=4, img_size=(64, 64))
+        val_ds = SyntheticDataset(size=2, img_size=(64, 64))
+        test_ds = SyntheticDataset(size=2, img_size=(64, 64))
+
+        train_loader = DataLoader(train_ds, batch_size=2)
+        val_loader = DataLoader(val_ds, batch_size=2)
+        test_loader = DataLoader(test_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+        )
+
+        results = trainer.train()
+        assert results["test_results"] is not None
+        assert "test_report_path" in results
+        assert os.path.exists(os.path.join(tmpdir, "reports", "test_evaluation_report.md"))
+        assert os.path.exists(os.path.join(tmpdir, "reports", "test_evaluation_report.json"))
+

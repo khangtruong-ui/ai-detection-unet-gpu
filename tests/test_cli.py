@@ -71,9 +71,10 @@ def test_cli_train_eval_predict_pipeline(monkeypatch):
         test_eval_args = [
             "sid-eval",
             "--checkpoint", best_ckpt,
+            "--split", "test",
+            "--samples", "2",
             "--override",
             "data.num_workers=0",
-            "data.val_samples=2",
             "data.batch_size=2",
             "project.device=cpu",
             "--output_dir", os.path.join(output_dir, "eval_reports"),

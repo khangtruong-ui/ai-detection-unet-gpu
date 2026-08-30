@@ -11,8 +11,12 @@ data:
   batch_size: 16
   num_workers: 0
   pin_memory: false
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
   train_samples_per_epoch: 6
   val_samples: 2
+  test_samples: 2
   augmentations:
     horizontal_flip: 0.0
     vertical_flip: 0.0

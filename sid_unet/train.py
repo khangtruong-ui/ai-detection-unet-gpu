@@ -104,13 +104,19 @@ def train_single_run(
 
     # Build DataLoaders
     logger.info("Initializing DataLoaders...")
-    train_loader, val_loader = create_dataloaders(config)
+    evaluate_on_test = bool(config.data.get("evaluate_on_test", False))
+    if evaluate_on_test:
+        train_loader, val_loader, test_loader = create_dataloaders(config, include_test=True)
+    else:
+        train_loader, val_loader = create_dataloaders(config, include_test=False)
+        test_loader = None
 
     # Build Trainer
     trainer = Trainer(
         config=config,
         train_loader=train_loader,
         val_loader=val_loader,
+        test_loader=test_loader,
         custom_logger=logger,
     )
 

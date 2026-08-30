@@ -14,8 +14,10 @@ data:
   shuffle_buffer_size: 1000
   train_split: "train"
   val_split: "validation"
+  test_split: "test"
   train_samples_per_epoch: -1  # Set to -1 to run until dataset is depleted
   val_samples: -1              # Set to -1 to run until dataset is depleted
+  test_samples: -1             # Set to -1 to run until dataset is depleted
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

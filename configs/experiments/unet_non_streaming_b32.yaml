@@ -18,8 +18,10 @@ data:
   pin_memory: true
   train_split: "train"
   val_split: "validation"
+  test_split: "test"
   train_samples_per_epoch: -1
   val_samples: -1
+  test_samples: -1
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

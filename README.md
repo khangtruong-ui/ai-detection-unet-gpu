@@ -33,16 +33,14 @@ Supports large-scale streaming and local datasets including standard 2-column im
 
 - **Streaming-First Dataset Pipeline**: Natively consumes massive Hugging Face datasets with `streaming = True` (or non-streaming if configured), preventing disk storage exhaustion.
 - **Universal Dataset Support**:
-  - **Standard 2-Column Datasets ([KhangTruong/IMD2020](https://huggingface.co/datasets/KhangTruong/IMD2020))**: Contains `image` and `mask`. Masks are directly normalized and binarized, and classification labels are automatically derived.
+  - **Standard 2-Column Datasets ([KhangTruong/IMD2020](https://huggingface.co/datasets/KhangTruong/IMD2020))**: Contains `image` and `mask` across all three official subsets: **`train`**, **`validation`**, and **`test`**. Masks are directly normalized and binarized, and classification labels are automatically derived.
   - **3-Class Labeled Datasets ([saberzl/SID_Set](https://huggingface.co/datasets/saberzl/SID_Set))**:
     - **Label `0` (Real/Authentic)**: Target mask is **full black** (all $0$s).
     - **Label `1` (Fully Synthetic)**: Target mask is **full white** (all $1$s).
     - **Label `2` (Partially Synthetic / Tampered)**: Ground truth mask loaded from dataset, normalized, and binarized.
-- **Modular UNet Backbone**: Configurable depth, channel counts, bilinear/transposed upsampling, and dropout.
-- **Auxiliary 3-Class Classifier**: Bottleneck head to jointly classify whole images as `0: Real`, `1: Fully Synthetic`, or `2: Partially Synthetic` alongside pixel-level masking.
-- **Flexible Losses**: BCE with Logits, Soft Dice Loss, Binary Focal Loss, and Hybrid/Combined loss weighting.
-- **Comprehensive Reporting**: Automatically exports tabulated Markdown summaries, JSON benchmark files, and 3x3 confusion matrices.
-- **Production Ready**: Fully pip-installable (`pip install -e .`) with CLI entrypoints (`sid-train`, `sid-eval`, `sid-predict`), automatic mixed precision (AMP), and gradient clipping.
+- **Robust Subset & Split Resolution**:
+  - Automatically loads and evaluates on explicit `test`, `validation`, or `train` splits.
+  - Transparently falls back to `validation` when evaluating datasets where `val == test` (or datasets missing an explicit `test` split).
 
 ---
 
@@ -51,6 +49,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
 The framework supports multiple dataset formats:
 
 ### 1. Common / Regular 2-Column Format ([KhangTruong/IMD2020](https://huggingface.co/datasets/KhangTruong/IMD2020))
+- **Subsets Available**: `train`, `validation`, and `test`.
 - `image`: RGB image (PIL Image or tensor).
 - `mask`: Binary / grayscale segmentation mask for manipulated or inpainted regions.
 - When `label` is not provided in the dataset, class indicators are inferred automatically from pixel statistics ($0$: all-zero mask / authentic, $1$: all-one mask / fully synthetic, $2$: mixed mask / tampered).
@@ -207,22 +206,27 @@ pip install -e ".[dev]"
 
 Configurations are written in standard YAML. Any parameter can be overridden via CLI with dot-notation `--override key.nested=value`.
 
-Example `configs/train_streaming.yaml`:
+Example `configs/default.yaml`:
 ```yaml
 project:
-  name: "sid_unet_streaming"
+  name: "sid_unet_baseline"
   seed: 42
   device: "auto"                    # 'auto', 'cuda', or 'cpu'
-  output_dir: "outputs/streaming_run"
+  output_dir: "outputs"
 
 data:
-  dataset_name: "saberzl/SID_Set"
-  streaming: true                   # Always true for streaming operation
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false                  # false for downloaded datasets, true for streaming
   image_size: [256, 256]            # Input resolution [H, W]
   batch_size: 16
   num_workers: 2
-  train_samples_per_epoch: 2000     # Delineates epoch steps on streaming datasets
-  val_samples: 400                  # Max samples for validation pass
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  train_samples_per_epoch: -1       # -1 for full dataset until depletion
+  val_samples: -1                   # -1 for full validation set
+  test_samples: -1                  # -1 for full test set
+  evaluate_on_test: true            # Automatically evaluate on test set post-training
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2
@@ -264,13 +268,13 @@ training:
 ### 1. Training
 
 #### A. Single Experiment Training
-Run training with a configuration file:
+Run training with a configuration file (includes per-epoch validation and post-training test set evaluation):
 ```bash
 # Using installed CLI command:
-sid-train --config configs/train_streaming.yaml
+sid-train --config configs/default.yaml
 
 # Or using Python module:
-python -m sid_unet.train --config configs/train_streaming.yaml
+python -m sid_unet.train --config configs/default.yaml
 ```
 
 **Fast Smoke Testing:**
@@ -315,15 +319,23 @@ python -m sid_unet.train \
 
 ### 2. Evaluation & Benchmarking
 
-Evaluate a saved checkpoint against the validation split and generate reports:
+Evaluate a saved checkpoint against the test or validation split:
 ```bash
-# Using installed CLI command:
-sid-eval --checkpoint outputs/streaming_run/checkpoints/checkpoint_best.pt
+# Evaluate on test set (automatically falls back to validation if test set is not present):
+sid-eval --checkpoint outputs/checkpoints/checkpoint_best.pt --split test
 
-# Or using Python module:
+# Evaluate on specific split with sample limit and custom threshold:
+sid-eval \
+  --checkpoint outputs/checkpoints/checkpoint_best.pt \
+  --split validation \
+  --samples 500 \
+  --threshold 0.5
+
+# Or with config overrides:
 python -m sid_unet.evaluate \
-  --checkpoint outputs/streaming_run/checkpoints/checkpoint_best.pt \
-  --override data.val_samples=1000 --threshold 0.5
+  --checkpoint outputs/checkpoints/checkpoint_best.pt \
+  --split test \
+  --override data.batch_size=32 data.streaming=false
 ```
 
 This outputs a tabulated summary in the terminal and saves:

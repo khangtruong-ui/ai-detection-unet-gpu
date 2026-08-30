@@ -43,6 +43,7 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
     return {
         "Project Name": project_cfg.get("name", "N/A"),
         "Dataset": data_cfg.get("dataset_name", "N/A"),
+        "Splits": f"Train: '{data_cfg.get('train_split', 'train')}' | Val: '{data_cfg.get('val_split', 'validation')}' | Test: '{data_cfg.get('test_split', 'test')}'",
         "Streaming": data_cfg.get("streaming", True),
         "Image Size": str(data_cfg.get("image_size", [256, 256])),
         "Batch Size": data_cfg.get("batch_size", 16),

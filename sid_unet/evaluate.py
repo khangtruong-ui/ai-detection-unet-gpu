@@ -12,7 +12,7 @@ import os
 import torch
 from tqdm import tqdm
 
-from sid_unet.dataset.loader import create_dataloaders
+from sid_unet.dataset.loader import create_eval_dataloader, create_dataloaders
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
@@ -35,6 +35,18 @@ def parse_args():
         type=str,
         default=None,
         help="Path to YAML configuration file (optional; defaults to config embedded in checkpoint or evaluate.yaml)",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Dataset split to evaluate ('test', 'validation', 'val', 'train'). Defaults to test (with auto fallback to val).",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=None,
+        help="Number of samples to evaluate on (overrides config sample limits, e.g. --samples 500)",
     )
     parser.add_argument(
         "--override",
@@ -97,9 +109,11 @@ def main():
 
     loss_fn = build_loss(config).to(device)
 
-    # Build DataLoader for validation/test
-    logger.info("Loading evaluation dataset...")
-    _, val_loader = create_dataloaders(config)
+    # Build DataLoader for specified evaluation split (test, validation, etc.)
+    eval_loader = create_eval_dataloader(config, split=args.split, max_samples=args.samples)
+    resolved_split = getattr(eval_loader.dataset, "resolved_split", args.split or config.data.get("eval_split", "test"))
+    requested_split = args.split or config.data.get("eval_split", config.data.get("test_split", "test"))
+    logger.info(f"Evaluating dataset '{config.data.get('dataset_name')}' on split: '{resolved_split}' (requested: '{requested_split}')")
 
     seg_tracker = SegmentationMetricTracker(threshold=args.threshold)
     cls_tracker = ClassificationMetricTracker(num_classes=config.model.get("num_classes", 3))
@@ -107,7 +121,7 @@ def main():
     total_loss_sum = 0.0
     total_samples = 0
 
-    pbar = tqdm(val_loader, desc="Evaluating", leave=True)
+    pbar = tqdm(eval_loader, desc=f"Evaluating ({resolved_split})", leave=True)
     with torch.no_grad():
         for batch in pbar:
             images = batch["image"].to(device)
@@ -135,6 +149,7 @@ def main():
     cls_metrics, confusion_mat = cls_tracker.compute()
 
     overall_metrics = {
+        "eval_split": resolved_split,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
         **overall_seg,
         **cls_metrics,

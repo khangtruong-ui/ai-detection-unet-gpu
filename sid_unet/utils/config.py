@@ -117,8 +117,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "shuffle_buffer_size": 1000,
         "train_split": "train",
         "val_split": "validation",
+        "test_split": "test",
+        "eval_split": "test",
         "train_samples_per_epoch": -1,  # Set to -1 to run until dataset is depleted
         "val_samples": -1,              # Set to -1 to run until dataset is depleted
+        "test_samples": -1,             # Set to -1 to run until dataset is depleted
+        "evaluate_on_test": True,       # Evaluate on test set after training if available
         "augmentations": {
             "horizontal_flip": 0.5,
             "vertical_flip": 0.2,

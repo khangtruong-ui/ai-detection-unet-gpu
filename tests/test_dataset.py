@@ -107,3 +107,109 @@ def test_two_column_dataset_processing():
     assert processed_syn["label"].item() == 1  # Inferred fully synthetic (1)
 
 
+def test_get_split_candidates():
+    from sid_unet.dataset.loader import get_split_candidates
+
+    test_cands = get_split_candidates("test")
+    assert test_cands[0] == "test"
+    assert "validation" in test_cands
+    assert "val" in test_cands
+    assert "train" in test_cands
+
+    val_cands = get_split_candidates("validation")
+    assert val_cands[0] == "validation"
+    assert "val" in val_cands
+    assert "test" in val_cands
+
+    train_cands = get_split_candidates("train")
+    assert train_cands[0] == "train"
+
+
+def test_load_hf_dataset_robust_fallback(monkeypatch):
+    from sid_unet.dataset.loader import load_hf_dataset_robust
+
+    # Mock dataset dictionary with only 'train' and 'validation' (no 'test')
+    class MockDataset:
+        def __init__(self, split):
+            self.split = split
+            self.samples = [{"image": Image.new("RGB", (32, 32)), "mask": None, "label": 0}]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+        def select(self, r):
+            return self
+
+    def mock_load(dataset_name, split=None, streaming=False):
+        valid_splits = {"train": MockDataset("train"), "validation": MockDataset("validation")}
+        if split in valid_splits:
+            return valid_splits[split]
+        raise ValueError(f"Unknown split {split}")
+
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", mock_load)
+
+    # 1. Exact match for 'train'
+    ds, resolved = load_hf_dataset_robust("mock_dataset", requested_split="train")
+    assert resolved == "train"
+
+    # 2. Exact match for 'validation'
+    ds, resolved = load_hf_dataset_robust("mock_dataset", requested_split="validation")
+    assert resolved == "validation"
+
+    # 3. Alias 'val' falls back to 'validation'
+    ds, resolved = load_hf_dataset_robust("mock_dataset", requested_split="val")
+    assert resolved == "validation"
+
+    # 4. 'test' falls back to 'validation' when dataset has validation but no test (val=test case)
+    ds, resolved = load_hf_dataset_robust("mock_dataset", requested_split="test")
+    assert resolved == "validation"
+
+
+def test_create_eval_and_test_dataloaders(monkeypatch):
+    from sid_unet.dataset.loader import create_eval_dataloader, create_test_dataloader, create_dataloaders
+    from sid_unet.utils.config import load_config
+
+    class MockDataset:
+        def __init__(self):
+            self.samples = [
+                {"image": Image.new("RGB", (32, 32)), "mask": None, "label": 0}
+                for _ in range(6)
+            ]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+        def select(self, r):
+            return self
+
+        def shuffle(self, **kw):
+            return self
+
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockDataset())
+
+    cfg = load_config(overrides=[
+        "data.batch_size=2",
+        "data.num_workers=0",
+        "data.test_split=test",
+        "data.val_split=validation",
+        "data.streaming=false",
+    ])
+
+    eval_loader = create_eval_dataloader(cfg, split="test", max_samples=4)
+    assert isinstance(eval_loader, DataLoader)
+
+    test_loader = create_test_dataloader(cfg, max_samples=2)
+    assert isinstance(test_loader, DataLoader)
+
+    train_l, val_l, test_l = create_dataloaders(cfg, include_test=True)
+    assert isinstance(train_l, DataLoader)
+    assert isinstance(val_l, DataLoader)
+    assert isinstance(test_l, DataLoader)
+
+
