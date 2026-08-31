@@ -10,11 +10,8 @@ data:
   batch_size: 16
   num_workers: 2
   pin_memory: true
-  train_split: "train"
-  val_split: "validation"
-  test_split: "test"
-  eval_split: "test"
-  val_samples: -1
+  eval_split: "cross_test"
+  test_split: "cross_test"
   test_samples: -1
 
 model:

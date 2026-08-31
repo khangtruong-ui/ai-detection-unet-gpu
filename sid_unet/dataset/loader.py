@@ -115,17 +115,19 @@ def resolve_sample_limit(
 def get_split_candidates(requested_split: str) -> List[str]:
     """
     Return priority list of split name candidates for a requested split.
-    Handles synonyms and sensible fallbacks (e.g. test -> validation -> val -> train).
+    Handles synonyms and sensible fallbacks (e.g. cross_test, test -> validation -> val -> train).
     """
     req_lower = requested_split.strip().lower()
-    if req_lower in ("test", "testing", "eval", "evaluation"):
-        candidates = [requested_split, "test", "testing", "validation", "val", "eval", "evaluation", "train"]
+    if req_lower in ("cross_test", "crosstest", "cross-test"):
+        candidates = [requested_split, "cross_test", "cross-test", "test", "testing", "validation", "val", "eval", "train"]
+    elif req_lower in ("test", "testing", "eval", "evaluation"):
+        candidates = [requested_split, "cross_test", "test", "testing", "validation", "val", "eval", "evaluation", "train"]
     elif req_lower in ("val", "validation", "valid", "dev"):
-        candidates = [requested_split, "validation", "val", "valid", "dev", "test", "testing", "eval", "train"]
+        candidates = [requested_split, "validation", "val", "valid", "dev", "cross_test", "test", "testing", "eval", "train"]
     elif req_lower in ("train", "training"):
         candidates = [requested_split, "train", "training", "train_data", "train_set"]
     else:
-        candidates = [requested_split, "test", "validation", "val", "train"]
+        candidates = [requested_split, "cross_test", "test", "validation", "val", "train"]
 
     # De-duplicate while preserving order
     seen = set()

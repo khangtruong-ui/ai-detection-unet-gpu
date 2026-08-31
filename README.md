@@ -482,14 +482,22 @@ with torch.no_grad():
 ## Loss Functions & Metrics
 
 ### Loss Functions
-- **BCELoss**: Binary Cross-Entropy with Logits:
-  $$\mathcal{L}_{\text{BCE}} = - [y \log \sigma(x) + (1 - y) \log (1 - \sigma(x))]$$
-- **DiceLoss**: Soft Dice Loss:
-  $$\mathcal{L}_{\text{Dice}} = 1 - \frac{2 \sum p_i y_i + \epsilon}{\sum p_i + \sum y_i + \epsilon}$$
-- **FocalLoss**: Binary Focal Loss with focusing parameter $\gamma$ and balance $\alpha$:
-  $$\mathcal{L}_{\text{Focal}} = -\alpha_t (1 - p_t)^\gamma \log(p_t)$$
-- **Total Loss**:
-  $$\mathcal{L}_{\text{Total}} = \alpha \mathcal{L}_{\text{BCE}} + \beta \mathcal{L}_{\text{Dice}} + \lambda_{\text{aux}} \mathcal{L}_{\text{CE}}(\hat{y}_{\text{cls}}, y_{\text{cls}})$$
+
+- **BCELoss** (Binary Cross-Entropy with Logits):
+
+$$\mathcal{L}_{\text{BCE}} = - \left[ y \log \sigma(x) + (1 - y) \log (1 - \sigma(x)) \right]$$
+
+- **DiceLoss** (Soft Dice Loss):
+
+$$\mathcal{L}_{\text{Dice}} = 1 - \frac{2 \sum p_i y_i + \epsilon}{\sum p_i + \sum y_i + \epsilon}$$
+
+- **FocalLoss** (Binary Focal Loss with focusing parameter $\gamma$ and balance $\alpha$):
+
+$$\mathcal{L}_{\text{Focal}} = -\alpha_t (1 - p_t)^\gamma \log(p_t)$$
+
+- **Total Composite Loss**:
+
+$$\mathcal{L}_{\text{Total}} = \alpha \mathcal{L}_{\text{BCE}} + \beta \mathcal{L}_{\text{Dice}} + \lambda_{\text{aux}} \mathcal{L}_{\text{CE}}(\hat{y}_{\text{cls}}, y_{\text{cls}})$$
 
 ### Metrics Tracked
 - **Intersection over Union (IoU / Jaccard Index)**: $\frac{|P \cap T|}{|P \cup T|}$
