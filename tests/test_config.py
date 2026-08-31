@@ -14,7 +14,9 @@ def test_default_config_loading():
     assert cfg.data.batch_size == 16
     assert cfg.data.train_samples_per_epoch == -1
     assert cfg.data.val_samples == -1
-    assert cfg.model.aux_classifier is True
+    assert cfg.model.aux_classifier is False
+    assert cfg.training.auto_batch_size is True
+    assert cfg.training.save_latest is False
 
 
 def test_config_overrides():

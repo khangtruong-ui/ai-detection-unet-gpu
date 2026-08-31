@@ -28,7 +28,7 @@ model:
   features: [64, 128, 256, 512]
   bilinear: true
   dropout: 0.1
-  aux_classifier: true
+  aux_classifier: false
   num_classes: 3
 
 loss:
@@ -46,7 +46,7 @@ training:
   scheduler: "cosine"
   amp: true
   save_best: true
-  save_latest: true
+  save_latest: false
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"

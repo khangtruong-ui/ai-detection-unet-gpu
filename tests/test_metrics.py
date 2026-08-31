@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 import torch
-from sid_unet.metrics.segmentation import compute_binary_metrics, SegmentationMetricTracker
+from sid_unet.metrics.segmentation import compute_binary_metrics, compute_binary_auroc, SegmentationMetricTracker
 from sid_unet.metrics.classification import ClassificationMetricTracker
 
 
@@ -12,9 +12,13 @@ def test_perfect_mask_metrics():
     m = compute_binary_metrics(pred, target)
     assert m["iou"] == 1.0
     assert m["dice"] == 1.0
+    assert m["f1"] == 1.0
+    assert m["pixel_f1"] == 1.0
     assert m["pixel_acc"] == 1.0
     assert m["precision"] == 1.0
     assert m["recall"] == 1.0
+    assert m["auroc"] == 1.0
+    assert m["pixel_auroc"] == 1.0
 
 
 def test_empty_mask_metrics():
@@ -23,7 +27,28 @@ def test_empty_mask_metrics():
 
     m = compute_binary_metrics(pred, target)
     assert m["iou"] == 1.0
+    assert m["f1"] == 1.0
+    assert m["pixel_f1"] == 1.0
     assert m["pixel_acc"] == 1.0
+    assert m["auroc"] == 1.0
+    assert m["pixel_auroc"] == 1.0
+
+
+def test_auroc_metric_calculation():
+    # 50% positive, 50% negative with perfect ranked probabilities
+    target = np.zeros((10, 10), dtype=np.float32)
+    target[:5, :] = 1.0
+    pred_probs = np.zeros((10, 10), dtype=np.float32)
+    pred_probs[:5, :] = 0.9
+    pred_probs[5:, :] = 0.1
+
+    auroc = compute_binary_auroc(pred_probs, target)
+    assert auroc == 1.0
+
+    # Inverted predictions
+    pred_probs_inv = 1.0 - pred_probs
+    auroc_inv = compute_binary_auroc(pred_probs_inv, target)
+    assert auroc_inv == 0.0
 
 
 def test_segmentation_tracker_per_label():
@@ -49,8 +74,12 @@ def test_segmentation_tracker_per_label():
     assert 1 in per_label
     assert 2 in per_label
     assert per_label[0]["iou"] == 1.0
+    assert per_label[0]["f1"] == 1.0
+    assert per_label[0]["auroc"] == 1.0
     assert per_label[1]["iou"] == 0.0
     assert per_label[2]["iou"] == 1.0
+    assert "pixel_f1" in overall
+    assert "pixel_auroc" in overall
 
 
 def test_classification_tracker():
@@ -67,6 +96,7 @@ def test_classification_tracker():
     metrics, cm = tracker.compute()
 
     assert metrics["aux_accuracy"] == 0.75
+    assert "aux_auroc" in metrics
     assert len(cm) == 3
     assert cm[0][0] == 1 # Target 0, Pred 0
     assert cm[1][1] == 1 # Target 1, Pred 1

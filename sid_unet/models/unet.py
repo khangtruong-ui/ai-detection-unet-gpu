@@ -221,6 +221,10 @@ class UNet(nn.Module):
             saved_cfg_dict = {}
 
         merged = deep_merge(DEFAULT_CONFIG, saved_cfg_dict)
+        if not saved_cfg_dict and isinstance(state_dict, dict):
+            has_aux = any(k.startswith("classifier_head.") for k in state_dict.keys())
+            merged["model"]["aux_classifier"] = has_aux
+
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
             merged = deep_merge(merged, override_dict)

@@ -34,7 +34,7 @@ model:
   features: [128, 256, 512, 1024]  # Wide channel representation
   bilinear: true
   dropout: 0.15
-  aux_classifier: true
+  aux_classifier: false
   num_classes: 3
 
 loss:
@@ -55,7 +55,7 @@ training:
   grad_clip_norm: 1.0
   amp: true
   save_best: true
-  save_latest: true
+  save_latest: false
   eval_interval: 1
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"

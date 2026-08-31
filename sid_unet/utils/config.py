@@ -137,7 +137,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "features": [64, 128, 256, 512],
         "bilinear": True,
         "dropout": 0.1,
-        "aux_classifier": True,      # 3-class auxiliary classification head
+        "aux_classifier": False,     # Disabled by default for 2-column datasets like KhangTruong/IMD2020
         "num_classes": 3,            # Real (0), Fully AI (1), Partially AI (2)
         "gradient_checkpointing": False, # Activation checkpointing to reduce VRAM
     },
@@ -161,10 +161,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "grad_clip_norm": 1.0,
         "amp": True,                  # Automatic mixed precision
         "gradient_accumulation_steps": 1, # Number of micro-batches to accumulate before optimizer step
-        "auto_batch_size": False,     # Automatically search and scale safe batch size to avoid OOM
+        "auto_batch_size": True,      # Automatically search and scale safe batch size to avoid OOM
         "empty_cache_per_epoch": True,# Free PyTorch memory allocator cache between epochs
         "save_best": True,
-        "save_latest": True,
+        "save_latest": False,         # Only save best model checkpoint by default
         "eval_interval": 1,           # Validate every N epochs
         "early_stopping_patience": 5,
         "early_stopping_metric": "val_iou",

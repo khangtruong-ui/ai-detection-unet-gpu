@@ -21,7 +21,7 @@ class CheckpointManager:
         metric_name: str = "val_iou",
         mode: str = "max",
         save_best: bool = True,
-        save_latest: bool = True,
+        save_latest: bool = False,
     ):
         self.checkpoint_dir = checkpoint_dir
         self.metric_name = metric_name

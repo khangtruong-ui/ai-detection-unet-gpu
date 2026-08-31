@@ -239,7 +239,7 @@ model:
   features: [64, 128, 256, 512]
   bilinear: true
   dropout: 0.1
-  aux_classifier: true             # 3-class auxiliary classification head
+  aux_classifier: false            # Set false for 2-column image/mask datasets like IMD2020 (set true for 3-class datasets like SID_Set)
   num_classes: 3
 
 loss:
@@ -256,6 +256,9 @@ training:
   optimizer: "adamw"
   scheduler: "cosine"
   amp: true
+  auto_batch_size: true            # Enabled by default to automatically search safe batch size and avoid OOM
+  save_best: true
+  save_latest: false               # Saves only best model checkpoint by default
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"
@@ -288,9 +291,9 @@ sid-train --config configs/test_quick.yaml
 ```
 
 #### B. Multi-Experiment Suite (Run Multiple Configs in One Command)
-You can pass multiple configuration files to execute a series of experiments sequentially. Each run gets an isolated output directory, and a consolidated markdown & JSON comparative benchmark report is generated automatically:
+You can pass multiple configuration files to execute a series of experiments sequentially. Each run gets a clean, dedicated output directory (`RUN001`, `RUN002`, `RUN003`, etc.), and a consolidated markdown & JSON comparative benchmark report is generated automatically:
 ```bash
-sid-train --configs configs/test_smoke.yaml configs/test_quick.yaml
+sid-train --configs configs/test_smoke.yaml configs/test_quick.yaml --output_dir outputs/benchmark_suite
 ```
 
 **Override parameters via CLI across runs:**
@@ -318,10 +321,10 @@ python -m sid_unet.train \
 #### C. Handling Large Batch Sizes & GPU Memory (OOM Prevention)
 When training on high resolutions or constrained GPU memory, multiple built-in mechanisms prevent Out-of-Memory (OOM) failures:
 
-1. **Automatic Batch Sizing (`--auto-batch-size`)**:
-   Automatically probes device VRAM before training and scales down the physical batch size while increasing gradient accumulation steps to maintain the target effective batch size:
+1. **Automatic Batch Sizing (Enabled by Default)**:
+   Probes device VRAM before training and scales down the physical batch size while increasing gradient accumulation steps to maintain the target effective batch size. Pass `--no-auto-batch-size` if you wish to disable auto-tuning:
    ```bash
-   python -m sid_unet.train --config configs/default.yaml --batch_size 64 --auto-batch-size
+   python -m sid_unet.train --config configs/default.yaml --batch_size 64
    ```
 
 2. **Gradient Accumulation (`--gradient-accumulation-steps`)**:
@@ -344,28 +347,40 @@ When training on high resolutions or constrained GPU memory, multiple built-in m
 
 ### 2. Evaluation & Benchmarking
 
-Evaluate a saved checkpoint against the test or validation split:
+#### A. Single Checkpoint Evaluation
+Evaluate a checkpoint against the test or validation split (reports are saved and override in-place in the checkpoint's local run directory, e.g. `outputs/RUN001/eval_reports/`):
 ```bash
-# Evaluate on test set (automatically falls back to validation if test set is not present):
-sid-eval --checkpoint outputs/checkpoints/checkpoint_best.pt --split test
+# Evaluate on test set (automatically falls back to validation if test split is not present):
+sid-eval --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt --split test
 
 # Evaluate on specific split with sample limit and custom threshold:
 sid-eval \
-  --checkpoint outputs/checkpoints/checkpoint_best.pt \
+  --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt \
   --split validation \
   --samples 500 \
   --threshold 0.5
 
 # Or with config overrides:
 python -m sid_unet.evaluate \
-  --checkpoint outputs/checkpoints/checkpoint_best.pt \
+  --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt \
   --split test \
   --override data.batch_size=32 data.streaming=false
 ```
 
+#### B. Multi-Checkpoint Evaluation (Evaluate Multiple Models at Once)
+Pass multiple checkpoints or glob patterns to evaluate a suite of models sequentially. Individual reports override in-place in each model's directory, and a consolidated comparative evaluation report (`multi_checkpoint_evaluation.md` / `.json`) with side-by-side metrics is generated:
+```bash
+# Evaluate multiple checkpoints explicitly:
+sid-eval --checkpoints outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN002/checkpoints/checkpoint_best.pt --split test
+
+# Evaluate all best checkpoints across all runs via glob pattern:
+sid-eval --checkpoints "outputs/RUN*/checkpoints/checkpoint_best.pt" --split test
+```
+
 This outputs a tabulated summary in the terminal and saves:
-- `outputs/eval_reports/evaluation_report.md`
-- `outputs/eval_reports/evaluation_report.json`
+- `<checkpoint_run_dir>/eval_reports/evaluation_report.md` (overridden in-place)
+- `<checkpoint_run_dir>/eval_reports/evaluation_report.json`
+- `outputs/multi_checkpoint_evaluation.md` (when multiple checkpoints are evaluated)
 
 Example generated report:
 ```markdown
@@ -377,7 +392,8 @@ Example generated report:
 |-------------------------|---------|
 | Eval Total Loss         |  0.3142 |
 | Iou                     |  0.8415 |
-| Dice                    |  0.9023 |
+| Dice / Pixel F1         |  0.9023 |
+| Pixel Auroc             |  0.9610 |
 | Pixel Acc               |  0.9412 |
 | Precision               |  0.8876 |
 | Recall                  |  0.9201 |
@@ -452,7 +468,8 @@ with torch.no_grad():
 
 ### Metrics Tracked
 - **Intersection over Union (IoU / Jaccard Index)**: $\frac{|P \cap T|}{|P \cup T|}$
-- **Dice Coefficient / F1-Score**: $\frac{2 |P \cap T|}{|P| + |T|}$
+- **Pixel F1-Score / Dice Coefficient**: $\frac{2 |P \cap T|}{|P| + |T|}$
+- **Area Under ROC Curve (AUROC / ROC-AUC)**: Continuous pixel prediction probability ranking performance
 - **Pixel Accuracy**: $\frac{\text{TP} + \text{TN}}{\text{Total Pixels}}$
 - **Precision, Recall & Specificity**
 - **Auxiliary 3-Class Accuracy, Macro F1, and Confusion Matrix**

@@ -94,14 +94,15 @@ def format_history_table(history: List[Dict[str, Any]]) -> str:
     """Format epoch-by-epoch training and validation metrics into a clean tabulated table."""
     if not history:
         return ""
-    headers = ["Epoch", "Train Loss", "Val Loss", "Val IoU", "Val Dice", "Val Pixel Acc", "Learning Rate"]
+    headers = ["Epoch", "Train Loss", "Val Loss", "Val IoU", "Val F1", "Val AUROC", "Val Pixel Acc", "Learning Rate"]
     rows = []
     for h in history:
         ep = h.get("epoch", "-")
         tr_loss = h.get("train_loss", h.get("total_loss"))
         v_loss = h.get("val_loss", h.get("val_total_loss"))
         v_iou = h.get("val_iou", h.get("iou"))
-        v_dice = h.get("val_dice", h.get("dice"))
+        v_f1 = h.get("val_f1", h.get("val_pixel_f1", h.get("val_dice", h.get("dice"))))
+        v_auroc = h.get("val_auroc", h.get("val_pixel_auroc", h.get("auroc")))
         v_pacc = h.get("val_pixel_acc", h.get("pixel_acc"))
         lr = h.get("lr", h.get("learning_rate"))
 
@@ -110,7 +111,8 @@ def format_history_table(history: List[Dict[str, Any]]) -> str:
             f"{tr_loss:.4f}" if isinstance(tr_loss, (int, float)) else "-",
             f"{v_loss:.4f}" if isinstance(v_loss, (int, float)) else "-",
             f"{v_iou:.4f}" if isinstance(v_iou, (int, float)) else "-",
-            f"{v_dice:.4f}" if isinstance(v_dice, (int, float)) else "-",
+            f"{v_f1:.4f}" if isinstance(v_f1, (int, float)) else "-",
+            f"{v_auroc:.4f}" if isinstance(v_auroc, (int, float)) else "-",
             f"{v_pacc:.4f}" if isinstance(v_pacc, (int, float)) else "-",
             f"{lr:.2e}" if isinstance(lr, (int, float)) else "-",
         ])
@@ -252,12 +254,13 @@ def generate_multi_experiment_report(
 
         hp = extract_key_hyperparameters(config)
 
-        # Pull key metric scores
-        val_loss = metrics.get("val_total_loss", metrics.get("val_loss"))
-        val_iou = metrics.get("val_iou")
-        val_dice = metrics.get("val_dice")
-        val_pixel_acc = metrics.get("val_pixel_acc")
-        val_acc = metrics.get("val_aux_accuracy", metrics.get("val_accuracy"))
+        # Pull key metric scores (supports validation and evaluation metrics)
+        val_loss = metrics.get("val_total_loss", metrics.get("val_loss", metrics.get("eval_total_loss")))
+        val_iou = metrics.get("val_iou", metrics.get("iou"))
+        val_f1 = metrics.get("val_f1", metrics.get("val_pixel_f1", metrics.get("val_dice", metrics.get("f1", metrics.get("pixel_f1", metrics.get("dice"))))))
+        val_auroc = metrics.get("val_auroc", metrics.get("val_pixel_auroc", metrics.get("auroc", metrics.get("pixel_auroc"))))
+        val_pixel_acc = metrics.get("val_pixel_acc", metrics.get("pixel_acc"))
+        val_acc = metrics.get("val_aux_accuracy", metrics.get("val_accuracy", metrics.get("aux_accuracy", metrics.get("accuracy"))))
 
         row = [
             exp_name,
@@ -268,7 +271,8 @@ def generate_multi_experiment_report(
             f"{best_epoch}",
             f"{val_loss:.4f}" if isinstance(val_loss, (int, float)) else "N/A",
             f"{val_iou:.4f}" if isinstance(val_iou, (int, float)) else "N/A",
-            f"{val_dice:.4f}" if isinstance(val_dice, (int, float)) else "N/A",
+            f"{val_f1:.4f}" if isinstance(val_f1, (int, float)) else "N/A",
+            f"{val_auroc:.4f}" if isinstance(val_auroc, (int, float)) else "N/A",
             f"{val_pixel_acc:.4f}" if isinstance(val_pixel_acc, (int, float)) else "N/A",
             f"{val_acc:.4f}" if isinstance(val_acc, (int, float)) else "N/A",
         ]
@@ -294,7 +298,8 @@ def generate_multi_experiment_report(
         "Best Epoch",
         "Val Loss",
         "Val IoU",
-        "Val Dice",
+        "Val F1",
+        "Val AUROC",
         "Pixel Acc",
         "Class Acc",
     ]

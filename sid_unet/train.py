@@ -51,6 +51,13 @@ def parse_args():
         help="Path(s) to YAML configuration file(s). Pass multiple files to run multiple experiments sequentially.",
     )
     parser.add_argument(
+        "--output_dir",
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory to save experiment outputs/checkpoints/reports",
+    )
+    parser.add_argument(
         "--batch_size",
         "--batch-size",
         type=int,
@@ -60,9 +67,18 @@ def parse_args():
     parser.add_argument(
         "--auto_batch_size",
         "--auto-batch-size",
+        dest="auto_batch_size",
         action="store_true",
-        default=False,
-        help="Automatically probe GPU memory and scale down batch size / increase gradient accumulation to avoid OOM",
+        default=None,
+        help="Automatically probe GPU memory and scale down batch size / increase gradient accumulation to avoid OOM (default: enabled)",
+    )
+    parser.add_argument(
+        "--no_auto_batch_size",
+        "--no-auto-batch-size",
+        "--disable-auto-batch-size",
+        dest="auto_batch_size",
+        action="store_false",
+        help="Disable automatic batch size scaling",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -99,7 +115,7 @@ def train_single_run(
     resume: Optional[str] = None,
     run_idx: int = 1,
     total_runs: int = 1,
-    base_output_dir: str = "outputs",
+    base_output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a single training experiment with its given config."""
     config = load_config(config_path, overrides=overrides or [])
@@ -108,13 +124,21 @@ def train_single_run(
     seed = int(config.project.get("seed", 42))
     set_seed(seed)
 
-    # In multi-run mode, give each run an isolated output subdirectory under base_output_dir
+    # In multi-run mode, name each run folder cleanly as RUN001, RUN002, etc.
     cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
     if total_runs > 1:
-        output_dir = os.path.join(base_output_dir, f"exp_{run_idx:02d}_{cfg_stem}")
+        run_name = f"RUN{run_idx:03d}"
+        root_dir = base_output_dir if base_output_dir else "outputs"
+        output_dir = os.path.join(root_dir, run_name)
         config.project.output_dir = output_dir
+        config.project.name = run_name
     else:
-        output_dir = config.project.get("output_dir", "outputs")
+        if base_output_dir:
+            output_dir = base_output_dir
+            config.project.output_dir = output_dir
+        else:
+            output_dir = config.project.get("output_dir", "outputs")
+        run_name = config.project.get("name", cfg_stem)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -123,10 +147,10 @@ def train_single_run(
     save_config(config, config_save_path)
 
     logger = setup_logger(
-        name=f"SID_UNet_Run_{run_idx}" if total_runs > 1 else "SID_UNet",
+        name=run_name,
         log_file=os.path.join(output_dir, "logs", "train_run.log"),
     )
-    logger.info(f"[{run_idx}/{total_runs}] Loaded configuration from '{config_path}'")
+    logger.info(f"[{run_idx}/{total_runs}] Loaded configuration from '{config_path}' (Run: {run_name})")
     logger.info(f"Effective configuration saved to '{config_save_path}'")
     logger.info(f"Dataset: {config.data.dataset_name} | Streaming: {config.data.streaming}")
 
@@ -156,7 +180,7 @@ def train_single_run(
     # Run training
     results = trainer.train()
     results["config_path"] = config_path
-    results["run_name"] = config.project.get("name", cfg_stem)
+    results["run_name"] = run_name
 
     logger.info(f"Experiment '{results['run_name']}' finished successfully!")
     logger.info(f"Best Score: {results['best_score']:.4f} (Epoch {results['best_epoch']})")
@@ -172,8 +196,10 @@ def main():
     overrides = list(args.override)
     if args.batch_size is not None:
         overrides.append(f"data.batch_size={args.batch_size}")
-    if args.auto_batch_size:
+    if args.auto_batch_size is True:
         overrides.append("training.auto_batch_size=true")
+    elif args.auto_batch_size is False:
+        overrides.append("training.auto_batch_size=false")
     if args.gradient_accumulation_steps is not None:
         overrides.append(f"training.gradient_accumulation_steps={args.gradient_accumulation_steps}")
     if args.gradient_checkpointing:
@@ -181,26 +207,37 @@ def main():
         overrides.append("training.gradient_checkpointing=true")
 
     if len(config_paths) == 1:
+        if args.output_dir:
+            overrides.append(f"project.output_dir={args.output_dir}")
         results = train_single_run(
             config_path=config_paths[0],
             overrides=overrides,
             resume=args.resume,
             run_idx=1,
             total_runs=1,
+            base_output_dir=args.output_dir,
         )
         return results
 
     # Multi-experiment suite
+    parent_output_dir = args.output_dir
+    if not parent_output_dir:
+        for ov in overrides:
+            if ov.startswith("project.output_dir="):
+                parent_output_dir = ov.split("=", 1)[1].strip()
+                break
+    if not parent_output_dir:
+        parent_output_dir = "outputs"
+
     print("\n" + "=" * 70)
     print(f"🚀 Launching Multi-Experiment Suite ({len(config_paths)} experiments)")
+    print(f"📁 Suite Output Directory: {parent_output_dir}")
     print("=" * 70 + "\n")
 
     all_results: List[Dict[str, Any]] = []
-    first_cfg = load_config(config_paths[0], overrides=overrides)
-    parent_output_dir = first_cfg.project.get("output_dir", "outputs")
 
     for i, cfg_path in enumerate(config_paths, 1):
-        print(f"\n>>> Running Experiment [{i}/{len(config_paths)}]: {cfg_path}")
+        print(f"\n>>> Running Experiment [{i}/{len(config_paths)}]: {cfg_path} (RUN{i:03d})")
         print("-" * 70)
         res = train_single_run(
             config_path=cfg_path,

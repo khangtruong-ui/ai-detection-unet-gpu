@@ -116,8 +116,8 @@ def test_cli_multi_config_training(monkeypatch):
         test_train_args = [
             "sid-train",
             "--configs", "configs/test_smoke.yaml", "configs/test_quick.yaml",
+            "--output_dir", output_dir,
             "--override",
-            f"project.output_dir={output_dir}",
             "project.device=cpu",
             "training.epochs=1",
             "data.num_workers=0",
@@ -139,9 +139,9 @@ def test_cli_multi_config_training(monkeypatch):
         assert os.path.exists(comparison_md)
         assert os.path.exists(comparison_json)
 
-        # Check that individual experiment dirs exist
-        exp1_dir = os.path.join(output_dir, "exp_01_test_smoke")
-        exp2_dir = os.path.join(output_dir, "exp_02_test_quick")
+        # Check that individual experiment dirs exist (RUN001, RUN002)
+        exp1_dir = os.path.join(output_dir, "RUN001")
+        exp2_dir = os.path.join(output_dir, "RUN002")
         assert os.path.exists(exp1_dir)
         assert os.path.exists(exp2_dir)
         assert os.path.exists(os.path.join(exp1_dir, "reports", "training_final_report.md"))
@@ -176,5 +176,58 @@ def test_cli_memory_and_batch_options(monkeypatch):
 
         assert "best_score" in results
         assert os.path.exists(os.path.join(output_dir, "checkpoints", "checkpoint_best.pt"))
+
+
+def test_cli_multi_checkpoint_evaluation(monkeypatch):
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(10))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        suite_dir = os.path.join(tmpdir, "multi_eval_suite")
+
+        # 1. Train 2 runs
+        test_train_args = [
+            "sid-train",
+            "--configs", "configs/test_smoke.yaml", "configs/test_quick.yaml",
+            "--output_dir", suite_dir,
+            "--override",
+            "project.device=cpu",
+            "training.epochs=1",
+            "data.num_workers=0",
+            "data.train_samples_per_epoch=2",
+            "data.val_samples=2",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ]
+        monkeypatch.setattr(sys, "argv", test_train_args)
+        train_main()
+
+        ckpt1 = os.path.join(suite_dir, "RUN001", "checkpoints", "checkpoint_best.pt")
+        ckpt2 = os.path.join(suite_dir, "RUN002", "checkpoints", "checkpoint_best.pt")
+        assert os.path.exists(ckpt1)
+        assert os.path.exists(ckpt2)
+
+        # 2. Evaluate both checkpoints at once
+        test_eval_args = [
+            "sid-eval",
+            "--checkpoints", ckpt1, ckpt2,
+            "--split", "test",
+            "--samples", "2",
+            "--output_dir", suite_dir,
+            "--override",
+            "data.num_workers=0",
+            "data.batch_size=2",
+            "project.device=cpu",
+        ]
+        monkeypatch.setattr(sys, "argv", test_eval_args)
+        eval_results = eval_main()
+
+        assert len(eval_results) == 2
+        # Check individual in-place report files
+        assert os.path.exists(os.path.join(suite_dir, "RUN001", "eval_reports", "evaluation_report.md"))
+        assert os.path.exists(os.path.join(suite_dir, "RUN002", "eval_reports", "evaluation_report.md"))
+        # Check consolidated comparative report
+        assert os.path.exists(os.path.join(suite_dir, "multi_checkpoint_evaluation.md"))
+        assert os.path.exists(os.path.join(suite_dir, "multi_checkpoint_evaluation.json"))
+
 
 

@@ -98,7 +98,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.grad_clip = float(config.training.get("grad_clip_norm", 1.0))
         self.gradient_accumulation_steps = max(1, int(config.training.get("gradient_accumulation_steps", 1)))
-        self.auto_batch_size = bool(config.training.get("auto_batch_size", False))
+        self.auto_batch_size = bool(config.training.get("auto_batch_size", True))
         self.empty_cache_per_epoch = bool(config.training.get("empty_cache_per_epoch", True))
         self.log_memory = bool(config.logging.get("log_memory", True))
 
@@ -108,7 +108,7 @@ class Trainer:
             metric_name=config.training.get("early_stopping_metric", "val_iou"),
             mode=config.training.get("early_stopping_mode", "max"),
             save_best=bool(config.training.get("save_best", True)),
-            save_latest=bool(config.training.get("save_latest", True)),
+            save_latest=bool(config.training.get("save_latest", False)),
         )
         self.early_stopping = EarlyStopping(
             patience=int(config.training.get("early_stopping_patience", 5)),
@@ -429,6 +429,10 @@ class Trainer:
                 "val_aux_loss": float(val_summary.get("val_aux_loss", 0.0)),
                 "val_iou": float(val_summary.get("val_iou", 0.0)),
                 "val_dice": float(val_summary.get("val_dice", 0.0)),
+                "val_f1": float(val_summary.get("val_f1", val_summary.get("val_dice", 0.0))),
+                "val_pixel_f1": float(val_summary.get("val_pixel_f1", val_summary.get("val_dice", 0.0))),
+                "val_auroc": float(val_summary.get("val_auroc", val_summary.get("val_pixel_auroc", 0.0))),
+                "val_pixel_auroc": float(val_summary.get("val_pixel_auroc", val_summary.get("val_auroc", 0.0))),
                 "val_pixel_acc": float(val_summary.get("val_pixel_acc", 0.0)),
                 "val_precision": float(val_summary.get("val_precision", 0.0)),
                 "val_recall": float(val_summary.get("val_recall", 0.0)),
@@ -462,7 +466,8 @@ class Trainer:
                 f"Train Loss: {train_metrics.get('total_loss', 0.0):.4f} - "
                 f"Val Loss: {val_summary.get('val_total_loss', 0.0):.4f} - "
                 f"Val IoU: {val_summary.get('val_iou', 0.0):.4f} - "
-                f"Val Dice: {val_summary.get('val_dice', 0.0):.4f}"
+                f"Val F1: {val_summary.get('val_f1', val_summary.get('val_dice', 0.0)):.4f} - "
+                f"Val AUROC: {val_summary.get('val_auroc', 0.0):.4f}"
             )
 
             if "best" in saved_paths:

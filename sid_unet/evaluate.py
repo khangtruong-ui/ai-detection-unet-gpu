@@ -1,41 +1,53 @@
 """
 CLI evaluation and benchmarking entrypoint for SID-UNet.
+Supports evaluating single or multiple checkpoints concurrently with local report overriding
+and consolidated multi-checkpoint comparative benchmarking.
+
 Usage:
-    python -m sid_unet.evaluate --checkpoint outputs/checkpoints/checkpoint_best.pt --config configs/evaluate.yaml
+    # Single checkpoint (saves/overwrites report in checkpoint's local directory):
+    python -m sid_unet.evaluate --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt
+
+    # Multiple checkpoints at once:
+    python -m sid_unet.evaluate --checkpoints outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN002/checkpoints/checkpoint_best.pt
+    sid-eval --checkpoints outputs/*/checkpoints/checkpoint_best.pt --split test
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+from typing import Any, Dict, List, Optional
 import torch
 from tqdm import tqdm
 
-from sid_unet.dataset.loader import create_eval_dataloader, create_dataloaders
+from sid_unet.dataset.loader import create_eval_dataloader
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
-from sid_unet.models.unet import UNet, build_model
-from sid_unet.utils.config import load_config
+from sid_unet.models.unet import UNet
+from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
-from sid_unet.utils.report import generate_evaluation_report
+from sid_unet.utils.report import generate_evaluation_report, generate_multi_experiment_report
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate trained SID-UNet checkpoint")
+    parser = argparse.ArgumentParser(description="Evaluate trained SID-UNet checkpoint(s)")
     parser.add_argument(
         "--checkpoint",
-        type=str,
+        "--checkpoints",
+        nargs="+",
+        dest="checkpoint",
         required=True,
-        help="Path to checkpoint .pt file",
+        help="Path(s) to checkpoint .pt file(s) or glob pattern(s). Pass multiple files to evaluate multiple checkpoints at once.",
     )
     parser.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to YAML configuration file (optional; defaults to config embedded in checkpoint or evaluate.yaml)",
+        help="Path to YAML configuration file (optional; defaults to config embedded in checkpoint)",
     )
     parser.add_argument(
         "--split",
@@ -64,9 +76,10 @@ def parse_args():
     )
     parser.add_argument(
         "--output_dir",
+        "--output-dir",
         type=str,
         default=None,
-        help="Directory to save evaluation reports (defaults to outputs/eval_reports)",
+        help="Directory to save evaluation reports. If omitted, reports override in-place in each checkpoint's local run directory.",
     )
     parser.add_argument(
         "--threshold",
@@ -101,40 +114,73 @@ def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker):
     return loss.item() * b_size, b_size
 
 
-def main():
-    args = parse_args()
+def resolve_checkpoint_output_dir(checkpoint_path: str, specified_output_dir: Optional[str] = None, run_name: Optional[str] = None, multi_run: bool = False) -> str:
+    """
+    Resolve the target directory where the evaluation report will be written and override old reports.
+    If specified_output_dir is given, use it (or subfolder in multi_run). Otherwise, place reports inside the checkpoint's local run directory.
+    """
+    if specified_output_dir:
+        if multi_run and run_name:
+            return os.path.join(specified_output_dir, run_name, "eval_reports")
+        return specified_output_dir
 
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    if os.path.basename(ckpt_dir) == "checkpoints":
+        run_dir = os.path.dirname(ckpt_dir)
+        return os.path.join(run_dir, "eval_reports")
 
-    overrides = list(args.override)
-    if args.batch_size is not None:
-        overrides.append(f"data.batch_size={args.batch_size}")
+    return os.path.join(ckpt_dir, "eval_reports")
+
+
+def evaluate_single_checkpoint(
+    checkpoint_path: str,
+    config_path: Optional[str] = None,
+    split: Optional[str] = None,
+    samples: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    overrides: Optional[List[str]] = None,
+    output_dir: Optional[str] = None,
+    threshold: float = 0.5,
+    multi_run: bool = False,
+) -> Dict[str, Any]:
+    """Run full evaluation on a single checkpoint and override report in its local directory."""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    overrides = list(overrides or [])
+    if batch_size is not None:
+        overrides.append(f"data.batch_size={batch_size}")
 
     # Load model and config from checkpoint with optional overrides
-    if args.config:
-        override_cfg = load_config(args.config, overrides=overrides)
+    if config_path:
+        override_cfg = load_config(config_path, overrides=overrides)
     elif overrides:
-        from sid_unet.utils.config import apply_overrides, ConfigDict
         override_cfg = ConfigDict(apply_overrides({}, overrides))
     else:
         override_cfg = None
 
     model, config = UNet.from_checkpoint(
-        args.checkpoint,
+        checkpoint_path,
         override_config=override_cfg,
         return_config=True,
     )
 
-    output_dir = args.output_dir or os.path.join(config.project.get("output_dir", "outputs"), "eval_reports")
-    os.makedirs(output_dir, exist_ok=True)
+    ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
+    run_name = config.project.get("name", ckpt_stem)
+
+    resolved_out_dir = resolve_checkpoint_output_dir(checkpoint_path, output_dir, run_name=run_name, multi_run=multi_run)
+    os.makedirs(resolved_out_dir, exist_ok=True)
+
+    # Local checkpoint run directory for guaranteed in-place update
+    local_out_dir = resolve_checkpoint_output_dir(checkpoint_path, None)
+    os.makedirs(local_out_dir, exist_ok=True)
 
     logger = setup_logger(
-        name="SID_Eval",
-        log_file=os.path.join(output_dir, "evaluate.log"),
+        name=f"SID_Eval_{run_name}",
+        log_file=os.path.join(resolved_out_dir, "evaluate.log"),
     )
-    logger.info(f"Loaded checkpoint: {args.checkpoint}")
-    logger.info(f"Threshold: {args.threshold}")
+    logger.info(f"Loaded checkpoint: {checkpoint_path}")
+    logger.info(f"Threshold: {threshold}")
 
     device_str = config.project.get("device", "auto")
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) or device_str == "cuda" else "cpu")
@@ -148,22 +194,22 @@ def main():
     loss_fn = build_loss(config).to(device)
 
     # Build DataLoader for specified evaluation split (test, validation, etc.)
-    eval_loader = create_eval_dataloader(config, split=args.split, max_samples=args.samples)
-    resolved_split = getattr(eval_loader.dataset, "resolved_split", args.split or config.data.get("eval_split", "test"))
-    requested_split = args.split or config.data.get("eval_split", config.data.get("test_split", "test"))
+    eval_loader = create_eval_dataloader(config, split=split, max_samples=samples)
+    resolved_split = getattr(eval_loader.dataset, "resolved_split", split or config.data.get("eval_split", "test"))
+    requested_split = split or config.data.get("eval_split", config.data.get("test_split", "test"))
     logger.info(f"Evaluating dataset '{config.data.get('dataset_name')}' on split: '{resolved_split}' (requested: '{requested_split}')")
 
-    seg_tracker = SegmentationMetricTracker(threshold=args.threshold)
+    seg_tracker = SegmentationMetricTracker(threshold=threshold)
     cls_tracker = ClassificationMetricTracker(num_classes=config.model.get("num_classes", 3))
 
     total_loss_sum = 0.0
     total_samples = 0
 
     clear_memory_cache(device)
-    pbar = tqdm(eval_loader, desc=f"Evaluating ({resolved_split})", leave=True)
+    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", leave=True)
     with torch.no_grad():
         for batch in pbar:
-            batch_size = len(batch["image"])
+            b_sz = len(batch["image"])
             try:
                 loss_contrib, count = eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker)
                 total_loss_sum += loss_contrib
@@ -171,10 +217,10 @@ def main():
             except Exception as exc:
                 if is_oom_error(exc):
                     logger.warning(
-                        f"⚠️ OOM on evaluation batch size {batch_size}! Clearing cache and recovering with sub-batching..."
+                        f"⚠️ OOM on evaluation batch size {b_sz}! Clearing cache and recovering with sub-batching..."
                     )
                     clear_memory_cache(device)
-                    sub_batches = split_batch(batch, micro_batch_size=max(1, batch_size // 2))
+                    sub_batches = split_batch(batch, micro_batch_size=max(1, b_sz // 2))
                     for sub_b in sub_batches:
                         try:
                             loss_contrib, count = eval_single_batch(sub_b, model, loss_fn, device, seg_tracker, cls_tracker)
@@ -206,18 +252,143 @@ def main():
         "total_evaluated_samples": total_samples,
     }
 
+    # Generate and override the report in the target output directory
     report_result = generate_evaluation_report(
         overall_metrics=overall_metrics,
         per_label_metrics=per_label_seg,
         confusion_matrix=confusion_mat,
         config=config.to_dict() if hasattr(config, "to_dict") else dict(config),
-        output_dir=output_dir,
+        output_dir=resolved_out_dir,
         report_name="evaluation_report",
     )
 
+    # Also ensure local run directory report is overwritten
+    if local_out_dir != resolved_out_dir:
+        generate_evaluation_report(
+            overall_metrics=overall_metrics,
+            per_label_metrics=per_label_seg,
+            confusion_matrix=confusion_mat,
+            config=config.to_dict() if hasattr(config, "to_dict") else dict(config),
+            output_dir=local_out_dir,
+            report_name="evaluation_report",
+        )
+
     logger.info("\n" + report_result["markdown"])
-    logger.info(f"Reports saved to: {output_dir}")
-    return report_result
+    logger.info(f"Evaluation report overridden at: {os.path.join(resolved_out_dir, 'evaluation_report.md')}")
+
+    return {
+        "run_name": run_name,
+        "checkpoint_path": checkpoint_path,
+        "config": config.to_dict() if hasattr(config, "to_dict") else dict(config),
+        "overall_metrics": overall_metrics,
+        "final_metrics": overall_metrics,
+        "per_label_metrics": per_label_seg,
+        "confusion_matrix": confusion_mat,
+        "report_path": os.path.join(resolved_out_dir, "evaluation_report.md"),
+        "report_result": report_result,
+        "output_dir": resolved_out_dir,
+    }
+
+
+def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
+    """Expand list of checkpoint file paths or glob patterns into sorted unique file paths."""
+    resolved_paths: List[str] = []
+    for pattern in patterns:
+        if any(char in pattern for char in ["*", "?", "["]):
+            matches = glob.glob(pattern, recursive=True)
+            resolved_paths.extend([m for m in matches if os.path.isfile(m)])
+        elif os.path.isdir(pattern):
+            candidates = [
+                os.path.join(pattern, "checkpoints", "checkpoint_best.pt"),
+                os.path.join(pattern, "checkpoint_best.pt"),
+            ]
+            found = False
+            for c in candidates:
+                if os.path.isfile(c):
+                    resolved_paths.append(c)
+                    found = True
+                    break
+            if not found:
+                resolved_paths.extend(glob.glob(os.path.join(pattern, "**", "*.pt"), recursive=True))
+        elif os.path.isfile(pattern):
+            resolved_paths.append(pattern)
+        else:
+            raise FileNotFoundError(f"Checkpoint path not found: {pattern}")
+
+    seen = set()
+    unique_paths = []
+    for p in resolved_paths:
+        abs_p = os.path.abspath(p)
+        if abs_p not in seen:
+            seen.add(abs_p)
+            unique_paths.append(p)
+
+    return unique_paths
+
+
+def main():
+    args = parse_args()
+    raw_patterns = args.checkpoint if isinstance(args.checkpoint, list) else [args.checkpoint]
+    checkpoint_paths = expand_checkpoint_patterns(raw_patterns)
+
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"No valid checkpoints found for pattern(s): {raw_patterns}")
+
+    overrides = list(args.override)
+
+    # Single Checkpoint Evaluation
+    if len(checkpoint_paths) == 1:
+        res = evaluate_single_checkpoint(
+            checkpoint_path=checkpoint_paths[0],
+            config_path=args.config,
+            split=args.split,
+            samples=args.samples,
+            batch_size=args.batch_size,
+            overrides=overrides,
+            output_dir=args.output_dir,
+            threshold=args.threshold,
+            multi_run=False,
+        )
+        return res["report_result"]
+
+    # Multiple Checkpoints Evaluation Suite
+    print("\n" + "=" * 70)
+    print(f"📊 Evaluating Multiple Checkpoints ({len(checkpoint_paths)} models)")
+    print("=" * 70 + "\n")
+
+    all_results: List[Dict[str, Any]] = []
+    for i, ckpt_path in enumerate(checkpoint_paths, 1):
+        print(f"\n>>> [{i}/{len(checkpoint_paths)}] Evaluating Checkpoint: {ckpt_path}")
+        print("-" * 70)
+        res = evaluate_single_checkpoint(
+            checkpoint_path=ckpt_path,
+            config_path=args.config,
+            split=args.split,
+            samples=args.samples,
+            batch_size=args.batch_size,
+            overrides=overrides,
+            output_dir=args.output_dir,
+            threshold=args.threshold,
+            multi_run=True,
+        )
+        all_results.append(res)
+
+    # Generate comparative benchmarking report across all evaluated checkpoints
+    suite_output_dir = args.output_dir or "outputs"
+    multi_report = generate_multi_experiment_report(
+        experiment_results=all_results,
+        output_dir=suite_output_dir,
+        report_name="multi_checkpoint_evaluation",
+    )
+
+    print("\n" + "=" * 70)
+    print("⭐ MULTI-CHECKPOINT EVALUATION SUMMARY")
+    print("=" * 70)
+    print(multi_report["summary_table"])
+    print(f"\nDetailed Markdown comparison: {os.path.join(suite_output_dir, 'multi_checkpoint_evaluation.md')}")
+    print(f"Detailed JSON comparison: {os.path.join(suite_output_dir, 'multi_checkpoint_evaluation.json')}\n")
+
+    return all_results
 
 
 def cli_main():
