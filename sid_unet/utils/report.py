@@ -364,3 +364,367 @@ def generate_multi_experiment_report(
         "summary_table": summary_table_md,
     }
 
+
+def generate_checkpoint_cross_eval_report(
+    checkpoint_path: str,
+    results: List[Dict[str, Any]],
+    output_dir: Optional[str] = None,
+    report_name: str = "cross_evaluation_report",
+) -> Dict[str, Any]:
+    """
+    Generate a cross-evaluation report for a single checkpoint evaluated across multiple configs.
+    Saved neighbor to the checkpoint folder.
+    """
+    ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
+    ckpt_name = results[0].get("checkpoint_name", ckpt_stem) if results else ckpt_stem
+
+    summary_rows = []
+    for res in results:
+        cfg_name = res.get("config_name", "default")
+        ds_name = res.get("dataset_name", res.get("config", {}).get("data", {}).get("dataset_name", "N/A"))
+        m = res.get("metrics", res.get("overall_metrics", {}))
+        split = res.get("eval_split", m.get("eval_split", "test"))
+        samples = res.get("total_evaluated_samples", m.get("total_evaluated_samples", 0))
+        loss = m.get("eval_total_loss", m.get("total_loss", m.get("loss")))
+        iou = m.get("iou", 0.0)
+        f1 = m.get("f1", m.get("pixel_f1", m.get("dice", 0.0)))
+        auroc = m.get("auroc", m.get("pixel_auroc", 0.0))
+        pacc = m.get("pixel_acc", 0.0)
+        cacc = m.get("aux_accuracy", m.get("accuracy"))
+
+        summary_rows.append([
+            cfg_name,
+            ds_name,
+            str(split),
+            str(samples),
+            f"{loss:.4f}" if isinstance(loss, (int, float)) else "N/A",
+            f"{iou:.4f}" if isinstance(iou, (int, float)) else "N/A",
+            f"{f1:.4f}" if isinstance(f1, (int, float)) else "N/A",
+            f"{auroc:.4f}" if isinstance(auroc, (int, float)) else "N/A",
+            f"{pacc:.4f}" if isinstance(pacc, (int, float)) else "N/A",
+            f"{cacc:.4f}" if isinstance(cacc, (int, float)) else "N/A",
+        ])
+
+    headers = [
+        "Config",
+        "Dataset",
+        "Split",
+        "Samples",
+        "Loss",
+        "IoU",
+        "Dice / F1",
+        "AUROC",
+        "Pixel Acc",
+        "Class Acc",
+    ]
+    summary_table_md = tabulate(summary_rows, headers=headers, tablefmt="github", disable_numparse=True)
+
+    md_lines = [
+        f"# Cross-Evaluation Report: {ckpt_name}\n",
+        f"- **Checkpoint Path**: `{checkpoint_path}`",
+        f"- **Evaluated Configurations**: {len(results)}\n",
+        "## Cross-Dataset Performance Summary\n",
+        summary_table_md,
+        "\n",
+    ]
+
+    # Detailed per-config sections
+    md_lines.append("---\n\n## Per-Configuration Breakdown\n")
+    for res in results:
+        cfg_name = res.get("config_name", "default")
+        ds_name = res.get("dataset_name", "N/A")
+        m = res.get("metrics", res.get("overall_metrics", {}))
+        per_label = res.get("per_label_metrics", {})
+        cm = res.get("confusion_matrix")
+
+        md_lines.append(f"### Configuration: {cfg_name} (Dataset: {ds_name})\n")
+        if res.get("config_path"):
+            md_lines.append(f"- **Config File**: `{res['config_path']}`")
+
+        md_lines.append(format_metrics_table(m, title="Evaluation Metrics"))
+
+        if per_label:
+            label_names = {0: "Label 0 (Real)", 1: "Label 1 (Synthetic)", 2: "Label 2 (Tampered)"}
+            pl_rows = []
+            for lbl, stats in per_label.items():
+                name = label_names.get(lbl, f"Label {lbl}")
+                pl_rows.append([
+                    name,
+                    f"{stats.get('iou', 0.0):.4f}",
+                    f"{stats.get('dice', stats.get('f1', 0.0)):.4f}",
+                    f"{stats.get('pixel_acc', 0.0):.4f}",
+                    f"{stats.get('samples', 0)}",
+                ])
+            md_lines.append("#### Per-Subset Breakdown\n")
+            md_lines.append(tabulate(pl_rows, headers=["Subset", "IoU", "Dice / F1", "Pixel Acc", "Samples"], tablefmt="github", disable_numparse=True))
+            md_lines.append("\n")
+
+        if cm and len(cm) > 0:
+            md_lines.append("#### Confusion Matrix\n")
+            cm_headers = ["Actual \\ Pred"] + [f"Class {i}" for i in range(len(cm))]
+            cm_rows = [[f"Class {i}", *row] for i, row in enumerate(cm)]
+            md_lines.append(tabulate(cm_rows, headers=cm_headers, tablefmt="github"))
+            md_lines.append("\n")
+
+    markdown_content = "\n".join(md_lines)
+
+    report_dict = {
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_name": ckpt_name,
+        "total_configs": len(results),
+        "results": results,
+    }
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        json_path = os.path.join(output_dir, f"{report_name}.json")
+        md_path = os.path.join(output_dir, f"{report_name}.md")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report_dict, f, indent=2)
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+
+    return {
+        "report_dict": report_dict,
+        "markdown": markdown_content,
+        "summary_table": summary_table_md,
+    }
+
+
+def _build_matrix_table(
+    checkpoints: List[str],
+    configs: List[str],
+    matrix_data: Dict[Tuple[str, str], float],
+    metric_name: str,
+) -> Tuple[str, List[List[Any]]]:
+    """Helper to build 2D tabulated cross-evaluation matrix."""
+    headers = ["Checkpoint \\ Config"] + configs
+    rows = []
+    for ckpt in checkpoints:
+        row = [ckpt]
+        for cfg in configs:
+            val = matrix_data.get((ckpt, cfg))
+            if val is not None and isinstance(val, (int, float)):
+                row.append(f"{val:.4f}")
+            else:
+                row.append("N/A")
+        rows.append(row)
+    table_str = tabulate(rows, headers=headers, tablefmt="github", disable_numparse=True)
+    return f"### {metric_name} Cross-Evaluation Matrix\n\n{table_str}\n", rows
+
+
+def generate_master_cross_evaluation_report(
+    cross_results: List[Dict[str, Any]],
+    output_dir: Optional[str] = None,
+    report_name: str = "master_cross_evaluation_report",
+) -> Dict[str, Any]:
+    """
+    Generate master cross-evaluation report containing all cross-evaluation information,
+    matrices (IoU, F1, AUROC, Loss), rankings, and checkpoint/config breakdowns.
+    """
+    checkpoints_seen: Dict[str, str] = {}  # ckpt_path -> ckpt_name
+    configs_seen: Dict[str, str] = {}      # cfg_path -> cfg_name
+
+    for res in cross_results:
+        cp = res.get("checkpoint_path", "unknown")
+        cn = res.get("checkpoint_name", os.path.splitext(os.path.basename(cp))[0])
+        kp = res.get("config_path", "unknown")
+        kn = res.get("config_name", os.path.splitext(os.path.basename(kp))[0])
+        checkpoints_seen[cp] = cn
+        configs_seen[kp] = kn
+
+    unique_ckpt_names = list(checkpoints_seen.values())
+    unique_config_names = list(configs_seen.values())
+
+    iou_matrix: Dict[Tuple[str, str], float] = {}
+    f1_matrix: Dict[Tuple[str, str], float] = {}
+    auroc_matrix: Dict[Tuple[str, str], float] = {}
+    pacc_matrix: Dict[Tuple[str, str], float] = {}
+    loss_matrix: Dict[Tuple[str, str], float] = {}
+
+    master_summary_rows = []
+
+    for res in cross_results:
+        cp = res.get("checkpoint_path", "")
+        cn = res.get("checkpoint_name", checkpoints_seen.get(cp, cp))
+        kp = res.get("config_path", "")
+        kn = res.get("config_name", configs_seen.get(kp, kp))
+        ds_name = res.get("dataset_name", res.get("config", {}).get("data", {}).get("dataset_name", "N/A"))
+        m = res.get("metrics", res.get("overall_metrics", {}))
+        split = res.get("eval_split", m.get("eval_split", "test"))
+        samples = res.get("total_evaluated_samples", m.get("total_evaluated_samples", 0))
+
+        loss = m.get("eval_total_loss", m.get("total_loss", m.get("loss")))
+        iou = m.get("iou", 0.0)
+        f1 = m.get("f1", m.get("pixel_f1", m.get("dice", 0.0)))
+        auroc = m.get("auroc", m.get("pixel_auroc", 0.0))
+        pacc = m.get("pixel_acc", 0.0)
+        prec = m.get("precision", 0.0)
+        rec = m.get("recall", 0.0)
+        spec = m.get("specificity", 0.0)
+        cacc = m.get("aux_accuracy", m.get("accuracy"))
+
+        iou_matrix[(cn, kn)] = iou
+        f1_matrix[(cn, kn)] = f1
+        auroc_matrix[(cn, kn)] = auroc
+        pacc_matrix[(cn, kn)] = pacc
+        if isinstance(loss, (int, float)):
+            loss_matrix[(cn, kn)] = loss
+
+        master_summary_rows.append([
+            cn,
+            f"{kn} ({ds_name})",
+            str(split),
+            str(samples),
+            f"{loss:.4f}" if isinstance(loss, (int, float)) else "N/A",
+            f"{iou:.4f}" if isinstance(iou, (int, float)) else "N/A",
+            f"{f1:.4f}" if isinstance(f1, (int, float)) else "N/A",
+            f"{auroc:.4f}" if isinstance(auroc, (int, float)) else "N/A",
+            f"{pacc:.4f}" if isinstance(pacc, (int, float)) else "N/A",
+            f"{prec:.4f}" if isinstance(prec, (int, float)) else "N/A",
+            f"{rec:.4f}" if isinstance(rec, (int, float)) else "N/A",
+            f"{spec:.4f}" if isinstance(spec, (int, float)) else "N/A",
+            f"{cacc:.4f}" if isinstance(cacc, (int, float)) else "N/A",
+        ])
+
+    # Sort master summary rows by IoU descending
+    def _safe_float(val):
+        try:
+            return float(val)
+        except Exception:
+            return -1.0
+
+    master_summary_rows.sort(key=lambda r: _safe_float(r[5]), reverse=True)
+
+    master_headers = [
+        "Checkpoint",
+        "Config (Dataset)",
+        "Split",
+        "Samples",
+        "Loss",
+        "IoU",
+        "Dice / F1",
+        "AUROC",
+        "Pixel Acc",
+        "Precision",
+        "Recall",
+        "Specificity",
+        "Class Acc",
+    ]
+    master_table_md = tabulate(master_summary_rows, headers=master_headers, tablefmt="github", disable_numparse=True)
+
+    iou_table_md, iou_rows = _build_matrix_table(unique_ckpt_names, unique_config_names, iou_matrix, "Mean IoU (Intersection over Union)")
+    f1_table_md, f1_rows = _build_matrix_table(unique_ckpt_names, unique_config_names, f1_matrix, "Dice / Pixel F1 Score")
+    auroc_table_md, auroc_rows = _build_matrix_table(unique_ckpt_names, unique_config_names, auroc_matrix, "AUROC (Pixel-level ROC-AUC)")
+    pacc_table_md, pacc_rows = _build_matrix_table(unique_ckpt_names, unique_config_names, pacc_matrix, "Pixel Accuracy")
+    loss_table_md, loss_rows = _build_matrix_table(unique_ckpt_names, unique_config_names, loss_matrix, "Evaluation Total Loss")
+
+    md_lines = [
+        "# SID-UNet Master Cross-Evaluation Report\n",
+        "## Overview\n",
+        f"- **Evaluated Checkpoints**: {len(unique_ckpt_names)}",
+        f"- **Evaluated Configurations**: {len(unique_config_names)}",
+        f"- **Total Cross-Evaluation Runs**: {len(cross_results)}\n",
+        "## Cross-Evaluation Matrices\n",
+        iou_table_md,
+        f1_table_md,
+        auroc_table_md,
+        pacc_table_md,
+        loss_table_md,
+        "## Master Consolidated Ranking\n",
+        master_table_md,
+        "\n",
+    ]
+
+    # Checkpoint-centric breakdown
+    md_lines.append("---\n\n## Per-Checkpoint Deep-Dive\n")
+    for cp, cn in checkpoints_seen.items():
+        ckpt_runs = [r for r in cross_results if r.get("checkpoint_path") == cp]
+        md_lines.append(f"### Checkpoint: {cn}\n")
+        md_lines.append(f"- **Path**: `{cp}`\n")
+        ckpt_rows = []
+        for cr in ckpt_runs:
+            kn = cr.get("config_name", "N/A")
+            ds = cr.get("dataset_name", "N/A")
+            m = cr.get("metrics", cr.get("overall_metrics", {}))
+            ckpt_rows.append([
+                kn,
+                ds,
+                f"{m.get('eval_total_loss', 0.0):.4f}",
+                f"{m.get('iou', 0.0):.4f}",
+                f"{m.get('f1', m.get('pixel_f1', 0.0)):.4f}",
+                f"{m.get('auroc', m.get('pixel_auroc', 0.0)):.4f}",
+                f"{m.get('pixel_acc', 0.0):.4f}",
+                f"{cr.get('total_evaluated_samples', 0)}",
+            ])
+        md_lines.append(tabulate(ckpt_rows, headers=["Config", "Dataset", "Loss", "IoU", "Dice / F1", "AUROC", "Pixel Acc", "Samples"], tablefmt="github"))
+        md_lines.append("\n")
+
+    # Config-centric breakdown
+    md_lines.append("---\n\n## Per-Configuration / Dataset Deep-Dive\n")
+    for kp, kn in configs_seen.items():
+        cfg_runs = [r for r in cross_results if r.get("config_path") == kp]
+        first_ds = cfg_runs[0].get("dataset_name", "N/A") if cfg_runs else "N/A"
+        md_lines.append(f"### Configuration: {kn} (Dataset: {first_ds})\n")
+        md_lines.append(f"- **Config Path**: `{kp}`\n")
+        cfg_rows = []
+        for cr in cfg_runs:
+            cn = cr.get("checkpoint_name", "N/A")
+            m = cr.get("metrics", cr.get("overall_metrics", {}))
+            cfg_rows.append([
+                cn,
+                f"{m.get('eval_total_loss', 0.0):.4f}",
+                f"{m.get('iou', 0.0):.4f}",
+                f"{m.get('f1', m.get('pixel_f1', 0.0)):.4f}",
+                f"{m.get('auroc', m.get('pixel_auroc', 0.0)):.4f}",
+                f"{m.get('pixel_acc', 0.0):.4f}",
+                f"{cr.get('total_evaluated_samples', 0)}",
+            ])
+        md_lines.append(tabulate(cfg_rows, headers=["Checkpoint", "Loss", "IoU", "Dice / F1", "AUROC", "Pixel Acc", "Samples"], tablefmt="github"))
+        md_lines.append("\n")
+
+    markdown_content = "\n".join(md_lines)
+
+    matrices_dict = {
+        "iou": {f"{c}:{k}": v for (c, k), v in iou_matrix.items()},
+        "dice_f1": {f"{c}:{k}": v for (c, k), v in f1_matrix.items()},
+        "auroc": {f"{c}:{k}": v for (c, k), v in auroc_matrix.items()},
+        "pixel_acc": {f"{c}:{k}": v for (c, k), v in pacc_matrix.items()},
+        "loss": {f"{c}:{k}": v for (c, k), v in loss_matrix.items()},
+    }
+
+    report_dict = {
+        "total_checkpoints": len(unique_ckpt_names),
+        "total_configs": len(unique_config_names),
+        "total_runs": len(cross_results),
+        "checkpoints": unique_ckpt_names,
+        "configs": unique_config_names,
+        "matrices": matrices_dict,
+        "cross_results": cross_results,
+    }
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        json_path = os.path.join(output_dir, f"{report_name}.json")
+        md_path = os.path.join(output_dir, f"{report_name}.md")
+        matrix_path = os.path.join(output_dir, "cross_eval_matrix.json")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report_dict, f, indent=2)
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+
+        with open(matrix_path, "w", encoding="utf-8") as f:
+            json.dump(matrices_dict, f, indent=2)
+
+    return {
+        "report_dict": report_dict,
+        "markdown": markdown_content,
+        "summary_table": master_table_md,
+        "iou_matrix_table": iou_table_md,
+        "matrices": matrices_dict,
+    }
+

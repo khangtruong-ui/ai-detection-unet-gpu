@@ -377,6 +377,31 @@ sid-eval --checkpoints outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN
 sid-eval --checkpoints "outputs/RUN*/checkpoints/checkpoint_best.pt" --split test
 ```
 
+#### C. Cross-Evaluation Matrix Benchmarking (`sid-cross-eval`)
+Evaluate multiple checkpoints across multiple dataset configurations ($N \times M$ evaluation matrix):
+```bash
+# Cross-evaluate checkpoints against multiple configuration files:
+sid-cross-eval \
+  --cross-configs configs/experiments/unet_wide_b32.yaml configs/experiments/unet_deep_5stage_b32.yaml \
+  --checkpoints outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN002/checkpoints/checkpoint_best.pt \
+  --split test
+
+# With custom sample limits and output directory:
+sid-cross-eval \
+  --cross-configs configs/experiments/*.yaml \
+  --checkpoints "outputs/RUN*/checkpoints/checkpoint_best.pt" \
+  --samples 500 \
+  --output_dir outputs/cross_evaluation
+```
+
+**Key Cross-Evaluation Behaviors:**
+1. **2-Column Image & Mask Mismatch Verification**: Automatically detects and handles image and mask dimension mismatches and verifies dataset column integrity.
+2. **Neighbor Reports**: Writes a local cross-evaluation report (`cross_evaluation_report.md` and `.json`) adjacent / neighbor to each checkpoint folder.
+3. **Master Cross-Evaluation Report**: Generates a consolidated master report (`master_cross_evaluation_report.md`, `.json`, and `cross_eval_matrix.json`) containing:
+   - **Cross-Evaluation Matrices**: 2D grid views for Mean IoU, Dice / F1 Score, AUROC, Pixel Accuracy, and Total Loss.
+   - **Master Ranking Table**: Comprehensive ranking of all $(C_i, K_j)$ pairs.
+   - **Per-Checkpoint & Per-Dataset Deep-Dives**: Detailed breakdowns including per-label metrics (Real, Synthetic, Tampered).
+
 This outputs a tabulated summary in the terminal and saves:
 - `<checkpoint_run_dir>/eval_reports/evaluation_report.md` (overridden in-place)
 - `<checkpoint_run_dir>/eval_reports/evaluation_report.json`

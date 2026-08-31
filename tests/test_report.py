@@ -6,6 +6,8 @@ from sid_unet.utils.report import (
     format_metrics_table,
     generate_evaluation_report,
     generate_multi_experiment_report,
+    generate_checkpoint_cross_eval_report,
+    generate_master_cross_evaluation_report,
 )
 
 
@@ -140,3 +142,96 @@ def test_generate_multi_experiment_report():
         assert os.path.exists(os.path.join(tmpdir, "comparison_test.json"))
         assert "exp_baseline" in res["summary_table"]
         assert "exp_dice" in res["summary_table"]
+
+
+def test_generate_checkpoint_cross_eval_report():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        results = [
+            {
+                "checkpoint_name": "model_exp1",
+                "config_name": "config_imd2020",
+                "dataset_name": "KhangTruong/IMD2020",
+                "eval_split": "test",
+                "total_evaluated_samples": 100,
+                "metrics": {"eval_total_loss": 0.25, "iou": 0.82, "f1": 0.89, "auroc": 0.95, "pixel_acc": 0.98},
+                "per_label_metrics": {
+                    0: {"iou": 0.99, "dice": 0.99, "pixel_acc": 0.99, "samples": 50},
+                    2: {"iou": 0.65, "dice": 0.79, "pixel_acc": 0.97, "samples": 50},
+                },
+                "confusion_matrix": [[50, 0], [5, 45]],
+                "config_path": "configs/test_smoke.yaml",
+            }
+        ]
+
+        res = generate_checkpoint_cross_eval_report(
+            checkpoint_path="/path/to/checkpoints/checkpoint_best.pt",
+            results=results,
+            output_dir=tmpdir,
+            report_name="cross_eval_report",
+        )
+
+        assert os.path.exists(os.path.join(tmpdir, "cross_eval_report.md"))
+        assert os.path.exists(os.path.join(tmpdir, "cross_eval_report.json"))
+        assert "config_imd2020" in res["markdown"]
+        assert "0.8200" in res["summary_table"]
+
+
+def test_generate_master_cross_evaluation_report():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cross_results = [
+            {
+                "checkpoint_path": "/checkpoints/ckpt1.pt",
+                "checkpoint_name": "model_1",
+                "config_path": "configs/conf1.yaml",
+                "config_name": "conf1",
+                "dataset_name": "Dataset_A",
+                "eval_split": "test",
+                "total_evaluated_samples": 50,
+                "metrics": {"eval_total_loss": 0.30, "iou": 0.75, "f1": 0.83, "auroc": 0.91, "pixel_acc": 0.96},
+            },
+            {
+                "checkpoint_path": "/checkpoints/ckpt1.pt",
+                "checkpoint_name": "model_1",
+                "config_path": "configs/conf2.yaml",
+                "config_name": "conf2",
+                "dataset_name": "Dataset_B",
+                "eval_split": "test",
+                "total_evaluated_samples": 50,
+                "metrics": {"eval_total_loss": 0.20, "iou": 0.85, "f1": 0.91, "auroc": 0.96, "pixel_acc": 0.98},
+            },
+            {
+                "checkpoint_path": "/checkpoints/ckpt2.pt",
+                "checkpoint_name": "model_2",
+                "config_path": "configs/conf1.yaml",
+                "config_name": "conf1",
+                "dataset_name": "Dataset_A",
+                "eval_split": "test",
+                "total_evaluated_samples": 50,
+                "metrics": {"eval_total_loss": 0.28, "iou": 0.78, "f1": 0.86, "auroc": 0.93, "pixel_acc": 0.97},
+            },
+            {
+                "checkpoint_path": "/checkpoints/ckpt2.pt",
+                "checkpoint_name": "model_2",
+                "config_path": "configs/conf2.yaml",
+                "config_name": "conf2",
+                "dataset_name": "Dataset_B",
+                "eval_split": "test",
+                "total_evaluated_samples": 50,
+                "metrics": {"eval_total_loss": 0.18, "iou": 0.88, "f1": 0.93, "auroc": 0.97, "pixel_acc": 0.99},
+            },
+        ]
+
+        res = generate_master_cross_evaluation_report(
+            cross_results=cross_results,
+            output_dir=tmpdir,
+            report_name="master_cross_eval",
+        )
+
+        assert os.path.exists(os.path.join(tmpdir, "master_cross_eval.md"))
+        assert os.path.exists(os.path.join(tmpdir, "master_cross_eval.json"))
+        assert os.path.exists(os.path.join(tmpdir, "cross_eval_matrix.json"))
+        assert "Mean IoU (Intersection over Union) Cross-Evaluation Matrix" in res["markdown"]
+        assert "model_1" in res["summary_table"]
+        assert "model_2" in res["summary_table"]
+        assert "0.8800" in res["markdown"]
+

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from PIL import Image
 import torch
-from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image
+from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image, check_image_mask_mismatch
 
 
 def test_label_0_full_black_mask():
@@ -86,4 +86,47 @@ def test_two_column_dataset_mask_processing():
     processed_none = process_sample_mask(mask_input=None, label=None, image_size=(256, 256))
     assert processed_none.shape == (256, 256)
     assert np.all(processed_none == 0.0)
+
+
+def test_check_image_mask_mismatch():
+    # 1. Matching PIL image and mask
+    img = Image.new("RGB", (128, 128))
+    mask = Image.new("L", (128, 128))
+    res = check_image_mask_mismatch(img, mask)
+    assert res["mismatch"] is False
+    assert len(res["issues"]) == 0
+    assert res["image_size"] == (128, 128)
+    assert res["mask_size"] == (128, 128)
+
+    # 2. Mismatched dimensions (e.g. image 256x128 vs mask 128x128)
+    img_mismatch = Image.new("RGB", (256, 128))
+    res_mismatch = check_image_mask_mismatch(img_mismatch, mask)
+    assert res_mismatch["mismatch"] is True
+    assert any("Spatial size mismatch" in issue for issue in res_mismatch["issues"])
+
+    # 3. Missing image
+    res_no_img = check_image_mask_mismatch(None, mask)
+    assert res_no_img["mismatch"] is True
+    assert "Image is None or missing" in res_no_img["issues"]
+
+    # 4. With raise_on_mismatch=True
+    with pytest.raises(ValueError):
+        check_image_mask_mismatch(img_mismatch, mask, raise_on_mismatch=True)
+
+    # 5. Numpy array matching & mismatch
+    np_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    np_mask = np.zeros((64, 64), dtype=np.uint8)
+    assert check_image_mask_mismatch(np_img, np_mask)["mismatch"] is False
+
+    np_mask_diff = np.zeros((32, 32), dtype=np.uint8)
+    assert check_image_mask_mismatch(np_img, np_mask_diff)["mismatch"] is True
+
+    # 6. PyTorch tensor matching & mismatch
+    t_img = torch.zeros(3, 64, 64)
+    t_mask = torch.zeros(1, 64, 64)
+    assert check_image_mask_mismatch(t_img, t_mask)["mismatch"] is False
+
+    t_mask_diff = torch.zeros(1, 32, 32)
+    assert check_image_mask_mismatch(t_img, t_mask_diff)["mismatch"] is True
+
 

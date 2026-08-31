@@ -70,6 +70,7 @@ reports/
 *.pt
 *.pth
 *.onnx
+*.zip
 .hf_home/
 hf_cache/
 data/

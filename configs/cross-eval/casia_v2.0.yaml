@@ -1,0 +1,35 @@
+project:
+  name: "eval_casia_v2.0"
+  device: "auto"
+  output_dir: "outputs/cross_eval_results"
+
+data:
+  dataset_name: "KhangTruong/Casia-v2.0"
+  streaming: false
+  image_size: [256, 256]
+  batch_size: 16
+  num_workers: 2
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  eval_split: "test"
+  val_samples: -1
+  test_samples: -1
+
+model:
+  name: "unet"
+  in_channels: 3
+  out_channels: 1
+  features: [64, 128, 256, 512]
+  bilinear: true
+  dropout: 0.0
+  aux_classifier: false
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2

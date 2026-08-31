@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from datasets import load_dataset as hf_load_dataset
 
-from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask
+from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask, check_image_mask_mismatch
 from sid_unet.dataset.transforms import get_transforms, JointCompose
 
 
@@ -28,11 +28,24 @@ def process_raw_sample(
     """
     Process a single raw sample from datasets such as KhangTruong/IMD2020 or saberzl/SID_Set into model tensors.
     Handles 2-column format (image, mask) as well as labeled format (image, label, mask, img_id).
+    Validates and checks for any image/mask data or dimension mismatches.
     """
+    if not isinstance(sample, dict):
+        raise TypeError(f"Expected sample to be a dict, got {type(sample)}")
+
+    if "image" not in sample and "mask" not in sample:
+        raise KeyError(f"Sample is missing required dataset columns ('image', 'mask'). Keys present: {list(sample.keys())}")
+
     raw_img = sample.get("image")
+    if raw_img is None:
+        raise ValueError(f"Sample '{sample.get('img_id', sample.get('id', 'unknown'))}' has null or missing image data.")
+
     raw_label = sample.get("label", None)
     raw_mask = sample.get("mask", None)
     img_id = str(sample.get("img_id", sample.get("id", "")))
+
+    # Check for image and mask mismatches
+    check_image_mask_mismatch(raw_img, raw_mask, raise_on_mismatch=False)
 
     # 1. Convert to RGB PIL Image
     pil_image = ensure_rgb_image(raw_img)

@@ -96,6 +96,107 @@ def process_sample_mask(
     return _extract_and_binarize_mask(mask_input, image_size=(w, h), threshold=threshold)
 
 
+def check_image_mask_mismatch(
+    image: Optional[Union[Image.Image, np.ndarray, torch.Tensor]],
+    mask: Optional[Union[Image.Image, np.ndarray, torch.Tensor]] = None,
+    raise_on_mismatch: bool = False,
+) -> Dict[str, Any]:
+    """
+    Check if image and mask pair has any shape, dimension, channel, or missing value mismatches.
+
+    Specifically validates:
+    - Missing image or missing mask
+    - Spatial resolution mismatch (width, height of image vs mask)
+    - Channel mismatch / unexpected dimensions
+    - Data type consistency
+
+    Returns:
+        Dict with keys:
+            - 'mismatch': bool (True if mismatch detected, False otherwise)
+            - 'image_size': Optional[Tuple[int, int]] (width, height)
+            - 'mask_size': Optional[Tuple[int, int]] (width, height)
+            - 'issues': List[str] describing any detected discrepancies.
+    """
+    issues: List[str] = []
+    img_size: Optional[Tuple[int, int]] = None
+    mask_size: Optional[Tuple[int, int]] = None
+
+    if image is None:
+        issues.append("Image is None or missing")
+    else:
+        if isinstance(image, Image.Image):
+            img_size = (image.width, image.height)
+        elif isinstance(image, np.ndarray):
+            if image.ndim == 2:
+                img_size = (image.shape[1], image.shape[0])
+            elif image.ndim == 3:
+                if image.shape[2] in (1, 3, 4):
+                    img_size = (image.shape[1], image.shape[0])
+                elif image.shape[0] in (1, 3, 4):
+                    img_size = (image.shape[2], image.shape[1])
+                else:
+                    img_size = (image.shape[1], image.shape[0])
+            else:
+                issues.append(f"Image has unexpected ndarray dimension {image.ndim}")
+        elif isinstance(image, torch.Tensor):
+            if image.ndim == 2:
+                img_size = (image.shape[1], image.shape[0])
+            elif image.ndim == 3:
+                img_size = (image.shape[2], image.shape[1])
+            elif image.ndim == 4:
+                img_size = (image.shape[3], image.shape[2])
+            else:
+                issues.append(f"Image has unexpected tensor dimension {image.ndim}")
+        else:
+            issues.append(f"Image has unsupported type: {type(image)}")
+
+    if mask is not None:
+        if isinstance(mask, Image.Image):
+            mask_size = (mask.width, mask.height)
+        elif isinstance(mask, np.ndarray):
+            if mask.ndim == 2:
+                mask_size = (mask.shape[1], mask.shape[0])
+            elif mask.ndim == 3:
+                if mask.shape[2] in (1, 3, 4):
+                    mask_size = (mask.shape[1], mask.shape[0])
+                elif mask.shape[0] in (1, 3, 4):
+                    mask_size = (mask.shape[2], mask.shape[1])
+                else:
+                    mask_size = (mask.shape[1], mask.shape[0])
+            else:
+                issues.append(f"Mask has unexpected ndarray dimension {mask.ndim}")
+        elif isinstance(mask, torch.Tensor):
+            if mask.ndim == 2:
+                mask_size = (mask.shape[1], mask.shape[0])
+            elif mask.ndim == 3:
+                mask_size = (mask.shape[2], mask.shape[1])
+            elif mask.ndim == 4:
+                mask_size = (mask.shape[3], mask.shape[2])
+            else:
+                issues.append(f"Mask has unexpected tensor dimension {mask.ndim}")
+        else:
+            issues.append(f"Mask has unsupported type: {type(mask)}")
+
+    if img_size is not None and mask_size is not None:
+        if img_size != mask_size:
+            issues.append(
+                f"Spatial size mismatch: Image is {img_size[0]}x{img_size[1]} (W x H) "
+                f"but mask is {mask_size[0]}x{mask_size[1]} (W x H)"
+            )
+
+    has_mismatch = len(issues) > 0
+
+    if has_mismatch and raise_on_mismatch:
+        raise ValueError(f"Image-mask mismatch detected: {'; '.join(issues)}")
+
+    return {
+        "mismatch": has_mismatch,
+        "image_size": img_size,
+        "mask_size": mask_size,
+        "issues": issues,
+    }
+
+
 def ensure_rgb_image(image: Union[Image.Image, np.ndarray]) -> Image.Image:
     """Ensure input image is a PIL Image in RGB format."""
     if isinstance(image, np.ndarray):
