@@ -51,6 +51,34 @@ def parse_args():
         help="Path(s) to YAML configuration file(s). Pass multiple files to run multiple experiments sequentially.",
     )
     parser.add_argument(
+        "--batch_size",
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size per training/validation step (overrides config data.batch_size)",
+    )
+    parser.add_argument(
+        "--auto_batch_size",
+        "--auto-batch-size",
+        action="store_true",
+        default=False,
+        help="Automatically probe GPU memory and scale down batch size / increase gradient accumulation to avoid OOM",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="Number of micro-batches to accumulate before optimizer step",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        "--gradient-checkpointing",
+        action="store_true",
+        default=False,
+        help="Enable activation gradient checkpointing in UNet to save VRAM",
+    )
+    parser.add_argument(
         "--override",
         nargs="*",
         default=[],
@@ -141,10 +169,21 @@ def main():
     args = parse_args()
     config_paths = args.config if isinstance(args.config, list) else [args.config]
 
+    overrides = list(args.override)
+    if args.batch_size is not None:
+        overrides.append(f"data.batch_size={args.batch_size}")
+    if args.auto_batch_size:
+        overrides.append("training.auto_batch_size=true")
+    if args.gradient_accumulation_steps is not None:
+        overrides.append(f"training.gradient_accumulation_steps={args.gradient_accumulation_steps}")
+    if args.gradient_checkpointing:
+        overrides.append("model.gradient_checkpointing=true")
+        overrides.append("training.gradient_checkpointing=true")
+
     if len(config_paths) == 1:
         results = train_single_run(
             config_path=config_paths[0],
-            overrides=args.override,
+            overrides=overrides,
             resume=args.resume,
             run_idx=1,
             total_runs=1,
@@ -157,7 +196,7 @@ def main():
     print("=" * 70 + "\n")
 
     all_results: List[Dict[str, Any]] = []
-    first_cfg = load_config(config_paths[0], overrides=args.override)
+    first_cfg = load_config(config_paths[0], overrides=overrides)
     parent_output_dir = first_cfg.project.get("output_dir", "outputs")
 
     for i, cfg_path in enumerate(config_paths, 1):
@@ -165,7 +204,7 @@ def main():
         print("-" * 70)
         res = train_single_run(
             config_path=cfg_path,
-            overrides=args.override,
+            overrides=overrides,
             resume=args.resume if i == 1 else None,
             run_idx=i,
             total_runs=len(config_paths),

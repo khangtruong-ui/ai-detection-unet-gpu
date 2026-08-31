@@ -19,6 +19,7 @@ from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.utils.config import load_config
 from sid_unet.utils.logger import setup_logger
+from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
 from sid_unet.utils.report import generate_evaluation_report
 
 
@@ -49,6 +50,13 @@ def parse_args():
         help="Number of samples to evaluate on (overrides config sample limits, e.g. --samples 500)",
     )
     parser.add_argument(
+        "--batch_size",
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size for evaluation (overrides config data.batch_size)",
+    )
+    parser.add_argument(
         "--override",
         nargs="*",
         default=[],
@@ -69,18 +77,46 @@ def parse_args():
     return parser.parse_args()
 
 
+def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker):
+    """Execute forward evaluation for a single batch and return (loss_val * batch_size, batch_size)."""
+    images = batch["image"].to(device, non_blocking=True)
+    masks = batch["mask"].to(device, non_blocking=True)
+    labels = batch.get("label")
+    if labels is not None:
+        labels = labels.to(device, non_blocking=True)
+
+    outputs = model(images)
+    loss, _ = loss_fn(outputs, masks, labels)
+
+    b_size = images.size(0)
+    if isinstance(outputs, tuple):
+        mask_logits, class_logits = outputs
+    else:
+        mask_logits, class_logits = outputs, None
+
+    seg_tracker.update(mask_logits, masks, labels)
+    if class_logits is not None and labels is not None:
+        cls_tracker.update(class_logits, labels)
+
+    return loss.item() * b_size, b_size
+
+
 def main():
     args = parse_args()
 
     if not os.path.exists(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
 
+    overrides = list(args.override)
+    if args.batch_size is not None:
+        overrides.append(f"data.batch_size={args.batch_size}")
+
     # Load model and config from checkpoint with optional overrides
     if args.config:
-        override_cfg = load_config(args.config, overrides=args.override)
-    elif args.override:
+        override_cfg = load_config(args.config, overrides=overrides)
+    elif overrides:
         from sid_unet.utils.config import apply_overrides, ConfigDict
-        override_cfg = ConfigDict(apply_overrides({}, args.override))
+        override_cfg = ConfigDict(apply_overrides({}, overrides))
     else:
         override_cfg = None
 
@@ -103,6 +139,8 @@ def main():
     device_str = config.project.get("device", "auto")
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) or device_str == "cuda" else "cpu")
     logger.info(f"Evaluation device: {device}")
+    if device.type == "cuda":
+        logger.info(f"GPU Memory: {format_memory_summary(device)}")
 
     model.to(device)
     model.eval()
@@ -121,29 +159,41 @@ def main():
     total_loss_sum = 0.0
     total_samples = 0
 
+    clear_memory_cache(device)
     pbar = tqdm(eval_loader, desc=f"Evaluating ({resolved_split})", leave=True)
     with torch.no_grad():
         for batch in pbar:
-            images = batch["image"].to(device)
-            masks = batch["mask"].to(device)
-            labels = batch.get("label")
-            if labels is not None:
-                labels = labels.to(device)
+            batch_size = len(batch["image"])
+            try:
+                loss_contrib, count = eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker)
+                total_loss_sum += loss_contrib
+                total_samples += count
+            except Exception as exc:
+                if is_oom_error(exc):
+                    logger.warning(
+                        f"⚠️ OOM on evaluation batch size {batch_size}! Clearing cache and recovering with sub-batching..."
+                    )
+                    clear_memory_cache(device)
+                    sub_batches = split_batch(batch, micro_batch_size=max(1, batch_size // 2))
+                    for sub_b in sub_batches:
+                        try:
+                            loss_contrib, count = eval_single_batch(sub_b, model, loss_fn, device, seg_tracker, cls_tracker)
+                            total_loss_sum += loss_contrib
+                            total_samples += count
+                        except Exception as sub_exc:
+                            if is_oom_error(sub_exc):
+                                clear_memory_cache(device)
+                                nano_batches = split_batch(sub_b, micro_batch_size=1)
+                                for nano_b in nano_batches:
+                                    loss_contrib, count = eval_single_batch(nano_b, model, loss_fn, device, seg_tracker, cls_tracker)
+                                    total_loss_sum += loss_contrib
+                                    total_samples += count
+                            else:
+                                raise sub_exc
+                else:
+                    raise exc
 
-            outputs = model(images)
-            loss, _ = loss_fn(outputs, masks, labels)
-
-            total_loss_sum += loss.item() * images.size(0)
-            total_samples += images.size(0)
-
-            if isinstance(outputs, tuple):
-                mask_logits, class_logits = outputs
-            else:
-                mask_logits, class_logits = outputs, None
-
-            seg_tracker.update(mask_logits, masks, labels)
-            if class_logits is not None and labels is not None:
-                cls_tracker.update(class_logits, labels)
+    clear_memory_cache(device)
 
     overall_seg, per_label_seg = seg_tracker.compute()
     cls_metrics, confusion_mat = cls_tracker.compute()

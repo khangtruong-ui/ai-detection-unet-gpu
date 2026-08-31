@@ -315,6 +315,31 @@ python -m sid_unet.train \
   --resume outputs/streaming_run/checkpoints/checkpoint_best.pt
 ```
 
+#### C. Handling Large Batch Sizes & GPU Memory (OOM Prevention)
+When training on high resolutions or constrained GPU memory, multiple built-in mechanisms prevent Out-of-Memory (OOM) failures:
+
+1. **Automatic Batch Sizing (`--auto-batch-size`)**:
+   Automatically probes device VRAM before training and scales down the physical batch size while increasing gradient accumulation steps to maintain the target effective batch size:
+   ```bash
+   python -m sid_unet.train --config configs/default.yaml --batch_size 64 --auto-batch-size
+   ```
+
+2. **Gradient Accumulation (`--gradient-accumulation-steps`)**:
+   Simulate large effective batch sizes with smaller memory footprints:
+   ```bash
+   # Effective batch size of 64 using micro-batch size 16 accumulated over 4 steps:
+   python -m sid_unet.train --config configs/default.yaml --batch_size 16 --gradient-accumulation-steps 4
+   ```
+
+3. **Gradient (Activation) Checkpointing (`--gradient-checkpointing`)**:
+   Reduces activation memory by ~60-70% during backpropagation, enabling much larger batches or higher image resolutions:
+   ```bash
+   python -m sid_unet.train --config configs/default.yaml --gradient-checkpointing
+   ```
+
+4. **Dynamic OOM Auto-Recovery**:
+   If an unexpected OOM occurs during a training or validation step, the Trainer automatically catches the exception, clears the PyTorch allocator cache, splits the batch into smaller micro-batches, and completes the step seamlessly without crashing the job.
+
 ---
 
 ### 2. Evaluation & Benchmarking

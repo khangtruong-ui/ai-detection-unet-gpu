@@ -21,6 +21,7 @@ from tabulate import tabulate
 
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.utils.config import load_config, DEFAULT_CONFIG, deep_merge, ConfigDict, apply_overrides
+from sid_unet.utils.memory import clear_memory_cache, is_oom_error
 
 
 def parse_args():
@@ -31,6 +32,7 @@ def parse_args():
     parser.add_argument("--image", type=str, default=None, help="Path to single input image")
     parser.add_argument("--input_dir", type=str, default=None, help="Directory of input images")
     parser.add_argument("--output_dir", type=str, default="predictions", help="Directory to save output masks")
+    parser.add_argument("--batch_size", "--batch-size", type=int, default=16, help="Batch size for batch inference")
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256], help="Inference resolution [H, W]")
     parser.add_argument("--threshold", type=float, default=0.5, help="Binarization probability threshold")
     parser.add_argument("--save_overlay", action="store_true", help="Save color overlay visualization")
@@ -83,6 +85,17 @@ def create_overlay(orig_pil: Image.Image, mask_2d: np.ndarray, alpha: float = 0.
     return Image.fromarray(np.clip(overlay_arr, 0, 255).astype(np.uint8))
 
 
+def _predict_chunk(model, chunk_tensors, device):
+    """Run model prediction on a batch of tensors with OOM handling."""
+    chunk_inp = torch.cat(chunk_tensors, dim=0).to(device)
+    outputs = model(chunk_inp)
+    if isinstance(outputs, tuple):
+        mask_logits, class_logits = outputs
+    else:
+        mask_logits, class_logits = outputs, None
+    return mask_logits, class_logits
+
+
 def main():
     args = parse_args()
 
@@ -114,45 +127,73 @@ def main():
     class_names = {0: "Real", 1: "Fully AI", 2: "Partially AI (Tampered)"}
 
     results_table = []
+    batch_size = max(1, args.batch_size)
 
-    print(f"Running inference on {len(image_paths)} image(s) using device: {device}...")
+    print(f"Running inference on {len(image_paths)} image(s) using device: {device} (batch_size={batch_size})...")
+    clear_memory_cache(device)
+
     with torch.no_grad():
-        for img_path in image_paths:
-            base_name = os.path.splitext(os.path.basename(img_path))[0]
-            inp_tensor, orig_pil = preprocess_image(img_path, target_size)
-            inp_tensor = inp_tensor.to(device)
+        for i in range(0, len(image_paths), batch_size):
+            chunk_paths = image_paths[i : i + batch_size]
+            preprocessed = [preprocess_image(p, target_size) for p in chunk_paths]
+            chunk_tensors = [t for t, _ in preprocessed]
+            orig_pils = [p for _, p in preprocessed]
 
-            outputs = model(inp_tensor)
-            if isinstance(outputs, tuple):
-                mask_logits, class_logits = outputs
-            else:
-                mask_logits, class_logits = outputs, None
+            try:
+                mask_logits, class_logits = _predict_chunk(model, chunk_tensors, device)
+            except Exception as exc:
+                if is_oom_error(exc):
+                    print(f"⚠️ OOM during batch inference of {len(chunk_paths)} images. Falling back to single-image mode...")
+                    clear_memory_cache(device)
+                    # Process individually
+                    mask_logits_list = []
+                    class_logits_list = []
+                    for t in chunk_tensors:
+                        m_l, c_l = _predict_chunk(model, [t], device)
+                        mask_logits_list.append(m_l)
+                        if c_l is not None:
+                            class_logits_list.append(c_l)
+                    mask_logits = torch.cat(mask_logits_list, dim=0)
+                    class_logits = torch.cat(class_logits_list, dim=0) if class_logits_list else None
+                else:
+                    raise exc
 
-            probs = torch.sigmoid(mask_logits).squeeze().cpu().numpy()
-            bin_mask = (probs >= args.threshold).astype(np.uint8)
-
-            # Resize predicted mask back to original image dimensions
-            orig_w, orig_h = orig_pil.size
-            mask_pil = Image.fromarray(bin_mask * 255).resize((orig_w, orig_h), resample=Image.NEAREST)
-
-            mask_save_path = os.path.join(args.output_dir, f"{base_name}_mask.png")
-            mask_pil.save(mask_save_path)
-
-            if args.save_overlay:
-                overlay_img = create_overlay(orig_pil, np.array(mask_pil) > 128)
-                overlay_save_path = os.path.join(args.output_dir, f"{base_name}_overlay.png")
-                overlay_img.save(overlay_save_path)
-
-            mask_ratio = float(np.mean(np.array(mask_pil) > 128))
-
-            pred_class_str = "N/A"
+            probs = torch.sigmoid(mask_logits).cpu().numpy()
             if class_logits is not None:
-                class_probs = torch.softmax(class_logits, dim=1).squeeze().cpu().numpy()
-                pred_cls = int(np.argmax(class_probs))
-                conf = float(class_probs[pred_cls])
-                pred_class_str = f"{class_names.get(pred_cls, str(pred_cls))} ({conf:.1%})"
+                class_probs = torch.softmax(class_logits, dim=1).cpu().numpy()
+            else:
+                class_probs = None
 
-            results_table.append([base_name, f"{mask_ratio:.2%}", pred_class_str, mask_save_path])
+            for idx, img_path in enumerate(chunk_paths):
+                base_name = os.path.splitext(os.path.basename(img_path))[0]
+                orig_pil = orig_pils[idx]
+                sample_prob = probs[idx, 0] if probs.ndim == 4 else probs[idx]
+                bin_mask = (sample_prob >= args.threshold).astype(np.uint8)
+
+                # Resize predicted mask back to original image dimensions
+                orig_w, orig_h = orig_pil.size
+                mask_pil = Image.fromarray(bin_mask * 255).resize((orig_w, orig_h), resample=Image.NEAREST)
+
+                mask_save_path = os.path.join(args.output_dir, f"{base_name}_mask.png")
+                mask_pil.save(mask_save_path)
+
+                if args.save_overlay:
+                    overlay_img = create_overlay(orig_pil, np.array(mask_pil) > 128)
+                    overlay_save_path = os.path.join(args.output_dir, f"{base_name}_overlay.png")
+                    overlay_img.save(overlay_save_path)
+
+                mask_ratio = float(np.mean(np.array(mask_pil) > 128))
+
+                pred_class_str = "N/A"
+                if class_probs is not None:
+                    sample_cls_probs = class_probs[idx]
+                    pred_cls = int(np.argmax(sample_cls_probs))
+                    conf = float(sample_cls_probs[pred_cls])
+                    pred_class_str = f"{class_names.get(pred_cls, str(pred_cls))} ({conf:.1%})"
+
+                results_table.append([base_name, f"{mask_ratio:.2%}", pred_class_str, mask_save_path])
+
+    clear_memory_cache(device)
 
     headers = ["Image", "Synthetic Area Ratio", "Pred Label (Confidence)", "Saved Mask"]
     print("\n" + tabulate(results_table, headers=headers, tablefmt="github"))

@@ -11,10 +11,22 @@ import torch.nn as nn
 from sid_unet.models.blocks import AuxiliaryClassifier, DoubleConv, Down, OutConv, Up
 
 
+def _safe_checkpoint(func, *args):
+    """Run function with torch activation checkpointing safely across PyTorch versions."""
+    try:
+        return torch.utils.checkpoint.checkpoint(func, *args, use_reentrant=False)
+    except TypeError:
+        return torch.utils.checkpoint.checkpoint(func, *args)
+
+
+def _run_module(module: nn.Module, *inputs: torch.Tensor) -> torch.Tensor:
+    return module(*inputs)
+
+
 class UNet(nn.Module):
     """
     Standard UNet architecture with modular depth, configurable channel dimensions,
-    bilinear/transposed upsampling, and an optional 3-class auxiliary classification head.
+    bilinear/transposed upsampling, optional gradient checkpointing, and an optional 3-class auxiliary classification head.
 
     Args:
         in_channels (int): Input image channels (default: 3 for RGB).
@@ -24,6 +36,7 @@ class UNet(nn.Module):
         dropout (float): Dropout probability.
         aux_classifier (bool): Whether to enable auxiliary 3-class classification head.
         num_classes (int): Number of target classes for auxiliary classification (default: 3).
+        gradient_checkpointing (bool): Whether to enable activation checkpointing to save VRAM.
     """
 
     def __init__(
@@ -35,12 +48,14 @@ class UNet(nn.Module):
         dropout: float = 0.0,
         aux_classifier: bool = True,
         num_classes: int = 3,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.bilinear = bilinear
         self.aux_classifier = aux_classifier
+        self.gradient_checkpointing = gradient_checkpointing
 
         if features is None:
             features = [64, 128, 256, 512]
@@ -91,6 +106,10 @@ class UNet(nn.Module):
         # Final 1x1 Convolution to binary mask logits
         self.outc = OutConv(self.features[0], out_channels)
 
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        """Dynamically enable or disable gradient checkpointing."""
+        self.gradient_checkpointing = bool(enable)
+
     def forward(
         self, x: torch.Tensor
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -100,17 +119,25 @@ class UNet(nn.Module):
             If aux_classifier is True: (mask_logits, class_logits)
             If aux_classifier is False: mask_logits
         """
+        use_ckpt = self.gradient_checkpointing and self.training and x.requires_grad
+
         # Encoder
         x1 = self.inc(x)
         encoder_skips = [x1]
 
         curr = x1
         for down_block in self.downs:
-            curr = down_block(curr)
+            if use_ckpt:
+                curr = _safe_checkpoint(_run_module, down_block, curr)
+            else:
+                curr = down_block(curr)
             encoder_skips.append(curr)
 
         # Bottleneck
-        bottleneck_feat = self.bottleneck(curr)
+        if use_ckpt:
+            bottleneck_feat = _safe_checkpoint(_run_module, self.bottleneck, curr)
+        else:
+            bottleneck_feat = self.bottleneck(curr)
 
         # Auxiliary Classification
         class_logits = None
@@ -121,7 +148,10 @@ class UNet(nn.Module):
         d_curr = bottleneck_feat
         for i, up_block in enumerate(self.ups):
             skip = encoder_skips[-(i + 1)]
-            d_curr = up_block(d_curr, skip)
+            if use_ckpt:
+                d_curr = _safe_checkpoint(_run_module, up_block, d_curr, skip)
+            else:
+                d_curr = up_block(d_curr, skip)
 
         mask_logits = self.outc(d_curr)
 
@@ -216,7 +246,14 @@ class UNet(nn.Module):
 
 def build_model(config: Any) -> UNet:
     """Build UNet model instance from configuration dict."""
-    model_cfg = config.get("model", {})
+    model_cfg = config.get("model", {}) if hasattr(config, "get") else {}
+    training_cfg = config.get("training", {}) if hasattr(config, "get") else {}
+    ckpt_flag = bool(
+        model_cfg.get(
+            "gradient_checkpointing",
+            training_cfg.get("gradient_checkpointing", False) if hasattr(training_cfg, "get") else False,
+        )
+    )
     return UNet(
         in_channels=int(model_cfg.get("in_channels", 3)),
         out_channels=int(model_cfg.get("out_channels", 1)),
@@ -225,4 +262,5 @@ def build_model(config: Any) -> UNet:
         dropout=float(model_cfg.get("dropout", 0.0)),
         aux_classifier=bool(model_cfg.get("aux_classifier", True)),
         num_classes=int(model_cfg.get("num_classes", 3)),
+        gradient_checkpointing=ckpt_flag,
     )

@@ -147,3 +147,34 @@ def test_cli_multi_config_training(monkeypatch):
         assert os.path.exists(os.path.join(exp1_dir, "reports", "training_final_report.md"))
         assert os.path.exists(os.path.join(exp2_dir, "reports", "training_final_report.md"))
 
+
+def test_cli_memory_and_batch_options(monkeypatch):
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(10))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = os.path.join(tmpdir, "memory_test_output")
+
+        test_train_args = [
+            "sid-train",
+            "--config", "configs/test_smoke.yaml",
+            "--batch_size", "2",
+            "--gradient_accumulation_steps", "2",
+            "--gradient_checkpointing",
+            "--auto_batch_size",
+            "--override",
+            f"project.output_dir={output_dir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "data.num_workers=0",
+            "data.train_samples_per_epoch=2",
+            "data.val_samples=2",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ]
+        monkeypatch.setattr(sys, "argv", test_train_args)
+        results = train_main()
+
+        assert "best_score" in results
+        assert os.path.exists(os.path.join(output_dir, "checkpoints", "checkpoint_best.pt"))
+
+
