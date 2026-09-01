@@ -5,15 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sid-unet"
 version = "0.1.0"
-description = "Config-driven UNet for AI-generated synthetic image segmentation and classification on saberzl/SID_Set"
+description = "Config-driven UNet for AI-generated synthetic image segmentation"
 readme = "README.md"
-authors = [{ name = "AI Research Team" }]
+authors = [{ name = "KhangTruong" }]
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
     "datasets>=2.14.0",
+    "transformers",
     "numpy>=1.22.0",
     "pillow>=9.0.0",
     "pyyaml>=6.0",

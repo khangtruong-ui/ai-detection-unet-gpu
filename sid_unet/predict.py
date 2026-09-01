@@ -37,7 +37,14 @@ def parse_args():
     parser.add_argument("--threshold", type=float, default=0.5, help="Binarization probability threshold")
     parser.add_argument("--save_overlay", action="store_true", help="Save color overlay visualization")
     parser.add_argument("--device", type=str, default="auto", help="Device ('auto', 'cuda', 'cpu')")
+    parser.add_argument(
+        "--segment",
+        type=str,
+        default=None,
+        help="Optional segment model for mask refinement (e.g. 'facebook/sam3'). Contrasts UNet mask areas with SAM segments via joins.",
+    )
     return parser.parse_args()
+
 
 
 def load_model_for_inference(
@@ -126,6 +133,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     class_names = {0: "Real", 1: "Fully AI", 2: "Partially AI (Tampered)"}
 
+    refiner = None
+    if args.segment:
+        from sid_unet.models.sam3_refiner import get_sam_refiner
+        print(f"Loading Segment Mask Refiner '{args.segment}' on device: {device}...")
+        refiner = get_sam_refiner(args.segment, device=device, threshold=args.threshold)
+        print(f"Segment Mask Refinement active ({args.segment}).")
+
     results_table = []
     batch_size = max(1, args.batch_size)
 
@@ -169,10 +183,19 @@ def main():
                 orig_pil = orig_pils[idx]
                 sample_prob = probs[idx, 0] if probs.ndim == 4 else probs[idx]
                 bin_mask = (sample_prob >= args.threshold).astype(np.uint8)
+                raw_mask_ratio = float(np.mean(bin_mask > 0))
+
+                if refiner is not None:
+                    refined_mask_np, change_met = refiner.refine_single_sample(orig_pil, bin_mask)
+                    final_mask_np = (refined_mask_np >= 0.5).astype(np.uint8)
+                    change_ratio_str = f"{change_met['pixel_change_ratio']:.2%}"
+                else:
+                    final_mask_np = bin_mask
+                    change_ratio_str = "N/A"
 
                 # Resize predicted mask back to original image dimensions
                 orig_w, orig_h = orig_pil.size
-                mask_pil = Image.fromarray(bin_mask * 255).resize((orig_w, orig_h), resample=Image.NEAREST)
+                mask_pil = Image.fromarray(final_mask_np * 255).resize((orig_w, orig_h), resample=Image.NEAREST)
 
                 mask_save_path = os.path.join(args.output_dir, f"{base_name}_mask.png")
                 mask_pil.save(mask_save_path)
@@ -191,14 +214,22 @@ def main():
                     conf = float(sample_cls_probs[pred_cls])
                     pred_class_str = f"{class_names.get(pred_cls, str(pred_cls))} ({conf:.1%})"
 
-                results_table.append([base_name, f"{mask_ratio:.2%}", pred_class_str, mask_save_path])
+                if refiner is not None:
+                    results_table.append([base_name, f"{raw_mask_ratio:.2%}", f"{mask_ratio:.2%}", change_ratio_str, pred_class_str, mask_save_path])
+                else:
+                    results_table.append([base_name, f"{mask_ratio:.2%}", pred_class_str, mask_save_path])
 
     clear_memory_cache(device)
 
-    headers = ["Image", "Synthetic Area Ratio", "Pred Label (Confidence)", "Saved Mask"]
+    if refiner is not None:
+        headers = ["Image", "UNet Area", "Refined Area", "Pixel Change Ratio", "Pred Label (Confidence)", "Saved Mask"]
+    else:
+        headers = ["Image", "Synthetic Area Ratio", "Pred Label (Confidence)", "Saved Mask"]
+
     print("\n" + tabulate(results_table, headers=headers, tablefmt="github"))
     print(f"\nAll outputs saved to '{args.output_dir}'")
     return results_table
+
 
 
 def cli_main():

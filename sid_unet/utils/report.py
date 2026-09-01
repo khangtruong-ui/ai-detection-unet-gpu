@@ -170,7 +170,20 @@ def generate_evaluation_report(
     if config:
         md_lines.append(format_config_table(config, title="Run Configuration & Hyperparameters"))
 
+    if "sam_refinement_stats" in overall_metrics:
+        stats = overall_metrics["sam_refinement_stats"]
+        md_lines.append("### 🔬 SAM Mask Refinement Analysis\n")
+        sam_rows = [
+            ["Segment Model", str(stats.get("segment_model", "N/A"))],
+            ["Mean Pixel Change Ratio", f"{stats.get('mean_pixel_change_ratio', 0.0):.2%}"],
+            ["Total Refined Masks", f"{stats.get('total_masks_refined', 0)} / {stats.get('total_samples', 0)}"],
+            ["Total Pixels Changed", f"{stats.get('total_pixels_changed', 0):,}"],
+        ]
+        md_lines.append(tabulate(sam_rows, headers=["Refinement Property", "Value"], tablefmt="github"))
+        md_lines.append("\n\n")
+
     md_lines.append(format_metrics_table(overall_metrics, title="Overall Segmentation & Classification Metrics"))
+
 
     if curves_path:
         rel_curve_name = os.path.basename(curves_path)
@@ -441,7 +454,12 @@ def generate_checkpoint_cross_eval_report(
         if res.get("config_path"):
             md_lines.append(f"- **Config File**: `{res['config_path']}`")
 
+        if "sam_refinement_stats" in m:
+            stats = m["sam_refinement_stats"]
+            md_lines.append(f"- **SAM Refinement**: Model=`{stats.get('segment_model')}`, Mean Change=`{stats.get('mean_pixel_change_ratio', 0.0):.2%}`, Refined Masks=`{stats.get('total_masks_refined', 0)} / {stats.get('total_samples', 0)}`")
+
         md_lines.append(format_metrics_table(m, title="Evaluation Metrics"))
+
 
         if per_label:
             label_names = {0: "Label 0 (Real)", 1: "Label 1 (Synthetic)", 2: "Label 2 (Tampered)"}

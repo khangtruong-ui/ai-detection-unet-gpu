@@ -23,6 +23,7 @@ from sid_unet.dataset.loader import create_eval_dataloader
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
+from sid_unet.models.sam3_refiner import get_sam_refiner
 from sid_unet.models.unet import UNet
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
@@ -33,6 +34,7 @@ from sid_unet.utils.report import (
     generate_checkpoint_cross_eval_report,
     generate_master_cross_evaluation_report,
 )
+import numpy as np
 
 
 def parse_args():
@@ -95,7 +97,14 @@ def parse_args():
         default=0.5,
         help="Binarization threshold for predicted mask probabilities (default: 0.5).",
     )
+    parser.add_argument(
+        "--segment",
+        type=str,
+        default=None,
+        help="Optional segment model for mask refinement (e.g. 'facebook/sam3'). Contrasts UNet mask areas with SAM segments via joins.",
+    )
     return parser.parse_args()
+
 
 
 def expand_config_patterns(patterns: List[str]) -> List[str]:
@@ -172,8 +181,8 @@ def resolve_checkpoint_neighbor_dir(checkpoint_path: str) -> str:
     return os.path.join(ckpt_dir, "cross_eval_reports")
 
 
-def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker):
-    """Execute forward evaluation for a single batch and return (loss_val * batch_size, batch_size)."""
+def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker, refiner=None):
+    """Execute forward evaluation for a single batch and return (loss_val * batch_size, batch_size, change_metrics_list)."""
     images = batch["image"].to(device, non_blocking=True)
     masks = batch["mask"].to(device, non_blocking=True)
     labels = batch.get("label")
@@ -189,11 +198,18 @@ def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker):
     else:
         mask_logits, class_logits = outputs, None
 
-    seg_tracker.update(mask_logits, masks, labels)
+    change_metrics_list = []
+    if refiner is not None:
+        refined_masks, change_metrics_list = refiner.refine_batch(images, mask_logits)
+        eval_mask_input = refined_masks
+    else:
+        eval_mask_input = mask_logits
+
+    seg_tracker.update(eval_mask_input, masks, labels)
     if class_logits is not None and labels is not None:
         cls_tracker.update(class_logits, labels)
 
-    return loss.item() * b_size, b_size
+    return loss.item() * b_size, b_size, change_metrics_list
 
 
 def evaluate_checkpoint_on_config(
@@ -204,6 +220,7 @@ def evaluate_checkpoint_on_config(
     batch_size: Optional[int] = None,
     overrides: Optional[List[str]] = None,
     threshold: float = 0.5,
+    segment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -230,6 +247,10 @@ def evaluate_checkpoint_on_config(
     device_str = eval_config.project.get("device", ckpt_config.project.get("device", "auto"))
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) or device_str == "cuda" else "cpu")
 
+    refiner = None
+    if segment:
+        refiner = get_sam_refiner(segment, device=device, threshold=threshold)
+
     model.to(device)
     model.eval()
 
@@ -244,6 +265,7 @@ def evaluate_checkpoint_on_config(
 
     total_loss_sum = 0.0
     total_samples = 0
+    all_change_metrics: List[Dict[str, Any]] = []
 
     clear_memory_cache(device)
     pbar = tqdm(
@@ -256,26 +278,32 @@ def evaluate_checkpoint_on_config(
         for batch in pbar:
             b_sz = len(batch["image"])
             try:
-                loss_contrib, count = eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker)
+                loss_contrib, count, change_met = eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker, refiner=refiner)
                 total_loss_sum += loss_contrib
                 total_samples += count
+                if change_met:
+                    all_change_metrics.extend(change_met)
             except Exception as exc:
                 if is_oom_error(exc):
                     clear_memory_cache(device)
                     sub_batches = split_batch(batch, micro_batch_size=max(1, b_sz // 2))
                     for sub_b in sub_batches:
                         try:
-                            loss_contrib, count = eval_single_batch(sub_b, model, loss_fn, device, seg_tracker, cls_tracker)
+                            loss_contrib, count, change_met = eval_single_batch(sub_b, model, loss_fn, device, seg_tracker, cls_tracker, refiner=refiner)
                             total_loss_sum += loss_contrib
                             total_samples += count
+                            if change_met:
+                                all_change_metrics.extend(change_met)
                         except Exception as sub_exc:
                             if is_oom_error(sub_exc):
                                 clear_memory_cache(device)
                                 nano_batches = split_batch(sub_b, micro_batch_size=1)
                                 for nano_b in nano_batches:
-                                    loss_contrib, count = eval_single_batch(nano_b, model, loss_fn, device, seg_tracker, cls_tracker)
+                                    loss_contrib, count, change_met = eval_single_batch(nano_b, model, loss_fn, device, seg_tracker, cls_tracker, refiner=refiner)
                                     total_loss_sum += loss_contrib
                                     total_samples += count
+                                    if change_met:
+                                        all_change_metrics.extend(change_met)
                             else:
                                 raise sub_exc
                 else:
@@ -293,6 +321,23 @@ def evaluate_checkpoint_on_config(
         **cls_metrics,
         "total_evaluated_samples": total_samples,
     }
+
+    if refiner is not None and all_change_metrics:
+        change_ratios = [m.get("pixel_change_ratio", 0.0) for m in all_change_metrics]
+        pixels_changed = [m.get("pixels_changed", 0) for m in all_change_metrics]
+        masks_refined = sum(1 for p in pixels_changed if p > 0)
+        overall_metrics["segment_model"] = segment
+        overall_metrics["segment_refinement"] = True
+        overall_metrics["mean_pixel_change_ratio"] = float(np.mean(change_ratios))
+        overall_metrics["total_masks_refined"] = masks_refined
+        overall_metrics["refined_sample_count"] = len(all_change_metrics)
+        overall_metrics["sam_refinement_stats"] = {
+            "segment_model": segment,
+            "mean_pixel_change_ratio": float(np.mean(change_ratios)),
+            "total_pixels_changed": int(sum(pixels_changed)),
+            "total_masks_refined": masks_refined,
+            "total_samples": len(all_change_metrics),
+        }
 
     return {
         "checkpoint_path": checkpoint_path,
@@ -322,6 +367,7 @@ def run_cross_evaluation(
     overrides: Optional[List[str]] = None,
     output_dir: Optional[str] = None,
     threshold: float = 0.5,
+    segment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -341,6 +387,8 @@ def run_cross_evaluation(
     logger.info(f"   Checkpoints ({len(checkpoint_paths)}): {checkpoint_paths}")
     logger.info(f"   Configurations ({len(config_paths)}): {config_paths}")
     logger.info(f"   Total Evaluation Runs: {len(checkpoint_paths) * len(config_paths)}")
+    if segment:
+        logger.info(f"   Segment Mask Refinement Model: {segment}")
     logger.info(f"   Master Output Directory: {master_output_dir}")
     logger.info("=" * 75)
 
@@ -364,6 +412,7 @@ def run_cross_evaluation(
                 batch_size=batch_size,
                 overrides=overrides,
                 threshold=threshold,
+                segment=segment,
             )
 
             all_cross_results.append(res)
@@ -448,6 +497,7 @@ def main():
         overrides=args.override,
         output_dir=args.output_dir,
         threshold=args.threshold,
+        segment=args.segment,
     )
     return results
 
@@ -461,3 +511,4 @@ def cli_main():
 
 if __name__ == "__main__":
     cli_main()
+

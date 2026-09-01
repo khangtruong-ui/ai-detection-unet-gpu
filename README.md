@@ -360,12 +360,19 @@ sid-eval \
   --samples 500 \
   --threshold 0.5
 
+# Evaluate with SAM3 Mask Refinement (--segment facebook/sam3):
+sid-eval \
+  --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt \
+  --split test \
+  --segment facebook/sam3
+
 # Or with config overrides:
 python -m sid_unet.evaluate \
   --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt \
   --split test \
   --override data.batch_size=32 data.streaming=false
 ```
+
 
 #### B. Multi-Checkpoint Evaluation (Evaluate Multiple Models at Once)
 Pass multiple checkpoints or glob patterns to evaluate a suite of models sequentially. Individual reports override in-place in each model's directory, and a consolidated comparative evaluation report (`multi_checkpoint_evaluation.md` / `.json`) with side-by-side metrics is generated:
@@ -391,7 +398,12 @@ sid-cross-eval \
   --cross-configs configs/experiments/*.yaml \
   --checkpoints "outputs/RUN*/checkpoints/checkpoint_best.pt" \
   --samples 500 \
-  --output_dir outputs/cross_evaluation
+# Cross-evaluate with SAM3 Mask Refinement:
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml configs/cross-eval/cocoglide.yaml \
+  --checkpoints "outputs/RUN*/checkpoints/checkpoint_best.pt" \
+  --split test \
+  --segment facebook/sam3
 ```
 
 **Key Cross-Evaluation Behaviors:**
@@ -450,14 +462,24 @@ sid-predict \
   --output_dir predictions \
   --save_overlay
 
-# Directory batch prediction
+# Single image prediction with SAM3 Mask Refinement:
+sid-predict \
+  --checkpoint outputs/streaming_run/checkpoints/checkpoint_best.pt \
+  --image /path/to/test_image.jpg \
+  --output_dir predictions \
+  --segment facebook/sam3 \
+  --save_overlay
+
+# Directory batch prediction with SAM3 Mask Refinement:
 python -m sid_unet.predict \
   --checkpoint outputs/streaming_run/checkpoints/checkpoint_best.pt \
   --input_dir /path/to/image_folder \
   --output_dir predictions \
+  --segment facebook/sam3 \
   --threshold 0.5 \
   --save_overlay
 ```
+
 
 **Inference Outputs:**
 - `<image_name>_mask.png`: Binary mask ($0$ = Authentic background, $255$ = AI-generated).
