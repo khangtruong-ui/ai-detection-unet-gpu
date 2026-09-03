@@ -40,6 +40,12 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
     if loss_desc == "combined":
         loss_desc = f"Combined (BCE: {loss_cfg.get('bce_weight', 0.5)}, Dice: {loss_cfg.get('dice_weight', 0.5)})"
 
+    post_cfg = config.get("post_processing", {})
+    if post_cfg and post_cfg.get("enabled", True):
+        post_desc = f"Enabled (min_area={post_cfg.get('min_area', 64)}, fill_holes={post_cfg.get('fill_holes', True)}, morph={post_cfg.get('morphology', 'open_close')})"
+    else:
+        post_desc = "Disabled"
+
     return {
         "Project Name": project_cfg.get("name", "N/A"),
         "Dataset": data_cfg.get("dataset_name", "N/A"),
@@ -52,11 +58,36 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
         "Aux Classifier": f"{model_cfg.get('aux_classifier', True)} (classes={model_cfg.get('num_classes', 3)})",
         "Mask Loss": loss_desc,
         "Aux Loss": f"{loss_cfg.get('aux_loss_type', 'cross_entropy')} (wt={loss_cfg.get('aux_weight', 0.2)})",
+        "Post-Processing": post_desc,
         "Optimizer": f"{train_cfg.get('optimizer', 'adamw')} (lr={train_cfg.get('learning_rate', 1e-3)}, wd={train_cfg.get('weight_decay', 1e-4)})",
         "Scheduler": train_cfg.get("scheduler", "cosine"),
         "Epochs": train_cfg.get("epochs", 10),
         "AMP": train_cfg.get("amp", True),
     }
+
+
+def format_ablation_table(ablation_results: Dict[str, Dict[str, Any]], title: str = "Pipeline Ablation & Mask Refinement Comparison") -> str:
+    """Format comparative table showing metrics across pipeline stages (Raw UNet, +Post-Processing, +SAM, +Both)."""
+    headers = ["Pipeline Stage / Variant", "Mean IoU", "Dice / F1", "Pixel AUROC", "Pixel Acc", "Precision", "Recall"]
+    rows = []
+    for stage_name, m in ablation_results.items():
+        iou = m.get("iou", m.get("val_iou", 0.0))
+        f1 = m.get("f1", m.get("dice", m.get("pixel_f1", 0.0)))
+        auroc = m.get("auroc", m.get("pixel_auroc", 0.0))
+        pacc = m.get("pixel_acc", 0.0)
+        prec = m.get("precision", 0.0)
+        rec = m.get("recall", 0.0)
+        rows.append([
+            stage_name,
+            float(iou) if isinstance(iou, (int, float)) else "N/A",
+            float(f1) if isinstance(f1, (int, float)) else "N/A",
+            float(auroc) if isinstance(auroc, (int, float)) else "N/A",
+            float(pacc) if isinstance(pacc, (int, float)) else "N/A",
+            float(prec) if isinstance(prec, (int, float)) else "N/A",
+            float(rec) if isinstance(rec, (int, float)) else "N/A",
+        ])
+    table_str = tabulate(rows, headers=headers, tablefmt="github", floatfmt=".4f")
+    return f"### 🔬 {title}\n\n{table_str}\n\n"
 
 
 def format_config_table(config: Dict[str, Any], title: str = "Configuration & Hyperparameters") -> str:
@@ -130,10 +161,12 @@ def generate_evaluation_report(
     report_name: str = "evaluation_report",
     history: Optional[List[Dict[str, Any]]] = None,
     curves_path: Optional[str] = None,
+    ablation_results: Optional[Dict[str, Dict[str, Any]]] = None,
+    illustration_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Generate comprehensive evaluation report with configuration details, overall metrics,
-    per-label stats, training curves plot links, and auxiliary classification details. Saves both JSON and Markdown formats.
+    Generate comprehensive evaluation report with configuration details, ablation study, overall metrics,
+    per-label stats, visual illustrations, and auxiliary classification details. Saves both JSON and Markdown formats.
     """
     label_names = {
         0: "Label 0 (Real / Black Mask)",
@@ -145,6 +178,12 @@ def generate_evaluation_report(
         "overall_metrics": overall_metrics,
         "per_label_metrics": {},
     }
+
+    if ablation_results:
+        report_dict["ablation_comparison"] = ablation_results
+
+    if illustration_paths:
+        report_dict["illustration_paths"] = illustration_paths
 
     if curves_path:
         report_dict["curves_plot_path"] = curves_path
@@ -170,6 +209,9 @@ def generate_evaluation_report(
     if config:
         md_lines.append(format_config_table(config, title="Run Configuration & Hyperparameters"))
 
+    if ablation_results:
+        md_lines.append(format_ablation_table(ablation_results, title="Pipeline Ablation & Mask Refinement Comparison"))
+
     if "sam_refinement_stats" in overall_metrics:
         stats = overall_metrics["sam_refinement_stats"]
         md_lines.append("### 🔬 SAM Mask Refinement Analysis\n")
@@ -184,6 +226,15 @@ def generate_evaluation_report(
 
     md_lines.append(format_metrics_table(overall_metrics, title="Overall Segmentation & Classification Metrics"))
 
+    if illustration_paths:
+        md_lines.append("### 🖼️ Evaluation Illustrations & Sample Predictions\n")
+        for ip in illustration_paths:
+            if output_dir:
+                rel_ip = os.path.relpath(ip, output_dir)
+            else:
+                rel_ip = os.path.basename(ip)
+            fname = os.path.splitext(os.path.basename(ip))[0].replace("_", " ").title()
+            md_lines.append(f"**{fname}**\n\n![{fname}]({rel_ip})\n")
 
     if curves_path:
         rel_curve_name = os.path.basename(curves_path)
@@ -383,6 +434,7 @@ def generate_checkpoint_cross_eval_report(
     results: List[Dict[str, Any]],
     output_dir: Optional[str] = None,
     report_name: str = "cross_evaluation_report",
+    illustration_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Generate a cross-evaluation report for a single checkpoint evaluated across multiple configs.
@@ -484,6 +536,16 @@ def generate_checkpoint_cross_eval_report(
             md_lines.append(tabulate(cm_rows, headers=cm_headers, tablefmt="github"))
             md_lines.append("\n")
 
+    if illustration_paths:
+        md_lines.append("## 🖼️ Visual Illustrations & Sample Predictions\n")
+        for ip in illustration_paths:
+            if output_dir:
+                rel_ip = os.path.relpath(ip, output_dir)
+            else:
+                rel_ip = os.path.basename(ip)
+            fname = os.path.splitext(os.path.basename(ip))[0].replace("_", " ").title()
+            md_lines.append(f"**{fname}**\n\n![{fname}]({rel_ip})\n")
+
     markdown_content = "\n".join(md_lines)
 
     report_dict = {
@@ -492,6 +554,8 @@ def generate_checkpoint_cross_eval_report(
         "total_configs": len(results),
         "results": results,
     }
+    if illustration_paths:
+        report_dict["illustration_paths"] = illustration_paths
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -537,10 +601,11 @@ def generate_master_cross_evaluation_report(
     cross_results: List[Dict[str, Any]],
     output_dir: Optional[str] = None,
     report_name: str = "master_cross_evaluation_report",
+    illustration_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Generate master cross-evaluation report containing all cross-evaluation information,
-    matrices (IoU, F1, AUROC, Loss), rankings, and checkpoint/config breakdowns.
+    matrices (IoU, F1, AUROC, Loss), rankings, illustrations/heatmaps, and checkpoint/config breakdowns.
     """
     checkpoints_seen: Dict[str, str] = {}  # ckpt_path -> ckpt_name
     configs_seen: Dict[str, str] = {}      # cfg_path -> cfg_name
@@ -656,6 +721,16 @@ def generate_master_cross_evaluation_report(
         "\n",
     ]
 
+    if illustration_paths:
+        md_lines.append("## 🖼️ Cross-Evaluation Heatmaps & Visual Illustrations\n")
+        for ip in illustration_paths:
+            if output_dir:
+                rel_ip = os.path.relpath(ip, output_dir)
+            else:
+                rel_ip = os.path.basename(ip)
+            fname = os.path.splitext(os.path.basename(ip))[0].replace("_", " ").title()
+            md_lines.append(f"### {fname}\n\n![{fname}]({rel_ip})\n")
+
     # Checkpoint-centric breakdown
     md_lines.append("---\n\n## Per-Checkpoint Deep-Dive\n")
     for cp, cn in checkpoints_seen.items():
@@ -722,6 +797,8 @@ def generate_master_cross_evaluation_report(
         "matrices": matrices_dict,
         "cross_results": cross_results,
     }
+    if illustration_paths:
+        report_dict["illustration_paths"] = illustration_paths
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)

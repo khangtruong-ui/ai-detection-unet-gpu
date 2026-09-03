@@ -43,6 +43,49 @@ def parse_args():
         default=None,
         help="Optional segment model for mask refinement (e.g. 'facebook/sam3'). Contrasts UNet mask areas with SAM segments via joins.",
     )
+    parser.add_argument(
+        "--post-process",
+        "--postprocess",
+        dest="post_process",
+        action="store_true",
+        default=None,
+        help="Enable mask post-processing (small area filtering, hole filling, morphological smoothing). Default is True.",
+    )
+    parser.add_argument(
+        "--no-post-process",
+        "--no-postprocess",
+        dest="post_process",
+        action="store_false",
+        help="Disable mask post-processing.",
+    )
+    parser.add_argument(
+        "--min-area",
+        "--min_area",
+        type=int,
+        default=None,
+        help="Minimum area (pixels) for connected components in post-processing.",
+    )
+    parser.add_argument(
+        "--fill-holes",
+        "--fill_holes",
+        dest="fill_holes",
+        action="store_true",
+        default=None,
+        help="Enable hole filling in post-processing.",
+    )
+    parser.add_argument(
+        "--no-fill-holes",
+        "--no_fill_holes",
+        dest="fill_holes",
+        action="store_false",
+        help="Disable hole filling in post-processing.",
+    )
+    parser.add_argument(
+        "--morphology",
+        type=str,
+        default=None,
+        help="Morphological operation for post-processing ('open_close', 'open', 'close', 'none').",
+    )
     return parser.parse_args()
 
 
@@ -133,6 +176,18 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     class_names = {0: "Real", 1: "Fully AI", 2: "Partially AI (Tampered)"}
 
+    from sid_unet.postprocessing import get_postprocessor_from_config
+    postprocessor = get_postprocessor_from_config(config, threshold=args.threshold, override_enabled=args.post_process)
+    if args.min_area is not None:
+        postprocessor.min_area = args.min_area
+    if args.fill_holes is not None:
+        postprocessor.fill_holes_enabled = args.fill_holes
+    if args.morphology is not None:
+        postprocessor.morphology = args.morphology
+
+    if postprocessor.enabled:
+        print(f"Mask Post-Processing active: min_area={postprocessor.min_area}, fill_holes={postprocessor.fill_holes_enabled}, morph='{postprocessor.morphology}'.")
+
     refiner = None
     if args.segment:
         from sid_unet.models.sam3_refiner import get_sam_refiner
@@ -185,13 +240,20 @@ def main():
                 bin_mask = (sample_prob >= args.threshold).astype(np.uint8)
                 raw_mask_ratio = float(np.mean(bin_mask > 0))
 
+                candidate_mask = bin_mask
+                change_ratio_str = "N/A"
                 if refiner is not None:
-                    refined_mask_np, change_met = refiner.refine_single_sample(orig_pil, bin_mask)
-                    final_mask_np = (refined_mask_np >= 0.5).astype(np.uint8)
+                    refined_mask_np, change_met = refiner.refine_single_sample(orig_pil, candidate_mask)
+                    candidate_mask = (refined_mask_np >= 0.5).astype(np.uint8)
                     change_ratio_str = f"{change_met['pixel_change_ratio']:.2%}"
-                else:
-                    final_mask_np = bin_mask
-                    change_ratio_str = "N/A"
+
+                post_change_str = "N/A"
+                if postprocessor.enabled:
+                    candidate_mask, post_met = postprocessor.process_single(candidate_mask)
+                    candidate_mask = (candidate_mask >= 0.5).astype(np.uint8)
+                    post_change_str = f"{post_met['pixel_change_ratio']:.2%}"
+
+                final_mask_np = candidate_mask
 
                 # Resize predicted mask back to original image dimensions
                 orig_w, orig_h = orig_pil.size
@@ -214,18 +276,18 @@ def main():
                     conf = float(sample_cls_probs[pred_cls])
                     pred_class_str = f"{class_names.get(pred_cls, str(pred_cls))} ({conf:.1%})"
 
-                if refiner is not None:
-                    results_table.append([base_name, f"{raw_mask_ratio:.2%}", f"{mask_ratio:.2%}", change_ratio_str, pred_class_str, mask_save_path])
-                else:
-                    results_table.append([base_name, f"{mask_ratio:.2%}", pred_class_str, mask_save_path])
+                results_table.append([
+                    base_name,
+                    f"{raw_mask_ratio:.2%}",
+                    f"{mask_ratio:.2%}",
+                    change_ratio_str if refiner else post_change_str,
+                    pred_class_str,
+                    mask_save_path,
+                ])
 
     clear_memory_cache(device)
 
-    if refiner is not None:
-        headers = ["Image", "UNet Area", "Refined Area", "Pixel Change Ratio", "Pred Label (Confidence)", "Saved Mask"]
-    else:
-        headers = ["Image", "Synthetic Area Ratio", "Pred Label (Confidence)", "Saved Mask"]
-
+    headers = ["Image", "Raw UNet Area", "Final Mask Area", "Change Ratio", "Pred Label (Confidence)", "Saved Mask"]
     print("\n" + tabulate(results_table, headers=headers, tablefmt="github"))
     print(f"\nAll outputs saved to '{args.output_dir}'")
     return results_table

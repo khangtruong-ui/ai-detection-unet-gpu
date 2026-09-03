@@ -1,11 +1,13 @@
 """
 CLI and execution engine for cross-evaluation of SID-UNet models.
 Evaluates multiple checkpoints against multiple dataset/experiment configuration files (cross-evaluation matrix),
-generates neighbor reports adjacent to checkpoint folders, and compiles a comprehensive master report with 2D matrices.
+tracks ablation metrics (with/without SAM, with/without post-processing), generates neighbor reports adjacent
+to checkpoint folders, generates visual illustrations (prediction grids & heatmaps), and compiles a master report.
 
 Usage:
     sid-cross-eval --cross-configs conf1.yaml conf2.yaml --checkpoints ckpt1.pt ckpt2.pt
-    python -m sid_unet.cross_eval --cross-configs configs/experiments/*.yaml --checkpoints outputs/*/checkpoints/checkpoint_best.pt --split test
+    python -m sid_unet.cross_eval --cross-configs configs/cross-eval/*.yaml --checkpoints "outputs/*/checkpoints/checkpoint_best.pt"
+    sid-cross-eval --cross-configs configs/cross-eval/*.yaml --checkpoints ckpt.pt --segment facebook/sam3
 """
 
 from __future__ import annotations
@@ -14,8 +16,10 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -25,16 +29,17 @@ from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.sam3_refiner import get_sam_refiner
 from sid_unet.models.unet import UNet
+from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
+from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_cross_eval_heatmaps
 from sid_unet.utils.report import (
     extract_key_hyperparameters,
     generate_evaluation_report,
     generate_checkpoint_cross_eval_report,
     generate_master_cross_evaluation_report,
 )
-import numpy as np
 
 
 def parse_args():
@@ -103,8 +108,72 @@ def parse_args():
         default=None,
         help="Optional segment model for mask refinement (e.g. 'facebook/sam3'). Contrasts UNet mask areas with SAM segments via joins.",
     )
+    # Post-processing flags
+    parser.add_argument(
+        "--post-process",
+        "--postprocess",
+        dest="post_process",
+        action="store_true",
+        default=None,
+        help="Enable mask post-processing (small area filtering, hole filling, morphological smoothing). Default is True.",
+    )
+    parser.add_argument(
+        "--no-post-process",
+        "--no-postprocess",
+        dest="post_process",
+        action="store_false",
+        help="Disable mask post-processing.",
+    )
+    parser.add_argument(
+        "--min-area",
+        "--min_area",
+        type=int,
+        default=None,
+        help="Minimum area (pixels) for connected components in post-processing.",
+    )
+    parser.add_argument(
+        "--fill-holes",
+        "--fill_holes",
+        dest="fill_holes",
+        action="store_true",
+        default=None,
+        help="Enable hole filling in post-processing.",
+    )
+    parser.add_argument(
+        "--no-fill-holes",
+        "--no_fill_holes",
+        dest="fill_holes",
+        action="store_false",
+        help="Disable hole filling in post-processing.",
+    )
+    parser.add_argument(
+        "--morphology",
+        type=str,
+        default=None,
+        help="Morphological operation for post-processing ('open_close', 'open', 'close', 'none').",
+    )
+    # Illustration flags
+    parser.add_argument(
+        "--illustrations",
+        "--save-illustrations",
+        dest="save_illustrations",
+        action="store_true",
+        default=True,
+        help="Generate and save visual prediction illustrations and heatmaps in outputs folder (default: True).",
+    )
+    parser.add_argument(
+        "--no-illustrations",
+        dest="save_illustrations",
+        action="store_false",
+        help="Disable generating visual illustrations.",
+    )
+    parser.add_argument(
+        "--max-illustrations",
+        type=int,
+        default=6,
+        help="Maximum number of sample images per dataset in visual illustration grid (default: 6).",
+    )
     return parser.parse_args()
-
 
 
 def expand_config_patterns(patterns: List[str]) -> List[str]:
@@ -181,8 +250,23 @@ def resolve_checkpoint_neighbor_dir(checkpoint_path: str) -> str:
     return os.path.join(ckpt_dir, "cross_eval_reports")
 
 
-def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker, refiner=None):
-    """Execute forward evaluation for a single batch and return (loss_val * batch_size, batch_size, change_metrics_list)."""
+def eval_single_batch(
+    batch: Dict[str, Any],
+    model: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    device: torch.device,
+    raw_seg_tracker: SegmentationMetricTracker,
+    cls_tracker: ClassificationMetricTracker,
+    threshold: float = 0.5,
+    post_seg_tracker: Optional[SegmentationMetricTracker] = None,
+    sam_seg_tracker: Optional[SegmentationMetricTracker] = None,
+    both_seg_tracker: Optional[SegmentationMetricTracker] = None,
+    postprocessor: Optional[MaskPostProcessor] = None,
+    refiner: Optional[Any] = None,
+    collect_samples: Optional[List[Dict[str, Any]]] = None,
+    max_collect: int = 6,
+) -> Tuple[float, int, List[Dict[str, Any]]]:
+    """Execute forward evaluation for a single batch across active pipeline variants."""
     images = batch["image"].to(device, non_blocking=True)
     masks = batch["mask"].to(device, non_blocking=True)
     labels = batch.get("label")
@@ -198,18 +282,70 @@ def eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker, r
     else:
         mask_logits, class_logits = outputs, None
 
-    change_metrics_list = []
-    if refiner is not None:
-        refined_masks, change_metrics_list = refiner.refine_batch(images, mask_logits)
-        eval_mask_input = refined_masks
-    else:
-        eval_mask_input = mask_logits
+    # 1. Baseline Raw UNet
+    raw_seg_tracker.update(mask_logits, masks, labels)
 
-    seg_tracker.update(eval_mask_input, masks, labels)
+    # 2. Post-processed UNet
+    post_masks = None
+    if post_seg_tracker is not None and postprocessor is not None:
+        post_masks, _ = postprocessor.process_batch(mask_logits)
+        post_seg_tracker.update(post_masks, masks, labels)
+
+    # 3. SAM-Refined UNet
+    sam_masks = None
+    sam_change_metrics = []
+    if sam_seg_tracker is not None and refiner is not None:
+        sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
+        sam_seg_tracker.update(sam_masks, masks, labels)
+
+    # 4. SAM + Post-Processing
+    both_masks = None
+    if both_seg_tracker is not None and postprocessor is not None:
+        base_for_both = sam_masks if sam_masks is not None else (refiner.refine_batch(images, mask_logits)[0] if refiner else mask_logits)
+        both_masks, _ = postprocessor.process_batch(base_for_both)
+        both_seg_tracker.update(both_masks, masks, labels)
+
+    # 5. Classification tracker
     if class_logits is not None and labels is not None:
         cls_tracker.update(class_logits, labels)
 
-    return loss.item() * b_size, b_size, change_metrics_list
+    # 6. Collect sample illustrations
+    if collect_samples is not None and len(collect_samples) < max_collect:
+        raw_probs = torch.sigmoid(mask_logits)
+        for i in range(b_size):
+            if len(collect_samples) >= max_collect:
+                break
+            img_item = images[i].detach().cpu()
+            gt_item = masks[i, 0].detach().cpu().numpy() if masks[i].ndim == 3 else masks[i].detach().cpu().numpy()
+            u_item = raw_probs[i, 0].detach().cpu().numpy() if raw_probs[i].ndim == 3 else raw_probs[i].detach().cpu().numpy()
+
+            p_item = post_masks[i, 0].detach().cpu().numpy() if post_masks is not None else None
+            s_item = sam_masks[i, 0].detach().cpu().numpy() if sam_masks is not None else None
+            if both_masks is not None:
+                f_item = both_masks[i, 0].detach().cpu().numpy()
+            elif s_item is not None:
+                f_item = s_item
+            elif p_item is not None:
+                f_item = p_item
+            else:
+                f_item = (u_item >= threshold).astype(np.float32)
+
+            lbl_val = int(labels[i].item()) if labels is not None else None
+            img_ids = batch.get("img_id")
+            sample_id = img_ids[i] if (isinstance(img_ids, list) and i < len(img_ids)) else f"Sample {len(collect_samples)+1}"
+
+            collect_samples.append({
+                "image": img_item,
+                "gt_mask": gt_item,
+                "unet_mask": u_item,
+                "post_mask": p_item,
+                "sam_mask": s_item,
+                "final_mask": f_item,
+                "label": lbl_val,
+                "img_id": sample_id,
+            })
+
+    return loss.item() * b_size, b_size, sam_change_metrics
 
 
 def evaluate_checkpoint_on_config(
@@ -221,6 +357,13 @@ def evaluate_checkpoint_on_config(
     overrides: Optional[List[str]] = None,
     threshold: float = 0.5,
     segment: Optional[str] = None,
+    post_process: Optional[bool] = None,
+    min_area: Optional[int] = None,
+    fill_holes: Optional[bool] = None,
+    morphology: Optional[str] = None,
+    save_illustrations: bool = True,
+    max_illustrations: int = 6,
+    master_output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -251,6 +394,14 @@ def evaluate_checkpoint_on_config(
     if segment:
         refiner = get_sam_refiner(segment, device=device, threshold=threshold)
 
+    postprocessor = get_postprocessor_from_config(eval_config, threshold=threshold, override_enabled=post_process)
+    if min_area is not None:
+        postprocessor.min_area = min_area
+    if fill_holes is not None:
+        postprocessor.fill_holes_enabled = fill_holes
+    if morphology is not None:
+        postprocessor.morphology = morphology
+
     model.to(device)
     model.eval()
 
@@ -260,12 +411,16 @@ def evaluate_checkpoint_on_config(
     resolved_split = getattr(eval_loader.dataset, "resolved_split", split or eval_config.data.get("eval_split", "test"))
     dataset_name = eval_config.data.get("dataset_name", "KhangTruong/IMD2020")
 
-    seg_tracker = SegmentationMetricTracker(threshold=threshold)
+    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold)
+    post_seg_tracker = SegmentationMetricTracker(threshold=threshold) if postprocessor.enabled else None
+    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold) if refiner is not None else None
+    both_seg_tracker = SegmentationMetricTracker(threshold=threshold) if (refiner is not None and postprocessor.enabled) else None
     cls_tracker = ClassificationMetricTracker(num_classes=ckpt_config.model.get("num_classes", 3))
 
     total_loss_sum = 0.0
     total_samples = 0
     all_change_metrics: List[Dict[str, Any]] = []
+    collected_samples: List[Dict[str, Any]] = [] if save_illustrations else None
 
     clear_memory_cache(device)
     pbar = tqdm(
@@ -278,7 +433,22 @@ def evaluate_checkpoint_on_config(
         for batch in pbar:
             b_sz = len(batch["image"])
             try:
-                loss_contrib, count, change_met = eval_single_batch(batch, model, loss_fn, device, seg_tracker, cls_tracker, refiner=refiner)
+                loss_contrib, count, change_met = eval_single_batch(
+                    batch,
+                    model,
+                    loss_fn,
+                    device,
+                    raw_seg_tracker,
+                    cls_tracker,
+                    threshold=threshold,
+                    post_seg_tracker=post_seg_tracker,
+                    sam_seg_tracker=sam_seg_tracker,
+                    both_seg_tracker=both_seg_tracker,
+                    postprocessor=postprocessor,
+                    refiner=refiner,
+                    collect_samples=collected_samples,
+                    max_collect=max_illustrations,
+                )
                 total_loss_sum += loss_contrib
                 total_samples += count
                 if change_met:
@@ -289,7 +459,22 @@ def evaluate_checkpoint_on_config(
                     sub_batches = split_batch(batch, micro_batch_size=max(1, b_sz // 2))
                     for sub_b in sub_batches:
                         try:
-                            loss_contrib, count, change_met = eval_single_batch(sub_b, model, loss_fn, device, seg_tracker, cls_tracker, refiner=refiner)
+                            loss_contrib, count, change_met = eval_single_batch(
+                                sub_b,
+                                model,
+                                loss_fn,
+                                device,
+                                raw_seg_tracker,
+                                cls_tracker,
+                                threshold=threshold,
+                                post_seg_tracker=post_seg_tracker,
+                                sam_seg_tracker=sam_seg_tracker,
+                                both_seg_tracker=both_seg_tracker,
+                                postprocessor=postprocessor,
+                                refiner=refiner,
+                                collect_samples=collected_samples,
+                                max_collect=max_illustrations,
+                            )
                             total_loss_sum += loss_contrib
                             total_samples += count
                             if change_met:
@@ -299,7 +484,22 @@ def evaluate_checkpoint_on_config(
                                 clear_memory_cache(device)
                                 nano_batches = split_batch(sub_b, micro_batch_size=1)
                                 for nano_b in nano_batches:
-                                    loss_contrib, count, change_met = eval_single_batch(nano_b, model, loss_fn, device, seg_tracker, cls_tracker, refiner=refiner)
+                                    loss_contrib, count, change_met = eval_single_batch(
+                                        nano_b,
+                                        model,
+                                        loss_fn,
+                                        device,
+                                        raw_seg_tracker,
+                                        cls_tracker,
+                                        threshold=threshold,
+                                        post_seg_tracker=post_seg_tracker,
+                                        sam_seg_tracker=sam_seg_tracker,
+                                        both_seg_tracker=both_seg_tracker,
+                                        postprocessor=postprocessor,
+                                        refiner=refiner,
+                                        collect_samples=collected_samples,
+                                        max_collect=max_illustrations,
+                                    )
                                     total_loss_sum += loss_contrib
                                     total_samples += count
                                     if change_met:
@@ -311,15 +511,35 @@ def evaluate_checkpoint_on_config(
 
     clear_memory_cache(device)
 
-    overall_seg, per_label_seg = seg_tracker.compute()
+    # Compute metrics across variants
+    raw_seg, per_label_seg = raw_seg_tracker.compute()
     cls_metrics, confusion_mat = cls_tracker.compute()
+
+    ablation_dict: Dict[str, Dict[str, Any]] = {"Baseline (Raw UNet)": raw_seg}
+    chosen_seg = raw_seg
+
+    if post_seg_tracker is not None:
+        post_seg, _ = post_seg_tracker.compute()
+        ablation_dict["+ Post-Processing"] = post_seg
+        chosen_seg = post_seg
+
+    if sam_seg_tracker is not None:
+        sam_seg, _ = sam_seg_tracker.compute()
+        ablation_dict["+ SAM Refinement"] = sam_seg
+        chosen_seg = sam_seg
+
+    if both_seg_tracker is not None:
+        both_seg, _ = both_seg_tracker.compute()
+        ablation_dict["+ SAM & Post-Processing"] = both_seg
+        chosen_seg = both_seg
 
     overall_metrics = {
         "eval_split": resolved_split,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
-        **overall_seg,
+        **chosen_seg,
         **cls_metrics,
         "total_evaluated_samples": total_samples,
+        "ablation_summary": ablation_dict,
     }
 
     if refiner is not None and all_change_metrics:
@@ -339,6 +559,22 @@ def evaluate_checkpoint_on_config(
             "total_samples": len(all_change_metrics),
         }
 
+    # Generate dataset-specific visual illustration grid
+    dataset_illustration_path = None
+    if save_illustrations and collected_samples and master_output_dir:
+        ill_dir = os.path.join(master_output_dir, "illustrations")
+        os.makedirs(ill_dir, exist_ok=True)
+        dataset_illustration_path = os.path.join(ill_dir, f"sample_predictions_{cfg_stem}.png")
+        try:
+            plot_eval_sample_predictions(
+                collected_samples,
+                dataset_illustration_path,
+                title=f"Sample Mask Predictions: {ckpt_run_name} on {dataset_name} ({cfg_stem})",
+                max_samples=max_illustrations,
+            )
+        except Exception as e:
+            dataset_illustration_path = None
+
     return {
         "checkpoint_path": checkpoint_path,
         "checkpoint_name": ckpt_run_name,
@@ -349,8 +585,10 @@ def evaluate_checkpoint_on_config(
         "total_evaluated_samples": total_samples,
         "metrics": overall_metrics,
         "overall_metrics": overall_metrics,
+        "ablation_metrics": ablation_dict,
         "per_label_metrics": per_label_seg,
         "confusion_matrix": confusion_mat,
+        "dataset_illustration_path": dataset_illustration_path,
         "checkpoint_config": ckpt_config.to_dict() if hasattr(ckpt_config, "to_dict") else dict(ckpt_config),
         "eval_config": eval_config.to_dict() if hasattr(eval_config, "to_dict") else dict(eval_config),
         "checkpoint_hyperparameters": extract_key_hyperparameters(ckpt_config),
@@ -368,14 +606,25 @@ def run_cross_evaluation(
     output_dir: Optional[str] = None,
     threshold: float = 0.5,
     segment: Optional[str] = None,
+    post_process: Optional[bool] = None,
+    min_area: Optional[int] = None,
+    fill_holes: Optional[bool] = None,
+    morphology: Optional[str] = None,
+    save_illustrations: bool = True,
+    max_illustrations: int = 6,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
-    Generates neighbor reports for each checkpoint and consolidated master report.
+    Generates neighbor reports for each checkpoint, visual illustrations (heatmaps & prediction grids),
+    and consolidated master report.
     """
     overrides = list(overrides or [])
     master_output_dir = output_dir or "outputs/cross_evaluation"
     os.makedirs(master_output_dir, exist_ok=True)
+
+    illustrations_dir = os.path.join(master_output_dir, "illustrations")
+    if save_illustrations:
+        os.makedirs(illustrations_dir, exist_ok=True)
 
     logger = setup_logger(
         name="SID_CrossEval",
@@ -413,6 +662,13 @@ def run_cross_evaluation(
                 overrides=overrides,
                 threshold=threshold,
                 segment=segment,
+                post_process=post_process,
+                min_area=min_area,
+                fill_holes=fill_holes,
+                morphology=morphology,
+                save_illustrations=save_illustrations,
+                max_illustrations=max_illustrations,
+                master_output_dir=master_output_dir,
             )
 
             all_cross_results.append(res)
@@ -428,19 +684,36 @@ def run_cross_evaluation(
                 f"PixelAcc: {m.get('pixel_acc', 0.0):.4f}"
             )
 
-    # 1. Generate neighbor report for each checkpoint folder
+    # 1. Generate neighbor reports for each checkpoint folder
     for ckpt_path, results in checkpoint_to_results.items():
         neighbor_dir = resolve_checkpoint_neighbor_dir(ckpt_path)
         os.makedirs(neighbor_dir, exist_ok=True)
+        neighbor_ill_dir = os.path.join(neighbor_dir, "illustrations")
+        os.makedirs(neighbor_ill_dir, exist_ok=True)
+
+        ckpt_illustration_paths: List[str] = []
+        for r in results:
+            if r.get("dataset_illustration_path") and os.path.exists(r["dataset_illustration_path"]):
+                src = r["dataset_illustration_path"]
+                dst = os.path.join(neighbor_ill_dir, os.path.basename(src))
+                try:
+                    shutil.copyfile(src, dst)
+                    ckpt_illustration_paths.append(dst)
+                except Exception:
+                    ckpt_illustration_paths.append(src)
+
         generate_checkpoint_cross_eval_report(
             checkpoint_path=ckpt_path,
             results=results,
             output_dir=neighbor_dir,
             report_name="cross_evaluation_report",
+            illustration_paths=ckpt_illustration_paths if ckpt_illustration_paths else None,
         )
+
         # Also write per-config reports in neighbor dir
         for r in results:
             cfg_stem = r.get("config_name", "config").replace(" ", "_")
+            r_ill = [r["dataset_illustration_path"]] if r.get("dataset_illustration_path") else None
             generate_evaluation_report(
                 overall_metrics=r["metrics"],
                 per_label_metrics=r["per_label_metrics"],
@@ -448,14 +721,70 @@ def run_cross_evaluation(
                 config=r["eval_config"],
                 output_dir=neighbor_dir,
                 report_name=f"eval_{cfg_stem}_report",
+                ablation_results=r.get("ablation_metrics"),
+                illustration_paths=r_ill,
             )
         logger.info(f"✅ Checkpoint neighbor report saved at: {os.path.join(neighbor_dir, 'cross_evaluation_report.md')}")
 
-    # 2. Generate Master Cross-Evaluation Report
+    # 2. Generate Master Heatmaps and Illustrations
+    master_illustration_paths: List[str] = []
+    if save_illustrations:
+        # Extract unique checkpoint & config names
+        seen_ckpts = []
+        seen_cfgs = []
+        for r in all_cross_results:
+            cn = r["checkpoint_name"]
+            kn = r["config_name"]
+            if cn not in seen_ckpts:
+                seen_ckpts.append(cn)
+            if kn not in seen_cfgs:
+                seen_cfgs.append(kn)
+
+        iou_matrix = {}
+        f1_matrix = {}
+        pixel_acc_matrix = {}
+        auroc_matrix = {}
+
+        for r in all_cross_results:
+            cn = r["checkpoint_name"]
+            kn = r["config_name"]
+            m = r["metrics"]
+            iou_matrix[(cn, kn)] = m.get("iou", 0.0)
+            f1_matrix[(cn, kn)] = m.get("f1", m.get("dice", 0.0))
+            pixel_acc_matrix[(cn, kn)] = m.get("pixel_acc", 0.0)
+            auroc_matrix[(cn, kn)] = m.get("auroc", 0.0)
+
+        matrix_dict = {
+            "iou": iou_matrix,
+            "dice_f1": f1_matrix,
+            "pixel_acc": pixel_acc_matrix,
+            "auroc": auroc_matrix,
+        }
+
+        try:
+            heatmaps = plot_cross_eval_heatmaps(
+                matrices=matrix_dict,
+                checkpoints=seen_ckpts,
+                configs=seen_cfgs,
+                output_dir=illustrations_dir,
+            )
+            master_illustration_paths.extend(heatmaps)
+            logger.info(f"Generated {len(heatmaps)} cross-evaluation heatmaps in {illustrations_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to generate cross-eval heatmaps: {e}")
+
+        # Also add sample prediction grids to master illustrations
+        for r in all_cross_results:
+            p = r.get("dataset_illustration_path")
+            if p and p not in master_illustration_paths:
+                master_illustration_paths.append(p)
+
+    # 3. Generate Master Cross-Evaluation Report
     master_report = generate_master_cross_evaluation_report(
         cross_results=all_cross_results,
         output_dir=master_output_dir,
         report_name="master_cross_evaluation_report",
+        illustration_paths=master_illustration_paths if master_illustration_paths else None,
     )
 
     print("\n" + "=" * 75)
@@ -472,6 +801,7 @@ def run_cross_evaluation(
         "cross_results": all_cross_results,
         "checkpoint_results": checkpoint_to_results,
         "output_dir": master_output_dir,
+        "illustration_paths": master_illustration_paths,
     }
 
 
@@ -498,6 +828,12 @@ def main():
         output_dir=args.output_dir,
         threshold=args.threshold,
         segment=args.segment,
+        post_process=args.post_process,
+        min_area=args.min_area,
+        fill_holes=args.fill_holes,
+        morphology=args.morphology,
+        save_illustrations=args.save_illustrations,
+        max_illustrations=args.max_illustrations,
     )
     return results
 
@@ -511,4 +847,3 @@ def cli_main():
 
 if __name__ == "__main__":
     cli_main()
-

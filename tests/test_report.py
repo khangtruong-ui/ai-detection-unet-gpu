@@ -235,3 +235,38 @@ def test_generate_master_cross_evaluation_report():
         assert "model_2" in res["summary_table"]
         assert "0.8800" in res["markdown"]
 
+
+def test_generate_evaluation_report_with_ablation_and_illustrations():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        overall = {"eval_total_loss": 0.25, "iou": 0.85, "dice": 0.91, "pixel_acc": 0.96}
+        ablation = {
+            "Baseline (Raw UNet)": {"iou": 0.78, "dice": 0.85, "pixel_acc": 0.94, "precision": 0.82, "recall": 0.88},
+            "+ Post-Processing": {"iou": 0.82, "dice": 0.88, "pixel_acc": 0.95, "precision": 0.86, "recall": 0.90},
+            "+ SAM Refinement": {"iou": 0.85, "dice": 0.91, "pixel_acc": 0.96, "precision": 0.89, "recall": 0.93},
+        }
+        ill_path = os.path.join(tmpdir, "illustrations", "sample.png")
+        os.makedirs(os.path.dirname(ill_path), exist_ok=True)
+        with open(ill_path, "w") as f:
+            f.write("fake-png")
+
+        res = generate_evaluation_report(
+            overall_metrics=overall,
+            output_dir=tmpdir,
+            report_name="eval_test_report",
+            ablation_results=ablation,
+            illustration_paths=[ill_path],
+        )
+
+        md = res["markdown"]
+        assert "Pipeline Ablation & Mask Refinement Comparison" in md
+        assert "Baseline (Raw UNet)" in md
+        assert "+ Post-Processing" in md
+        assert "+ SAM Refinement" in md
+        assert "0.7800" in md
+        assert "Sample" in md
+        assert "illustrations/sample.png" in md
+        assert os.path.exists(os.path.join(tmpdir, "eval_test_report.md"))
+        assert os.path.exists(os.path.join(tmpdir, "eval_test_report.json"))
+        assert "ablation_comparison" in res["report_dict"]
+        assert "illustration_paths" in res["report_dict"]
+

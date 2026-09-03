@@ -174,6 +174,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "log_interval": 20,           # Log training metrics every N steps
         "log_memory": True,           # Log GPU memory allocation info
     },
+    "post_processing": {
+        "enabled": True,              # Enable mask post-processing by default
+        "min_area": 64,               # Suppress components smaller than 64 pixels
+        "fill_holes": True,           # Fill small holes within detected regions
+        "max_hole_size": 256,         # Maximum hole size in pixels to fill
+        "morphology": "open_close",   # 'open', 'close', 'open_close', or 'none'
+        "morph_kernel_size": 3,       # Structuring element kernel size
+    },
 }
 
 

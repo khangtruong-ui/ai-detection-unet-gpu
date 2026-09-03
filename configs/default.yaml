@@ -61,3 +61,11 @@ training:
 
 logging:
   log_interval: 20
+
+post_processing:
+  enabled: true
+  min_area: 64
+  fill_holes: true
+  max_hole_size: 256
+  morphology: "open_close"
+  morph_kernel_size: 3

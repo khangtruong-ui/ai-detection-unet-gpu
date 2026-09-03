@@ -1,10 +1,10 @@
 project:
-  name: "eval_casia_v2.0"
+  name: "eval_diffseg30k"
   device: "auto"
   output_dir: "outputs/cross_eval_results"
 
 data:
-  dataset_name: "KhangTruong/Casia-v2.0"
+  dataset_name: "KhangTruong/Diffseg30k"
   streaming: false
   image_size: [256, 256]
   batch_size: 16
