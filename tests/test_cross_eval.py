@@ -60,9 +60,9 @@ def test_expand_patterns():
 
 def test_resolve_checkpoint_neighbor_dir():
     # When checkpoint is inside a 'checkpoints' subdirectory
-    path1 = "/workspace/outputs/RUN001/checkpoints/checkpoint_best.pt"
+    path1 = "/workspace/outputs/RUN/test_smoke/checkpoints/checkpoint_best.pt"
     res1 = resolve_checkpoint_neighbor_dir(path1)
-    assert res1 == "/workspace/outputs/RUN001/cross_eval_reports"
+    assert res1 == "/workspace/outputs/RUN/test_smoke/cross_eval_reports"
 
     # When checkpoint is in a root/flat directory
     path2 = "/workspace/models/checkpoint_best.pt"
@@ -95,8 +95,8 @@ def test_cross_eval_pipeline(monkeypatch):
         monkeypatch.setattr(sys, "argv", train_args)
         train_main()
 
-        ckpt1 = os.path.join(train_dir, "RUN001", "checkpoints", "checkpoint_best.pt")
-        ckpt2 = os.path.join(train_dir, "RUN002", "checkpoints", "checkpoint_best.pt")
+        ckpt1 = os.path.join(train_dir, "RUN", "test_smoke", "checkpoints", "checkpoint_best.pt")
+        ckpt2 = os.path.join(train_dir, "RUN", "test_quick", "checkpoints", "checkpoint_best.pt")
         assert os.path.exists(ckpt1)
         assert os.path.exists(ckpt2)
 
@@ -120,8 +120,8 @@ def test_cross_eval_pipeline(monkeypatch):
         assert len(results["cross_results"]) == 4
 
         # Verify neighbor reports for each checkpoint
-        neighbor_1 = os.path.join(train_dir, "RUN001", "cross_eval_reports")
-        neighbor_2 = os.path.join(train_dir, "RUN002", "cross_eval_reports")
+        neighbor_1 = os.path.join(train_dir, "RUN", "test_smoke", "cross_eval_reports")
+        neighbor_2 = os.path.join(train_dir, "RUN", "test_quick", "cross_eval_reports")
         assert os.path.exists(neighbor_1)
         assert os.path.exists(neighbor_2)
         assert os.path.exists(os.path.join(neighbor_1, "cross_evaluation_report.md"))
@@ -171,8 +171,8 @@ def test_cross_eval_collision_skipping_and_continuous_master_report(monkeypatch)
         monkeypatch.setattr(sys, "argv", train_args)
         train_main()
 
-        ckpt1 = os.path.join(train_dir, "RUN001", "checkpoints", "checkpoint_best.pt")
-        ckpt2 = os.path.join(train_dir, "RUN002", "checkpoints", "checkpoint_best.pt")
+        ckpt1 = os.path.join(train_dir, "RUN", "test_smoke", "checkpoints", "checkpoint_best.pt")
+        ckpt2 = os.path.join(train_dir, "RUN", "test_quick", "checkpoints", "checkpoint_best.pt")
 
         # 1. Run cross eval with only ckpt1 on configs/test_smoke.yaml
         cross_args_1 = [
@@ -212,6 +212,6 @@ def test_cross_eval_collision_skipping_and_continuous_master_report(monkeypatch)
         # Both entries are in the continuous master report
         assert len(res2["cross_results"]) == 2
         ckpt_names = [r["checkpoint_name"] for r in res2["cross_results"]]
-        assert "RUN001" in ckpt_names
-        assert "RUN002" in ckpt_names
+        assert "test_smoke" in ckpt_names
+        assert "test_quick" in ckpt_names
 

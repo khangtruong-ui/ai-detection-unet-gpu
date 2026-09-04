@@ -7,7 +7,7 @@ project:
   name: "sid_efficientnet_b0_sacrifice_of_pixel"
   seed: 42
   device: "auto"
-  output_dir: "outputs/exp_efficientnet_b0_sacrifice_of_pixel"
+  output_dir: "outputs/RUN/efficientnet_b0_sacrifice_of_pixel"
 
 data:
   dataset_name: "KhangTruong/IMD2020"

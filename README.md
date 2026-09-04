@@ -514,8 +514,24 @@ sid-train --config configs/experiments/efficientnet/efficientnet_b0_sacrifice_of
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
   configs/experiments/efficientnet/efficientnet_b0_unet.yaml \
-  configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml \
-  --output_dir outputs/benchmark_suite
+  configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
+```
+
+All runs are organized inside a unified `'RUN'` folder named by config (without arbitrary numbering):
+```
+outputs/RUN/
+├── unet_wide_b32/
+│   ├── checkpoints/
+│   │   ├── checkpoint_best.pt
+│   │   └── checkpoint_latest.pt
+│   ├── logs/
+│   │   └── train_run.log
+│   ├── eval_reports/
+│   └── effective_config.yaml
+├── efficientnet_b0_unet/
+│   └── checkpoints/
+├── multi_experiment_comparison.md
+└── multi_experiment_comparison.json
 ```
 
 ---
@@ -524,12 +540,15 @@ sid-train --configs \
 
 #### A. Single Checkpoint Evaluation
 ```bash
-sid-eval --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt --split test
+sid-eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt --split test
 ```
 
 #### B. Multi-Checkpoint Evaluation
 ```bash
-sid-eval --checkpoints outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN002/checkpoints/checkpoint_best.pt --split test
+sid-eval --checkpoints \
+  outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt \
+  outputs/RUN/efficientnet_b0_unet/checkpoints/checkpoint_best.pt \
+  --split test
 ```
 
 #### C. Cross-Evaluation Matrix Benchmarking (`sid-cross-eval`)
@@ -537,7 +556,7 @@ sid-eval --checkpoints outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN
 # Cross-evaluate checkpoints across multiple dataset configurations with collision skipping
 sid-cross-eval \
   --cross-configs configs/cross-eval/*.yaml \
-  --checkpoints "outputs/*/checkpoints/checkpoint_best.pt" \
+  --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
   --split test
 ```
 
@@ -550,7 +569,9 @@ Sample random examples from datasets and illustrate predictions side-by-side acr
 ```bash
 # Compare multiple checkpoints on multiple dataset configurations
 sid-illu \
-  --model-ckpts outputs/RUN001/checkpoints/checkpoint_best.pt outputs/RUN002/checkpoints/checkpoint_best.pt \
+  --model-ckpts \
+    outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt \
+    outputs/RUN/efficientnet_b0_unet/checkpoints/checkpoint_best.pt \
   --dataset-configs configs/cross-eval/diffseg30k.yaml configs/cross-eval/casia_v2.0.yaml \
   --num-samples 5 \
   --output-dir outputs/illustrations
@@ -566,7 +587,7 @@ Outputs:
 
 ```bash
 sid-predict \
-  --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt \
+  --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt \
   --image /path/to/test_image.jpg \
   --output_dir predictions \
   --save_overlay

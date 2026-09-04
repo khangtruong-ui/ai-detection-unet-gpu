@@ -350,10 +350,21 @@ def run_illustration(
         sam_refiner = get_sam_refiner(segment, device=device, threshold=threshold)
 
     for ckpt_path in model_ckpts:
-        ckpt_name = os.path.splitext(os.path.basename(ckpt_path))[0]
-        # If duplicated ckpt_name, append parent dir
+        ckpt_stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+        if ckpt_stem in ("checkpoint_best", "checkpoint_latest", "model", "checkpoint"):
+            ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path))
+            parent_name = os.path.basename(os.path.dirname(ckpt_dir)) if os.path.basename(ckpt_dir) == "checkpoints" else os.path.basename(ckpt_dir)
+            if parent_name and parent_name not in ("outputs", "RUN", "models", ".", "checkpoints"):
+                ckpt_name = parent_name
+            else:
+                ckpt_name = ckpt_stem
+        else:
+            ckpt_name = ckpt_stem
+
+        # If duplicated ckpt_name, append parent or index
         if ckpt_name in models_dict:
-            parent_name = os.path.basename(os.path.dirname(os.path.abspath(ckpt_path)))
+            ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path))
+            parent_name = os.path.basename(ckpt_dir)
             ckpt_name = f"{parent_name}_{ckpt_name}"
 
         logger.info(f"Loading model checkpoint '{ckpt_name}' from: {ckpt_path}")

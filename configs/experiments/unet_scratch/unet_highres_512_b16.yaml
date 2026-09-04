@@ -7,7 +7,7 @@ project:
   name: "sid_unet_highres_512_b16"
   seed: 42
   device: "auto"
-  output_dir: "outputs/exp_unet_highres_512_b16"
+  output_dir: "outputs/RUN/unet_highres_512_b16"
 
 data:
   dataset_name: "KhangTruong/IMD2020"

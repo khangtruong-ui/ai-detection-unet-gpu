@@ -141,21 +141,37 @@ def train_single_run(
     seed = int(config.project.get("seed", 42))
     set_seed(seed)
 
-    # In multi-run mode, name each run folder cleanly as RUN001, RUN002, etc.
+    # Unification folder 'RUN': name each subfolder after its config (no numbering)
     cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
-    if total_runs > 1:
-        run_name = f"RUN{run_idx:03d}"
-        root_dir = base_output_dir if base_output_dir else "outputs"
-        output_dir = os.path.join(root_dir, run_name)
-        config.project.output_dir = output_dir
-        config.project.name = run_name
-    else:
-        if base_output_dir:
+    run_name = cfg_stem
+
+    if base_output_dir:
+        norm = os.path.normpath(base_output_dir)
+        base_name = os.path.basename(norm)
+        if base_name == "RUN":
+            run_root = base_output_dir
+            output_dir = os.path.join(run_root, cfg_stem)
+        elif base_name == cfg_stem:
             output_dir = base_output_dir
-            config.project.output_dir = output_dir
         else:
-            output_dir = config.project.get("output_dir", "outputs")
-        run_name = config.project.get("name", cfg_stem)
+            run_root = os.path.join(base_output_dir, "RUN")
+            output_dir = os.path.join(run_root, cfg_stem)
+    else:
+        # Check if project.output_dir was explicitly provided via overrides (e.g. in targeted tests)
+        override_output_dir = None
+        if overrides:
+            for ov in overrides:
+                if ov.startswith("project.output_dir="):
+                    override_output_dir = ov.split("=", 1)[1].strip()
+                    break
+        if override_output_dir:
+            output_dir = override_output_dir
+        else:
+            run_root = os.path.join("outputs", "RUN")
+            output_dir = os.path.join(run_root, cfg_stem)
+
+    config.project.output_dir = output_dir
+    config.project.name = run_name
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -294,16 +310,20 @@ def main():
     if not parent_output_dir:
         parent_output_dir = "outputs"
 
+    norm = os.path.normpath(parent_output_dir)
+    suite_run_dir = parent_output_dir if os.path.basename(norm) == "RUN" else os.path.join(parent_output_dir, "RUN")
+
     print("\n" + "=" * 70)
     print(f"🚀 Launching Multi-Experiment Suite ({len(config_paths)} experiments)")
-    print(f"📁 Suite Output Directory: {parent_output_dir}")
+    print(f"📁 Suite Output Directory: {suite_run_dir}")
     print(f"⚡ Collision Detection / Skip: {args.skip_collision}")
     print("=" * 70 + "\n")
 
     all_results: List[Dict[str, Any]] = []
 
     for i, cfg_path in enumerate(config_paths, 1):
-        print(f"\n>>> Running Experiment [{i}/{len(config_paths)}]: {cfg_path} (RUN{i:03d})")
+        cfg_name = os.path.splitext(os.path.basename(cfg_path))[0]
+        print(f"\n>>> Running Experiment [{i}/{len(config_paths)}]: {cfg_path} ({cfg_name})")
         print("-" * 70)
         res = train_single_run(
             config_path=cfg_path,
@@ -311,7 +331,7 @@ def main():
             resume=args.resume if i == 1 else None,
             run_idx=i,
             total_runs=len(config_paths),
-            base_output_dir=parent_output_dir,
+            base_output_dir=suite_run_dir,
             skip_collision=args.skip_collision,
         )
         all_results.append(res)
@@ -325,7 +345,7 @@ def main():
 
     multi_curves_path = None
     if histories_dict:
-        multi_curves_path = os.path.join(parent_output_dir, "multi_experiment_curves.png")
+        multi_curves_path = os.path.join(suite_run_dir, "multi_experiment_curves.png")
         plot_multi_experiment_curves(
             experiment_histories=histories_dict,
             output_path=multi_curves_path,
@@ -333,7 +353,7 @@ def main():
 
     # Generate and display continuous multi-experiment comparison report
     combined_results = list(all_results)
-    multi_json_path = os.path.join(parent_output_dir, "multi_experiment_comparison.json")
+    multi_json_path = os.path.join(suite_run_dir, "multi_experiment_comparison.json")
     if os.path.exists(multi_json_path):
         try:
             with open(multi_json_path, "r", encoding="utf-8") as f:
@@ -350,7 +370,7 @@ def main():
 
     multi_report = generate_multi_experiment_report(
         experiment_results=combined_results,
-        output_dir=parent_output_dir,
+        output_dir=suite_run_dir,
         report_name="multi_experiment_comparison",
         multi_curves_path=multi_curves_path,
     )
@@ -361,8 +381,8 @@ def main():
     print(multi_report["summary_table"])
     if multi_curves_path and os.path.exists(multi_curves_path):
         print(f"Multi-Experiment comparison curves plot: {multi_curves_path}")
-    print(f"\nDetailed Markdown comparison: {os.path.join(parent_output_dir, 'multi_experiment_comparison.md')}")
-    print(f"Detailed JSON comparison: {os.path.join(parent_output_dir, 'multi_experiment_comparison.json')}\n")
+    print(f"\nDetailed Markdown comparison: {os.path.join(suite_run_dir, 'multi_experiment_comparison.md')}")
+    print(f"Detailed JSON comparison: {os.path.join(suite_run_dir, 'multi_experiment_comparison.json')}\n")
 
     return all_results
 

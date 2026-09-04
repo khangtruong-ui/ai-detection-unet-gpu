@@ -6,16 +6,16 @@ and consolidated multi-checkpoint comparative benchmarking.
 
 Usage:
     # Single checkpoint evaluation (saves/overwrites report and illustrations in run directory):
-    python -m sid_unet.evaluate --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt
+    python -m sid_unet.evaluate --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt
 
     # Evaluate with SAM3 refinement:
-    sid-eval --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt --segment facebook/sam3
+    sid-eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt --segment facebook/sam3
 
     # Evaluate with custom post-processing options:
-    sid-eval --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt --min-area 128 --morphology open_close
+    sid-eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt --min-area 128 --morphology open_close
 
     # Disable post-processing to isolate raw UNet metrics:
-    sid-eval --checkpoint outputs/RUN001/checkpoints/checkpoint_best.pt --no-post-process
+    sid-eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt --no-post-process
 """
 
 from __future__ import annotations
@@ -358,7 +358,16 @@ def evaluate_single_checkpoint(
     )
 
     ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    run_name = config.project.get("name", ckpt_stem)
+    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    parent_folder = os.path.basename(os.path.dirname(ckpt_dir)) if os.path.basename(ckpt_dir) == "checkpoints" else os.path.basename(ckpt_dir)
+
+    raw_name = config.project.get("name") if hasattr(config, "project") else None
+    if raw_name and raw_name not in ("UNet_Training", "UNet_Experiment", "checkpoint_best", "checkpoint_latest"):
+        run_name = raw_name
+    elif parent_folder and parent_folder not in ("outputs", "RUN", "models", ".", "checkpoints"):
+        run_name = parent_folder
+    else:
+        run_name = ckpt_stem
 
     resolved_out_dir = resolve_checkpoint_output_dir(checkpoint_path, output_dir, run_name=run_name, multi_run=multi_run)
     os.makedirs(resolved_out_dir, exist_ok=True)

@@ -5,7 +5,7 @@ project:
   name: "sid_efficientnet_b2_unet"
   seed: 42
   device: "auto"
-  output_dir: "outputs/exp_efficientnet_b2_unet"
+  output_dir: "outputs/RUN/efficientnet_b2_unet"
 
 data:
   dataset_name: "KhangTruong/IMD2020"

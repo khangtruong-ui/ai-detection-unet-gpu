@@ -6,7 +6,7 @@ project:
   name: "sid_unet_deep_5stage_b32"
   seed: 42
   device: "auto"
-  output_dir: "outputs/exp_unet_deep_5stage_b32"
+  output_dir: "outputs/RUN/unet_deep_5stage_b32"
 
 data:
   dataset_name: "KhangTruong/IMD2020"

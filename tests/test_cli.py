@@ -133,15 +133,15 @@ def test_cli_multi_config_training(monkeypatch):
         results = train_main()
 
         assert len(results) == 2
-        # Check comparison report files
-        comparison_md = os.path.join(output_dir, "multi_experiment_comparison.md")
-        comparison_json = os.path.join(output_dir, "multi_experiment_comparison.json")
+        # Check comparison report files inside unified RUN directory
+        comparison_md = os.path.join(output_dir, "RUN", "multi_experiment_comparison.md")
+        comparison_json = os.path.join(output_dir, "RUN", "multi_experiment_comparison.json")
         assert os.path.exists(comparison_md)
         assert os.path.exists(comparison_json)
 
-        # Check that individual experiment dirs exist (RUN001, RUN002)
-        exp1_dir = os.path.join(output_dir, "RUN001")
-        exp2_dir = os.path.join(output_dir, "RUN002")
+        # Check that individual experiment dirs exist using config names without numbering (test_smoke, test_quick)
+        exp1_dir = os.path.join(output_dir, "RUN", "test_smoke")
+        exp2_dir = os.path.join(output_dir, "RUN", "test_quick")
         assert os.path.exists(exp1_dir)
         assert os.path.exists(exp2_dir)
         assert os.path.exists(os.path.join(exp1_dir, "reports", "training_final_report.md"))
@@ -201,8 +201,8 @@ def test_cli_multi_checkpoint_evaluation(monkeypatch):
         monkeypatch.setattr(sys, "argv", test_train_args)
         train_main()
 
-        ckpt1 = os.path.join(suite_dir, "RUN001", "checkpoints", "checkpoint_best.pt")
-        ckpt2 = os.path.join(suite_dir, "RUN002", "checkpoints", "checkpoint_best.pt")
+        ckpt1 = os.path.join(suite_dir, "RUN", "test_smoke", "checkpoints", "checkpoint_best.pt")
+        ckpt2 = os.path.join(suite_dir, "RUN", "test_quick", "checkpoints", "checkpoint_best.pt")
         assert os.path.exists(ckpt1)
         assert os.path.exists(ckpt2)
 
@@ -223,8 +223,8 @@ def test_cli_multi_checkpoint_evaluation(monkeypatch):
 
         assert len(eval_results) == 2
         # Check individual in-place report files
-        assert os.path.exists(os.path.join(suite_dir, "RUN001", "eval_reports", "evaluation_report.md"))
-        assert os.path.exists(os.path.join(suite_dir, "RUN002", "eval_reports", "evaluation_report.md"))
+        assert os.path.exists(os.path.join(suite_dir, "RUN", "test_smoke", "eval_reports", "evaluation_report.md"))
+        assert os.path.exists(os.path.join(suite_dir, "RUN", "test_quick", "eval_reports", "evaluation_report.md"))
         # Check consolidated comparative report
         assert os.path.exists(os.path.join(suite_dir, "multi_checkpoint_evaluation.md"))
         assert os.path.exists(os.path.join(suite_dir, "multi_checkpoint_evaluation.json"))
@@ -251,7 +251,8 @@ def test_cli_train_and_eval_collision_skipping(monkeypatch):
         ]
         monkeypatch.setattr(sys, "argv", train_args)
         res1 = train_main()
-        assert os.path.exists(os.path.join(output_dir, "checkpoints", "checkpoint_best.pt"))
+        best_ckpt = os.path.join(output_dir, "RUN", "test_smoke", "checkpoints", "checkpoint_best.pt")
+        assert os.path.exists(best_ckpt)
 
         # Second train run on same output directory - should trigger collision skipping!
         monkeypatch.setattr(sys, "argv", train_args)
@@ -260,7 +261,6 @@ def test_cli_train_and_eval_collision_skipping(monkeypatch):
         assert res2["best_score"] == res1["best_score"]
 
         # Evaluate on the checkpoint
-        best_ckpt = os.path.join(output_dir, "checkpoints", "checkpoint_best.pt")
         eval_args = [
             "sid-eval",
             "--checkpoint", best_ckpt,

@@ -399,7 +399,16 @@ def evaluate_checkpoint_on_config(
     )
 
     ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    ckpt_run_name = ckpt_config.project.get("name", ckpt_stem) if hasattr(ckpt_config, "project") else ckpt_stem
+    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    parent_folder = os.path.basename(os.path.dirname(ckpt_dir)) if os.path.basename(ckpt_dir) == "checkpoints" else os.path.basename(ckpt_dir)
+
+    raw_name = ckpt_config.project.get("name") if hasattr(ckpt_config, "project") else None
+    if raw_name and raw_name not in ("UNet_Training", "UNet_Experiment", "checkpoint_best", "checkpoint_latest"):
+        ckpt_run_name = raw_name
+    elif parent_folder and parent_folder not in ("outputs", "RUN", "models", ".", "checkpoints"):
+        ckpt_run_name = parent_folder
+    else:
+        ckpt_run_name = ckpt_stem
     cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
     cfg_proj_name = eval_config.project.get("name", cfg_stem)
 

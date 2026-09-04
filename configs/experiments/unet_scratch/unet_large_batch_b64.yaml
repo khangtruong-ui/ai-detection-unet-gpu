@@ -6,7 +6,7 @@ project:
   name: "sid_unet_large_batch_b64"
   seed: 42
   device: "auto"
-  output_dir: "outputs/exp_unet_large_batch_b64"
+  output_dir: "outputs/RUN/unet_large_batch_b64"
 
 data:
   dataset_name: "KhangTruong/IMD2020"

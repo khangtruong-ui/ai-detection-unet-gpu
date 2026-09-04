@@ -8,7 +8,7 @@ project:
   name: "sid_unet_focal_hard_mining_b32"
   seed: 42
   device: "auto"
-  output_dir: "outputs/exp_unet_focal_b32"
+  output_dir: "outputs/RUN/unet_focal_hard_mining_b32"
 
 data:
   dataset_name: "KhangTruong/IMD2020"
