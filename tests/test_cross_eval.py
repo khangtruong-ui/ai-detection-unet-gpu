@@ -144,3 +144,74 @@ def test_cross_eval_pipeline(monkeypatch):
             assert "auroc" in m
             assert "pixel_acc" in m
             assert "eval_total_loss" in m
+
+
+def test_cross_eval_collision_skipping_and_continuous_master_report(monkeypatch):
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(10))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        train_dir = os.path.join(tmpdir, "train_runs")
+        cross_out_dir = os.path.join(tmpdir, "cross_eval_master")
+
+        # Train 2 minimal checkpoints
+        train_args = [
+            "sid-train",
+            "--configs", "configs/test_smoke.yaml", "configs/test_quick.yaml",
+            "--output_dir", train_dir,
+            "--override",
+            "project.device=cpu",
+            "training.epochs=1",
+            "data.num_workers=0",
+            "data.train_samples_per_epoch=2",
+            "data.val_samples=2",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ]
+        monkeypatch.setattr(sys, "argv", train_args)
+        train_main()
+
+        ckpt1 = os.path.join(train_dir, "RUN001", "checkpoints", "checkpoint_best.pt")
+        ckpt2 = os.path.join(train_dir, "RUN002", "checkpoints", "checkpoint_best.pt")
+
+        # 1. Run cross eval with only ckpt1 on configs/test_smoke.yaml
+        cross_args_1 = [
+            "sid-cross-eval",
+            "--cross-configs", "configs/test_smoke.yaml",
+            "--checkpoints", ckpt1,
+            "--split", "test",
+            "--samples", "2",
+            "--batch_size", "2",
+            "--output_dir", cross_out_dir,
+            "--override",
+            "data.num_workers=0",
+            "project.device=cpu",
+        ]
+        monkeypatch.setattr(sys, "argv", cross_args_1)
+        res1 = cross_eval_main()
+        assert len(res1["cross_results"]) == 1
+
+        # 2. Run cross eval again with BOTH ckpt1 and ckpt2
+        # ckpt1 + test_smoke.yaml should be SKIPPED due to collision, and ckpt2 should be evaluated.
+        # Continuous master report should now hold BOTH results!
+        cross_args_2 = [
+            "sid-cross-eval",
+            "--cross-configs", "configs/test_smoke.yaml",
+            "--checkpoints", ckpt1, ckpt2,
+            "--split", "test",
+            "--samples", "2",
+            "--batch_size", "2",
+            "--output_dir", cross_out_dir,
+            "--override",
+            "data.num_workers=0",
+            "project.device=cpu",
+        ]
+        monkeypatch.setattr(sys, "argv", cross_args_2)
+        res2 = cross_eval_main()
+
+        # Both entries are in the continuous master report
+        assert len(res2["cross_results"]) == 2
+        ckpt_names = [r["checkpoint_name"] for r in res2["cross_results"]]
+        assert "RUN001" in ckpt_names
+        assert "RUN002" in ckpt_names
+

@@ -169,6 +169,22 @@ def parse_args():
         default=8,
         help="Maximum number of sample images in visual illustration grid (default: 8).",
     )
+    # Collision checking flags
+    parser.add_argument(
+        "--skip-collision",
+        "--skip_collision",
+        dest="skip_collision",
+        action="store_true",
+        default=True,
+        help="Check for collision against previously evaluated reports and skip with notification (default: True).",
+    )
+    parser.add_argument(
+        "--no-skip-collision",
+        "--force",
+        dest="skip_collision",
+        action="store_false",
+        help="Disable collision checking and force re-evaluation of all checkpoints.",
+    )
     return parser.parse_args()
 
 
@@ -317,6 +333,7 @@ def evaluate_single_checkpoint(
     save_illustrations: bool = True,
     max_illustrations: int = 8,
     multi_run: bool = False,
+    skip_collision: bool = True,
 ) -> Dict[str, Any]:
     """Run full evaluation on a single checkpoint with ablation tracking and illustration generation."""
     if not os.path.exists(checkpoint_path):
@@ -354,6 +371,46 @@ def evaluate_single_checkpoint(
         name=f"SID_Eval_{run_name}",
         log_file=os.path.join(resolved_out_dir, "evaluate.log"),
     )
+
+    # Check for collision against existing evaluation report
+    report_json_path = os.path.join(resolved_out_dir, "evaluation_report.json")
+    if not os.path.exists(report_json_path):
+        report_json_path = os.path.join(local_out_dir, "evaluation_report.json")
+
+    if skip_collision and os.path.exists(report_json_path):
+        try:
+            with open(report_json_path, "r", encoding="utf-8") as f:
+                saved_rep = json.load(f)
+                saved_cfg = saved_rep.get("config", {})
+                saved_data = saved_cfg.get("data", {})
+                target_ds = saved_data.get("dataset_name", config.data.dataset_name)
+                target_split = split or saved_data.get("test_split", saved_data.get("val_split", "test"))
+                logger.info(
+                    f"\n⚡ [COLLISION DETECTED - SKIPPED] Model checkpoint '{os.path.basename(checkpoint_path)}' "
+                    f"on dataset '{target_ds}' ({target_split}) has already been evaluated in '{resolved_out_dir}'. Skipping..."
+                )
+                saved_om = saved_rep.get("overall_metrics", {})
+                return {
+                    "run_name": run_name,
+                    "checkpoint_path": checkpoint_path,
+                    "config": saved_cfg,
+                    "overall_metrics": saved_om,
+                    "final_metrics": saved_om,
+                    "ablation_metrics": saved_rep.get("ablation_results", {}),
+                    "per_label_metrics": saved_rep.get("per_label_metrics", {}),
+                    "confusion_matrix": saved_rep.get("confusion_matrix", []),
+                    "illustration_paths": saved_rep.get("illustration_paths", []),
+                    "report_path": os.path.join(resolved_out_dir, "evaluation_report.md"),
+                    "report_result": {
+                        "report_dict": saved_rep,
+                        "overall_metrics": saved_om,
+                        "markdown": "",
+                    },
+                    "output_dir": resolved_out_dir,
+                }
+        except Exception as e:
+            logger.warning(f"Could not read existing evaluation report '{report_json_path}': {e}")
+
     logger.info(f"Loaded checkpoint: {checkpoint_path}")
     logger.info(f"Threshold: {threshold}")
 
@@ -694,12 +751,14 @@ def main():
             save_illustrations=args.save_illustrations,
             max_illustrations=args.max_illustrations,
             multi_run=False,
+            skip_collision=args.skip_collision,
         )
         return res["report_result"]
 
     # Multiple Checkpoints Evaluation Suite
     print("\n" + "=" * 70)
     print(f"📊 Evaluating Multiple Checkpoints ({len(checkpoint_paths)} models)")
+    print(f"   Collision Detection / Skip: {args.skip_collision}")
     print("=" * 70 + "\n")
 
     all_results: List[Dict[str, Any]] = []
@@ -723,13 +782,29 @@ def main():
             save_illustrations=args.save_illustrations,
             max_illustrations=args.max_illustrations,
             multi_run=True,
+            skip_collision=args.skip_collision,
         )
         all_results.append(res)
 
     # Generate comparative benchmarking report across all evaluated checkpoints
     suite_output_dir = args.output_dir or "outputs"
+    combined_results = list(all_results)
+    multi_json_path = os.path.join(suite_output_dir, "multi_checkpoint_evaluation.json")
+    if os.path.exists(multi_json_path):
+        try:
+            with open(multi_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "experiments" in data:
+                    existing_runs = data["experiments"]
+                    curr_runs = {r.get("run_name") for r in all_results if r.get("run_name")}
+                    for er in existing_runs:
+                        if er.get("run_name") not in curr_runs:
+                            combined_results.append(er)
+        except Exception:
+            pass
+
     multi_report = generate_multi_experiment_report(
-        experiment_results=all_results,
+        experiment_results=combined_results,
         output_dir=suite_output_dir,
         report_name="multi_checkpoint_evaluation",
     )
@@ -741,7 +816,7 @@ def main():
     print(f"\nDetailed Markdown comparison: {os.path.join(suite_output_dir, 'multi_checkpoint_evaluation.md')}")
     print(f"Detailed JSON comparison: {os.path.join(suite_output_dir, 'multi_checkpoint_evaluation.json')}\n")
 
-    return all_results
+    return combined_results
 
 
 def cli_main():

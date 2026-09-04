@@ -173,6 +173,22 @@ def parse_args():
         default=6,
         help="Maximum number of sample images per dataset in visual illustration grid (default: 6).",
     )
+    # Collision checking flags
+    parser.add_argument(
+        "--skip-collision",
+        "--skip_collision",
+        dest="skip_collision",
+        action="store_true",
+        default=True,
+        help="Check for collision against previously evaluated combinations in master report and skip with notification (default: True).",
+    )
+    parser.add_argument(
+        "--no-skip-collision",
+        "--force",
+        dest="skip_collision",
+        action="store_false",
+        help="Disable collision checking and force re-evaluation of all combinations.",
+    )
     return parser.parse_args()
 
 
@@ -612,11 +628,12 @@ def run_cross_evaluation(
     morphology: Optional[str] = None,
     save_illustrations: bool = True,
     max_illustrations: int = 6,
+    skip_collision: bool = True,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
-    Generates neighbor reports for each checkpoint, visual illustrations (heatmaps & prediction grids),
-    and consolidated master report.
+    Handles continuous master report accumulation and skips previously evaluated (checkpoint, config)
+    combinations when skip_collision=True with a notification.
     """
     overrides = list(overrides or [])
     master_output_dir = output_dir or "outputs/cross_evaluation"
@@ -635,11 +652,37 @@ def run_cross_evaluation(
     logger.info(f"🚀 Starting Cross-Evaluation Matrix")
     logger.info(f"   Checkpoints ({len(checkpoint_paths)}): {checkpoint_paths}")
     logger.info(f"   Configurations ({len(config_paths)}): {config_paths}")
-    logger.info(f"   Total Evaluation Runs: {len(checkpoint_paths) * len(config_paths)}")
+    logger.info(f"   Total Target Pairs: {len(checkpoint_paths) * len(config_paths)}")
+    logger.info(f"   Collision Detection / Skip: {skip_collision}")
     if segment:
         logger.info(f"   Segment Mask Refinement Model: {segment}")
     logger.info(f"   Master Output Directory: {master_output_dir}")
     logger.info("=" * 75)
+
+    # 0. Load existing master report for continuous reporting & collision detection
+    existing_cross_results: List[Dict[str, Any]] = []
+    master_json_path = os.path.join(master_output_dir, "master_cross_evaluation_report.json")
+    if os.path.exists(master_json_path):
+        try:
+            with open(master_json_path, "r", encoding="utf-8") as f:
+                saved_master = json.load(f)
+                if isinstance(saved_master, dict) and "cross_results" in saved_master:
+                    existing_cross_results = saved_master["cross_results"]
+                elif isinstance(saved_master, list):
+                    existing_cross_results = saved_master
+                logger.info(f"Loaded {len(existing_cross_results)} existing evaluation entries from master report.")
+        except Exception as e:
+            logger.warning(f"Failed to load existing master cross-evaluation report from '{master_json_path}': {e}")
+
+    # Build collision lookup map
+    existing_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in existing_cross_results:
+        cp_abs = os.path.abspath(r.get("checkpoint_path", ""))
+        kp_abs = os.path.abspath(r.get("config_path", ""))
+        cn = r.get("checkpoint_name", os.path.splitext(os.path.basename(cp_abs))[0])
+        kn = r.get("config_name", os.path.splitext(os.path.basename(kp_abs))[0])
+        existing_map[(cp_abs, kp_abs)] = r
+        existing_map[(cn, kn)] = r
 
     all_cross_results: List[Dict[str, Any]] = []
     checkpoint_to_results: Dict[str, List[Dict[str, Any]]] = {}
@@ -651,6 +694,53 @@ def run_cross_evaluation(
         checkpoint_to_results[ckpt_path] = []
         for cfg_path in config_paths:
             run_idx += 1
+            cp_abs = os.path.abspath(ckpt_path)
+            kp_abs = os.path.abspath(cfg_path)
+            cn = os.path.splitext(os.path.basename(ckpt_path))[0]
+            kn = os.path.splitext(os.path.basename(cfg_path))[0]
+
+            # Check for collision
+            existing_res = None
+            if skip_collision:
+                if (cp_abs, kp_abs) in existing_map:
+                    existing_res = existing_map[(cp_abs, kp_abs)]
+                elif (cn, kn) in existing_map:
+                    existing_res = existing_map[(cn, kn)]
+                else:
+                    # Check neighbor dir for saved per-config report
+                    neighbor_dir = resolve_checkpoint_neighbor_dir(ckpt_path)
+                    neighbor_cfg_json = os.path.join(neighbor_dir, f"eval_{kn}_report.json")
+                    if os.path.exists(neighbor_cfg_json):
+                        try:
+                            with open(neighbor_cfg_json, "r", encoding="utf-8") as f:
+                                rep = json.load(f)
+                                existing_res = {
+                                    "checkpoint_path": ckpt_path,
+                                    "checkpoint_name": cn,
+                                    "config_path": cfg_path,
+                                    "config_name": kn,
+                                    "dataset_name": rep.get("config", {}).get("data", {}).get("dataset_name", kn),
+                                    "eval_split": rep.get("config", {}).get("data", {}).get("val_split", "test"),
+                                    "metrics": rep.get("overall_metrics", {}),
+                                    "ablation_metrics": rep.get("ablation_results", {}),
+                                    "per_label_metrics": rep.get("per_label_metrics", {}),
+                                    "confusion_matrix": rep.get("confusion_matrix", []),
+                                    "eval_config": rep.get("config", {}),
+                                }
+                        except Exception:
+                            pass
+
+            if existing_res is not None:
+                ds_name = existing_res.get("dataset_name", kn)
+                logger.info(
+                    f"\n⚡ [COLLISION DETECTED - SKIPPED] [{run_idx}/{total_runs}] "
+                    f"Combination of Checkpoint '{os.path.basename(ckpt_path)}' and Config '{os.path.basename(cfg_path)}' "
+                    f"(Dataset: '{ds_name}') has already been evaluated. Skipping..."
+                )
+                all_cross_results.append(existing_res)
+                checkpoint_to_results[ckpt_path].append(existing_res)
+                continue
+
             logger.info(f"\n[{run_idx}/{total_runs}] Evaluating Checkpoint '{os.path.basename(ckpt_path)}' with Config '{os.path.basename(cfg_path)}'...")
 
             res = evaluate_checkpoint_on_config(
@@ -834,6 +924,7 @@ def main():
         morphology=args.morphology,
         save_illustrations=args.save_illustrations,
         max_illustrations=args.max_illustrations,
+        skip_collision=args.skip_collision,
     )
     return results
 

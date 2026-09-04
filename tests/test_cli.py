@@ -230,4 +230,54 @@ def test_cli_multi_checkpoint_evaluation(monkeypatch):
         assert os.path.exists(os.path.join(suite_dir, "multi_checkpoint_evaluation.json"))
 
 
+def test_cli_train_and_eval_collision_skipping(monkeypatch):
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(10))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = os.path.join(tmpdir, "train_run")
+
+        train_args = [
+            "sid-train",
+            "--config", "configs/test_smoke.yaml",
+            "--output_dir", output_dir,
+            "--override",
+            "project.device=cpu",
+            "training.epochs=1",
+            "data.num_workers=0",
+            "data.train_samples_per_epoch=2",
+            "data.val_samples=2",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ]
+        monkeypatch.setattr(sys, "argv", train_args)
+        res1 = train_main()
+        assert os.path.exists(os.path.join(output_dir, "checkpoints", "checkpoint_best.pt"))
+
+        # Second train run on same output directory - should trigger collision skipping!
+        monkeypatch.setattr(sys, "argv", train_args)
+        res2 = train_main()
+        assert res2["run_name"] == res1["run_name"]
+        assert res2["best_score"] == res1["best_score"]
+
+        # Evaluate on the checkpoint
+        best_ckpt = os.path.join(output_dir, "checkpoints", "checkpoint_best.pt")
+        eval_args = [
+            "sid-eval",
+            "--checkpoint", best_ckpt,
+            "--split", "test",
+            "--samples", "2",
+            "--override",
+            "data.num_workers=0",
+            "project.device=cpu",
+        ]
+        monkeypatch.setattr(sys, "argv", eval_args)
+        eval_res1 = eval_main()
+
+        # Second evaluation - should trigger collision skipping!
+        monkeypatch.setattr(sys, "argv", eval_args)
+        eval_res2 = eval_main()
+        assert eval_res2["overall_metrics"]["iou"] == eval_res1["overall_metrics"]["iou"]
+
+
+
 

@@ -1,0 +1,66 @@
+# Configuration: EfficientNet-B2 Backbone with UNet Multi-Scale Decoder
+# Scaled CNN backbone providing larger capacity and receptive field for AI mask detection.
+
+project:
+  name: "sid_efficientnet_b2_unet"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/exp_efficientnet_b2_unet"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  image_size: [256, 256]
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  train_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+
+model:
+  name: "efficientnet"
+  backbone: "efficientnet_b2"
+  pretrained: true
+  sacrifice_of_pixel: false
+  in_channels: 3
+  out_channels: 1
+  bilinear: true
+  dropout: 0.15
+  aux_classifier: false
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 15
+  learning_rate: 0.0004
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
+  amp: true
+  auto_batch_size: true
+  save_best: true
+  save_latest: false
+  eval_interval: 1
+  early_stopping_patience: 5
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 25

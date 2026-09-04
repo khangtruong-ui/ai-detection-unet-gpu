@@ -95,7 +95,10 @@ class Trainer:
 
         # 5. Mixed Precision, Gradient Accumulation & Clipping
         self.use_amp = bool(config.training.get("amp", True)) and self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        if hasattr(torch.amp, "GradScaler"):
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        else:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.grad_clip = float(config.training.get("grad_clip_norm", 1.0))
         self.gradient_accumulation_steps = max(1, int(config.training.get("gradient_accumulation_steps", 1)))
         self.auto_batch_size = bool(config.training.get("auto_batch_size", True))

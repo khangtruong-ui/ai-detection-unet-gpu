@@ -206,7 +206,7 @@ class UNet(nn.Module):
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
             saved_cfg = ckpt.get("config", {})
-        elif isinstance(ckpt, dict) and any(k.startswith(("inc.", "downs.", "bottleneck.")) for k in ckpt.keys()):
+        elif isinstance(ckpt, dict) and any(k.startswith(("inc.", "downs.", "bottleneck.", "stage1.", "linear.", "stage5.")) for k in ckpt.keys()):
             state_dict = ckpt
             saved_cfg = {}
         else:
@@ -221,9 +221,13 @@ class UNet(nn.Module):
             saved_cfg_dict = {}
 
         merged = deep_merge(DEFAULT_CONFIG, saved_cfg_dict)
-        if not saved_cfg_dict and isinstance(state_dict, dict):
+        if isinstance(state_dict, dict):
             has_aux = any(k.startswith("classifier_head.") for k in state_dict.keys())
-            merged["model"]["aux_classifier"] = has_aux
+            if not saved_cfg_dict or "aux_classifier" not in saved_cfg_dict.get("model", {}):
+                merged["model"]["aux_classifier"] = has_aux
+            if any(k.startswith(("stage1.", "linear.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "efficientnet"
+                merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
@@ -248,8 +252,8 @@ class UNet(nn.Module):
         return model
 
 
-def build_model(config: Any) -> UNet:
-    """Build UNet model instance from configuration dict."""
+def build_model(config: Any) -> nn.Module:
+    """Build model instance (UNet or EfficientNet) from configuration dict."""
     model_cfg = config.get("model", {}) if hasattr(config, "get") else {}
     training_cfg = config.get("training", {}) if hasattr(config, "get") else {}
     ckpt_flag = bool(
@@ -258,6 +262,28 @@ def build_model(config: Any) -> UNet:
             training_cfg.get("gradient_checkpointing", False) if hasattr(training_cfg, "get") else False,
         )
     )
+
+    model_name = str(model_cfg.get("name", "unet")).lower()
+    backbone = str(model_cfg.get("backbone", "")).lower()
+
+    if "efficientnet" in model_name or "efficientnet" in backbone:
+        from sid_unet.models.efficientnet import EfficientNetSegmentation
+        eff_backbone = backbone if backbone.startswith("efficientnet") else (
+            model_name if model_name.startswith("efficientnet") and model_name != "efficientnet" else "efficientnet_b0"
+        )
+        return EfficientNetSegmentation(
+            backbone=eff_backbone,
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            sacrifice_of_pixel=bool(model_cfg.get("sacrifice_of_pixel", False)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+            bilinear=bool(model_cfg.get("bilinear", True)),
+            gradient_checkpointing=ckpt_flag,
+        )
+
     return UNet(
         in_channels=int(model_cfg.get("in_channels", 3)),
         out_channels=int(model_cfg.get("out_channels", 1)),

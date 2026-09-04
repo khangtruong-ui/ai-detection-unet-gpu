@@ -119,3 +119,76 @@ def test_unet_from_checkpoint_raw_state_dict(tmp_path):
 def test_unet_from_checkpoint_file_not_found():
     with pytest.raises(FileNotFoundError):
         UNet.from_checkpoint("/nonexistent/checkpoint.pt")
+
+
+def test_efficientnet_unet_shapes_and_backward():
+    from sid_unet.models.efficientnet import EfficientNetSegmentation
+    model = EfficientNetSegmentation(
+        backbone="efficientnet_b0",
+        pretrained=False,
+        sacrifice_of_pixel=False,
+        aux_classifier=True,
+        num_classes=3,
+    )
+    x = torch.randn(2, 3, 128, 128, requires_grad=True)
+    mask_logits, cls_logits = model(x)
+
+    assert mask_logits.shape == (2, 1, 128, 128)
+    assert cls_logits.shape == (2, 3)
+
+    loss = mask_logits.sum() + cls_logits.sum()
+    loss.backward()
+    assert x.grad is not None
+
+
+def test_efficientnet_sacrifice_of_pixel():
+    from sid_unet.models.efficientnet import EfficientNetSegmentation
+    model = EfficientNetSegmentation(
+        backbone="efficientnet_b0",
+        pretrained=False,
+        sacrifice_of_pixel=True,
+        aux_classifier=True,
+        num_classes=3,
+    )
+    x = torch.randn(2, 3, 256, 256, requires_grad=True)
+    mask_logits, cls_logits = model(x)
+
+    # Output matches full image resolution
+    assert mask_logits.shape == (2, 1, 256, 256)
+    assert cls_logits.shape == (2, 3)
+
+    # Predict mask returns binary values
+    pred = model.predict_mask(x[:1], threshold=0.5)
+    assert pred.shape == (1, 1, 256, 256)
+    assert set(torch.unique(pred).tolist()).issubset({0.0, 1.0})
+
+    loss = mask_logits.sum() + cls_logits.sum()
+    loss.backward()
+    assert x.grad is not None
+
+
+def test_efficientnet_checkpoint_save_and_load(tmp_path):
+    from sid_unet.models.efficientnet import EfficientNetSegmentation
+    cfg = {
+        "model": {
+            "name": "efficientnet",
+            "backbone": "efficientnet_b0",
+            "pretrained": False,
+            "sacrifice_of_pixel": True,
+            "aux_classifier": False,
+            "in_channels": 3,
+            "out_channels": 1,
+        }
+    }
+    orig_model = build_model(cfg)
+    assert isinstance(orig_model, EfficientNetSegmentation)
+    assert orig_model.sacrifice_of_pixel is True
+
+    ckpt_path = tmp_path / "eff_sac_ckpt.pt"
+    torch.save({"model_state_dict": orig_model.state_dict(), "config": cfg}, str(ckpt_path))
+
+    # Test loading via UNet.from_checkpoint and EfficientNetSegmentation.from_checkpoint
+    loaded_model = UNet.from_checkpoint(str(ckpt_path))
+    assert isinstance(loaded_model, EfficientNetSegmentation)
+    assert loaded_model.sacrifice_of_pixel is True
+

@@ -222,7 +222,10 @@ def find_optimal_batch_size(
     model.train()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+    if hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
 
     c, h, w = sample_shape
     safe_bs = min_batch_size

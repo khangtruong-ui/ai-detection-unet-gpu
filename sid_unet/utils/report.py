@@ -46,6 +46,12 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
     else:
         post_desc = "Disabled"
 
+    if "efficientnet" in str(model_cfg.get("name", "")).lower() or "efficientnet" in str(model_cfg.get("backbone", "")).lower():
+        mode_str = "Sacrifice of Pixel (linear + zoom)" if model_cfg.get("sacrifice_of_pixel", False) else "UNet Multi-Scale Decoder"
+        model_repr = f"EfficientNet ({model_cfg.get('backbone', 'efficientnet_b0')}, mode={mode_str})"
+    else:
+        model_repr = f"{model_cfg.get('name', 'unet')} (features={model_cfg.get('features')}, bilinear={model_cfg.get('bilinear', True)})"
+
     return {
         "Project Name": project_cfg.get("name", "N/A"),
         "Dataset": data_cfg.get("dataset_name", "N/A"),
@@ -54,7 +60,7 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
         "Image Size": str(data_cfg.get("image_size", [256, 256])),
         "Batch Size": data_cfg.get("batch_size", 16),
         "Epoch Limit / Steps": steps_repr,
-        "Model": f"{model_cfg.get('name', 'unet')} (features={model_cfg.get('features')}, bilinear={model_cfg.get('bilinear', True)})",
+        "Model": model_repr,
         "Aux Classifier": f"{model_cfg.get('aux_classifier', True)} (classes={model_cfg.get('num_classes', 3)})",
         "Mask Loss": loss_desc,
         "Aux Loss": f"{loss_cfg.get('aux_loss_type', 'cross_entropy')} (wt={loss_cfg.get('aux_weight', 0.2)})",
@@ -291,6 +297,7 @@ def generate_evaluation_report(
 
     return {
         "report_dict": report_dict,
+        "overall_metrics": overall_metrics,
         "markdown": markdown_content,
     }
 

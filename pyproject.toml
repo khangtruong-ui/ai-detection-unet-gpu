@@ -35,6 +35,7 @@ sid-train = "sid_unet.train:cli_main"
 sid-eval = "sid_unet.evaluate:cli_main"
 sid-cross-eval = "sid_unet.cross_eval:cli_main"
 sid-predict = "sid_unet.predict:cli_main"
+sid-illu = "sid_unet.illustration:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["."]

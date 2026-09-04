@@ -92,3 +92,72 @@ def test_plot_cross_eval_heatmaps(tmp_path):
     for p in saved:
         assert os.path.exists(p)
         assert os.path.getsize(p) > 0
+
+
+def test_sid_illu_pipeline(tmp_path, monkeypatch):
+    from sid_unet.illustration import run_illustration, expand_patterns
+    from sid_unet.models.unet import build_model
+    from sid_unet.utils.config import save_config, load_config
+
+    # Create two dummy checkpoints (UNet and EfficientNet)
+    cfg1 = {"model": {"name": "unet", "features": [8, 16], "aux_classifier": False, "in_channels": 3, "out_channels": 1}}
+    m1 = build_model(cfg1)
+    ckpt1 = tmp_path / "ckpt1.pt"
+    torch.save({"model_state_dict": m1.state_dict(), "config": cfg1}, str(ckpt1))
+
+    cfg2 = {"model": {"name": "efficientnet", "backbone": "efficientnet_b0", "pretrained": False, "sacrifice_of_pixel": True, "aux_classifier": False, "in_channels": 3, "out_channels": 1}}
+    m2 = build_model(cfg2)
+    ckpt2 = tmp_path / "ckpt2.pt"
+    torch.save({"model_state_dict": m2.state_dict(), "config": cfg2}, str(ckpt2))
+
+    # Create dummy dataset config
+    smoke_cfg = load_config("configs/test_smoke.yaml").to_dict()
+    dataset_cfg_path = tmp_path / "test_data.yaml"
+    smoke_cfg["data"]["batch_size"] = 2
+    save_config(smoke_cfg, str(dataset_cfg_path))
+
+    # Mock create_eval_dataloader to return synthetic batches without network
+    from torch.utils.data import DataLoader, TensorDataset
+    images = torch.randn(4, 3, 64, 64)
+    masks = torch.zeros(4, 1, 64, 64)
+    masks[0, 0, 10:20, 10:20] = 1.0
+
+    class DummyLoader:
+        def __iter__(self):
+            yield {
+                "image": images[:2],
+                "mask": masks[:2],
+                "label": torch.tensor([0, 2]),
+                "image_id": ["sample_0", "sample_1"],
+            }
+            yield {
+                "image": images[2:],
+                "mask": masks[2:],
+                "label": torch.tensor([1, 0]),
+                "image_id": ["sample_2", "sample_3"],
+            }
+
+    import sid_unet.illustration
+    monkeypatch.setattr(sid_unet.illustration, "create_eval_dataloader", lambda config, split, samples_override: (DummyLoader(), "test"))
+
+    illu_out = str(tmp_path / "illu_outputs")
+    results = run_illustration(
+        model_ckpts=[str(ckpt1), str(ckpt2)],
+        dataset_configs=[str(dataset_cfg_path)],
+        num_samples=2,
+        output_dir=illu_out,
+        threshold=0.5,
+    )
+
+    assert os.path.exists(results["report_path"])
+    with open(results["report_path"], "r") as f:
+        content = f.read()
+        assert "SID-Illu" in content
+        assert "ckpt1" in content
+        assert "ckpt2" in content
+
+    for cfg_k, d_res in results["dataset_results"].items():
+        assert os.path.exists(d_res["figure_path"])
+        assert os.path.getsize(d_res["figure_path"]) > 0
+        assert len(d_res["samples"]) == 2
+

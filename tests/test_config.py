@@ -57,14 +57,14 @@ def test_all_experiment_configs_validity():
     from sid_unet.models.unet import build_model
     from sid_unet.losses.auxiliary import build_loss
 
-    exp_configs = glob.glob("configs/experiments/*.yaml")
-    assert len(exp_configs) >= 8, f"Expected at least 8 experiment configs, found {len(exp_configs)}"
+    exp_configs = glob.glob("configs/experiments/**/*.yaml", recursive=True)
+    assert len(exp_configs) >= 12, f"Expected at least 12 experiment configs, found {len(exp_configs)}"
 
     for cfg_file in exp_configs:
         cfg = load_config(cfg_file)
         assert cfg.data.dataset_name == "KhangTruong/IMD2020"
         assert cfg.data.streaming is False
-        assert cfg.data.batch_size == 16
+        assert cfg.data.batch_size in [16, 32]
         # Ensure sample budgets are -1 for running all dataset
         assert cfg.data.train_samples_per_epoch == -1
         assert cfg.data.val_samples == -1

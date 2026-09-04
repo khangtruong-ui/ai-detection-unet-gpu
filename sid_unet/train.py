@@ -106,6 +106,22 @@ def parse_args():
         default=None,
         help="Path to checkpoint .pt file to resume training from",
     )
+    # Collision checking flags
+    parser.add_argument(
+        "--skip-collision",
+        "--skip_collision",
+        dest="skip_collision",
+        action="store_true",
+        default=True,
+        help="Check for collision against previously trained/evaluated models and skip with notification (default: True).",
+    )
+    parser.add_argument(
+        "--no-skip-collision",
+        "--force",
+        dest="skip_collision",
+        action="store_false",
+        help="Disable collision checking and force retraining/evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -116,6 +132,7 @@ def train_single_run(
     run_idx: int = 1,
     total_runs: int = 1,
     base_output_dir: Optional[str] = None,
+    skip_collision: bool = True,
 ) -> Dict[str, Any]:
     """Execute a single training experiment with its given config."""
     config = load_config(config_path, overrides=overrides or [])
@@ -153,6 +170,53 @@ def train_single_run(
     logger.info(f"[{run_idx}/{total_runs}] Loaded configuration from '{config_path}' (Run: {run_name})")
     logger.info(f"Effective configuration saved to '{config_save_path}'")
     logger.info(f"Dataset: {config.data.dataset_name} | Streaming: {config.data.streaming}")
+
+    # Check for existing checkpoint (continue from checkpoint as default behaviour)
+    ckpt_dir = os.path.join(output_dir, "checkpoints")
+    latest_ckpt = os.path.join(ckpt_dir, "checkpoint_latest.pt")
+    best_ckpt = os.path.join(ckpt_dir, "checkpoint_best.pt")
+
+    if resume is None:
+        if os.path.exists(latest_ckpt):
+            resume = latest_ckpt
+            logger.info(f"Found existing latest checkpoint '{resume}' - continuing from checkpoint by default.")
+        elif os.path.exists(best_ckpt):
+            resume = best_ckpt
+            logger.info(f"Found existing best checkpoint '{resume}' - continuing from checkpoint by default.")
+
+    # Collision check: has this combination already been trained and evaluated?
+    eval_rep_json = os.path.join(output_dir, "eval_reports", "evaluation_report.json")
+    if not os.path.exists(eval_rep_json):
+        eval_rep_json = os.path.join(output_dir, "evaluation_report.json")
+
+    if skip_collision and os.path.exists(eval_rep_json) and (resume or os.path.exists(best_ckpt) or os.path.exists(latest_ckpt)):
+        try:
+            with open(eval_rep_json, "r", encoding="utf-8") as f:
+                import json
+                saved_eval = json.load(f)
+                saved_cfg = saved_eval.get("config", {})
+                m_name = saved_cfg.get("model", {}).get("name", config.model.name)
+                d_name = saved_cfg.get("data", {}).get("dataset_name", config.data.dataset_name)
+                om = saved_eval.get("overall_metrics", {})
+                score = om.get("val_iou", om.get("iou", 0.0))
+                logger.info(
+                    f"\n⚡ [COLLISION DETECTED - SKIPPED] Model config '{m_name}' and dataset config '{d_name}' "
+                    f"in '{output_dir}' has already been evaluated. Skipping run..."
+                )
+                return {
+                    "config_path": config_path,
+                    "run_name": run_name,
+                    "best_score": score,
+                    "best_epoch": saved_eval.get("best_epoch", -1),
+                    "best_checkpoint_path": best_ckpt if os.path.exists(best_ckpt) else (resume or ""),
+                    "report_path": eval_rep_json.replace(".json", ".md"),
+                    "history": saved_eval.get("history", []),
+                    "overall_metrics": om,
+                    "final_metrics": om,
+                    "output_dir": output_dir,
+                }
+        except Exception as e:
+            logger.warning(f"Could not read previous evaluation report '{eval_rep_json}': {e}")
 
     # Build DataLoaders
     logger.info("Initializing DataLoaders...")
@@ -216,6 +280,7 @@ def main():
             run_idx=1,
             total_runs=1,
             base_output_dir=args.output_dir,
+            skip_collision=args.skip_collision,
         )
         return results
 
@@ -232,6 +297,7 @@ def main():
     print("\n" + "=" * 70)
     print(f"🚀 Launching Multi-Experiment Suite ({len(config_paths)} experiments)")
     print(f"📁 Suite Output Directory: {parent_output_dir}")
+    print(f"⚡ Collision Detection / Skip: {args.skip_collision}")
     print("=" * 70 + "\n")
 
     all_results: List[Dict[str, Any]] = []
@@ -246,6 +312,7 @@ def main():
             run_idx=i,
             total_runs=len(config_paths),
             base_output_dir=parent_output_dir,
+            skip_collision=args.skip_collision,
         )
         all_results.append(res)
 
@@ -264,9 +331,25 @@ def main():
             output_path=multi_curves_path,
         )
 
-    # Generate and display multi-experiment comparison report
+    # Generate and display continuous multi-experiment comparison report
+    combined_results = list(all_results)
+    multi_json_path = os.path.join(parent_output_dir, "multi_experiment_comparison.json")
+    if os.path.exists(multi_json_path):
+        try:
+            with open(multi_json_path, "r", encoding="utf-8") as f:
+                import json
+                data = json.load(f)
+                if isinstance(data, dict) and "experiments" in data:
+                    existing_runs = data["experiments"]
+                    curr_runs = {r.get("run_name") for r in all_results if r.get("run_name")}
+                    for er in existing_runs:
+                        if er.get("run_name") not in curr_runs:
+                            combined_results.append(er)
+        except Exception:
+            pass
+
     multi_report = generate_multi_experiment_report(
-        experiment_results=all_results,
+        experiment_results=combined_results,
         output_dir=parent_output_dir,
         report_name="multi_experiment_comparison",
         multi_curves_path=multi_curves_path,
