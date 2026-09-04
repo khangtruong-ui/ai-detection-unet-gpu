@@ -80,9 +80,9 @@ The framework supports multiple dataset formats:
 - **`image`**: RGB image ($1024 \times 1024$ or variable resolutions).
 - **`label`**: Integer class indicator ($0, 1, 2$).
 - **`mask`**: Segmentation mask for tampered/inpainted regions:
-  - When $\text{label} = 0$, target mask is **all zeros** ($\mathbf{0}$).
-  - When $\text{label} = 1$, target mask is **all ones** ($\mathbf{1}$).
-  - When $\text{label} = 2$, target mask is thresholded to binary $\{0.0, 1.0\}$.
+  - When $\mathrm{label} = 0$, target mask is **all zeros** ($\mathbf{0}$).
+  - When $\mathrm{label} = 1$, target mask is **all ones** ($\mathbf{1}$).
+  - When $\mathrm{label} = 2$, target mask is thresholded to binary $\{0.0, 1.0\}$.
 
 ---
 
@@ -257,22 +257,22 @@ $$
 - **OutConv Layer**: A final $1 \times 1$ convolution projects the decoded representation to a 1-channel logit map:
 
 $$
-z = \operatorname{OutConv}(f_{\text{dec}}) \in \mathbb{R}^{1 \times H \times W}, \qquad \hat{p} = \sigma(z) = \frac{1}{1 + e^{-z}}
+z = \mathrm{OutConv}(f_{\mathrm{dec}}) \in \mathbb{R}^{1 \times H \times W}, \qquad \hat{p} = \sigma(z) = \frac{1}{1 + e^{-z}}
 $$
 
 - **Sacrifice of Pixel Formulation**:
   When `sacrifice_of_pixel: true` is configured:
 
 $$
-f_{\text{bot}} = \operatorname{Backbone}(x) \in \mathbb{R}^{C_{\text{bot}} \times H_{\text{bot}} \times W_{\text{bot}}}
+f_{\mathrm{bot}} = \mathrm{Backbone}(x) \in \mathbb{R}^{C_{\mathrm{bot}} \times H_{\mathrm{bot}} \times W_{\mathrm{bot}}}
 $$
 
 $$
-z_{\text{low}} = \operatorname{Linear}(f_{\text{bot}}) \in \mathbb{R}^{1 \times H_{\text{bot}} \times W_{\text{bot}}}
+z_{\mathrm{low}} = \mathrm{Linear}(f_{\mathrm{bot}}) \in \mathbb{R}^{1 \times H_{\mathrm{bot}} \times W_{\mathrm{bot}}}
 $$
 
 $$
-\hat{M}_{\text{sac}} = \operatorname{Interpolate}\bigl(z_{\text{low}}, \text{size}=(H, W), \text{mode}=\text{bilinear}\bigr)
+\hat{M}_{\mathrm{sac}} = \mathrm{Interpolate}\bigl(z_{\mathrm{low}}, \mathrm{size}=(H, W), \mathrm{mode}=\mathrm{bilinear}\bigr)
 $$
 
 ---
@@ -280,17 +280,17 @@ $$
 ### 3. Auxiliary Classifier & Multi-Task Semantic Regularization
 
 Stand-alone pixel segmentation can overfit to local textures without understanding scene composition. To enforce semantic grounding:
-- **Global Context Extraction**: At the bottleneck ($C_{\text{bot}}$ channels), an `AdaptiveAvgPool2d((1, 1))` operation collapses spatial dimensions to produce a compact 1D latent vector $v \in \mathbb{R}^{C_{\text{bot}}}$.
+- **Global Context Extraction**: At the bottleneck ($C_{\mathrm{bot}}$ channels), an `AdaptiveAvgPool2d((1, 1))` operation collapses spatial dimensions to produce a compact 1D latent vector $v \in \mathbb{R}^{C_{\mathrm{bot}}}$.
 - **Multi-Layer Perceptron (MLP)**: The latent vector is routed through an auxiliary classifier head:
 
 $$
-v \xrightarrow{\operatorname{Linear}(C_{\text{bot}}, 128)} h_1 \xrightarrow{\operatorname{ReLU}} h_2 \xrightarrow{\operatorname{Dropout}(p=0.2)} h_3 \xrightarrow{\operatorname{Linear}(128, 3)} \hat{y}_{\text{cls}} \in \mathbb{R}^3
+v \xrightarrow{\mathrm{Linear}(C_{\mathrm{bot}}, 128)} h_1 \xrightarrow{\mathrm{ReLU}} h_2 \xrightarrow{\mathrm{Dropout}(p=0.2)} h_3 \xrightarrow{\mathrm{Linear}(128, 3)} \hat{y}_{\mathrm{cls}} \in \mathbb{R}^3
 $$
 
 - **Joint Multi-Task Optimization**:
 
 $$
-\mathcal{L}_{\text{Total}} = \mathcal{L}_{\text{Mask}}(\hat{M}, M_{\text{gt}}) + \lambda_{\text{aux}} \, \mathcal{L}_{\text{CE}}(\hat{y}_{\text{cls}}, y_{\text{cls}})
+\mathcal{L}_{\mathrm{Total}} = \mathcal{L}_{\mathrm{Mask}}(\hat{M}, M_{\mathrm{gt}}) + \lambda_{\mathrm{aux}} \, \mathcal{L}_{\mathrm{CE}}(\hat{y}_{\mathrm{cls}}, y_{\mathrm{cls}})
 $$
 
 ---
@@ -306,10 +306,10 @@ To train on massive multi-gigabyte or terabyte forensic datasets without saturat
 - **Dynamic 2-Column Inferencing**: In 2-column image/mask datasets where explicit labels are omitted:
 
 $$
-\operatorname{Ratio} = \frac{1}{H \times W} \sum_{i=1}^H \sum_{j=1}^W M_{i,j}, \qquad \text{Label} = \begin{cases} 
-0 & \text{if } \operatorname{Ratio} = 0.0 \quad (\text{Real}) \\ 
-1 & \text{if } \operatorname{Ratio} = 1.0 \quad (\text{Fully Synthetic}) \\ 
-2 & \text{if } 0.0 < \operatorname{Ratio} < 1.0 \quad (\text{Tampered}) 
+\mathrm{Ratio} = \frac{1}{H \times W} \sum_{i=1}^H \sum_{j=1}^W M_{i,j}, \qquad \mathrm{Label} = \begin{cases} 
+0 & \text{if } \mathrm{Ratio} = 0.0 \quad (\text{Real}) \\ 
+1 & \text{if } \mathrm{Ratio} = 1.0 \quad (\text{Fully Synthetic}) \\ 
+2 & \text{if } 0.0 < \mathrm{Ratio} < 1.0 \quad (\text{Tampered}) 
 \end{cases}
 $$
 
@@ -322,14 +322,14 @@ Raw model probability maps can suffer from isolated false positive speckles or s
    Computes the pixel area of every disjoint connected component $C_k$:
 
 $$
-\operatorname{Area}(C_k) = \sum_{(i,j) \in C_k} 1
+\mathrm{Area}(C_k) = \sum_{(i,j) \in C_k} 1
 $$
 
-   Any component with $\operatorname{Area}(C_k) < \text{min\_area}$ (default: $64$ pixels) is suppressed to background ($0$).
+   Any component with $\mathrm{Area}(C_k) < 64$ pixels (parameter `min_area`) is suppressed to background ($0$).
 2. **Topological Hole Filling (`fill_mask_holes`)**:
-   Background cavities enclosed by positive foreground components with $\text{size} \le \text{max\_hole\_size}$ (default: $256$ pixels) are filled with $1$s.
+   Background cavities enclosed by positive foreground components with area $\le 256$ pixels (parameter `max_hole_size`) are filled with $1$s.
 3. **Mathematical Morphological Smoothing (`apply_morphology`)**:
-   Applies morphological opening ($\text{Erode} \circ \text{Dilate}$) followed by closing ($\text{Dilate} \circ \text{Erode}$) for boundary regularization.
+   Applies morphological opening ($\mathrm{Erode} \circ \mathrm{Dilate}$) followed by closing ($\mathrm{Dilate} \circ \mathrm{Erode}$) for boundary regularization.
 
 ---
 
@@ -341,7 +341,7 @@ The hybrid integration (`sid_unet.models.sam3_refiner.SAMRefiner`) executes a **
 3. A segment is joined into the output tampering mask if its intersection exceeds the overlap threshold:
 
 $$
-\operatorname{IoU}\bigl(S_{\text{SAM}}^k, M_{\text{Model}}\bigr) \ge \tau_{\text{join}}
+\mathrm{IoU}\bigl(S_{\mathrm{SAM}}^k, M_{\mathrm{Model}}\bigr) \ge \tau_{\mathrm{join}}
 $$
 
 ---
@@ -581,25 +581,25 @@ sid-predict \
 - **Binary Cross-Entropy Loss with Logits**:
 
 $$
-\mathcal{L}_{\text{BCE}}(x, y) = - \frac{1}{N} \sum_{i=1}^N \Bigl[ y_i \log \sigma(x_i) + (1 - y_i) \log \bigl(1 - \sigma(x_i)\bigr) \Bigr]
+\mathcal{L}_{\mathrm{BCE}}(x, y) = - \frac{1}{N} \sum_{i=1}^N \Bigl[ y_i \log \sigma(x_i) + (1 - y_i) \log \bigl(1 - \sigma(x_i)\bigr) \Bigr]
 $$
 
 - **Soft Dice Loss**:
 
 $$
-\mathcal{L}_{\text{Dice}}(p, y) = 1 - \frac{2 \sum_{i=1}^N p_i y_i + \epsilon}{\sum_{i=1}^N p_i + \sum_{i=1}^N y_i + \epsilon}
+\mathcal{L}_{\mathrm{Dice}}(p, y) = 1 - \frac{2 \sum_{i=1}^N p_i y_i + \epsilon}{\sum_{i=1}^N p_i + \sum_{i=1}^N y_i + \epsilon}
 $$
 
 - **Binary Focal Loss**:
 
 $$
-\mathcal{L}_{\text{Focal}}(p_t) = - \alpha_t (1 - p_t)^\gamma \log(p_t)
+\mathcal{L}_{\mathrm{Focal}}(p_t) = - \alpha_t (1 - p_t)^\gamma \log(p_t)
 $$
 
 - **Total Multi-Task Loss**:
 
 $$
-\mathcal{L}_{\text{Total}} = \alpha \, \mathcal{L}_{\text{BCE}} + \beta \, \mathcal{L}_{\text{Dice}} + \lambda_{\text{aux}} \, \mathcal{L}_{\text{CE}}(\hat{y}_{\text{cls}}, y_{\text{cls}})
+\mathcal{L}_{\mathrm{Total}} = \alpha \, \mathcal{L}_{\mathrm{BCE}} + \beta \, \mathcal{L}_{\mathrm{Dice}} + \lambda_{\mathrm{aux}} \, \mathcal{L}_{\mathrm{CE}}(\hat{y}_{\mathrm{cls}}, y_{\mathrm{cls}})
 $$
 
 ---
@@ -609,26 +609,26 @@ $$
 - **Intersection over Union (Mean IoU / Jaccard Index)**:
 
 $$
-\operatorname{IoU}(P, T) = \frac{|P \cap T|}{|P \cup T|} = \frac{\text{TP}}{\text{TP} + \text{FP} + \text{FN}}
+\mathrm{IoU}(P, T) = \frac{|P \cap T|}{|P \cup T|} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FP} + \mathrm{FN}}
 $$
 
 - **Dice Coefficient / Pixel F1-Score**:
 
 $$
-\operatorname{Dice}(P, T) = \frac{2 |P \cap T|}{|P| + |T|} = \frac{2\,\text{TP}}{2\,\text{TP} + \text{FP} + \text{FN}}
+\mathrm{Dice}(P, T) = \frac{2 |P \cap T|}{|P| + |T|} = \frac{2\,\mathrm{TP}}{2\,\mathrm{TP} + \mathrm{FP} + \mathrm{FN}}
 $$
 
 - **Area Under ROC Curve (Pixel AUROC)**: Continuous probability ranking metric across all pixels.
 - **Pixel Accuracy**:
 
 $$
-\operatorname{Acc} = \frac{\text{TP} + \text{TN}}{\text{TP} + \text{TN} + \text{FP} + \text{FN}}
+\mathrm{Acc} = \frac{\mathrm{TP} + \mathrm{TN}}{\mathrm{TP} + \mathrm{TN} + \mathrm{FP} + \mathrm{FN}}
 $$
 
 - **Precision, Recall, and Specificity**:
 
 $$
-\operatorname{Precision} = \frac{\text{TP}}{\text{TP} + \text{FP}}, \qquad \operatorname{Recall} = \frac{\text{TP}}{\text{TP} + \text{FN}}, \qquad \operatorname{Specificity} = \frac{\text{TN}}{\text{TN} + \text{FP}}
+\mathrm{Precision} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FP}}, \qquad \mathrm{Recall} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FN}}, \qquad \mathrm{Specificity} = \frac{\mathrm{TN}}{\mathrm{TN} + \mathrm{FP}}
 $$
 
 ---
