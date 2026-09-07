@@ -222,15 +222,20 @@ class SIDStreamingDataset(IterableDataset):
         hf_ds, resolved = load_hf_dataset_robust(self.dataset_name, requested_split=self.split, streaming=True)
         self.resolved_split = resolved
 
+        # Light shard-level shuffle on the remote stream (keep raw sample buffer tiny <= 8 to avoid OOM on 4K images)
         if self.shuffle_buffer_size > 0 and resolved.lower() in ("train", "training"):
-            hf_ds = hf_ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
+            if hasattr(hf_ds, "shuffle"):
+                hf_ds = hf_ds.shuffle(seed=self.seed, buffer_size=min(self.shuffle_buffer_size, 8))
 
         worker_info = get_worker_info()
         if worker_info is not None and worker_info.num_workers > 1:
-            # Multi-worker splitting for iterable dataset
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
-            stream_iter = itertools.islice(hf_ds, worker_id, None, num_workers)
+            if hasattr(hf_ds, "n_shards") and hf_ds.n_shards >= num_workers:
+                stream_iter = iter(hf_ds.shard(num_shards=num_workers, index=worker_id))
+            else:
+                stream_iter = itertools.islice(hf_ds, worker_id, None, num_workers)
+
             if self.max_samples is not None and self.max_samples > 0:
                 worker_max = (self.max_samples - 1 - worker_id) // num_workers + 1 if self.max_samples > worker_id else 0
                 stream_iter = itertools.islice(stream_iter, worker_max)
@@ -242,11 +247,18 @@ class SIDStreamingDataset(IterableDataset):
         return stream_iter
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
+        import random
         stream = self._get_stream()
+        # Maintain a lightweight reservoir/shuffle buffer on processed (resized) samples
+        # A processed 256x256 tensor is ~1 MB, compared to ~50 MB for raw 4000x3000 images!
+        target_buf_size = min(max(0, self.shuffle_buffer_size), 256) if self.resolved_split.lower() in ("train", "training") else 0
+        buf: List[Dict[str, Any]] = []
+        rng = random.Random(self.seed)
+
         try:
             for raw_sample in stream:
                 try:
-                    yield process_raw_sample(
+                    processed = process_raw_sample(
                         raw_sample,
                         transform=self.transform,
                         target_image_size=self.target_image_size,
@@ -254,7 +266,21 @@ class SIDStreamingDataset(IterableDataset):
                 except Exception:
                     # Silently skip corrupted samples in stream
                     continue
+
+                if target_buf_size > 1:
+                    buf.append(processed)
+                    if len(buf) >= target_buf_size:
+                        idx = rng.randint(0, len(buf) - 1)
+                        yield buf.pop(idx)
+                else:
+                    yield processed
+
+            if buf:
+                rng.shuffle(buf)
+                for item in buf:
+                    yield item
         finally:
+            buf.clear()
             if hasattr(stream, "close") and callable(getattr(stream, "close", None)):
                 try:
                     stream.close()
@@ -358,9 +384,8 @@ def create_eval_dataloader(
         return DataLoader(
             eval_dataset,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=pin_memory,
-            multiprocessing_context=mp_context,
         )
     else:
         eval_dataset = SIDMapDataset(
@@ -462,16 +487,14 @@ def create_dataloaders(
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=pin_memory,
-            multiprocessing_context=mp_context,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=pin_memory,
-            multiprocessing_context=mp_context,
         )
     else:
         train_dataset = SIDMapDataset(
