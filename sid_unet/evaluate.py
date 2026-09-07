@@ -30,7 +30,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from sid_unet.dataset.loader import create_eval_dataloader
+from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
@@ -477,7 +477,8 @@ def evaluate_single_checkpoint(
     collected_samples: List[Dict[str, Any]] = [] if save_illustrations else None
 
     clear_memory_cache(device)
-    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", leave=True)
+    eval_total = safe_dataloader_len(eval_loader)
+    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True)
     with torch.no_grad():
         for batch in pbar:
             b_sz = len(batch["image"])

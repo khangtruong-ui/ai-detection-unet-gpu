@@ -9,6 +9,7 @@ from sid_unet.dataset.loader import (
     get_split_candidates,
     load_hf_dataset_robust,
     process_raw_sample,
+    safe_dataloader_len,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "get_split_candidates",
     "load_hf_dataset_robust",
     "process_raw_sample",
+    "safe_dataloader_len",
 ]

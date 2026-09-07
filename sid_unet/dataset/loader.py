@@ -112,6 +112,19 @@ def resolve_sample_limit(
     return default_samples
 
 
+def safe_dataloader_len(loader: Optional[DataLoader]) -> Optional[int]:
+    """
+    Safely return DataLoader length, or None if dataset has no length (e.g. IterableDataset).
+    Avoids TypeError when DataLoader wraps an IterableDataset without __len__.
+    """
+    if loader is None:
+        return None
+    try:
+        return len(loader)
+    except (TypeError, NotImplementedError):
+        return None
+
+
 def get_split_candidates(requested_split: str) -> List[str]:
     """
     Return priority list of split name candidates for a requested split.
@@ -199,6 +212,11 @@ class SIDStreamingDataset(IterableDataset):
         self.seed = seed
         self.target_image_size = target_image_size
 
+    def __len__(self) -> int:
+        if self.max_samples is not None and self.max_samples > 0:
+            return self.max_samples
+        raise TypeError(f"'{type(self).__name__}' object has no len() when max_samples is None")
+
     def _get_stream(self) -> Iterator[Dict[str, Any]]:
         # Load streamed dataset with robust fallback
         hf_ds, resolved = load_hf_dataset_robust(self.dataset_name, requested_split=self.split, streaming=True)
@@ -213,11 +231,13 @@ class SIDStreamingDataset(IterableDataset):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
             stream_iter = itertools.islice(hf_ds, worker_id, None, num_workers)
+            if self.max_samples is not None and self.max_samples > 0:
+                worker_max = (self.max_samples - 1 - worker_id) // num_workers + 1 if self.max_samples > worker_id else 0
+                stream_iter = itertools.islice(stream_iter, worker_max)
         else:
             stream_iter = iter(hf_ds)
-
-        if self.max_samples is not None and self.max_samples > 0:
-            stream_iter = itertools.islice(stream_iter, self.max_samples)
+            if self.max_samples is not None and self.max_samples > 0:
+                stream_iter = itertools.islice(stream_iter, self.max_samples)
 
         return stream_iter
 

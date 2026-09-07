@@ -213,3 +213,37 @@ def test_create_eval_and_test_dataloaders(monkeypatch):
     assert isinstance(test_l, DataLoader)
 
 
+def test_safe_dataloader_len_and_streaming_len():
+    from sid_unet.dataset.loader import safe_dataloader_len, SIDStreamingDataset
+    from torch.utils.data import IterableDataset
+
+    class LenlessIterable(IterableDataset):
+        def __iter__(self):
+            yield {"image": torch.zeros(3, 16, 16), "mask": torch.zeros(1, 16, 16), "label": torch.tensor(0)}
+
+    class SizedIterable(IterableDataset):
+        def __len__(self):
+            return 10
+        def __iter__(self):
+            for _ in range(10):
+                yield {"image": torch.zeros(3, 16, 16), "mask": torch.zeros(1, 16, 16), "label": torch.tensor(0)}
+
+    dl_lenless = DataLoader(LenlessIterable(), batch_size=2)
+    assert hasattr(dl_lenless, "__len__")
+    assert safe_dataloader_len(dl_lenless) is None
+
+    dl_sized = DataLoader(SizedIterable(), batch_size=2)
+    assert safe_dataloader_len(dl_sized) == 5
+
+    assert safe_dataloader_len(None) is None
+
+    # Test SIDStreamingDataset __len__
+    ds_with_max = SIDStreamingDataset(max_samples=50)
+    assert len(ds_with_max) == 50
+
+    ds_without_max = SIDStreamingDataset(max_samples=None)
+    with pytest.raises(TypeError):
+        _ = len(ds_without_max)
+
+
+

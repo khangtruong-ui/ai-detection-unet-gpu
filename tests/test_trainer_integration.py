@@ -111,3 +111,55 @@ def test_trainer_with_test_loader():
         assert os.path.exists(os.path.join(tmpdir, "reports", "test_evaluation_report.md"))
         assert os.path.exists(os.path.join(tmpdir, "reports", "test_evaluation_report.json"))
 
+
+class SyntheticIterableDataset(torch.utils.data.IterableDataset):
+    def __init__(self, size=5, img_size=(64, 64)):
+        self.size = size
+        self.img_size = img_size
+
+    def __iter__(self):
+        for idx in range(self.size):
+            lbl = idx % 3
+            img = torch.randn(3, *self.img_size)
+            mask = torch.zeros(1, *self.img_size)
+            yield {
+                "image": img,
+                "mask": mask,
+                "label": torch.tensor(lbl, dtype=torch.long),
+                "img_id": f"syn_{idx}",
+            }
+
+
+def test_trainer_with_iterable_dataset_no_len():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "training.gradient_accumulation_steps=2",
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "logging.save_sample_images=false",
+            "training.amp=false",
+        ])
+
+        train_ds = SyntheticIterableDataset(size=5, img_size=(64, 64))
+        val_ds = SyntheticIterableDataset(size=2, img_size=(64, 64))
+
+        train_loader = DataLoader(train_ds, batch_size=2)
+        val_loader = DataLoader(val_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        results = trainer.train()
+        assert "best_score" in results
+        assert "final_metrics" in results
+        assert "val_total_loss" in results["final_metrics"]
+
+

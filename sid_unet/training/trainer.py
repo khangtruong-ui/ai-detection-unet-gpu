@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from sid_unet.dataset.loader import safe_dataloader_len
 from sid_unet.losses.auxiliary import SIDTotalLoss, build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
@@ -209,7 +210,13 @@ class Trainer:
         """Run one training epoch with gradient accumulation and Out-Of-Memory (OOM) recovery."""
         self.model.train()
         metric_logger = MetricLogger()
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.epochs} [Train]", leave=False)
+        total_batches = safe_dataloader_len(self.train_loader)
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch}/{self.epochs} [Train]",
+            total=total_batches,
+            leave=False,
+        )
 
         if self.empty_cache_per_epoch:
             clear_memory_cache(self.device)
@@ -217,7 +224,6 @@ class Trainer:
         self.optimizer.zero_grad()
         accum_steps = self.gradient_accumulation_steps
         step_in_epoch = 0
-        total_batches = len(self.train_loader) if hasattr(self.train_loader, "__len__") else None
 
         try:
             for batch in pbar:
@@ -289,6 +295,15 @@ class Trainer:
                     vram_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
                     postfix_dict["vram"] = f"{vram_mb:.0f}MB"
                 pbar.set_postfix(postfix_dict)
+
+            # Flush pending accumulated gradients if last step did not land on accumulation boundary
+            if step_in_epoch > 0 and step_in_epoch % accum_steps != 0:
+                if self.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
         finally:
             pbar.close()
             del pbar
@@ -348,7 +363,8 @@ class Trainer:
         metric_logger = MetricLogger()
 
         desc_str = f"Epoch {epoch}/{self.epochs} [{split_name.title()}]" if epoch is not None else f"Evaluating [{split_name.title()}]"
-        pbar = tqdm(target_loader, desc=desc_str, leave=False)
+        val_total = safe_dataloader_len(target_loader)
+        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False)
 
         try:
             for batch in pbar:
