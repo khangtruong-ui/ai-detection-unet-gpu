@@ -71,7 +71,13 @@ class Trainer:
         )
 
         # 3. Model, Loss, DataLoaders
-        self.model = (model or build_model(config)).to(self.device)
+        loaded_model = model or build_model(config)
+        is_quantized = getattr(loaded_model, "load_in_4bit", False) or getattr(loaded_model, "load_in_8bit", False)
+        if not is_quantized:
+            self.model = loaded_model.to(self.device)
+        else:
+            self.model = loaded_model
+
         self.loss_fn = (loss_fn or build_loss(config)).to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -82,12 +88,16 @@ class Trainer:
         self.weight_decay = float(config.training.get("weight_decay", 1e-4))
         self.opt_name = config.training.get("optimizer", "adamw").lower()
 
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            trainable_params = list(self.model.parameters())
+
         if self.opt_name == "adam":
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            self.optimizer = torch.optim.Adam(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
         elif self.opt_name == "sgd":
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
+            self.optimizer = torch.optim.SGD(trainable_params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         else:
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
 
         self.epochs = int(config.training.get("epochs", 10))
         self.scheduler_name = config.training.get("scheduler", "cosine").lower()

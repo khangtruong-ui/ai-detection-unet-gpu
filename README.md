@@ -19,6 +19,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [1. Standard UNet](#1-standard-unet)
   - [2. Pretrained EfficientNet Backbone (Default UNet Multi-Scale Decoder)](#2-pretrained-efficientnet-backbone-default-unet-multi-scale-decoder)
   - [3. EfficientNet 'Sacrifice of Pixel' Architecture](#3-efficientnet-sacrifice-of-pixel-architecture)
+  - [4. SAM3 + QLoRA Architecture](#4-sam3--qlora-architecture)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -83,6 +84,12 @@ The framework supports multiple dataset formats:
   - When $\mathrm{label} = 0$, target mask is **all zeros** ($\mathbf{0}$).
   - When $\mathrm{label} = 1$, target mask is **all ones** ($\mathbf{1}$).
   - When $\mathrm{label} = 2$, target mask is thresholded to binary $\{0.0, 1.0\}$.
+
+### 3. High-Resolution Inpainting & Tampering Format ([KhangTruong/BeyondTheBrush](https://huggingface.co/datasets/KhangTruong/BeyondTheBrush))
+- **Subsets Available**: `train`, `validation`, and `test` splits.
+- **`image`**: RGB images at resolutions up to $4000 \times 3000$.
+- **`mask`**: Binary mask ($L$ mode, values $0$ and $255$) highlighting fine inpainting, brush edits, and object synthesis.
+- Native streaming execution via `streaming: true` avoiding local disk storage of large image collections.
 
 ---
 
@@ -232,6 +239,44 @@ In this specialized mode (`sacrifice_of_pixel: true`), intermediate feature skip
                         ▼
               Binary Mask Logits (1, H, W)
 ```
+
+---
+
+### 4. SAM3 + QLoRA Architecture
+
+Meta's **Segment Anything Model 3 (SAM3)** integrated with **Quantized Low-Rank Adaptation (QLoRA)** allows fine-tuning foundation vision-language segmentation models directly on consumer GPUs (e.g. 12GB RTX 3060):
+
+```
+                      Input Image (3, H, W)             Text Prompt: "tampered region"
+                               │                                       │
+                               ▼                                       ▼
+                     Bilinear Resize (1008x1008)               CLIP Text Tokenizer
+                               │                                       │
+                               ▼                                       ▼
+                    ┌─────────────────────────────────────────────────────┐
+                    │               SAM3 Foundation Backbone              │
+                    │   - ViT Vision Encoder (4-bit NF4 Quantized)        │
+                    │   - LoRA Adapters (r=8..16 on q_proj, v_proj)       │
+                    │   - Text Encoder & Cross-Attention                  │
+                    │   - DETR Encoder & Decoder with Object Queries      │
+                    │   - Multiscale Mask Decoder & FPN Pixel Head        │
+                    └──────────────────────────┬──────────────────────────┘
+                                               │
+                                               ▼
+                              Semantic Segmentation Output (B, 1, H_fpn, W_fpn)
+                                               │
+                                               ▼
+                                   Bilinear Interpolate (H, W)
+                                               │
+                                               ▼
+                                  Binary Mask Logits (B, 1, H, W)
+```
+
+Key features:
+- **4-Bit NormalFloat (NF4) Quantization**: Reduces the 3.4GB FP32/BF16 base model footprint to only **~660 MB** of VRAM.
+- **PEFT LoRA Adapters**: Injects low-rank decomposition matrices ($r=8, \alpha=16$) into self-attention projection layers (`q_proj`, `v_proj`). Less than **0.5%** of total parameters are trainable.
+- **Hardware Compatibility**: Verified to fit and train on **12GB VRAM GPUs** (such as NVIDIA RTX 3060) with batch size 1 and gradient accumulation (e.g. 16 steps).
+- **Prompt Conditioning**: Defaults to text prompt `"tampered region"` to focus the DETR queries and mask decoder cross-attention on manipulated or inpainted artifacts.
 
 ---
 
@@ -421,6 +466,11 @@ pip install -e ".[dev]"
 │   │   ├── diffseg30k.yaml
 │   │   └── open-sdid.yaml
 │   └── experiments/
+│       ├── sam3-qlora/               # SAM3 + QLoRA (4-bit NF4) configs on BeyondTheBrush
+│       │   ├── sam3_qlora_beyondthebrush_b1.yaml
+│       │   ├── sam3_qlora_beyondthebrush_r16.yaml
+│       │   ├── sam3_qlora_beyondthebrush_focal.yaml
+│       │   └── sam3_qlora_beyondthebrush_dice.yaml
 │       ├── efficientnet/             # Pretrained EfficientNet experiment configs
 │       │   ├── efficientnet_b0_unet.yaml
 │       │   ├── efficientnet_b0_sacrifice_of_pixel.yaml
@@ -441,6 +491,7 @@ pip install -e ".[dev]"
 │   │   ├── blocks.py
 │   │   ├── unet.py                   # UNet architecture
 │   │   ├── efficientnet.py           # EfficientNet UNet & Sacrifice of Pixel
+│   │   ├── sam3_qlora.py             # SAM3 foundation model with 4-bit QLoRA
 │   │   └── sam3_refiner.py           # SAM3 spatial join refinement
 │   ├── losses/
 │   ├── metrics/
@@ -490,6 +541,31 @@ model:
   dropout: 0.1
 ```
 
+### SAM3 + QLoRA Config Example:
+```yaml
+model:
+  name: "sam3_qlora"
+  pretrained_model_name_or_path: "jetjodh/sam3"  # Or "facebook/sam3"
+  load_in_4bit: true                             # 4-bit NormalFloat quantization via bitsandbytes
+  lora_r: 8                                      # LoRA rank dimension
+  lora_alpha: 16                                 # LoRA scaling factor
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "v_proj"]      # Target attention projections
+  prompt_text: "tampered region"                 # Conditioning text prompt
+  aux_classifier: false
+  target_size: [1008, 1008]
+
+data:
+  dataset_name: "KhangTruong/BeyondTheBrush"
+  streaming: true                                # Streamed dataset loading
+  batch_size: 1                                  # Micro-batch 1 to fit inside 12GB VRAM
+
+training:
+  gradient_accumulation_steps: 16                # Effective batch size 16
+  learning_rate: 0.0002
+  amp: false
+```
+
 ---
 
 ## Quickstart: How to Run
@@ -498,6 +574,9 @@ model:
 
 #### A. Single Experiment Training
 ```bash
+# Train SAM3 + QLoRA on BeyondTheBrush (streaming mode)
+sid-train --config configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
+
 # Train standard UNet
 sid-train --config configs/default.yaml
 

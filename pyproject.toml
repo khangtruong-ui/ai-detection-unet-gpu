@@ -9,12 +9,15 @@ description = "Config-driven UNet for AI-generated synthetic image segmentation"
 readme = "README.md"
 authors = [{ name = "KhangTruong" }]
 license = { text = "Apache-2.0" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.13.0",
     "torchvision>=0.15.0",
     "datasets>=2.14.0",
     "transformers",
+    "peft>=0.7.0",
+    "bitsandbytes>=0.41.0",
+    "accelerate>=0.25.0",
     "numpy>=1.22.0",
     "pillow>=9.0.0",
     "pyyaml>=6.0",

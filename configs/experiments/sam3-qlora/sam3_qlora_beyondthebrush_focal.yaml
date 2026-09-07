@@ -1,0 +1,86 @@
+# Configuration: SAM3 + QLoRA with Binary Focal Loss on BeyondTheBrush
+# Addresses severe foreground-background mask imbalance where tampered areas occupy small fractions of the image.
+# Uses Binary Focal Loss (gamma=2.0, alpha=0.25) with 4-bit NF4 quantization.
+
+project:
+  name: "sid_sam3_qlora_beyondthebrush_focal"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/sam3_qlora_beyondthebrush_focal"
+
+data:
+  dataset_name: "KhangTruong/BeyondTheBrush"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 1
+  num_workers: 2
+  pin_memory: true
+  shuffle_buffer_size: 1000
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  eval_split: "test"
+  train_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  evaluate_on_test: true
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    color_jitter: 0.0
+
+model:
+  name: "sam3_qlora"
+  pretrained_model_name_or_path: "jetjodh/sam3"
+  load_in_4bit: true
+  load_in_8bit: false
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "v_proj"]
+  prompt_text: "tampered region"
+  aux_classifier: false
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+  target_size: [1008, 1008]
+
+loss:
+  mask_loss_type: "focal"
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 10
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
+  amp: false
+  gradient_accumulation_steps: 16
+  auto_batch_size: false
+  empty_cache_per_epoch: true
+  save_best: true
+  save_latest: false
+  eval_interval: 1
+  early_stopping_patience: 5
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20
+  log_memory: true
+
+post_processing:
+  enabled: true
+  min_area: 64
+  fill_holes: true
+  max_hole_size: 256
+  morphology: "open_close"
+  morph_kernel_size: 3

@@ -5,21 +5,33 @@ This directory contains organized configurations designed for higher throughput,
 Directory Layout:
 - **`unet_scratch/`**: Standard UNet architectures trained from scratch with varying widths, depths, loss formulations, and resolution budgets.
 - **`efficientnet/`**: Pretrained EfficientNet backbones with UNet multi-scale feature skip connections or the **Sacrifice of Pixel** linear-zoom architecture.
+- **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/BeyondTheBrush`.
 
 ---
 
-## 1. EfficientNet Configurations (`configs/experiments/efficientnet/`)
+## 1. SAM3 + QLoRA Configurations (`configs/experiments/sam3-qlora/`)
+
+| Configuration File | Model & Quantization | Dataset & Mode | LoRA Config | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| [`sam3_qlora_beyondthebrush_b1.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=8, \alpha=16$ ($q, v$) | Combined (BCE + Dice) | Baseline parameter-efficient fine-tuning on 12GB GPUs with gradient accumulation steps 16. |
+| [`sam3_qlora_beyondthebrush_r16.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_r16.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=16, \alpha=32$ ($q, k, v, out$) | Combined (BCE + Dice) | Expanded adaptation capacity across all attention projection layers. |
+| [`sam3_qlora_beyondthebrush_focal.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_focal.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=8, \alpha=16$ ($q, v$) | Focal ($\gamma=2.0, \alpha=0.25$) | Hard-mining loss addressing extreme foreground-background mask imbalance in subtle inpainting boundaries. |
+| [`sam3_qlora_beyondthebrush_dice.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_dice.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=8, \alpha=16$ ($q, v$) | Dice | Soft Sørensen-Dice direct optimization for sharp mask boundary overlap. |
+
+---
+
+## 2. EfficientNet Configurations (`configs/experiments/efficientnet/`)
 
 | Configuration File | Backbone & Mode | Batch Size | Image Resolution | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- |
-| [`efficientnet_b0_unet.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b0_unet.yaml) | EfficientNet-B0 (UNet Multi-Scale) | 16 | $256 \times 256$ | Pretrained ImageNet CNN encoder with multi-scale skip connections ($/2, /4, /8, /16, /32$) into progressive UNet decoder. |
-| [`efficientnet_b0_sacrifice_of_pixel.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml) | EfficientNet-B0 (Sacrifice of Pixel) | 16 | $256 \times 256$ | **Sacrifice of Pixel**: Uses only the final bottleneck feature map ($8 \times 8$), feeds through a single Linear layer, then zooms out (bilinear) to pixel resolution. |
-| [`efficientnet_b2_unet.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b2_unet.yaml) | EfficientNet-B2 (UNet Multi-Scale) | 16 | $256 \times 256$ | Scaled EfficientNet-B2 backbone providing larger model capacity and deeper receptive fields. |
-| [`efficientnet_b0_sacrifice_of_pixel_b32.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel_b32.yaml) | EfficientNet-B0 (Sacrifice of Pixel) | 32 | $256 \times 256$ | Accelerated training with batch size 32 leveraging low VRAM footprint of the sacrifice-of-pixel architecture. |
+| [`efficientnet_b0_unet.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b0_unet.yaml) | EfficientNet-B0 (UNet Multi-Scale) | 64 | $256 \times 256$ | Pretrained ImageNet CNN encoder with multi-scale skip connections ($/2, /4, /8, /16, /32$) into progressive UNet decoder. |
+| [`efficientnet_b0_sacrifice_of_pixel.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml) | EfficientNet-B0 (Sacrifice of Pixel) | 64 | $256 \times 256$ | **Sacrifice of Pixel**: Uses only the final bottleneck feature map ($8 \times 8$), feeds through a single Linear layer, then zooms out (bilinear) to pixel resolution. |
+| [`efficientnet_b2_unet.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b2_unet.yaml) | EfficientNet-B2 (UNet Multi-Scale) | 64 | $256 \times 256$ | Scaled EfficientNet-B2 backbone providing larger model capacity and deeper receptive fields. |
+| [`efficientnet_b0_sacrifice_of_pixel_b32.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel_b32.yaml) | EfficientNet-B0 (Sacrifice of Pixel) | 128 | $256 \times 256$ | Accelerated training with batch size 128 leveraging low VRAM footprint of the sacrifice-of-pixel architecture. |
 
 ---
 
-## 2. UNet Scratch Configurations (`configs/experiments/unet_scratch/`)
+## 3. UNet Scratch Configurations (`configs/experiments/unet_scratch/`)
 
 | Configuration File | Model Architecture | Features / Channels | Batch Size | Image Resolution | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -36,20 +48,25 @@ Directory Layout:
 
 ## How to Run
 
-### 1. Training with Pretrained EfficientNet (Default UNet Mode)
+### 1. Training with SAM3 + QLoRA
+```bash
+sid-train --config configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
+```
+
+### 2. Training with Pretrained EfficientNet (Default UNet Mode)
 ```bash
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_unet.yaml
 ```
 
-### 2. Training with 'Sacrifice of Pixel' Mode
+### 3. Training with 'Sacrifice of Pixel' Mode
 ```bash
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
 ```
 
-### 3. Multi-Experiment Comparative Suite
+### 4. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
   configs/experiments/efficientnet/efficientnet_b0_unet.yaml \
-  configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
+  configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
 ```

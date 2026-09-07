@@ -228,6 +228,8 @@ class UNet(nn.Module):
             if any(k.startswith(("stage1.", "linear.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "efficientnet"
                 merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
+            elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
+                merged["model"]["name"] = "sam3_qlora"
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
@@ -235,7 +237,8 @@ class UNet(nn.Module):
 
         config = ConfigDict(merged)
         model = build_model(config)
-        model.load_state_dict(state_dict, strict=strict)
+        is_sam3 = "sam3" in str(merged.get("model", {}).get("name", "")).lower()
+        model.load_state_dict(state_dict, strict=(strict and not is_sam3))
         model.eval()
 
         if device is not None:
@@ -244,7 +247,8 @@ class UNet(nn.Module):
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 else:
                     device = torch.device(device)
-            model.to(device)
+            if not is_sam3 or not getattr(model, "load_in_4bit", False):
+                model.to(device)
 
         model.config = config
         if return_config:
@@ -253,7 +257,7 @@ class UNet(nn.Module):
 
 
 def build_model(config: Any) -> nn.Module:
-    """Build model instance (UNet or EfficientNet) from configuration dict."""
+    """Build model instance (UNet, EfficientNet, or SAM3-QLoRA) from configuration dict."""
     model_cfg = config.get("model", {}) if hasattr(config, "get") else {}
     training_cfg = config.get("training", {}) if hasattr(config, "get") else {}
     ckpt_flag = bool(
@@ -265,6 +269,27 @@ def build_model(config: Any) -> nn.Module:
 
     model_name = str(model_cfg.get("name", "unet")).lower()
     backbone = str(model_cfg.get("backbone", "")).lower()
+
+    if "sam3" in model_name or "sam3" in backbone:
+        from sid_unet.models.sam3_qlora import SAM3QLoRA, DEFAULT_SAM3_CHECKPOINT
+        ckpt_name = model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_SAM3_CHECKPOINT))
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        return SAM3QLoRA(
+            pretrained_model_name_or_path=str(ckpt_name),
+            load_in_4bit=bool(model_cfg.get("load_in_4bit", True)),
+            load_in_8bit=bool(model_cfg.get("load_in_8bit", False)),
+            lora_r=int(model_cfg.get("lora_r", 8)),
+            lora_alpha=int(model_cfg.get("lora_alpha", 16)),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
+            lora_target_modules=model_cfg.get("lora_target_modules", None),
+            prompt_text=str(model_cfg.get("prompt_text", "tampered region")),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            target_size=tuple(model_cfg.get("target_size", [1008, 1008])),
+            device=dev_cfg,
+        )
 
     if "efficientnet" in model_name or "efficientnet" in backbone:
         from sid_unet.models.efficientnet import EfficientNetSegmentation
