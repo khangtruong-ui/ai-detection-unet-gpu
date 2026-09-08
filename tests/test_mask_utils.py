@@ -130,3 +130,30 @@ def test_check_image_mask_mismatch():
     assert check_image_mask_mismatch(t_img, t_mask_diff)["mismatch"] is True
 
 
+def test_mask_utils_with_dict_and_bytes():
+    import io
+    # Test ensure_rgb_image with bytes
+    im = Image.new("RGB", (64, 64), color="green")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    raw_b = buf.getvalue()
+
+    rgb_from_b = ensure_rgb_image(raw_b)
+    assert rgb_from_b.size == (64, 64)
+    assert rgb_from_b.mode == "RGB"
+
+    rgb_from_d = ensure_rgb_image({"bytes": raw_b, "path": None})
+    assert rgb_from_d.size == (64, 64)
+    assert rgb_from_d.mode == "RGB"
+
+    # Test process_sample_mask with bytes dict
+    m = Image.new("L", (64, 64), color=255)
+    buf_m = io.BytesIO()
+    m.save(buf_m, format="PNG")
+    mask_b = buf_m.getvalue()
+
+    mask_out = process_sample_mask({"bytes": mask_b}, label=2, image_size=(64, 64))
+    assert mask_out.shape == (64, 64)
+    assert np.all(mask_out == 1.0)
+
+

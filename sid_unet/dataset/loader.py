@@ -11,10 +11,19 @@ import itertools
 import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from datasets import load_dataset as hf_load_dataset
+
+# Ensure PIL loads truncated/partial images without raising OSError
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def worker_init_fn(worker_id: int) -> None:
+    """Worker initialization function to configure PIL for DataLoader workers."""
+    from PIL import ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask, check_image_mask_mismatch
 from sid_unet.dataset.transforms import get_transforms, JointCompose
@@ -256,15 +265,29 @@ class SIDStreamingDataset(IterableDataset):
         rng = random.Random(self.seed)
 
         try:
-            for raw_sample in stream:
+            while True:
+                try:
+                    raw_sample = next(stream)
+                except StopIteration:
+                    break
+                except Exception as stream_err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"Skipping corrupted or unreadable sample in dataset stream: {stream_err}"
+                    )
+                    continue
+
                 try:
                     processed = process_raw_sample(
                         raw_sample,
                         transform=self.transform,
                         target_image_size=self.target_image_size,
                     )
-                except Exception:
-                    # Silently skip corrupted samples in stream
+                except Exception as proc_err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"Skipping corrupted sample during processing: {proc_err}"
+                    )
                     continue
 
                 if target_buf_size > 1:
@@ -386,6 +409,7 @@ def create_eval_dataloader(
             batch_size=batch_size,
             num_workers=0,
             pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
         )
     else:
         eval_dataset = SIDMapDataset(
@@ -402,6 +426,7 @@ def create_eval_dataloader(
             num_workers=num_workers,
             pin_memory=pin_memory,
             multiprocessing_context=mp_context,
+            worker_init_fn=worker_init_fn,
         )
 
 
@@ -489,12 +514,14 @@ def create_dataloaders(
             batch_size=batch_size,
             num_workers=0,
             pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             num_workers=0,
             pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
         )
     else:
         train_dataset = SIDMapDataset(
@@ -519,6 +546,7 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=pin_memory,
             multiprocessing_context=mp_context,
+            worker_init_fn=worker_init_fn,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -527,6 +555,7 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=pin_memory,
             multiprocessing_context=mp_context,
+            worker_init_fn=worker_init_fn,
         )
 
     if include_test:

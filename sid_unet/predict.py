@@ -14,8 +14,11 @@ import os
 import glob
 from typing import List, Tuple
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 import torch
+
+# Ensure PIL handles truncated images during inference
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torchvision.transforms.functional as TF
 from tabulate import tabulate
 

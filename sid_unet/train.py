@@ -18,7 +18,11 @@ import os
 import random
 from typing import Any, Dict, List, Optional
 import numpy as np
+from PIL import ImageFile
 import torch
+
+# Ensure PIL handles truncated images during dataset loading and training
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from sid_unet.dataset.loader import create_dataloaders
 from sid_unet.training.trainer import Trainer

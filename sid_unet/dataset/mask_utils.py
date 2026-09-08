@@ -7,14 +7,18 @@ Handles logic for:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+import io
+from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 import torch
+
+# Ensure PIL handles truncated images without raising OSError
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def _extract_and_binarize_mask(
-    mask_input: Optional[Union[Image.Image, np.ndarray, torch.Tensor]],
+    mask_input: Optional[Union[Image.Image, np.ndarray, torch.Tensor, Dict[str, Any], bytes, bytearray, io.BytesIO]],
     image_size: Tuple[int, int],
     threshold: float = 0.5,
 ) -> np.ndarray:
@@ -23,7 +27,21 @@ def _extract_and_binarize_mask(
     if mask_input is None:
         return np.zeros((h, w), dtype=np.float32)
 
+    if isinstance(mask_input, dict):
+        if "bytes" in mask_input and mask_input["bytes"] is not None:
+            mask_input = Image.open(io.BytesIO(mask_input["bytes"]))
+        elif "path" in mask_input and mask_input["path"] is not None:
+            mask_input = Image.open(mask_input["path"])
+    elif isinstance(mask_input, (bytes, bytearray)):
+        mask_input = Image.open(io.BytesIO(mask_input))
+    elif isinstance(mask_input, io.BytesIO):
+        mask_input = Image.open(mask_input)
+
     if isinstance(mask_input, Image.Image):
+        try:
+            mask_input.load()
+        except Exception:
+            pass
         # Ensure single channel grayscale
         mask_gray = mask_input.convert("L")
         if mask_gray.size != (w, h):
@@ -147,6 +165,12 @@ def check_image_mask_mismatch(
                 img_size = (image.shape[3], image.shape[2])
             else:
                 issues.append(f"Image has unexpected tensor dimension {image.ndim}")
+        elif isinstance(image, (bytes, bytearray, io.BytesIO, dict)):
+            try:
+                temp_img = ensure_rgb_image(image)
+                img_size = (temp_img.width, temp_img.height)
+            except Exception as e:
+                issues.append(f"Failed to decode image from bytes/dict: {e}")
         else:
             issues.append(f"Image has unsupported type: {type(image)}")
 
@@ -174,6 +198,22 @@ def check_image_mask_mismatch(
                 mask_size = (mask.shape[3], mask.shape[2])
             else:
                 issues.append(f"Mask has unexpected tensor dimension {mask.ndim}")
+        elif isinstance(mask, (bytes, bytearray, io.BytesIO, dict)):
+            try:
+                if isinstance(mask, dict):
+                    raw_b = mask.get("bytes")
+                    p = mask.get("path")
+                    t_m = Image.open(io.BytesIO(raw_b)) if raw_b else (Image.open(p) if p else None)
+                elif isinstance(mask, (bytes, bytearray)):
+                    t_m = Image.open(io.BytesIO(mask))
+                elif isinstance(mask, io.BytesIO):
+                    t_m = Image.open(mask)
+                else:
+                    t_m = None
+                if t_m is not None:
+                    mask_size = (t_m.width, t_m.height)
+            except Exception as e:
+                issues.append(f"Failed to decode mask from bytes/dict: {e}")
         else:
             issues.append(f"Mask has unsupported type: {type(mask)}")
 
@@ -197,8 +237,25 @@ def check_image_mask_mismatch(
     }
 
 
-def ensure_rgb_image(image: Union[Image.Image, np.ndarray]) -> Image.Image:
-    """Ensure input image is a PIL Image in RGB format."""
+def ensure_rgb_image(
+    image: Union[Image.Image, np.ndarray, Dict[str, Any], bytes, bytearray, io.BytesIO]
+) -> Image.Image:
+    """
+    Ensure input image is a PIL Image in RGB format.
+    Supports PIL.Image, numpy arrays, raw bytes, io.BytesIO, and HuggingFace dict format (e.g. {'bytes': ...}).
+    """
+    if isinstance(image, dict):
+        if "bytes" in image and image["bytes"] is not None:
+            image = Image.open(io.BytesIO(image["bytes"]))
+        elif "path" in image and image["path"] is not None:
+            image = Image.open(image["path"])
+        else:
+            raise ValueError(f"Dictionary sample image has neither 'bytes' nor 'path': {list(image.keys())}")
+    elif isinstance(image, (bytes, bytearray)):
+        image = Image.open(io.BytesIO(image))
+    elif isinstance(image, io.BytesIO):
+        image = Image.open(image)
+
     if isinstance(image, np.ndarray):
         if image.ndim == 2:
             return Image.fromarray(image).convert("RGB")
@@ -206,6 +263,11 @@ def ensure_rgb_image(image: Union[Image.Image, np.ndarray]) -> Image.Image:
             return Image.fromarray(image).convert("RGB")
         return Image.fromarray(image).convert("RGB")
     elif isinstance(image, Image.Image):
+        # Force load image to verify and handle truncated image streams
+        try:
+            image.load()
+        except Exception:
+            pass
         return image.convert("RGB")
     else:
         raise TypeError(f"Unsupported image type: {type(image)}")

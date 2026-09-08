@@ -5,6 +5,9 @@ Supports streaming datasets on saberzl/SID_Set.
 
 __version__ = "0.1.0"
 
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 from sid_unet.postprocessing import (
     MaskPostProcessor,
     remove_small_components,
