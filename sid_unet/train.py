@@ -110,6 +110,24 @@ def parse_args():
         default=None,
         help="Path to checkpoint .pt file to resume training from",
     )
+    parser.add_argument(
+        "--val-samples-per-epoch",
+        "--val_samples_per_epoch",
+        "--val-samples",
+        "--val_samples",
+        type=int,
+        default=None,
+        help="Limit number of validation samples evaluated per epoch (-1 for entire split)",
+    )
+    parser.add_argument(
+        "--checkpoint-period",
+        "--checkpoint_period",
+        "--checkpoint-interval",
+        "--checkpoint_interval",
+        type=float,
+        default=None,
+        help="Interval in seconds (or hours if <= 24) to save periodic checkpoints (default: 3600s / 1 hour)",
+    )
     # Collision checking flags
     parser.add_argument(
         "--skip-collision",
@@ -289,6 +307,11 @@ def main():
     if args.gradient_checkpointing:
         overrides.append("model.gradient_checkpointing=true")
         overrides.append("training.gradient_checkpointing=true")
+    if args.val_samples_per_epoch is not None:
+        overrides.append(f"data.val_samples_per_epoch={args.val_samples_per_epoch}")
+        overrides.append(f"data.val_samples={args.val_samples_per_epoch}")
+    if args.checkpoint_period is not None:
+        overrides.append(f"training.checkpoint_period={args.checkpoint_period}")
 
     if len(config_paths) == 1:
         if args.output_dir:

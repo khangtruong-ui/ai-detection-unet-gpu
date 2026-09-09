@@ -163,3 +163,96 @@ def test_trainer_with_iterable_dataset_no_len():
         assert "val_total_loss" in results["final_metrics"]
 
 
+def test_parse_checkpoint_period():
+    from sid_unet.training.trainer import parse_checkpoint_period
+
+    assert parse_checkpoint_period({}) == 3600.0
+    assert parse_checkpoint_period(None) == 3600.0
+    assert parse_checkpoint_period({"checkpoint_period": 3600}) == 3600.0
+    assert parse_checkpoint_period({"checkpoint_period": 1}) == 3600.0  # <= 24 treated as hours
+    assert parse_checkpoint_period({"checkpoint_period": 0.5}) == 1800.0
+    assert parse_checkpoint_period({"checkpoint_period": "2h"}) == 7200.0
+    assert parse_checkpoint_period({"checkpoint_period": "30m"}) == 1800.0
+    assert parse_checkpoint_period({"checkpoint_period": "45s"}) == 45.0
+    assert parse_checkpoint_period({"checkpoint_period_hours": 1.5}) == 5400.0
+
+
+def test_checkpoint_manager_periodic_save():
+    import time
+    from sid_unet.training.callbacks import CheckpointManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, checkpoint_period=0.01)
+        time.sleep(0.02)
+        assert mgr.should_save_periodic() is True
+
+        model = torch.nn.Linear(2, 2)
+        paths = mgr.save_periodic(epoch=1, model=model, config={"test": 1}, step=10)
+        assert os.path.exists(paths["periodic"])
+        assert os.path.exists(paths["latest"])
+        assert mgr.should_save_periodic() is False
+
+
+def test_checkpoint_manager_load_with_unexpected_keys():
+    from sid_unet.training.callbacks import CheckpointManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = CheckpointManager(checkpoint_dir=tmpdir)
+        model = torch.nn.Linear(2, 2)
+
+        ckpt_path = os.path.join(tmpdir, "test_ckpt.pt")
+        state_dict = model.state_dict()
+        # Simulate quantization metadata / extra LoRA keys
+        state_dict["extra_quant_map.weight.absmax"] = torch.tensor([1.0])
+        torch.save({"model_state_dict": state_dict, "epoch": 3}, ckpt_path)
+
+        # Loading should gracefully fall back to strict=False instead of raising RuntimeError
+        loaded_epoch = mgr.load_checkpoint(ckpt_path, model)
+        assert loaded_epoch == 3
+
+
+def test_trainer_periodic_checkpointing_in_loop():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "training.checkpoint_period=0.0001",  # Trigger immediately
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "logging.save_sample_images=false",
+            "training.amp=false",
+        ])
+
+        train_ds = SyntheticDataset(size=4, img_size=(64, 64))
+        val_ds = SyntheticDataset(size=2, img_size=(64, 64))
+
+        train_loader = DataLoader(train_ds, batch_size=2)
+        val_loader = DataLoader(val_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        trainer.train()
+        periodic_ckpt = os.path.join(tmpdir, "checkpoints", "checkpoint_periodic.pt")
+        assert os.path.exists(periodic_ckpt)
+
+
+def test_val_samples_per_epoch_resolves():
+    from sid_unet.dataset.loader import resolve_sample_limit
+
+    # Specified val_samples_per_epoch
+    res = resolve_sample_limit(samples_val=50, steps_val=None, batch_size=1)
+    assert res == 50
+
+    # -1 means full dataset (None)
+    res_unlimited = resolve_sample_limit(samples_val=-1, steps_val=None, batch_size=1)
+    assert res_unlimited is None
+
+
+

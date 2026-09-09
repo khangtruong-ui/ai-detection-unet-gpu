@@ -33,6 +33,47 @@ from sid_unet.utils.memory import (
 from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
 
+def parse_checkpoint_period(training_cfg: Any) -> float:
+    """Parse checkpoint period from config, defaulting to 3600 seconds (1 hour)."""
+    if not hasattr(training_cfg, "get"):
+        return 3600.0
+
+    raw = training_cfg.get(
+        "checkpoint_period",
+        training_cfg.get(
+            "checkpoint_period_hours",
+            training_cfg.get(
+                "checkpoint_period_seconds",
+                training_cfg.get("checkpoint_interval", 3600.0),
+            ),
+        ),
+    )
+    if raw is None:
+        return 3600.0
+
+    if isinstance(raw, (int, float)):
+        if raw <= 0:
+            return 0.0
+        if "checkpoint_period_hours" in training_cfg or raw <= 24:
+            return float(raw) * 3600.0
+        return float(raw)
+
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s.endswith("h"):
+            return float(s[:-1]) * 3600.0
+        elif s.endswith("m"):
+            return float(s[:-1]) * 60.0
+        elif s.endswith("s"):
+            return float(s[:-1])
+        try:
+            val = float(s)
+            return (val * 3600.0) if val <= 24 else val
+        except ValueError:
+            return 3600.0
+
+    return 3600.0
+
 
 class Trainer:
     """End-to-end training and validation loop manager with OOM safety and gradient accumulation."""
@@ -117,12 +158,14 @@ class Trainer:
         self.log_memory = bool(config.logging.get("log_memory", True))
 
         # 6. Callbacks
+        checkpoint_period = parse_checkpoint_period(config.training)
         self.ckpt_manager = CheckpointManager(
             checkpoint_dir=self.checkpoint_dir,
             metric_name=config.training.get("early_stopping_metric", "val_iou"),
             mode=config.training.get("early_stopping_mode", "max"),
             save_best=bool(config.training.get("save_best", True)),
             save_latest=bool(config.training.get("save_latest", False)),
+            checkpoint_period=checkpoint_period,
         )
         self.early_stopping = EarlyStopping(
             patience=int(config.training.get("early_stopping_patience", 5)),
@@ -285,6 +328,18 @@ class Trainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
+
+                    if self.ckpt_manager.should_save_periodic():
+                        p_paths = self.ckpt_manager.save_periodic(
+                            epoch=epoch,
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            metrics={"train_loss": float(loss_val), "step": self.global_step},
+                            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                            step=self.global_step,
+                        )
+                        self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Step {self.global_step}, Epoch {epoch})")
 
                 postfix_dict = {
                     "loss": f"{loss_val:.4f}",
@@ -501,6 +556,19 @@ class Trainer:
 
             if "best" in saved_paths:
                 self.logger.info(f"⭐ New best model saved to {saved_paths['best']} (score: {self.ckpt_manager.best_score:.4f})")
+
+            # Check periodic checkpointing
+            if self.ckpt_manager.should_save_periodic():
+                p_paths = self.ckpt_manager.save_periodic(
+                    epoch=epoch,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    scheduler=self.scheduler,
+                    metrics=val_summary,
+                    config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                    step=self.global_step,
+                )
+                self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Epoch {epoch})")
 
             # Check early stopping
             monitored_score = val_summary.get(self.ckpt_manager.metric_name, 0.0)

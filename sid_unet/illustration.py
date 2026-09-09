@@ -35,13 +35,19 @@ def parse_args():
         description="Illustrate predictions on random dataset samples across multiple model checkpoints."
     )
     parser.add_argument(
+        "inputs",
+        nargs="*",
+        default=[],
+        help="Optional positional checkpoint .pt file(s) or dataset config .yaml file(s).",
+    )
+    parser.add_argument(
         "--model-ckpts",
         "--model_ckpts",
         "--checkpoints",
         "--checkpoint",
         nargs="+",
         dest="model_ckpts",
-        required=True,
+        default=None,
         help="Path(s) to model checkpoint .pt file(s) or glob pattern(s).",
     )
     parser.add_argument(
@@ -51,7 +57,7 @@ def parse_args():
         "--config",
         nargs="+",
         dest="dataset_configs",
-        required=True,
+        default=None,
         help="Path(s) to dataset YAML configuration file(s) or glob pattern(s).",
     )
     parser.add_argument(
@@ -164,11 +170,22 @@ def extract_random_dataset_samples(
     # Create evaluation dataloader with a small batch size
     # We fetch a buffer of samples to randomly pick from
     buffer_size = max(50, num_samples * 10)
-    eval_loader, resolved_split = create_eval_dataloader(
-        config=config,
-        split=target_split,
-        samples_override=buffer_size,
-    )
+    try:
+        eval_res = create_eval_dataloader(
+            config=config,
+            split=target_split,
+            samples_override=buffer_size,
+        )
+    except TypeError:
+        eval_res = create_eval_dataloader(
+            config=config,
+            split=target_split,
+            max_samples=buffer_size,
+        )
+    if isinstance(eval_res, tuple):
+        eval_loader = eval_res[0]
+    else:
+        eval_loader = eval_res
 
     collected_samples: List[Dict[str, Any]] = []
     for batch in eval_loader:
@@ -533,14 +550,43 @@ def run_illustration(
 
 def main():
     args = parse_args()
-    raw_ckpts = args.model_ckpts if isinstance(args.model_ckpts, list) else [args.model_ckpts]
+
+    raw_ckpts = list(args.model_ckpts) if args.model_ckpts is not None else []
+    raw_cfgs = list(args.dataset_configs) if args.dataset_configs is not None else []
+
+    for inp in args.inputs:
+        if inp.endswith((".pt", ".pth")):
+            raw_ckpts.append(inp)
+        elif inp.endswith((".yaml", ".yml")):
+            raw_cfgs.append(inp)
+
+    if not raw_ckpts:
+        found = glob.glob("outputs/**/checkpoint_best.pt", recursive=True)
+        if found:
+            raw_ckpts = found
+
     ckpt_paths = expand_patterns(raw_ckpts, (".pt", ".pth"))
-
-    raw_cfgs = args.dataset_configs if isinstance(args.dataset_configs, list) else [args.dataset_configs]
-    cfg_paths = expand_patterns(raw_cfgs, (".yaml", ".yml"))
-
     if not ckpt_paths:
         raise FileNotFoundError(f"No checkpoint files found matching: {raw_ckpts}")
+
+    if not raw_cfgs:
+        inferred = []
+        for cp in ckpt_paths:
+            c_dir = os.path.dirname(os.path.abspath(cp))
+            p_dir = os.path.dirname(c_dir)
+            eff_1 = os.path.join(c_dir, "checkpoint_best_config.yaml")
+            eff_2 = os.path.join(p_dir, "effective_config.yaml")
+            eff_3 = os.path.join(c_dir, "effective_config.yaml")
+            for eff in [eff_1, eff_2, eff_3]:
+                if os.path.exists(eff) and eff not in inferred:
+                    inferred.append(eff)
+                    break
+        if inferred:
+            raw_cfgs = inferred
+        elif os.path.exists("configs/default.yaml"):
+            raw_cfgs = ["configs/default.yaml"]
+
+    cfg_paths = expand_patterns(raw_cfgs, (".yaml", ".yml"))
     if not cfg_paths:
         raise FileNotFoundError(f"No dataset configuration files found matching: {raw_cfgs}")
 

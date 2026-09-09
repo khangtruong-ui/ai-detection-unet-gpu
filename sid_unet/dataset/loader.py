@@ -357,6 +357,7 @@ def create_eval_dataloader(
     config: Any,
     split: Optional[str] = None,
     max_samples: Optional[int] = None,
+    samples_override: Optional[int] = None,
 ) -> DataLoader:
     """
     Create a DataLoader specifically for evaluation or testing on a given split.
@@ -367,7 +368,11 @@ def create_eval_dataloader(
         split: Split name (e.g. 'test', 'validation', 'val').
                If None, defaults to config.data.get('eval_split', config.data.get('test_split', 'test')).
         max_samples: Optional sample count limit (overrides config).
+        samples_override: Alias for max_samples.
     """
+    if max_samples is None and samples_override is not None:
+        max_samples = samples_override
+
     dataset_name = config.data.get("dataset_name", "KhangTruong/IMD2020")
     streaming = bool(config.data.get("streaming", False))
     batch_size = int(config.data.get("batch_size", 16))
@@ -381,8 +386,10 @@ def create_eval_dataloader(
     if max_samples is not None:
         eval_max_samples = None if max_samples <= 0 else int(max_samples)
     else:
-        sample_key = "test_samples" if "test" in str(eval_split).lower() else "val_samples"
-        samples_cfg = config.data.get(sample_key, config.data.get("val_samples", -1))
+        if "test" in str(eval_split).lower():
+            samples_cfg = config.data.get("test_samples", -1)
+        else:
+            samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", -1))
         steps_cfg = config.data.get("eval_steps", None)
         eval_max_samples = resolve_sample_limit(
             samples_val=samples_cfg,
@@ -470,7 +477,7 @@ def create_dataloaders(
         default_samples=2000,
     )
 
-    val_samples_cfg = config.data.get("val_samples", 400)
+    val_samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", 400))
     val_steps_cfg = config.data.get(
         "val_steps",
         config.training.get("val_steps", None) if hasattr(config, "training") else None,

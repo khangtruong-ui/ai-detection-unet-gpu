@@ -16,7 +16,8 @@ data:
   val_split: "validation"
   test_split: "test"
   train_samples_per_epoch: -1  # Set to -1 or negative to run until dataset is depleted
-  val_samples: -1              # Set to -1 or negative to run until dataset is depleted
+  val_samples_per_epoch: -1    # Set to -1 or negative to run until dataset is depleted
+  val_samples: -1              # Alias for val_samples_per_epoch
   test_samples: -1             # Set to -1 or negative to run until dataset is depleted
   augmentations:
     horizontal_flip: 0.5
@@ -54,6 +55,7 @@ training:
   amp: true
   save_best: true
   save_latest: false
+  checkpoint_period: 3600      # Periodic checkpoint interval in seconds (default: 3600 = 1 hour)
   eval_interval: 1
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"

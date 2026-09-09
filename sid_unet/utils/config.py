@@ -120,7 +120,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "test_split": "test",
         "eval_split": "test",
         "train_samples_per_epoch": -1,  # Set to -1 to run until dataset is depleted
-        "val_samples": -1,              # Set to -1 to run until dataset is depleted
+        "val_samples_per_epoch": -1,    # Limit validation samples per epoch (-1 to run until dataset is depleted)
+        "val_samples": -1,              # Alias for val_samples_per_epoch
         "test_samples": -1,             # Set to -1 to run until dataset is depleted
         "evaluate_on_test": True,       # Evaluate on test set after training if available
         "augmentations": {
@@ -165,6 +166,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "empty_cache_per_epoch": True,# Free PyTorch memory allocator cache between epochs
         "save_best": True,
         "save_latest": False,         # Only save best model checkpoint by default
+        "checkpoint_period": 3600,    # Periodic checkpoint interval in seconds (default: 3600 = 1 hour)
         "eval_interval": 1,           # Validate every N epochs
         "early_stopping_patience": 5,
         "early_stopping_metric": "val_iou",
