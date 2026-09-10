@@ -6,11 +6,20 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
 from sid_unet.utils.config import save_config
+from sid_unet.utils.checkpoint import (
+    find_auto_resume_checkpoint,
+    download_hf_checkpoint,
+    is_hf_repo_id,
+    inspect_checkpoint,
+    format_resume_notification,
+    format_no_resume_notification,
+    parse_hf_repo_uri,
+)
 
 
 class CheckpointManager:
@@ -36,6 +45,7 @@ class CheckpointManager:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.best_score = float("-inf") if mode == "max" else float("inf")
         self.best_epoch = -1
+        self.last_loaded_checkpoint_info: Dict[str, Any] = {}
 
     def is_better(self, score: float) -> bool:
         if self.mode == "max":
@@ -57,6 +67,8 @@ class CheckpointManager:
         metrics: Optional[Dict[str, float]] = None,
         config: Optional[Dict[str, Any]] = None,
         step: Optional[int] = None,
+        scaler: Optional[Any] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         """Save a periodic checkpoint based on elapsed time."""
         self.last_periodic_save_time = time.time()
@@ -67,7 +79,11 @@ class CheckpointManager:
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scaler_state_dict": scaler.state_dict() if (scaler is not None and hasattr(scaler, "state_dict")) else None,
             "metrics": metrics or {},
+            "best_score": self.best_score,
+            "best_epoch": self.best_epoch,
+            "history": history or [],
             "config": cfg_dict,
         }
 
@@ -93,14 +109,27 @@ class CheckpointManager:
         metrics: Dict[str, float],
         config: Dict[str, Any],
         is_best: bool = False,
+        step: Optional[int] = None,
+        scaler: Optional[Any] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         """Save checkpoints to disk."""
+        current_score = metrics.get(self.metric_name, None)
+        if current_score is not None and self.is_better(current_score):
+            self.best_score = current_score
+            self.best_epoch = epoch
+
         state = {
             "epoch": epoch,
+            "step": step,
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scaler_state_dict": scaler.state_dict() if (scaler is not None and hasattr(scaler, "state_dict")) else None,
             "metrics": metrics,
+            "best_score": self.best_score,
+            "best_epoch": self.best_epoch,
+            "history": history or [],
             "config": config,
         }
 
@@ -113,10 +142,7 @@ class CheckpointManager:
             save_config(config, latest_cfg_path)
             saved_paths["latest"] = latest_path
 
-        current_score = metrics.get(self.metric_name, None)
-        if current_score is not None and self.is_better(current_score):
-            self.best_score = current_score
-            self.best_epoch = epoch
+        if current_score is not None and current_score == self.best_score:
             if self.save_best:
                 best_path = os.path.join(self.checkpoint_dir, "checkpoint_best.pt")
                 torch.save(state, best_path)
@@ -131,13 +157,14 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
         strict: Optional[bool] = None,
     ) -> Optional[int]:
         """Load latest checkpoint if available. Returns resumed epoch."""
         latest_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
         if not os.path.exists(latest_path):
             return None
-        return self.load_checkpoint(latest_path, model, optimizer, scheduler, strict=strict)
+        return self.load_checkpoint(latest_path, model, optimizer, scheduler, scaler=scaler, strict=strict)
 
     def load_checkpoint(
         self,
@@ -145,11 +172,12 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
         strict: Optional[bool] = None,
     ) -> int:
         """Load specific checkpoint with robust strict/non-strict fallback for quantized/LoRA models."""
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = checkpoint["model_state_dict"]
+        state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
 
         is_sam3 = "sam3" in getattr(model, "__class__", type(model)).__name__.lower() or getattr(model, "load_in_4bit", False) or hasattr(model, "pretrained_model_name_or_path")
         effective_strict = (not is_sam3) if strict is None else strict
@@ -162,17 +190,41 @@ class CheckpointManager:
             else:
                 raise err
 
-        if optimizer is not None and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
+        if optimizer is not None and isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
             try:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except Exception:
                 pass
-        if scheduler is not None and "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
+        if scheduler is not None and isinstance(checkpoint, dict) and "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
             try:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             except Exception:
                 pass
-        return checkpoint.get("epoch", 0)
+        if scaler is not None and isinstance(checkpoint, dict) and "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None:
+            try:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except Exception:
+                pass
+
+        if isinstance(checkpoint, dict):
+            if "best_score" in checkpoint and checkpoint["best_score"] is not None:
+                self.best_score = float(checkpoint["best_score"])
+            if "best_epoch" in checkpoint and checkpoint["best_epoch"] is not None:
+                self.best_epoch = int(checkpoint["best_epoch"])
+
+        epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
+        step = int(checkpoint.get("step", 0)) if isinstance(checkpoint, dict) and checkpoint.get("step") is not None else None
+
+        self.last_loaded_checkpoint_info = {
+            "epoch": epoch,
+            "step": step,
+            "best_score": self.best_score,
+            "best_epoch": self.best_epoch,
+            "history": checkpoint.get("history", []) if isinstance(checkpoint, dict) else [],
+            "metrics": checkpoint.get("metrics", {}) if isinstance(checkpoint, dict) else {},
+            "checkpoint_path": checkpoint_path,
+        }
+        return epoch
 
 
 class EarlyStopping:

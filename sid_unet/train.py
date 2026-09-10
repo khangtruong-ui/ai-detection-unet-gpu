@@ -26,6 +26,14 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from sid_unet.dataset.loader import create_dataloaders
 from sid_unet.training.trainer import Trainer
+from sid_unet.utils.checkpoint import (
+    find_auto_resume_checkpoint,
+    download_hf_checkpoint,
+    is_hf_repo_id,
+    inspect_checkpoint,
+    format_resume_notification,
+    format_no_resume_notification,
+)
 from sid_unet.utils.config import load_config, save_config
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.plotting import plot_multi_experiment_curves
@@ -108,7 +116,32 @@ def parse_args():
         "--resume",
         type=str,
         default=None,
-        help="Path to checkpoint .pt file to resume training from",
+        help="Path to checkpoint .pt file or Hugging Face model repo (e.g. 'hf://owner/repo') to resume training from",
+    )
+    parser.add_argument(
+        "--resume-repo",
+        "--resume_repo",
+        "--hf-repo",
+        "--hf_repo",
+        type=str,
+        default=None,
+        help="Hugging Face model repository ID or URI (e.g. 'KhangTruong/sid-unet' or 'hf://KhangTruong/sid-unet:checkpoint_best.pt') to resume from.",
+    )
+    parser.add_argument(
+        "--auto-resume",
+        "--auto_resume",
+        dest="auto_resume",
+        action="store_true",
+        default=True,
+        help="Automatically search the repository and output directories for existing checkpoints to resume from (default: True).",
+    )
+    parser.add_argument(
+        "--no-auto-resume",
+        "--no_auto_resume",
+        "--no-resume",
+        dest="auto_resume",
+        action="store_false",
+        help="Disable automatic checkpoint resumption.",
     )
     parser.add_argument(
         "--val-samples-per-epoch",
@@ -151,6 +184,8 @@ def train_single_run(
     config_path: str,
     overrides: Optional[List[str]] = None,
     resume: Optional[str] = None,
+    resume_repo: Optional[str] = None,
+    auto_resume: bool = True,
     run_idx: int = 1,
     total_runs: int = 1,
     base_output_dir: Optional[str] = None,
@@ -209,18 +244,52 @@ def train_single_run(
     logger.info(f"Effective configuration saved to '{config_save_path}'")
     logger.info(f"Dataset: {config.data.dataset_name} | Streaming: {config.data.streaming}")
 
-    # Check for existing checkpoint (continue from checkpoint as default behaviour)
+    # Checkpoint resolution:
+    # 1. Explicit Hugging Face repo or URI (--resume-repo or --resume hf://...)
+    # 2. Explicit local path (--resume path/to/ckpt.pt)
+    # 3. Config project.resume_repo or training.resume_repo
+    # 4. Automatic search in repo and output directories (if auto_resume=True)
+    resume_target = resume or resume_repo or config.project.get("resume_repo") or config.training.get("resume_repo")
+    resume_info = None
+
+    if resume_target:
+        if is_hf_repo_id(str(resume_target)):
+            logger.info(f"Resolving checkpoint from Hugging Face model repository '{resume_target}'...")
+            try:
+                hf_data = download_hf_checkpoint(str(resume_target))
+                resume = hf_data["checkpoint_path"]
+                resume_info = {**inspect_checkpoint(resume), **hf_data}
+            except Exception as e:
+                logger.error(f"Failed to download checkpoint from Hugging Face repo '{resume_target}': {e}")
+                raise e
+        elif os.path.exists(str(resume_target)):
+            resume = str(resume_target)
+            resume_info = {"checkpoint_path": resume, "source": "local_repo", **inspect_checkpoint(resume)}
+        else:
+            raise FileNotFoundError(f"Specified checkpoint or repo not found: '{resume_target}'")
+    elif auto_resume:
+        found = find_auto_resume_checkpoint(
+            output_dir=output_dir,
+            config_stem=cfg_stem,
+            repo_root=".",
+        )
+        if found:
+            resume = found["checkpoint_path"]
+            resume_info = found
+
+    # On-screen and logger notification
+    if resume_info:
+        msg = format_resume_notification(resume_info)
+        print(msg)
+        logger.info(msg)
+    elif auto_resume:
+        msg = format_no_resume_notification(output_dir)
+        print(msg)
+        logger.info(msg)
+
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     latest_ckpt = os.path.join(ckpt_dir, "checkpoint_latest.pt")
     best_ckpt = os.path.join(ckpt_dir, "checkpoint_best.pt")
-
-    if resume is None:
-        if os.path.exists(latest_ckpt):
-            resume = latest_ckpt
-            logger.info(f"Found existing latest checkpoint '{resume}' - continuing from checkpoint by default.")
-        elif os.path.exists(best_ckpt):
-            resume = best_ckpt
-            logger.info(f"Found existing best checkpoint '{resume}' - continuing from checkpoint by default.")
 
     # Collision check: has this combination already been trained and evaluated?
     eval_rep_json = os.path.join(output_dir, "eval_reports", "evaluation_report.json")
@@ -274,10 +343,9 @@ def train_single_run(
         custom_logger=logger,
     )
 
-    # Optional resume
+    # Resume training state if checkpoint found
     if resume:
-        logger.info(f"Resuming training from checkpoint '{resume}'...")
-        trainer.ckpt_manager.load_checkpoint(resume, trainer.model, trainer.optimizer, trainer.scheduler)
+        trainer.resume_from_checkpoint(resume)
 
     # Run training
     results = trainer.train()
@@ -320,6 +388,8 @@ def main():
             config_path=config_paths[0],
             overrides=overrides,
             resume=args.resume,
+            resume_repo=args.resume_repo,
+            auto_resume=args.auto_resume,
             run_idx=1,
             total_runs=1,
             base_output_dir=args.output_dir,
@@ -356,6 +426,8 @@ def main():
             config_path=cfg_path,
             overrides=overrides,
             resume=args.resume if i == 1 else None,
+            resume_repo=args.resume_repo if i == 1 else None,
+            auto_resume=args.auto_resume,
             run_idx=i,
             total_runs=len(config_paths),
             base_output_dir=suite_run_dir,

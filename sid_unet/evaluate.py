@@ -37,6 +37,7 @@ from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.sam3_refiner import get_sam_refiner
 from sid_unet.models.unet import UNet
 from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
+from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
@@ -718,6 +719,9 @@ def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
                 resolved_paths.extend(glob.glob(os.path.join(pattern, "**", "*.pt"), recursive=True))
         elif os.path.isfile(pattern):
             resolved_paths.append(pattern)
+        elif is_hf_repo_id(pattern):
+            hf_res = download_hf_checkpoint(pattern)
+            resolved_paths.append(hf_res["checkpoint_path"])
         else:
             raise FileNotFoundError(f"Checkpoint path not found: {pattern}")
 

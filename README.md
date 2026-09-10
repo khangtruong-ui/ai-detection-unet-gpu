@@ -1,7 +1,7 @@
 # SID-UNet: UNet & Pretrained CNN Backbones for AI-Generated Synthetic Image Masking & Classification
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.5%2B-ee4c2c.svg)](https://pytorch.org/)
 [![Datasets](https://img.shields.io/badge/HuggingFace-Datasets-orange.svg)](https://huggingface.co/datasets/saberzl/SID_Set)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
@@ -51,8 +51,10 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Standard UNet**: Modular depth, configurable channel dimensions, bilinear or transposed convolutions.
   - **Pretrained EfficientNet-UNet**: Leverage ImageNet pretrained CNN representations with multi-scale skip connections ($/2, /4, /8, /16, /32$) feeding into a progressive decoder.
   - **Sacrifice of Pixel Mode**: Uses **only the final bottleneck feature map** ($8 \times 8$ or $7 \times 7$), routes through a single Linear layer, and zooms out to match full image resolution.
-- **Continuous Master Reports & Collision Skipping**:
-  - **Default Checkpoint Continuation**: Automatically resumes from latest or best checkpoints when available.
+- **Continuous Master Reports & Automatic Checkpoint Continuation**:
+  - **Automatic Repository Checkpoint Discovery**: Automatically scans repository and output directories (`outputs/RUN/...`, `checkpoints/`, etc.) for existing checkpoints (`checkpoint_latest.pt`, `checkpoint_periodic.pt`, `checkpoint_best.pt`) and displays a highlighted on-screen notification with detailed resume metadata (epoch, global step, metric score).
+  - **Hugging Face Model Repository Resumption**: Download and resume training or evaluation directly from Hugging Face Hub repositories (`--resume-repo <owner/repo>` or `--resume hf://<owner/repo>`).
+  - **Full Training State Resumption**: Seamlessly restores model weights, optimizer state, LR scheduler, GradScaler, global step, best metric score, and training history across training epochs.
   - **Collision Detection & Skip**: Automatically detects if a combination of model config (with checkpoint) and dataset config has already been trained or evaluated, skipping duplicate work with clear notifications while preserving and updating consolidated continuous master reports.
 - **Random Sample Visual Illustration CLI (`sid-illu`)**:
   - Interactively sample random examples from datasets and produce side-by-side comparative grids across multiple checkpoints, detailing per-sample IoU, Dice/F1, overlays, and error maps.
@@ -435,7 +437,7 @@ Both training (`sid-train`) and evaluation (`sid-eval`, `sid-cross-eval`) native
 
 ## Installation
 
-Install in editable mode using `pip`:
+Install in editable mode using `pip` or `uv`:
 
 ```bash
 # Clone and enter directory
@@ -444,8 +446,13 @@ cd /workspace
 # Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu)
 pip install -e .
 
-# Or with development and testing dependencies:
+# Or using uv (compatible with torch>=2.5.0, preserving your existing PyTorch installation):
+uv pip install -e .
+
+# With development and testing dependencies:
 pip install -e ".[dev]"
+# or:
+uv pip install -e ".[dev]"
 ```
 
 ---
@@ -613,13 +620,38 @@ outputs/RUN/
 └── multi_experiment_comparison.json
 ```
 
+#### C. Automatic Resumption & Hugging Face Hub Resumption
+By default, `sid-train` automatically discovers existing checkpoints in the repository and output directories (`outputs/RUN/<stem>/checkpoints/`, `outputs/checkpoints/`, etc.), displaying an on-screen notification before seamlessly resuming training:
+
+```bash
+# 1. Automatic checkpoint discovery (enabled by default)
+# Finds checkpoint_latest.pt -> checkpoint_periodic.pt -> checkpoint_best.pt and resumes
+sid-train --config configs/default.yaml
+
+# 2. Direct Hugging Face Model Repository resumption
+# Downloads checkpoint weights from Hugging Face Hub and resumes training
+sid-train --config configs/default.yaml --resume-repo KhangTruong/sid-unet
+# Or using the hf:// URI scheme:
+sid-train --config configs/default.yaml --resume hf://KhangTruong/sid-unet
+
+# 3. Explicit local checkpoint file resumption
+sid-train --config configs/default.yaml --resume outputs/RUN/default/checkpoints/checkpoint_latest.pt
+
+# 4. Disable auto-resume to start a fresh training run from epoch 1
+sid-train --config configs/default.yaml --no-auto-resume
+```
+
 ---
 
 ### 2. Evaluation & Benchmarking
 
 #### A. Single Checkpoint Evaluation
 ```bash
+# Evaluate local checkpoint
 sid-eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt --split test
+
+# Evaluate directly from Hugging Face Hub repository
+sid-eval --checkpoint hf://KhangTruong/sid-unet --split test
 ```
 
 #### B. Multi-Checkpoint Evaluation
@@ -627,6 +659,7 @@ sid-eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt -
 sid-eval --checkpoints \
   outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt \
   outputs/RUN/efficientnet_b0_unet/checkpoints/checkpoint_best.pt \
+  hf://KhangTruong/sid-unet \
   --split test
 ```
 

@@ -34,6 +34,7 @@ from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
 from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_cross_eval_heatmaps
+from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.report import (
     extract_key_hyperparameters,
     generate_evaluation_report,
@@ -241,6 +242,9 @@ def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
                 resolved.extend(glob.glob(os.path.join(pat, "**", "*.pt"), recursive=True))
         elif os.path.isfile(pat):
             resolved.append(pat)
+        elif is_hf_repo_id(pat):
+            hf_res = download_hf_checkpoint(pat)
+            resolved.append(hf_res["checkpoint_path"])
         else:
             raise FileNotFoundError(f"Checkpoint path not found: {pat}")
 
