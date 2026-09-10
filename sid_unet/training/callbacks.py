@@ -4,11 +4,14 @@ Callbacks for training: checkpoint management and early stopping.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger("sid_unet.training.callbacks")
 
 from sid_unet.utils.config import save_config
 from sid_unet.utils.checkpoint import (
@@ -182,35 +185,86 @@ class CheckpointManager:
         is_sam3 = "sam3" in getattr(model, "__class__", type(model)).__name__.lower() or getattr(model, "load_in_4bit", False) or hasattr(model, "pretrained_model_name_or_path")
         effective_strict = (not is_sam3) if strict is None else strict
 
+        model_sd = model.state_dict()
+
+        # Handle 'module.' prefix differences (e.g. from DDP)
+        if not any(k in model_sd for k in state_dict.keys()):
+            if any(k.startswith("module.") for k in state_dict.keys()):
+                state_dict = {k[7:]: v for k, v in state_dict.items()}
+            elif any(f"module.{k}" in model_sd for k in state_dict.keys()):
+                state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+
+        # Filter out shape/size mismatches (e.g. 4-bit packed params loaded into float32 CPU model or vice versa)
+        compatible_sd = {}
+        mismatched_keys = []
+        for k, v in state_dict.items():
+            if k in model_sd:
+                if hasattr(v, "shape") and hasattr(model_sd[k], "shape") and v.shape != model_sd[k].shape:
+                    mismatched_keys.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+                    continue
+            compatible_sd[k] = v
+
+        if mismatched_keys:
+            if strict is True:
+                raise RuntimeError(
+                    f"Size mismatch when loading checkpoint in strict mode for {len(mismatched_keys)} keys: "
+                    f"{mismatched_keys[:3]}"
+                )
+            logger.warning(
+                f"⚠️ [CHECKPOINT COMPATIBILITY] Skipped {len(mismatched_keys)} parameter(s) with shape/quantization "
+                f"mismatches (e.g. 4-bit quantized vs float32). Successfully loaded {len(compatible_sd)} matching parameter(s)."
+            )
+
         try:
-            model.load_state_dict(state_dict, strict=effective_strict)
+            model.load_state_dict(compatible_sd, strict=effective_strict and not mismatched_keys)
         except RuntimeError as err:
-            if "Unexpected key(s) in state_dict" in str(err) or not (strict is True):
-                model.load_state_dict(state_dict, strict=False)
+            if not (strict is True):
+                model.load_state_dict(compatible_sd, strict=False)
             else:
                 raise err
 
         if optimizer is not None and isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
             try:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            except Exception:
-                pass
+                opt_sd = checkpoint["optimizer_state_dict"]
+                try:
+                    target_device = next(model.parameters()).device
+                    if "state" in opt_sd:
+                        for p_state in opt_sd["state"].values():
+                            if isinstance(p_state, dict):
+                                for sk, sv in p_state.items():
+                                    if isinstance(sv, torch.Tensor) and sv.device != target_device:
+                                        p_state[sk] = sv.to(target_device)
+                except Exception:
+                    pass
+                optimizer.load_state_dict(opt_sd)
+            except Exception as opt_err:
+                logger.warning(f"Could not restore optimizer state ({opt_err}); continuing with initialized optimizer.")
+
         if scheduler is not None and isinstance(checkpoint, dict) and "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
             try:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            except Exception:
-                pass
+            except Exception as sched_err:
+                logger.warning(f"Could not restore scheduler state ({sched_err}); continuing.")
+
         if scaler is not None and isinstance(checkpoint, dict) and "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None:
             try:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            except Exception:
-                pass
+            except Exception as scaler_err:
+                logger.warning(f"Could not restore scaler state ({scaler_err}); continuing.")
 
         if isinstance(checkpoint, dict):
             if "best_score" in checkpoint and checkpoint["best_score"] is not None:
                 self.best_score = float(checkpoint["best_score"])
+            elif "metrics" in checkpoint and isinstance(checkpoint["metrics"], dict):
+                m = checkpoint["metrics"]
+                for candidate in [self.metric_name, f"val_{self.metric_name}", "val_iou", "iou", "val_dice", "val_f1"]:
+                    if candidate in m and m[candidate] is not None:
+                        self.best_score = float(m[candidate])
+                        break
             if "best_epoch" in checkpoint and checkpoint["best_epoch"] is not None:
                 self.best_epoch = int(checkpoint["best_epoch"])
+            elif "epoch" in checkpoint and checkpoint["epoch"] is not None:
+                self.best_epoch = int(checkpoint["epoch"])
 
         epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
         step = int(checkpoint.get("step", 0)) if isinstance(checkpoint, dict) and checkpoint.get("step") is not None else None

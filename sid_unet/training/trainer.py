@@ -193,6 +193,16 @@ class Trainer:
             strict=strict,
         )
         self.start_epoch = resumed_epoch
+        if self.epochs <= self.start_epoch:
+            orig_epochs = self.epochs
+            self.epochs = self.start_epoch + orig_epochs
+            self.logger.info(
+                f"Resumed checkpoint completed epoch {self.start_epoch}, while configured epochs is {orig_epochs}. "
+                f"Extending total epochs to {self.epochs} (will execute epochs {self.start_epoch + 1} to {self.epochs})."
+            )
+            if self.scheduler is not None and hasattr(self.scheduler, "T_max"):
+                self.scheduler.T_max = self.epochs
+
         ckpt_meta = getattr(self.ckpt_manager, "last_loaded_checkpoint_info", {})
         if ckpt_meta.get("step") is not None:
             self.global_step = int(ckpt_meta["step"])

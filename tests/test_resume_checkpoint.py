@@ -402,3 +402,70 @@ def test_cli_resume_repo_flag(monkeypatch, capsys):
         assert "Hugging Face Hub (test/model)" in captured.out
         assert len(res["history"]) == 3
         assert res["history"][2]["epoch"] == 3
+
+
+def test_load_checkpoint_shape_mismatch_tolerance():
+    """Test that CheckpointManager.load_checkpoint safely skips shape-mismatched weights (e.g. 4-bit packed vs float)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        class MockNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.matching_layer = torch.nn.Linear(10, 10)
+                self.mismatched_layer = torch.nn.Linear(10, 10)
+
+        model = MockNet()
+        ckpt_path = os.path.join(tmpdir, "test_shape_mismatch.pt")
+        
+        # Save checkpoint where matching_layer has correct shape [10, 10]
+        # but mismatched_layer has a simulated 4-bit packed shape [50, 1]
+        torch.save({
+            "epoch": 1,
+            "model_state_dict": {
+                "matching_layer.weight": torch.ones(10, 10),
+                "matching_layer.bias": torch.ones(10),
+                "mismatched_layer.weight": torch.ones(50, 1),
+                "mismatched_layer.bias": torch.ones(10),
+            },
+            "metrics": {"val_iou": 0.42},
+        }, ckpt_path)
+
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_iou")
+        # In non-strict mode, it should load without raising RuntimeError
+        resumed_ep = mgr.load_checkpoint(ckpt_path, model=model, strict=False)
+        assert resumed_ep == 1
+        assert mgr.best_score == 0.42
+        # Check that matching layer was loaded
+        assert torch.all(model.matching_layer.weight == 1.0)
+
+
+def test_resume_epoch_extension_when_configured_epochs_less_or_equal_resumed():
+    """Test that when resuming a checkpoint where resumed_epoch >= configured_epochs, epochs is extended."""
+    from sid_unet.training.trainer import Trainer
+    from sid_unet.utils.config import ConfigDict
+
+    cfg = ConfigDict({
+        "project": {"name": "test_extend", "device": "cpu", "output_dir": "/tmp/test_extend"},
+        "data": {"dataset_name": "dummy"},
+        "model": {"name": "unet", "features": [8, 16], "bilinear": True},
+        "loss": {"mask_loss_type": "combined"},
+        "training": {"epochs": 1, "learning_rate": 0.001, "optimizer": "adamw", "scheduler": "cosine"},
+        "logging": {"log_interval": 10},
+    })
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, "ckpt_ep1.pt")
+        torch.save({
+            "epoch": 1,
+            "step": 10,
+            "best_score": 0.5,
+            "model_state_dict": {},
+            "history": [{"epoch": 1, "val_iou": 0.5}],
+        }, ckpt_path)
+
+        trainer = Trainer(config=cfg)
+        assert trainer.epochs == 1
+        res = trainer.resume_from_checkpoint(ckpt_path)
+        assert res["epoch"] == 1
+        # Configured epochs was 1, resumed was 1 -> total epochs should be extended to 1 + 1 = 2
+        assert trainer.epochs == 2
+
