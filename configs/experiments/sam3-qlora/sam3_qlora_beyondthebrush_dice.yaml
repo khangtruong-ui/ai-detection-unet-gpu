@@ -66,8 +66,9 @@ training:
   auto_batch_size: false
   empty_cache_per_epoch: true
   save_best: true
-  save_latest: false
+  save_latest: true
   checkpoint_period: 3600      # Periodic checkpoint interval in seconds (default: 3600 = 1 hour)
+  checkpoint_steps: null       # Optional periodic checkpoint step interval (e.g. 100)
   eval_interval: 1
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"

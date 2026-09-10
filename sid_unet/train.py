@@ -161,6 +161,30 @@ def parse_args():
         default=None,
         help="Interval in seconds (or hours if <= 24) to save periodic checkpoints (default: 3600s / 1 hour)",
     )
+    parser.add_argument(
+        "--checkpoint-steps",
+        "--checkpoint_steps",
+        "--checkpoint-interval-steps",
+        "--checkpoint_interval_steps",
+        type=int,
+        default=None,
+        help="Interval in training steps to save periodic checkpoints (e.g. 100 steps)",
+    )
+    parser.add_argument(
+        "--save-latest",
+        "--save_latest",
+        dest="save_latest",
+        action="store_true",
+        default=None,
+        help="Continuously save and maintain checkpoint_latest.pt (default: True)",
+    )
+    parser.add_argument(
+        "--no-save-latest",
+        "--no_save_latest",
+        dest="save_latest",
+        action="store_false",
+        help="Disable maintaining checkpoint_latest.pt",
+    )
     # Collision checking flags
     parser.add_argument(
         "--skip-collision",
@@ -380,6 +404,12 @@ def main():
         overrides.append(f"data.val_samples={args.val_samples_per_epoch}")
     if args.checkpoint_period is not None:
         overrides.append(f"training.checkpoint_period={args.checkpoint_period}")
+    if args.checkpoint_steps is not None:
+        overrides.append(f"training.checkpoint_steps={args.checkpoint_steps}")
+    if args.save_latest is True:
+        overrides.append("training.save_latest=true")
+    elif args.save_latest is False:
+        overrides.append("training.save_latest=false")
 
     if len(config_paths) == 1:
         if args.output_dir:

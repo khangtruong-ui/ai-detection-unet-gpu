@@ -469,3 +469,103 @@ def test_resume_epoch_extension_when_configured_epochs_less_or_equal_resumed():
         # Configured epochs was 1, resumed was 1 -> total epochs should be extended to 1 + 1 = 2
         assert trainer.epochs == 2
 
+
+def test_checkpoint_manager_step_based_saving():
+    """Verify that checkpoint_steps triggers periodic saving and writes both periodic and latest."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = CheckpointManager(
+            checkpoint_dir=tmpdir,
+            save_latest=True,
+            checkpoint_period=99999.0,
+            checkpoint_steps=10,
+        )
+        model = torch.nn.Linear(2, 2)
+
+        # Step 5: should not trigger
+        assert mgr.should_save_periodic(step=5) is False
+
+        # Step 10: triggers
+        assert mgr.should_save_periodic(step=10) is True
+        saved = mgr.save_periodic(epoch=1, model=model, step=10)
+        assert os.path.exists(saved["periodic"])
+        assert os.path.exists(saved["latest"])
+        assert os.path.exists(os.path.join(tmpdir, "checkpoint_latest_config.yaml"))
+
+        # Right after saving, step 10 should not trigger again
+        assert mgr.should_save_periodic(step=10) is False
+        assert mgr.should_save_periodic(step=15) is False
+        # Step 20: triggers again
+        assert mgr.should_save_periodic(step=20) is True
+
+
+def test_trainer_interrupted_emergency_save():
+    """Verify that KeyboardInterrupt during training safely saves checkpoint_latest.pt with current progress."""
+    from sid_unet.utils.config import ConfigDict
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_interrupt", "device": "cpu", "output_dir": tmpdir},
+            "data": {"dataset_name": "dummy"},
+            "model": {"name": "unet", "features": [8, 16], "bilinear": True},
+            "loss": {"mask_loss_type": "combined"},
+            "training": {"epochs": 3, "learning_rate": 0.001, "optimizer": "adamw", "save_latest": True},
+            "logging": {"log_interval": 1},
+        })
+
+        train_loader = DataLoader(DummyDataset(size=4), batch_size=2)
+        val_loader = DataLoader(DummyDataset(size=2), batch_size=2)
+        trainer = Trainer(config=cfg, train_loader=train_loader, val_loader=val_loader)
+
+        original_train_epoch = trainer.train_epoch
+        def mock_train_epoch(epoch):
+            if epoch == 2:
+                trainer.global_step = 42
+                raise KeyboardInterrupt("Simulated Ctrl+C")
+            return original_train_epoch(epoch)
+
+        trainer.train_epoch = mock_train_epoch
+
+        with pytest.raises(KeyboardInterrupt):
+            trainer.train()
+
+        # Emergency checkpoint should exist!
+        latest_ckpt = os.path.join(tmpdir, "checkpoints", "checkpoint_latest.pt")
+        assert os.path.exists(latest_ckpt)
+        meta = inspect_checkpoint(latest_ckpt)
+        assert meta["step"] == 42
+        assert meta["epoch"] == 2
+
+
+def test_trainer_resume_syncs_latest_checkpoint():
+    """Verify that resuming from an older checkpoint writes a synced checkpoint_latest.pt."""
+    from sid_unet.utils.config import ConfigDict
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_sync", "device": "cpu", "output_dir": tmpdir},
+            "data": {"dataset_name": "dummy"},
+            "model": {"name": "unet", "features": [8, 16], "bilinear": True},
+            "loss": {"mask_loss_type": "combined"},
+            "training": {"epochs": 2, "learning_rate": 0.001, "optimizer": "adamw", "save_latest": True},
+            "logging": {"log_interval": 1},
+        })
+
+        ckpt_dir = os.path.join(tmpdir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        best_path = os.path.join(ckpt_dir, "checkpoint_best.pt")
+        torch.save({
+            "epoch": 1,
+            "step": 15,
+            "best_score": 0.75,
+            "model_state_dict": {},
+        }, best_path)
+
+        latest_path = os.path.join(ckpt_dir, "checkpoint_latest.pt")
+        assert not os.path.exists(latest_path)
+
+        trainer = Trainer(config=cfg)
+        trainer.resume_from_checkpoint(best_path)
+
+        assert os.path.exists(latest_path)
+        meta = inspect_checkpoint(latest_path)
+        assert meta["epoch"] == 1
+        assert meta["step"] == 15
+

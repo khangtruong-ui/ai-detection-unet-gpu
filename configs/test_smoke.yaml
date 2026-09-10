@@ -47,7 +47,7 @@ training:
   scheduler: "cosine"
   amp: false
   save_best: true
-  save_latest: false
+  save_latest: true
   early_stopping_patience: 2
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"

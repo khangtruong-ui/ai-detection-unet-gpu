@@ -605,8 +605,9 @@ The configuration file is divided into modular top-level sections:
 | `auto_batch_size` | `bool` | `true` | Probes available GPU memory at startup to automatically adjust batch size. |
 | `empty_cache_per_epoch` | `bool` | `true` | Flushes `torch.cuda.empty_cache()` at every epoch boundary to prevent memory fragmentation. |
 | **`checkpoint_period`** | `int` / `str` | `3600` | **Time-based periodic checkpointing cadence** (see detailed breakdown below). |
+| **`checkpoint_steps`** | `int` | `null` | **Step-based periodic checkpointing cadence** (saves every $N$ training steps). |
 | **`save_best`** | `bool` | `true` | Saves `checkpoint_best.pt` whenever the validation metric achieves a new optimum. |
-| **`save_latest`** | `bool` | `false` | Saves `checkpoint_latest.pt` after every epoch (periodic checkpoints also maintain latest). |
+| **`save_latest`** | `bool` | `true` | Saves `checkpoint_latest.pt` after every epoch, periodic trigger, and on user interrupt. |
 | `eval_interval` | `int` | `1` | Frequency in epochs at which validation evaluation is executed. |
 | `early_stopping_patience` | `int` | `5` | Epochs without validation metric improvement before halting training early. |
 | `early_stopping_metric` | `str` | `"val_iou"` | Target validation metric to monitor (`"val_iou"`, `"val_dice"`, `"val_loss"`). |
@@ -632,40 +633,36 @@ The configuration file is divided into modular top-level sections:
 
 ### 2. Checkpoint Timing & Resumption Parameters
 
-Periodic checkpointing ensures that long-running jobs (especially large-scale streaming runs that take hours or days per epoch) save restorable training states at predictable wall-clock intervals without waiting for full epoch completion:
+Periodic checkpointing ensures that long-running jobs (especially large-scale streaming runs that take hours or days per epoch) save restorable training states at predictable intervals without waiting for full epoch completion:
 
-#### A. Periodic Checkpoint Interval (`checkpoint_period`)
-The trainer parses `checkpoint_period` using [`parse_checkpoint_period`](sid_unet/training/trainer.py), supporting multiple intuitive formats:
+#### A. Periodic Checkpoint Intervals (`checkpoint_period` & `checkpoint_steps`)
+The trainer parses `checkpoint_period` using [`parse_checkpoint_period`](sid_unet/training/trainer.py), and evaluates periodic saving on **every training batch step**:
 
 ```yaml
 training:
-  # Format 1: Direct seconds (e.g. 3600 = 1 hour, 1800 = 30 minutes, 7200 = 2 hours)
-  checkpoint_period: 3600
-
-  # Format 2: Formatted duration string
-  checkpoint_period: "1h"       # 1 hour
-  checkpoint_period: "30m"      # 30 minutes
-  checkpoint_period: "7200s"    # 7200 seconds (2 hours)
-
-  # Format 3: Direct hours (numeric values <= 24 are automatically treated as hours)
-  checkpoint_period: 2          # 2 hours (7200 seconds)
-
-  # Format 4: Explicit alias keys
+  # Time-based cadence (seconds, duration strings, or hours):
+  checkpoint_period: 3600       # 3600 seconds = 1 hour
+  # or:
+  checkpoint_period: "30m"      # "30m", "1h", "7200s"
+  # or:
   checkpoint_period_hours: 1.5  # 90 minutes
-  # or:
-  checkpoint_period_seconds: 1800
-  # or:
-  checkpoint_interval: 3600
 
-  # To disable time-based periodic saving entirely:
-  checkpoint_period: 0
+  # Step-based cadence (number of global batches/optimizer steps):
+  checkpoint_steps: 100         # Save every 100 training steps (CLI: --checkpoint-steps 100)
+
+  # Continuous latest checkpoint maintenance:
+  save_latest: true             # Always keeps checkpoint_latest.pt synchronized (default: true)
 ```
 
 #### B. Checkpoint Files & State Persistence
 During training, up to three checkpoints are managed in `outputs/RUN/<stem>/checkpoints/`:
-- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time since last save $\ge \text{checkpoint\_period}$. Contains the exact model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, evaluation metrics, and full `history` list.
-- **`checkpoint_latest.pt`**: Updated in-sync with periodic saves and written at every epoch boundary when `save_latest: true`.
+- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time $\ge \text{checkpoint\_period}$ or step interval is reached. Contains model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, metrics, and history.
+- **`checkpoint_latest.pt`**: Continuously synchronized on periodic saves, at epoch boundaries, and on emergency user interrupts. Prioritized first for auto-resumption.
 - **`checkpoint_best.pt`**: Updated whenever validation metric improves on `eval_interval` epochs (governed by `early_stopping_metric` and `save_best: true`).
+
+#### C. Graceful Interruption Recovery & Resume Synchronization
+- **Ctrl+C / Interruption Safety**: If a training process is interrupted (`KeyboardInterrupt` or `SystemExit`), the trainer automatically intercepts the signal, logs `⚠️ Training interrupted! Saving emergency checkpoint...`, and writes the current weights and `global_step` to `checkpoint_latest.pt` before halting.
+- **Cross-Precision Resume Synchronization**: When resuming a checkpoint from another environment (e.g. 4-bit CUDA NF4 loaded onto CPU float32), `resume_from_checkpoint` automatically synchronizes `checkpoint_latest.pt` in the current machine's native representation, eliminating parameter shape mismatch notices on subsequent runs.
 
 ---
 

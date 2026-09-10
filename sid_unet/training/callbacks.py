@@ -34,8 +34,9 @@ class CheckpointManager:
         metric_name: str = "val_iou",
         mode: str = "max",
         save_best: bool = True,
-        save_latest: bool = False,
+        save_latest: bool = True,
         checkpoint_period: Optional[float] = 3600.0,
+        checkpoint_steps: Optional[int] = None,
     ):
         self.checkpoint_dir = checkpoint_dir
         self.metric_name = metric_name
@@ -43,7 +44,9 @@ class CheckpointManager:
         self.save_best = save_best
         self.save_latest = save_latest
         self.checkpoint_period = checkpoint_period
+        self.checkpoint_steps = checkpoint_steps
         self.last_periodic_save_time = time.time()
+        self.last_periodic_step = 0
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.best_score = float("-inf") if mode == "max" else float("inf")
@@ -55,11 +58,16 @@ class CheckpointManager:
             return score > self.best_score
         return score < self.best_score
 
-    def should_save_periodic(self) -> bool:
-        """Check whether the configured checkpoint period has elapsed."""
-        if self.checkpoint_period is None or self.checkpoint_period <= 0:
-            return False
-        return (time.time() - self.last_periodic_save_time) >= self.checkpoint_period
+    def should_save_periodic(self, step: Optional[int] = None) -> bool:
+        """Check whether the configured checkpoint period or step interval has elapsed."""
+        now = time.time()
+        if self.checkpoint_steps is not None and self.checkpoint_steps > 0 and step is not None:
+            if step > 0 and (step - self.last_periodic_step) >= self.checkpoint_steps:
+                return True
+        if self.checkpoint_period is not None and self.checkpoint_period > 0:
+            if (now - self.last_periodic_save_time) >= self.checkpoint_period:
+                return True
+        return False
 
     def save_periodic(
         self,
@@ -73,8 +81,10 @@ class CheckpointManager:
         scaler: Optional[Any] = None,
         history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
-        """Save a periodic checkpoint based on elapsed time."""
+        """Save a periodic checkpoint based on elapsed time or step count."""
         self.last_periodic_save_time = time.time()
+        if step is not None:
+            self.last_periodic_step = step
         cfg_dict = config or {}
         state = {
             "epoch": epoch,
