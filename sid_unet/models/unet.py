@@ -180,7 +180,7 @@ class UNet(nn.Module):
         checkpoint_path: str,
         device: Optional[Union[str, torch.device]] = None,
         override_config: Optional[Union[Dict[str, Any], Any]] = None,
-        strict: bool = True,
+        strict: Optional[bool] = None,
         return_config: bool = False,
     ) -> Union[UNet, Tuple[UNet, Any]]:
         """

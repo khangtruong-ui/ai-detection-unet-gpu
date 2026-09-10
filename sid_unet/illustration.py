@@ -122,6 +122,18 @@ def parse_args():
         default=[],
         help="Config overrides applied to dataset loading (e.g. data.streaming=false).",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Inference device ('auto', 'cuda', 'cpu') (default: auto).",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Enforce strict state_dict key matching when loading model checkpoints (default: False).",
+    )
     return parser.parse_args()
 
 
@@ -339,6 +351,8 @@ def run_illustration(
     segment: Optional[str] = None,
     post_process: bool = True,
     overrides: Optional[List[str]] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    strict: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Execute multi-model illustration pipeline across dataset configs."""
     os.makedirs(output_dir, exist_ok=True)
@@ -357,14 +371,19 @@ def run_illustration(
 
     # 1. Load models
     models_dict: Dict[str, Tuple[torch.nn.Module, Any]] = {}
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Inference Device: {device}")
+    if device is None or device == "auto":
+        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, str):
+        target_device = torch.device(device)
+    else:
+        target_device = device
+    logger.info(f"Inference Device: {target_device}")
 
     # SAM refiner if requested
     sam_refiner = None
     if segment:
         logger.info(f"Loading SAM refiner model: {segment}")
-        sam_refiner = get_sam_refiner(segment, device=device, threshold=threshold)
+        sam_refiner = get_sam_refiner(segment, device=target_device, threshold=threshold)
 
     for ckpt_path in model_ckpts:
         ckpt_stem = os.path.splitext(os.path.basename(ckpt_path))[0]
@@ -385,7 +404,7 @@ def run_illustration(
             ckpt_name = f"{parent_name}_{ckpt_name}"
 
         logger.info(f"Loading model checkpoint '{ckpt_name}' from: {ckpt_path}")
-        model, cfg = UNet.from_checkpoint(ckpt_path, device=device, return_config=True)
+        model, cfg = UNet.from_checkpoint(ckpt_path, device=target_device, strict=strict, return_config=True)
         model.eval()
         models_dict[ckpt_name] = (model, cfg)
 
@@ -434,9 +453,9 @@ def run_illustration(
             img_tensor = s["image"]
             gt_mask_tensor = s["gt_mask"]
             if img_tensor.ndim == 3:
-                img_batch = img_tensor.unsqueeze(0).to(device)
+                img_batch = img_tensor.unsqueeze(0).to(target_device)
             else:
-                img_batch = img_tensor.to(device)
+                img_batch = img_tensor.to(target_device)
 
             gt_mask_np = gt_mask_tensor.squeeze().cpu().numpy()
 
@@ -449,8 +468,13 @@ def run_illustration(
             }
 
             for m_name, (model, m_cfg) in models_dict.items():
+                try:
+                    m_dev = next(model.parameters()).device
+                except Exception:
+                    m_dev = target_device
+                m_img_batch = img_batch.to(m_dev)
                 with torch.no_grad():
-                    out = model(img_batch)
+                    out = model(m_img_batch)
                     mask_logits = out[0] if isinstance(out, tuple) else out
                     prob_map = torch.sigmoid(mask_logits).squeeze().cpu().numpy()
                     bin_mask = (prob_map >= threshold).astype(np.float32)
@@ -574,10 +598,16 @@ def main():
         for cp in ckpt_paths:
             c_dir = os.path.dirname(os.path.abspath(cp))
             p_dir = os.path.dirname(c_dir)
-            eff_1 = os.path.join(c_dir, "checkpoint_best_config.yaml")
-            eff_2 = os.path.join(p_dir, "effective_config.yaml")
-            eff_3 = os.path.join(c_dir, "effective_config.yaml")
-            for eff in [eff_1, eff_2, eff_3]:
+            stem = os.path.splitext(os.path.basename(cp))[0]
+            eff_candidates = [
+                os.path.join(c_dir, f"{stem}_config.yaml"),
+                os.path.join(c_dir, "checkpoint_best_config.yaml"),
+                os.path.join(c_dir, "checkpoint_latest_config.yaml"),
+                os.path.join(c_dir, "checkpoint_periodic_config.yaml"),
+                os.path.join(p_dir, "effective_config.yaml"),
+                os.path.join(c_dir, "effective_config.yaml"),
+            ]
+            for eff in eff_candidates:
                 if os.path.exists(eff) and eff not in inferred:
                     inferred.append(eff)
                     break
@@ -601,6 +631,8 @@ def main():
         segment=args.segment,
         post_process=args.post_process,
         overrides=args.override,
+        device=args.device,
+        strict=args.strict if args.strict else None,
     )
     return results
 
