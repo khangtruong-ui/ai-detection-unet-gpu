@@ -8,10 +8,25 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+warnings.filterwarnings("ignore", message=".*memory_attention_rope_theta.*")
+
+class _TransformersDeprecationFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "memory_attention_rope_theta" not in record.getMessage()
+
+logging.getLogger("transformers").addFilter(_TransformersDeprecationFilter())
+try:
+    import transformers.utils.logging as _hf_logging
+    if hasattr(_hf_logging, "_default_handler") and _hf_logging._default_handler:
+        _hf_logging._default_handler.addFilter(_TransformersDeprecationFilter())
+except ImportError:
+    pass
 
 logger = logging.getLogger("sid_unet.models.sam3_qlora")
 
@@ -92,8 +107,14 @@ class SAM3QLoRA(nn.Module):
 
     def _init_processor_and_model(self):
         """Initialize SAM3 processor and QLoRA model with fallback."""
-        from transformers import Sam3Model, Sam3Processor, BitsAndBytesConfig
-        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        try:
+            from transformers import Sam3Model, Sam3Processor, BitsAndBytesConfig
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        except ImportError as exc:
+            raise ImportError(
+                "SAM3 models require transformers, peft, and bitsandbytes. "
+                "Please install them via `pip install 'sid-unet[sam]'`."
+            ) from exc
 
         # 1. Load processor / tokenizer
         self.processor = self._load_processor()

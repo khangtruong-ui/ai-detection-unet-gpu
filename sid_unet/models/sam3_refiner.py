@@ -8,12 +8,27 @@ Only used during evaluate, cross-eval, and predict phases (never during training
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
 from scipy.ndimage import label, find_objects
+
+warnings.filterwarnings("ignore", message=".*memory_attention_rope_theta.*")
+
+class _TransformersDeprecationFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "memory_attention_rope_theta" not in record.getMessage()
+
+logging.getLogger("transformers").addFilter(_TransformersDeprecationFilter())
+try:
+    import transformers.utils.logging as _hf_logging
+    if hasattr(_hf_logging, "_default_handler") and _hf_logging._default_handler:
+        _hf_logging._default_handler.addFilter(_TransformersDeprecationFilter())
+except ImportError:
+    pass
 
 logger = logging.getLogger("sid_unet.sam3_refiner")
 
@@ -110,6 +125,13 @@ class SAMRefiner:
         """Load SAM3 processor and model."""
         try:
             from transformers import Sam3Model, Sam3Processor
+        except ImportError as exc:
+            raise ImportError(
+                "SAM3 mask refinement requires transformers. "
+                "Please install it via `pip install 'sid-unet[sam]'`."
+            ) from exc
+
+        try:
             self.processor = Sam3Processor.from_pretrained(self.model_name)
             self.model = Sam3Model.from_pretrained(self.model_name)
             self.model.to(self.device)

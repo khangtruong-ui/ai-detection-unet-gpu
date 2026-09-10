@@ -155,11 +155,15 @@ def inspect_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file does not exist: '{checkpoint_path}'")
 
+    import warnings
     try:
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     except Exception:
-        # Fallback to weights_only=True if untrusted
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if not isinstance(ckpt, dict):
         return {

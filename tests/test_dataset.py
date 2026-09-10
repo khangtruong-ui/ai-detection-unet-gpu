@@ -246,4 +246,108 @@ def test_safe_dataloader_len_and_streaming_len():
         _ = len(ds_without_max)
 
 
+def test_is_mock_dataset():
+    from sid_unet.dataset import is_mock_dataset
+
+    assert is_mock_dataset("mock")
+    assert is_mock_dataset("MOCK")
+    assert is_mock_dataset("dummy")
+    assert is_mock_dataset("synthetic")
+    assert is_mock_dataset("mock:synthetic")
+    assert is_mock_dataset("mock/synthetic")
+    assert not is_mock_dataset("saberzl/SID_Set")
+    assert not is_mock_dataset("KhangTruong/IMD2020")
+    assert not is_mock_dataset(None)
+    assert not is_mock_dataset("")
+
+
+def test_generate_mock_raw_sample():
+    from sid_unet.dataset import generate_mock_raw_sample
+
+    sample_0 = generate_mock_raw_sample(0, target_image_size=(64, 64), split="train")
+    assert sample_0["label"] == 0
+    assert sample_0["mask"].shape == (64, 64)
+    assert (sample_0["mask"] == 0).all()
+    assert sample_0["image"].size == (64, 64)
+
+    sample_1 = generate_mock_raw_sample(1, target_image_size=(64, 64), split="train")
+    assert sample_1["label"] == 1
+    assert (sample_1["mask"] == 255).all()
+
+    sample_2 = generate_mock_raw_sample(2, target_image_size=(64, 64), split="train")
+    assert sample_2["label"] == 2
+    assert (sample_2["mask"] == 255).any()
+    assert (sample_2["mask"] == 0).any()
+
+
+def test_mock_datasets_map_and_streaming():
+    from sid_unet.dataset import SIDMockDataset, SIDStreamingMockDataset
+    from sid_unet.dataset.transforms import get_transforms
+
+    transform = get_transforms(image_size=(64, 64), is_train=False)
+
+    # Test SIDMockDataset (map style)
+    map_ds = SIDMockDataset(split="train", transform=transform, max_samples=10, target_image_size=(64, 64))
+    assert len(map_ds) == 10
+    s = map_ds[0]
+    assert s["image"].shape == (3, 64, 64)
+    assert s["mask"].shape == (1, 64, 64)
+    assert s["label"].dtype == torch.long
+
+    # Test SIDStreamingMockDataset (iterable style)
+    stream_ds = SIDStreamingMockDataset(split="val", transform=transform, max_samples=5, target_image_size=(64, 64))
+    assert len(stream_ds) == 5
+    items = list(iter(stream_ds))
+    assert len(items) == 5
+    assert items[0]["image"].shape == (3, 64, 64)
+
+
+def test_create_dataloaders_mock_override():
+    from sid_unet.dataset import create_dataloaders, create_eval_dataloader
+    from sid_unet.utils.config import load_config
+
+    # Test streaming mock override via dataset_name=mock
+    cfg_streaming = load_config(overrides=[
+        "data.dataset_name=mock",
+        "data.batch_size=4",
+        "data.streaming=true",
+        "data.train_samples_per_epoch=8",
+        "data.val_samples_per_epoch=4",
+        "data.test_samples=4",
+        "data.image_size=[64, 64]",
+    ])
+
+    train_l, val_l, test_l = create_dataloaders(cfg_streaming, include_test=True)
+    b_train = next(iter(train_l))
+    assert b_train["image"].shape == (4, 3, 64, 64)
+    assert b_train["mask"].shape == (4, 1, 64, 64)
+    assert b_train["label"].shape == (4,)
+
+    b_val = next(iter(val_l))
+    assert b_val["image"].shape == (4, 3, 64, 64)
+
+    eval_l = create_eval_dataloader(cfg_streaming, split="test", max_samples=4)
+    b_eval = next(iter(eval_l))
+    assert b_eval["image"].shape == (4, 3, 64, 64)
+
+    # Test non-streaming mock override via mock=true
+    cfg_map = load_config(overrides=[
+        "data.dataset_name=some_nonexistent_dataset",
+        "data.mock=true",
+        "data.batch_size=2",
+        "data.streaming=false",
+        "data.train_samples_per_epoch=6",
+        "data.val_samples_per_epoch=4",
+        "data.image_size=[64, 64]",
+        "data.num_workers=0",
+    ])
+
+    train_map_l, val_map_l = create_dataloaders(cfg_map, include_test=False)
+    b_map = next(iter(train_map_l))
+    assert b_map["image"].shape == (2, 3, 64, 64)
+    assert b_map["mask"].shape == (2, 1, 64, 64)
+    assert b_map["label"].shape == (2,)
+
+
+
 

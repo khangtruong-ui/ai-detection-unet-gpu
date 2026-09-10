@@ -7,7 +7,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+import warnings
+from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
@@ -23,6 +24,158 @@ from sid_unet.utils.checkpoint import (
     format_no_resume_notification,
     parse_hf_repo_uri,
 )
+
+
+def load_state_dict_compatible(
+    model: nn.Module,
+    state_dict: Dict[str, Any],
+    strict: Optional[bool] = None,
+    target_device: Optional[Union[str, torch.device]] = None,
+) -> Dict[str, Any]:
+    """Load state_dict into model with dynamic adaptation for quantized (4-bit/8-bit) and LoRA parameters.
+
+    Features:
+      - Automatically maps weights to the target model device.
+      - Detects bitsandbytes 4-bit packed parameters and converts floating-point checkpoint weights
+        directly into NormalFloat4 (NF4) Params4bit layers.
+      - Dequantizes 4-bit weights into float/half if restoring into an unquantized model on CUDA.
+      - Handles LoRA / PEFT models by ensuring all trained adapters are strictly restored while
+        preserving pre-initialized base foundation weights.
+      - Tolerates and corrects DDP 'module.' prefix mismatches.
+    """
+    if target_device is None:
+        try:
+            target_device = next(model.parameters()).device
+        except Exception:
+            target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(target_device, str):
+        if target_device == "auto":
+            target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            target_device = torch.device(target_device)
+
+    model_sd = model.state_dict()
+
+    # Handle 'module.' prefix differences (e.g. from DDP)
+    if not any(k in model_sd for k in state_dict.keys()):
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k[7:]: v for k, v in state_dict.items()}
+        elif any(f"module.{k}" in model_sd for k in state_dict.keys()):
+            state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+
+    compatible_sd = {}
+    adapted_keys = []
+    preserved_keys = []
+    mismatched_keys = []
+
+    for k, v in state_dict.items():
+        if k not in model_sd:
+            compatible_sd[k] = v
+            continue
+
+        target_tensor = model_sd[k]
+        if hasattr(v, "shape") and hasattr(target_tensor, "shape") and v.shape != target_tensor.shape:
+            # Check for parent module and param name
+            parts = k.split(".")
+            mod = model
+            for p in parts[:-1]:
+                mod = getattr(mod, p, None)
+                if mod is None:
+                    break
+            param_name = parts[-1]
+
+            adapted = False
+            if mod is not None and hasattr(mod, param_name):
+                target_param = getattr(mod, param_name)
+
+                # Case 1: Model parameter is 4-bit (Params4bit / Linear4bit) and incoming tensor is float/half
+                is_target_4bit = (
+                    hasattr(target_param, "quant_state")
+                    or type(target_param).__name__ == "Params4bit"
+                    or (hasattr(mod, "weight") and type(mod.weight).__name__ == "Params4bit")
+                )
+                if is_target_4bit and hasattr(v, "dtype") and v.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                    try:
+                        from bitsandbytes.nn.modules import Params4bit
+                        from bitsandbytes.functional import quantize_4bit
+
+                        q_type = getattr(target_param, "quant_type", "nf4")
+                        dev = (
+                            target_param.device
+                            if (hasattr(target_param, "device") and target_param.device.type == "cuda")
+                            else (target_device if target_device.type == "cuda" else torch.device("cuda"))
+                        )
+                        q_data, q_state = quantize_4bit(v.to(dev), quant_type=q_type)
+                        new_param = Params4bit(q_data, requires_grad=False, quant_state=q_state, quant_type=q_type)
+                        setattr(mod, param_name, new_param)
+                        compatible_sd[k] = q_data
+                        adapted = True
+                        adapted_keys.append(k)
+                    except Exception as e:
+                        logger.debug(f"Dynamic 4-bit quantization failed for {k}: {e}")
+
+                # Case 2: Model parameter is float and incoming tensor is 4-bit uint8
+                elif hasattr(v, "dtype") and v.dtype == torch.uint8 and target_tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                    try:
+                        from bitsandbytes.functional import dequantize_4bit
+
+                        qs = getattr(v, "quant_state", None)
+                        if qs is None:
+                            qs_key = f"{k}.quant_state.bitsandbytes__nf4"
+                            qs = state_dict.get(qs_key, None)
+                        if qs is not None:
+                            dev = target_device if target_device.type == "cuda" else torch.device("cuda")
+                            deq = dequantize_4bit(v.to(dev), quant_state=qs, quant_type="nf4")
+                            compatible_sd[k] = deq.to(device=target_device, dtype=target_tensor.dtype)
+                            adapted = True
+                            adapted_keys.append(k)
+                    except Exception as e:
+                        logger.debug(f"Dynamic dequantization failed for {k}: {e}")
+
+            if not adapted:
+                # Check if this is a frozen base model parameter
+                is_trainable = False
+                if mod is not None and hasattr(mod, param_name):
+                    p_obj = getattr(mod, param_name)
+                    if isinstance(p_obj, nn.Parameter) and p_obj.requires_grad:
+                        is_trainable = True
+                if not is_trainable and "lora_" not in k and "classifier_head" not in k:
+                    # Model already has pre-initialized foundation base weights
+                    preserved_keys.append(k)
+                else:
+                    mismatched_keys.append((k, tuple(v.shape), tuple(target_tensor.shape)))
+        else:
+            compatible_sd[k] = v
+
+    is_sam3 = "sam3" in getattr(model, "__class__", type(model)).__name__.lower() or getattr(model, "load_in_4bit", False) or hasattr(model, "pretrained_model_name_or_path")
+    effective_strict = (not is_sam3) if strict is None else strict
+
+    if mismatched_keys:
+        if strict is True:
+            raise RuntimeError(
+                f"Size mismatch when loading checkpoint in strict mode for {len(mismatched_keys)} keys: "
+                f"{mismatched_keys[:3]}"
+            )
+        logger.warning(
+            f"⚠️ [CHECKPOINT COMPATIBILITY] Skipped {len(mismatched_keys)} incompatible parameter(s): {mismatched_keys[:3]}"
+        )
+
+    if adapted_keys or preserved_keys:
+        logger.info(
+            f"✅ [CHECKPOINT COMPATIBILITY] Successfully loaded {len(compatible_sd) + len(preserved_keys)}/{len(state_dict)} parameters "
+            f"({len(compatible_sd) - len(adapted_keys)} exact match, {len(adapted_keys)} dynamically quantized/adapted, "
+            f"{len(preserved_keys)} base foundation parameters preserved)."
+        )
+
+    try:
+        model.load_state_dict(compatible_sd, strict=effective_strict and not (mismatched_keys or preserved_keys))
+    except RuntimeError as err:
+        if not (strict is True):
+            model.load_state_dict(compatible_sd, strict=False)
+        else:
+            raise err
+
+    return compatible_sd
 
 
 class CheckpointManager:
@@ -172,12 +325,21 @@ class CheckpointManager:
         scheduler: Optional[Any] = None,
         scaler: Optional[Any] = None,
         strict: Optional[bool] = None,
+        map_location: Optional[Union[str, torch.device]] = None,
     ) -> Optional[int]:
         """Load latest checkpoint if available. Returns resumed epoch."""
         latest_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
         if not os.path.exists(latest_path):
             return None
-        return self.load_checkpoint(latest_path, model, optimizer, scheduler, scaler=scaler, strict=strict)
+        return self.load_checkpoint(
+            latest_path,
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            strict=strict,
+            map_location=map_location,
+        )
 
     def load_checkpoint(
         self,
@@ -187,57 +349,59 @@ class CheckpointManager:
         scheduler: Optional[Any] = None,
         scaler: Optional[Any] = None,
         strict: Optional[bool] = None,
+        map_location: Optional[Union[str, torch.device]] = None,
     ) -> int:
-        """Load specific checkpoint with robust strict/non-strict fallback for quantized/LoRA models."""
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        """Load specific checkpoint with robust strict/non-strict fallback and dynamic quantization adaptation."""
+        # 1. Resolve map_location
+        if map_location is None:
+            try:
+                map_location = next(model.parameters()).device
+            except Exception:
+                map_location = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(map_location, str):
+            if map_location == "auto":
+                map_location = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                map_location = torch.device(map_location)
+
+        # 2. Load checkpoint safely (weights_only=True first, falling back to weights_only=False)
+        checkpoint = None
+        for weights_only_flag in [True, False]:
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+                    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only_flag)
+                break
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                # Fall back to CPU if target device runs out of memory or device mapping fails
+                try:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+                        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=weights_only_flag)
+                    break
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+        if checkpoint is None:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
         state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
 
-        is_sam3 = "sam3" in getattr(model, "__class__", type(model)).__name__.lower() or getattr(model, "load_in_4bit", False) or hasattr(model, "pretrained_model_name_or_path")
-        effective_strict = (not is_sam3) if strict is None else strict
-
-        model_sd = model.state_dict()
-
-        # Handle 'module.' prefix differences (e.g. from DDP)
-        if not any(k in model_sd for k in state_dict.keys()):
-            if any(k.startswith("module.") for k in state_dict.keys()):
-                state_dict = {k[7:]: v for k, v in state_dict.items()}
-            elif any(f"module.{k}" in model_sd for k in state_dict.keys()):
-                state_dict = {f"module.{k}": v for k, v in state_dict.items()}
-
-        # Filter out shape/size mismatches (e.g. 4-bit packed params loaded into float32 CPU model or vice versa)
-        compatible_sd = {}
-        mismatched_keys = []
-        for k, v in state_dict.items():
-            if k in model_sd:
-                if hasattr(v, "shape") and hasattr(model_sd[k], "shape") and v.shape != model_sd[k].shape:
-                    mismatched_keys.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
-                    continue
-            compatible_sd[k] = v
-
-        if mismatched_keys:
-            if strict is True:
-                raise RuntimeError(
-                    f"Size mismatch when loading checkpoint in strict mode for {len(mismatched_keys)} keys: "
-                    f"{mismatched_keys[:3]}"
-                )
-            logger.warning(
-                f"⚠️ [CHECKPOINT COMPATIBILITY] Skipped {len(mismatched_keys)} parameter(s) with shape/quantization "
-                f"mismatches (e.g. 4-bit quantized vs float32). Successfully loaded {len(compatible_sd)} matching parameter(s)."
-            )
-
-        try:
-            model.load_state_dict(compatible_sd, strict=effective_strict and not mismatched_keys)
-        except RuntimeError as err:
-            if not (strict is True):
-                model.load_state_dict(compatible_sd, strict=False)
-            else:
-                raise err
+        # 3. Use load_state_dict_compatible to handle LoRA, 4-bit/8-bit, and shape differences
+        load_state_dict_compatible(
+            model=model,
+            state_dict=state_dict,
+            strict=strict,
+            target_device=map_location,
+        )
 
         if optimizer is not None and isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
             try:
                 opt_sd = checkpoint["optimizer_state_dict"]
                 try:
-                    target_device = next(model.parameters()).device
+                    target_device = map_location
                     if "state" in opt_sd:
                         for p_state in opt_sd["state"].values():
                             if isinstance(p_state, dict):

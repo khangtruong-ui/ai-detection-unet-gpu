@@ -202,7 +202,19 @@ class UNet(nn.Module):
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        target_map = device if device not in (None, "auto") else ("cuda" if torch.cuda.is_available() else "cpu")
+        import warnings
+        ckpt = None
+        for wo in [True, False]:
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+                    ckpt = torch.load(checkpoint_path, map_location=target_map, weights_only=wo)
+                break
+            except Exception:
+                continue
+        if ckpt is None:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
             saved_cfg = ckpt.get("config", {})
@@ -237,8 +249,8 @@ class UNet(nn.Module):
 
         config = ConfigDict(merged)
         model = build_model(config)
-        is_sam3 = "sam3" in str(merged.get("model", {}).get("name", "")).lower()
-        model.load_state_dict(state_dict, strict=(strict and not is_sam3))
+        from sid_unet.training.callbacks import load_state_dict_compatible
+        load_state_dict_compatible(model, state_dict, strict=strict, target_device=target_map)
         model.eval()
 
         if device is not None:
@@ -247,7 +259,7 @@ class UNet(nn.Module):
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 else:
                     device = torch.device(device)
-            if not is_sam3 or not getattr(model, "load_in_4bit", False):
+            if not getattr(model, "load_in_4bit", False):
                 model.to(device)
 
         model.config = config

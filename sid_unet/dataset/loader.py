@@ -193,6 +193,136 @@ def load_hf_dataset_robust(
         raise e
 
 
+def is_mock_dataset(dataset_name: Optional[str]) -> bool:
+    """Check if the provided dataset name signifies a synthetic/mock dataset override."""
+    if not dataset_name or not isinstance(dataset_name, str):
+        return False
+    norm = dataset_name.strip().lower()
+    return norm in ("mock", "dummy", "synthetic", "mock:synthetic", "mock/synthetic")
+
+
+def generate_mock_raw_sample(
+    idx: int,
+    target_image_size: Tuple[int, int] = (256, 256),
+    split: str = "train",
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Generate a realistic synthetic image, mask, and label sample deterministically without network calls."""
+    w, h = target_image_size
+    rng = np.random.RandomState((seed + idx * 37) % (2**31 - 1))
+
+    # Cycle across all 3 classes:
+    # 0: Authentic / Real (all-zero mask)
+    # 1: Fully Synthetic / Deepfake (all-one mask)
+    # 2: Partially Tampered / Inpainted (localized masked region)
+    label = idx % 3
+
+    # Generate synthetic RGB background
+    base_color = rng.randint(40, 200, size=(3,), dtype=np.uint8)
+    noise = rng.randint(-25, 25, size=(h, w, 3), dtype=np.int16)
+    img_arr = np.clip(base_color[None, None, :] + noise, 0, 255).astype(np.uint8)
+
+    mask_arr = np.zeros((h, w), dtype=np.uint8)
+
+    if label == 1:
+        mask_arr.fill(255)
+    elif label == 2:
+        # Create a localized box of tampering
+        box_w = max(16, int(w * rng.uniform(0.25, 0.6)))
+        box_h = max(16, int(h * rng.uniform(0.25, 0.6)))
+        x0 = int(rng.randint(0, max(1, w - box_w)))
+        y0 = int(rng.randint(0, max(1, h - box_h)))
+        mask_arr[y0 : y0 + box_h, x0 : x0 + box_w] = 255
+        # Alter the image content inside the tampered region
+        tamper_color = rng.randint(0, 255, size=(3,), dtype=np.uint8)
+        img_arr[y0 : y0 + box_h, x0 : x0 + box_w] = (
+            img_arr[y0 : y0 + box_h, x0 : x0 + box_w] // 2 + tamper_color[None, None, :] // 2
+        )
+
+    pil_img = Image.fromarray(img_arr, mode="RGB")
+
+    return {
+        "image": pil_img,
+        "mask": mask_arr,
+        "label": label,
+        "img_id": f"mock_{split}_{idx}",
+    }
+
+
+class SIDMockDataset(Dataset):
+    """Indexable map-style mock dataset for offline testing and fast pipeline iteration."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        transform: Optional[JointCompose] = None,
+        max_samples: Optional[int] = 100,
+        target_image_size: Tuple[int, int] = (256, 256),
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.split = split
+        self.transform = transform
+        self.max_samples = max_samples if (max_samples is not None and max_samples > 0) else 100
+        self.target_image_size = target_image_size
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.max_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx < 0 or idx >= self.max_samples:
+            raise IndexError(f"Index {idx} out of range for SIDMockDataset of size {self.max_samples}")
+        raw = generate_mock_raw_sample(
+            idx=idx,
+            target_image_size=self.target_image_size,
+            split=self.split,
+            seed=self.seed,
+        )
+        return process_raw_sample(raw, transform=self.transform, target_image_size=self.target_image_size)
+
+
+class SIDStreamingMockDataset(IterableDataset):
+    """Streaming iterable mock dataset for offline testing and fast pipeline iteration."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        transform: Optional[JointCompose] = None,
+        max_samples: Optional[int] = None,
+        target_image_size: Tuple[int, int] = (256, 256),
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.split = split
+        self.transform = transform
+        self.max_samples = max_samples if (max_samples is not None and max_samples > 0) else None
+        self.target_image_size = target_image_size
+        self.seed = seed
+
+    def __len__(self) -> int:
+        if self.max_samples is not None:
+            return self.max_samples
+        return 100
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        worker_info = get_worker_info()
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        limit = self.max_samples if self.max_samples is not None else 100
+        idx = worker_id
+        while idx < limit:
+            raw = generate_mock_raw_sample(
+                idx=idx,
+                target_image_size=self.target_image_size,
+                split=self.split,
+                seed=self.seed,
+            )
+            yield process_raw_sample(raw, transform=self.transform, target_image_size=self.target_image_size)
+            idx += num_workers
+
+
 class SIDStreamingDataset(IterableDataset):
     """
     Streaming PyTorch Dataset wrapping HuggingFace IterableDataset.
@@ -224,9 +354,29 @@ class SIDStreamingDataset(IterableDataset):
     def __len__(self) -> int:
         if self.max_samples is not None and self.max_samples > 0:
             return self.max_samples
+        if is_mock_dataset(self.dataset_name):
+            return 100
         raise TypeError(f"'{type(self).__name__}' object has no len() when max_samples is None")
 
+    def _get_mock_stream(self) -> Iterator[Dict[str, Any]]:
+        limit = self.max_samples if (self.max_samples is not None and self.max_samples > 0) else 100
+        worker_info = get_worker_info()
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        worker_id = worker_info.id if worker_info is not None else 0
+        idx = worker_id
+        while idx < limit:
+            yield generate_mock_raw_sample(
+                idx=idx,
+                target_image_size=self.target_image_size,
+                split=self.split,
+                seed=self.seed,
+            )
+            idx += num_workers
+
     def _get_stream(self) -> Iterator[Dict[str, Any]]:
+        if is_mock_dataset(self.dataset_name):
+            return self._get_mock_stream()
+
         # Load streamed dataset with robust fallback
         hf_ds, resolved = load_hf_dataset_robust(self.dataset_name, requested_split=self.split, streaming=True)
         self.resolved_split = resolved
@@ -333,6 +483,15 @@ class SIDMapDataset(Dataset):
         self.target_image_size = target_image_size
         self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
 
+        if is_mock_dataset(dataset_name):
+            self.resolved_split = split
+            self.split = split
+            self._is_mock = True
+            self._mock_len = self.max_samples if (self.max_samples is not None and self.max_samples > 0) else 100
+            self.data = None
+            return
+
+        self._is_mock = False
         hf_ds, resolved = load_hf_dataset_robust(dataset_name, requested_split=split, streaming=False)
         self.resolved_split = resolved
         self.split = resolved
@@ -342,9 +501,24 @@ class SIDMapDataset(Dataset):
         self.data = hf_ds
 
     def __len__(self) -> int:
+        if getattr(self, "_is_mock", False):
+            return self._mock_len
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if getattr(self, "_is_mock", False):
+            if idx < 0 or idx >= self._mock_len:
+                raise IndexError(f"Index {idx} out of range for mock dataset of size {self._mock_len}")
+            raw_sample = generate_mock_raw_sample(
+                idx=idx,
+                target_image_size=self.target_image_size,
+                split=self.split,
+            )
+            return process_raw_sample(
+                raw_sample,
+                transform=self.transform,
+                target_image_size=self.target_image_size,
+            )
         raw_sample = self.data[idx]
         return process_raw_sample(
             raw_sample,
@@ -374,6 +548,8 @@ def create_eval_dataloader(
         max_samples = samples_override
 
     dataset_name = config.data.get("dataset_name", "KhangTruong/IMD2020")
+    if is_mock_dataset(dataset_name) or bool(config.data.get("mock", False)):
+        dataset_name = "mock"
     streaming = bool(config.data.get("streaming", False))
     batch_size = int(config.data.get("batch_size", 16))
     num_workers = int(config.data.get("num_workers", 2))
@@ -454,6 +630,8 @@ def create_dataloaders(
     until dataset depletion.
     """
     dataset_name = config.data.get("dataset_name", "saberzl/SID_Set")
+    if is_mock_dataset(dataset_name) or bool(config.data.get("mock", False)):
+        dataset_name = "mock"
     streaming = bool(config.data.get("streaming", True))
     batch_size = int(config.data.get("batch_size", 16))
     num_workers = int(config.data.get("num_workers", 2))

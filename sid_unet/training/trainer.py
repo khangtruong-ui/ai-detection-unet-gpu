@@ -195,6 +195,7 @@ class Trainer:
             scheduler=self.scheduler,
             scaler=getattr(self, "scaler", None),
             strict=strict,
+            map_location=self.device,
         )
         self.start_epoch = resumed_epoch
         if self.epochs <= self.start_epoch:
@@ -564,8 +565,12 @@ class Trainer:
         loader: Optional[DataLoader] = None,
         split_name: str = "test",
     ) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]], Optional[list]]:
-        """Evaluate model on a specific DataLoader."""
-        target_loader = loader or self.test_loader or self.val_loader
+        if loader is not None:
+            target_loader = loader
+        elif self.test_loader is not None:
+            target_loader = self.test_loader
+        else:
+            target_loader = self.val_loader
         if target_loader is None:
             raise ValueError("No DataLoader provided for evaluation.")
         return self.validate(epoch=None, loader=target_loader, split_name=split_name)

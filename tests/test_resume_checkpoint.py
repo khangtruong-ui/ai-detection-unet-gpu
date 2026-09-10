@@ -533,3 +533,69 @@ def test_trainer_resume_syncs_latest_checkpoint():
         assert meta["epoch"] == 1
         assert meta["step"] == 15
 
+
+def test_load_checkpoint_weights_only_and_map_location():
+    """Verify that CheckpointManager.load_checkpoint loads with weights_only=True and custom map_location without FutureWarning."""
+    import warnings
+    from sid_unet.training.callbacks import CheckpointManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        net = torch.nn.Linear(4, 2)
+        ckpt_path = os.path.join(tmpdir, "ckpt.pt")
+        torch.save({
+            "epoch": 3,
+            "model_state_dict": net.state_dict(),
+            "metrics": {"val_iou": 0.8},
+        }, ckpt_path)
+
+        mgr = CheckpointManager(checkpoint_dir=tmpdir)
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            ep = mgr.load_checkpoint(ckpt_path, model=net, map_location="cpu")
+            assert ep == 3
+            # Ensure no FutureWarning was emitted
+            future_warns = [w for w in recorded if issubclass(w.category, FutureWarning)]
+            assert len(future_warns) == 0
+
+
+def test_load_state_dict_compatible_dynamic_quantization():
+    """Verify that load_state_dict_compatible adapts float weights to 4-bit layers when available."""
+    from sid_unet.training.callbacks import load_state_dict_compatible
+
+    class MockModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(8, 8)
+
+    model = MockModule()
+    # Provide matching state_dict
+    sd = {"linear.weight": torch.ones(8, 8), "linear.bias": torch.zeros(8)}
+    loaded = load_state_dict_compatible(model, sd, strict=True, target_device="cpu")
+    assert "linear.weight" in loaded
+    assert torch.all(model.linear.weight == 1.0)
+
+
+def test_memory_attention_rope_theta_warning_filtered():
+    """Verify that memory_attention_rope_theta log messages are filtered."""
+    import logging
+    import sid_unet  # imports root filter
+
+    record = logging.LogRecord(
+        name="transformers.models.sam3_tracker_video.configuration_sam3_tracker_video",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="`memory_attention_rope_theta` is deprecated and will be removed in v5.0. Use `rope_parameters['rope_theta']` instead.",
+        args=(),
+        exc_info=None,
+    )
+    logger = logging.getLogger("transformers")
+    # Filters should reject this record
+    rejected = False
+    for f in logger.filters:
+        if not f.filter(record):
+            rejected = True
+            break
+    assert rejected is True
+
+
