@@ -34,6 +34,9 @@ Supports large-scale streaming and local datasets including standard 2-column im
 - [Installation](#installation)
 - [Project Structure](#project-structure)
 - [Configuration System](#configuration-system)
+  - [1. Configuration Field Reference](#1-configuration-field-reference)
+  - [2. Checkpoint Timing & Resumption Parameters](#2-checkpoint-timing--resumption-parameters)
+  - [3. Architecture-Specific Config Examples](#3-architecture-specific-config-examples)
 - [Quickstart: How to Run](#quickstart-how-to-run)
   - [1. Training](#1-training)
   - [2. Evaluation & Benchmarking](#2-evaluation--benchmarking)
@@ -518,9 +521,157 @@ uv pip install -e ".[dev]"
 
 ## Configuration System
 
-Configurations are written in standard YAML and can be overridden via CLI with `--override key.nested=value`.
+Configurations are organized into modular, human-readable YAML files located in `configs/`. Any config setting can also be dynamically overridden from the CLI using `--override key.nested=value`.
 
-### EfficientNet UNet Config Example:
+### 1. Configuration Field Reference
+
+The configuration file is divided into modular top-level sections:
+
+#### `project`
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | `str` | `"sid_unet_baseline"` | Experiment run identifier used to name output directories. |
+| `seed` | `int` | `42` | Random seed for deterministic reproducibility across PyTorch, NumPy, and random. |
+| `device` | `str` | `"auto"` | Execution device: `"auto"` (selects CUDA if available), `"cuda"`, or `"cpu"`. |
+| `output_dir` | `str` | `"outputs"` | Base output directory where runs, checkpoints, logs, and reports are saved. |
+
+#### `data`
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `dataset_name` | `str` | `"KhangTruong/IMD2020"` | Hugging Face dataset identifier or local path. |
+| `streaming` | `bool` | `false` | When `true`, streams samples on-the-fly without downloading entire datasets to disk. |
+| `image_size` | `[H, W]` | `[256, 256]` | Target input image resolution `[height, width]` passed to model. |
+| `batch_size` | `int` | `16` | Micro-batch size per forward/backward pass. |
+| `num_workers` | `int` | `2` | DataLoader worker processes for multi-process sample prefetching. |
+| `pin_memory` | `bool` | `true` | Pins CPU memory pages to accelerate host-to-GPU data transfers. |
+| `shuffle_buffer_size` | `int` | `1000` | Sample buffer size for pseudo-random shuffling when `streaming: true`. |
+| `train_split` | `str` | `"train"` | Dataset split name for training. |
+| `val_split` | `str` | `"validation"` | Dataset split name for validation. |
+| `test_split` | `str` | `"test"` | Dataset split name for evaluation/benchmarking. |
+| `train_samples_per_epoch` | `int` | `-1` | Cap on training samples per epoch (`-1` to consume until dataset is depleted). |
+| `val_samples_per_epoch` | `int` | `-1` | Cap on validation samples per epoch (`-1` or negative for full validation set). |
+| `val_samples` | `int` | `-1` | Alias for `val_samples_per_epoch`. |
+| `test_samples` | `int` | `-1` | Cap on test samples during evaluation (`-1` or negative for full test set). |
+| `augmentations` | `dict` | - | Data augmentation probabilities (`horizontal_flip`, `vertical_flip`, `random_rotate90`). |
+
+#### `model`
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | `str` | `"unet"` | Model architecture family: `"unet"`, `"efficientnet"`, or `"sam3_qlora"`. |
+| `in_channels` | `int` | `3` | Input image channels (RGB = 3). |
+| `out_channels` | `int` | `1` | Output mask channels (1 for binary foreground mask logits). |
+| `features` | `list[int]` | `[64, 128, 256, 512]` | Feature channel dimensions for standard UNet contracting/expanding stages. |
+| `bilinear` | `bool` | `true` | Upsampling method for UNet: `true` for bilinear interpolation, `false` for transposed conv. |
+| `dropout` | `float` | `0.1` | Dropout rate applied before upsampling/bottleneck layers. |
+| `aux_classifier` | `bool` | `false` | Enables auxiliary 3-class classification head (`Real`, `Fully AI`, `Tampered`). |
+| `num_classes` | `int` | `3` | Number of classes for the auxiliary classification head. |
+| `backbone` | `str` | `"efficientnet_b0"` | Pretrained CNN backbone for EfficientNet (`"efficientnet_b0"` to `"b7"`). |
+| `pretrained` | `bool` | `true` | Loads ImageNet pretrained weights for EfficientNet backbones. |
+| `sacrifice_of_pixel` | `bool` | `false` | When `true`, uses only bottleneck features routed to a linear layer and zoomed directly. |
+| `pretrained_model_name_or_path` | `str` | `"jetjodh/sam3"` | Base Hugging Face model repository or local path for SAM3 foundation models. |
+| `load_in_4bit` | `bool` | `true` | Applies 4-bit NormalFloat (NF4) quantization via bitsandbytes for SAM3. |
+| `load_in_8bit` | `bool` | `false` | Applies 8-bit quantization via bitsandbytes for SAM3. |
+| `lora_r` | `int` | `8` | Low-Rank Adaptation (LoRA) rank dimension for PEFT parameter adapters. |
+| `lora_alpha` | `int` | `16` | LoRA alpha scaling hyperparameter. |
+| `lora_dropout` | `float` | `0.05` | Dropout probability for LoRA adapter layers. |
+| `lora_target_modules` | `list[str]` | `["q_proj", "v_proj"]`| Target attention projection layers to attach LoRA adapters to. |
+| `prompt_text` | `str` | `"tampered region"` | Natural language conditioning prompt guiding SAM3 attention queries. |
+| `target_size` | `[H, W]` | `[1008, 1008]` | Native ViT patch grid resolution for SAM3 input processing. |
+
+#### `loss`
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `mask_loss_type` | `str` | `"combined"` | Mask loss formulation: `"combined"` (BCE + Dice), `"bce"`, `"dice"`, or `"focal"`. |
+| `bce_weight` | `float` | `0.5` | Weight $\alpha$ for Binary Cross-Entropy loss in combined mode. |
+| `dice_weight` | `float` | `0.5` | Weight $\beta$ for Soft Dice loss in combined mode. |
+| `focal_gamma` | `float` | `2.0` | Focusing parameter $\gamma$ for Focal loss (higher values down-weight easy pixels). |
+| `focal_alpha` | `float` | `0.25` | Balance factor $\alpha$ for Focal loss class weighting. |
+| `aux_loss_type` | `str` | `"cross_entropy"`| Loss function for auxiliary classifier head. |
+| `aux_weight` | `float` | `0.2` | Multi-task loss weight $\lambda_{\mathrm{aux}}$ balancing classification against segmentation. |
+
+#### `training` (Optimization, Checkpointing & Timing)
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `epochs` | `int` | `10` | Maximum number of training epochs. |
+| `learning_rate` | `float` | `0.001` | Initial base learning rate for optimizer. |
+| `weight_decay` | `float` | `0.0001` | L2 weight regularization penalty. |
+| `optimizer` | `str` | `"adamw"` | Optimization algorithm (`"adamw"`, `"adam"`, `"sgd"`). |
+| `scheduler` | `str` | `"cosine"` | Learning rate schedule (`"cosine"`, `"step"`, `"plateau"`, `"none"`). |
+| `warmup_epochs` | `int` | `1` | Number of epochs for linear learning rate warmup. |
+| `min_lr` | `float` | `1e-6` | Minimum learning rate floor reached at end of cosine decay. |
+| `grad_clip_norm` | `float` | `1.0` | Maximum gradient Euclidean norm threshold to prevent exploding gradients. |
+| `amp` | `bool` | `true` | Automatic Mixed Precision (`torch.cuda.amp`) using FP16/BF16 for 2x speedup. |
+| `gradient_accumulation_steps` | `int` | `1` | Number of forward passes to accumulate gradients over before optimizer step. |
+| `auto_batch_size` | `bool` | `true` | Probes available GPU memory at startup to automatically adjust batch size. |
+| `empty_cache_per_epoch` | `bool` | `true` | Flushes `torch.cuda.empty_cache()` at every epoch boundary to prevent memory fragmentation. |
+| **`checkpoint_period`** | `int` / `str` | `3600` | **Time-based periodic checkpointing cadence** (see detailed breakdown below). |
+| **`save_best`** | `bool` | `true` | Saves `checkpoint_best.pt` whenever the validation metric achieves a new optimum. |
+| **`save_latest`** | `bool` | `false` | Saves `checkpoint_latest.pt` after every epoch (periodic checkpoints also maintain latest). |
+| `eval_interval` | `int` | `1` | Frequency in epochs at which validation evaluation is executed. |
+| `early_stopping_patience` | `int` | `5` | Epochs without validation metric improvement before halting training early. |
+| `early_stopping_metric` | `str` | `"val_iou"` | Target validation metric to monitor (`"val_iou"`, `"val_dice"`, `"val_loss"`). |
+| `early_stopping_mode` | `str` | `"max"` | Optimization direction: `"max"` (for IoU/Dice) or `"min"` (for Loss). |
+
+#### `logging`
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `log_interval` | `int` | `20` | Step interval for printing batch loss, memory usage, and throughput to stdout. |
+| `log_memory` | `bool` | `true` | Logs allocated and reserved GPU VRAM in megabytes during training. |
+
+#### `post_processing`
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | Enables post-processing on output binary masks during inference and evaluation. |
+| `min_area` | `int` | `64` | Minimum pixel area for connected components; smaller regions are removed as noise. |
+| `fill_holes` | `bool` | `true` | Whether to fill enclosed background cavities inside detected tampering regions. |
+| `max_hole_size` | `int` | `256` | Maximum pixel area of an enclosed hole to fill. |
+| `morphology` | `str` | `"open_close"` | Morphological smoothing algorithm (`"open_close"`, `"open"`, `"close"`). |
+| `morph_kernel_size` | `int` | `3` | Structuring element kernel size for morphological operations. |
+
+---
+
+### 2. Checkpoint Timing & Resumption Parameters
+
+Periodic checkpointing ensures that long-running jobs (especially large-scale streaming runs that take hours or days per epoch) save restorable training states at predictable wall-clock intervals without waiting for full epoch completion:
+
+#### A. Periodic Checkpoint Interval (`checkpoint_period`)
+The trainer parses `checkpoint_period` using [`parse_checkpoint_period`](sid_unet/training/trainer.py), supporting multiple intuitive formats:
+
+```yaml
+training:
+  # Format 1: Direct seconds (e.g. 3600 = 1 hour, 1800 = 30 minutes, 7200 = 2 hours)
+  checkpoint_period: 3600
+
+  # Format 2: Formatted duration string
+  checkpoint_period: "1h"       # 1 hour
+  checkpoint_period: "30m"      # 30 minutes
+  checkpoint_period: "7200s"    # 7200 seconds (2 hours)
+
+  # Format 3: Direct hours (numeric values <= 24 are automatically treated as hours)
+  checkpoint_period: 2          # 2 hours (7200 seconds)
+
+  # Format 4: Explicit alias keys
+  checkpoint_period_hours: 1.5  # 90 minutes
+  # or:
+  checkpoint_period_seconds: 1800
+  # or:
+  checkpoint_interval: 3600
+
+  # To disable time-based periodic saving entirely:
+  checkpoint_period: 0
+```
+
+#### B. Checkpoint Files & State Persistence
+During training, up to three checkpoints are managed in `outputs/RUN/<stem>/checkpoints/`:
+- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time since last save $\ge \text{checkpoint\_period}$. Contains the exact model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, evaluation metrics, and full `history` list.
+- **`checkpoint_latest.pt`**: Updated in-sync with periodic saves and written at every epoch boundary when `save_latest: true`.
+- **`checkpoint_best.pt`**: Updated whenever validation metric improves on `eval_interval` epochs (governed by `early_stopping_metric` and `save_best: true`).
+
+---
+
+### 3. Architecture-Specific Config Examples
+
+#### EfficientNet UNet Config Example:
 ```yaml
 model:
   name: "efficientnet"
