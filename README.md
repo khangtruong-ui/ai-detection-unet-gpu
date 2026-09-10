@@ -607,7 +607,7 @@ The configuration file is divided into modular top-level sections:
 | **`checkpoint_period`** | `int` / `str` | `3600` | **Time-based periodic checkpointing cadence** (see detailed breakdown below). |
 | **`checkpoint_steps`** | `int` | `null` | **Step-based periodic checkpointing cadence** (saves every $N$ training steps). |
 | **`save_best`** | `bool` | `true` | Saves `checkpoint_best.pt` whenever the validation metric achieves a new optimum. |
-| **`save_latest`** | `bool` | `true` | Saves `checkpoint_latest.pt` after every epoch, periodic trigger, and on user interrupt. |
+| **`save_latest`** | `bool` | `true` | Saves `checkpoint_latest.pt` after every epoch and periodic save trigger. |
 | `eval_interval` | `int` | `1` | Frequency in epochs at which validation evaluation is executed. |
 | `early_stopping_patience` | `int` | `5` | Epochs without validation metric improvement before halting training early. |
 | `early_stopping_metric` | `str` | `"val_iou"` | Target validation metric to monitor (`"val_iou"`, `"val_dice"`, `"val_loss"`). |
@@ -657,12 +657,11 @@ training:
 #### B. Checkpoint Files & State Persistence
 During training, up to three checkpoints are managed in `outputs/RUN/<stem>/checkpoints/`:
 - **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time $\ge \text{checkpoint\_period}$ or step interval is reached. Contains model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, metrics, and history.
-- **`checkpoint_latest.pt`**: Continuously synchronized on periodic saves, at epoch boundaries, and on emergency user interrupts. Prioritized first for auto-resumption.
+- **`checkpoint_latest.pt`**: Continuously synchronized on periodic saves and written at every epoch boundary. Prioritized first for auto-resumption.
 - **`checkpoint_best.pt`**: Updated whenever validation metric improves on `eval_interval` epochs (governed by `early_stopping_metric` and `save_best: true`).
 
-#### C. Graceful Interruption Recovery & Resume Synchronization
-- **Ctrl+C / Interruption Safety**: If a training process is interrupted (`KeyboardInterrupt` or `SystemExit`), the trainer automatically intercepts the signal, logs `⚠️ Training interrupted! Saving emergency checkpoint...`, and writes the current weights and `global_step` to `checkpoint_latest.pt` before halting.
-- **Cross-Precision Resume Synchronization**: When resuming a checkpoint from another environment (e.g. 4-bit CUDA NF4 loaded onto CPU float32), `resume_from_checkpoint` automatically synchronizes `checkpoint_latest.pt` in the current machine's native representation, eliminating parameter shape mismatch notices on subsequent runs.
+#### C. Cross-Precision Resume Synchronization
+- **Resume Format Synchronization**: When resuming a checkpoint from another environment (e.g. 4-bit CUDA NF4 loaded onto CPU float32), `resume_from_checkpoint` automatically synchronizes `checkpoint_latest.pt` in the current machine's native representation, eliminating parameter shape mismatch notices on subsequent runs.
 
 ---
 

@@ -498,42 +498,6 @@ def test_checkpoint_manager_step_based_saving():
         assert mgr.should_save_periodic(step=20) is True
 
 
-def test_trainer_interrupted_emergency_save():
-    """Verify that KeyboardInterrupt during training safely saves checkpoint_latest.pt with current progress."""
-    from sid_unet.utils.config import ConfigDict
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = ConfigDict({
-            "project": {"name": "test_interrupt", "device": "cpu", "output_dir": tmpdir},
-            "data": {"dataset_name": "dummy"},
-            "model": {"name": "unet", "features": [8, 16], "bilinear": True},
-            "loss": {"mask_loss_type": "combined"},
-            "training": {"epochs": 3, "learning_rate": 0.001, "optimizer": "adamw", "save_latest": True},
-            "logging": {"log_interval": 1},
-        })
-
-        train_loader = DataLoader(DummyDataset(size=4), batch_size=2)
-        val_loader = DataLoader(DummyDataset(size=2), batch_size=2)
-        trainer = Trainer(config=cfg, train_loader=train_loader, val_loader=val_loader)
-
-        original_train_epoch = trainer.train_epoch
-        def mock_train_epoch(epoch):
-            if epoch == 2:
-                trainer.global_step = 42
-                raise KeyboardInterrupt("Simulated Ctrl+C")
-            return original_train_epoch(epoch)
-
-        trainer.train_epoch = mock_train_epoch
-
-        with pytest.raises(KeyboardInterrupt):
-            trainer.train()
-
-        # Emergency checkpoint should exist!
-        latest_ckpt = os.path.join(tmpdir, "checkpoints", "checkpoint_latest.pt")
-        assert os.path.exists(latest_ckpt)
-        meta = inspect_checkpoint(latest_ckpt)
-        assert meta["step"] == 42
-        assert meta["epoch"] == 2
-
 
 def test_trainer_resume_syncs_latest_checkpoint():
     """Verify that resuming from an older checkpoint writes a synced checkpoint_latest.pt."""
