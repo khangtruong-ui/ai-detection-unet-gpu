@@ -656,7 +656,7 @@ training:
 
 #### B. Checkpoint Files & State Persistence
 During training, up to three checkpoints are managed in `outputs/RUN/<stem>/checkpoints/`:
-- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time $\ge \text{checkpoint\_period}$ or step interval is reached. Contains model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, metrics, and history.
+- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time $\ge \text{checkpoint}\_\text{period}$ or step interval is reached. Contains model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, metrics, and history.
 - **`checkpoint_latest.pt`**: Continuously synchronized on periodic saves and written at every epoch boundary. Prioritized first for auto-resumption.
 - **`checkpoint_best.pt`**: Updated whenever validation metric improves on `eval_interval` epochs (governed by `early_stopping_metric` and `save_best: true`).
 
