@@ -3,6 +3,13 @@ from sid_unet.models.blocks import DoubleConv, Down, Up, OutConv, AuxiliaryClass
 from sid_unet.models.efficientnet import EfficientNetSegmentation
 from sid_unet.models.sam3_qlora import SAM3QLoRA
 from sid_unet.models.sam3_refiner import SAMRefiner, get_sam_refiner
+from sid_unet.models.vae_finetune import DiffusionVAEFinetune, VAEFinetune, SDVAEFinetune
+from sid_unet.models.diffusion_diff import (
+    DiffusionDiffModel,
+    DiffusionDiff,
+    TrainableLatentDecoder,
+    sinusoidal_embedding,
+)
 
 __all__ = [
     "UNet",
@@ -16,5 +23,13 @@ __all__ = [
     "AuxiliaryClassifier",
     "SAMRefiner",
     "get_sam_refiner",
+    "DiffusionVAEFinetune",
+    "VAEFinetune",
+    "SDVAEFinetune",
+    "DiffusionDiffModel",
+    "DiffusionDiff",
+    "TrainableLatentDecoder",
+    "sinusoidal_embedding",
 ]
+
 

@@ -6,6 +6,8 @@ Directory Layout:
 - **`unet_scratch/`**: Standard UNet architectures trained from scratch with varying widths, depths, loss formulations, and resolution budgets.
 - **`efficientnet/`**: Pretrained EfficientNet backbones with UNet multi-scale feature skip connections or the **Sacrifice of Pixel** linear-zoom architecture.
 - **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/BeyondTheBrush`.
+- **`sd_vae_finetune/`**: Finetuned Stable Diffusion 1.5 VAE (AutoencoderKL) adapted for binary synthetic image mask segmentation.
+- **`diffusion_diff/`**: Diffusion multi-noise feature decoder combining multi-step perturbations, frozen diffuser noise predictions, and sinusoidal embeddings with a configurable trainable decoder.
 
 ---
 
@@ -46,6 +48,22 @@ Directory Layout:
 
 ---
 
+## 4. Finetuned Diffusion VAE Configurations (`configs/experiments/sd_vae_finetune/`)
+
+| Configuration File | Model & Base VAE | Decoder Conv Out | Freeze Encoder | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sd_vae_finetune/default.yaml) | `DiffusionVAEFinetune` (SD1.5 AutoencoderKL) | $128 \to 1$ Conv2d | `false` (End-to-End) | Combined (BCE + Dice) + Aux (0.2) | Fine-tuning Stable Diffusion 1.5 VAE directly to decode compressed latent distributions into binary tampering masks. |
+
+---
+
+## 5. Diffusion Multi-Noise Feature Decoder (`diffusion_diff`) (`configs/experiments/diffusion_diff/`)
+
+| Configuration File | Model Architecture | Timesteps | Diffuser & VAE | Trainable Decoder | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/diffusion_diff/default.yaml) | `DiffusionDiffModel` | `[100, 250, 500]` | SD1.5 Frozen | `[256, 128, 64, 32]` Bilinear | Combined (BCE + Dice) + Aux (0.2) | Real image $x \to z_0$, inject noise at multiple timesteps, compute diffuser predicted noise $\hat{\epsilon}$ and sinusoidal embeddings ($t, \sigma$), concatenating into high-dimensional $Z$ with a trainable decoder. |
+
+---
+
 ## How to Run
 
 ### 1. Training with SAM3 + QLoRA
@@ -63,10 +81,21 @@ sid-train --config configs/experiments/efficientnet/efficientnet_b0_unet.yaml
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
 ```
 
-### 4. Multi-Experiment Comparative Suite
+### 4. Training with Finetuned Diffusion VAE
+```bash
+sid-train --config configs/experiments/sd_vae_finetune/default.yaml
+```
+
+### 5. Training with Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)
+```bash
+sid-train --config configs/experiments/diffusion_diff/default.yaml
+```
+
+### 6. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
   configs/experiments/efficientnet/efficientnet_b0_unet.yaml \
-  configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
+  configs/experiments/sd_vae_finetune/default.yaml \
+  configs/experiments/diffusion_diff/default.yaml
 ```

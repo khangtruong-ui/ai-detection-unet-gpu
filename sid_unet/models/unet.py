@@ -242,6 +242,10 @@ class UNet(nn.Module):
                 merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_qlora"
+            elif any(k.startswith(("decoder.", "diffuser.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "diffusion_diff"
+            elif any(k.startswith("vae.") for k in state_dict.keys()):
+                merged["model"]["name"] = "vae_finetune"
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
@@ -319,6 +323,54 @@ def build_model(config: Any) -> nn.Module:
             dropout=float(model_cfg.get("dropout", 0.1)),
             bilinear=bool(model_cfg.get("bilinear", True)),
             gradient_checkpointing=ckpt_flag,
+        )
+
+    if any(k in model_name for k in ["diffusion_diff", "diffusion_noise", "diffuser_noise", "diffusion_multistep", "latent_noise"]):
+        from sid_unet.models.diffusion_diff import DiffusionDiffModel, DEFAULT_DIFFUSION_CHECKPOINT
+        ckpt_name = model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_DIFFUSION_CHECKPOINT))
+        dec_cfg = model_cfg.get("decoder", {})
+        return DiffusionDiffModel(
+            pretrained_model_name_or_path=str(ckpt_name),
+            vae_subfolder=model_cfg.get("vae_subfolder", "vae"),
+            unet_subfolder=model_cfg.get("unet_subfolder", "unet"),
+            timesteps=model_cfg.get("timesteps", [100, 250, 500]),
+            timestep_embed_dim=int(model_cfg.get("timestep_embed_dim", 32)),
+            sigma_embed_dim=int(model_cfg.get("sigma_embed_dim", 32)),
+            include_noisy_latents=bool(model_cfg.get("include_noisy_latents", True)),
+            include_added_noise=bool(model_cfg.get("include_added_noise", True)),
+            include_predicted_noise=bool(model_cfg.get("include_predicted_noise", True)),
+            include_noise_diff=bool(model_cfg.get("include_noise_diff", True)),
+            include_z0=bool(model_cfg.get("include_z0", True)),
+            decoder_config=dec_cfg,
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            scaling_factor=float(model_cfg.get("scaling_factor", 0.18215)),
+            use_dummy=bool(model_cfg.get("use_dummy", False)),
+            dummy_vae_channels=tuple(model_cfg.get("dummy_vae_channels", [32, 64])),
+            dummy_unet_channels=tuple(model_cfg.get("dummy_unet_channels", [32, 64])),
+            input_rescale=bool(model_cfg.get("input_rescale", True)),
+        )
+
+    if any(k in model_name for k in ["vae_finetune", "diffusion_vae", "sd_vae"]) or (model_name == "vae"):
+        from sid_unet.models.vae_finetune import DiffusionVAEFinetune, DEFAULT_SD_VAE_CHECKPOINT
+        ckpt_name = model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_SD_VAE_CHECKPOINT))
+        return DiffusionVAEFinetune(
+            pretrained_model_name_or_path=str(ckpt_name),
+            subfolder=model_cfg.get("subfolder", "vae"),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            freeze_encoder=bool(model_cfg.get("freeze_encoder", False)),
+            sample_mode=str(model_cfg.get("sample_mode", "sample")),
+            scaling_factor=float(model_cfg.get("scaling_factor", 0.18215)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            gradient_checkpointing=ckpt_flag,
+            use_dummy=bool(model_cfg.get("use_dummy", False)),
+            dummy_channels=tuple(model_cfg.get("dummy_channels", [32, 64])),
+            input_rescale=bool(model_cfg.get("input_rescale", True)),
         )
 
     return UNet(

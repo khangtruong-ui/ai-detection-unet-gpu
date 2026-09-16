@@ -1,0 +1,84 @@
+project:
+  name: "diffusion_diff_detection"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/diffusion_diff"
+
+data:
+  dataset_name: "KhangTruong/BeyondTheBrush"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  train_split: "train"
+  val_split: "test"
+  test_split: "test"
+  eval_split: "test"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.25
+
+model:
+  name: "diffusion_diff"
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  vae_subfolder: "vae"
+  unet_subfolder: "unet"
+  # Multi-timestep noise perturbations
+  timesteps: [100, 250, 500]
+  timestep_embed_dim: 32
+  sigma_embed_dim: 32
+  include_noisy_latents: true
+  include_added_noise: true
+  include_predicted_noise: true
+  include_noise_diff: true
+  include_z0: true
+  scaling_factor: 0.18215
+  # Trainable Decoder defined by config (the only part with trainable parameters)
+  decoder:
+    channels: [256, 128, 64, 32]
+    upsample_mode: "bilinear" # "bilinear", "transpose", or "pixelshuffle"
+    norm_layer: "batchnorm"   # "batchnorm", "groupnorm", or "none"
+    activation: "silu"        # "silu", "relu", or "leaky_relu"
+    dropout: 0.1
+    num_res_blocks: 1
+  aux_classifier: true
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+  input_rescale: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 10
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 4
+  save_best: true
+  save_latest: true
+  checkpoint_period: 1
+  early_stopping_patience: 4
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20
+  log_memory: true

@@ -1,0 +1,70 @@
+project:
+  name: "sd_vae_finetune"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/sd_vae_finetune"
+
+data:
+  dataset_name: "KhangTruong/BeyondTheBrush"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  train_split: "train"
+  val_split: "test"
+  test_split: "test"
+  eval_split: "test"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.25
+
+model:
+  name: "vae_finetune"
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  subfolder: "vae"
+  in_channels: 3
+  out_channels: 1
+  freeze_encoder: false # End-to-end fine-tuning of both encoder and decoder
+  sample_mode: "sample" # Sample with noise during training, mode during eval
+  scaling_factor: 0.18215
+  aux_classifier: true
+  num_classes: 3
+  dropout: 0.1
+  gradient_checkpointing: true
+  input_rescale: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 10
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 2
+  save_best: true
+  save_latest: true
+  checkpoint_period: 1
+  early_stopping_patience: 4
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20
+  log_memory: true

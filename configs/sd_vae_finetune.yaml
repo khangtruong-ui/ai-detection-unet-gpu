@@ -1,0 +1,57 @@
+# Top-level configuration for Fine-tuning Diffusion VAE (SD1.5 AutoencoderKL)
+project:
+  name: "sd_vae_finetune"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/sd_vae_finetune"
+
+data:
+  dataset_name: "KhangTruong/BeyondTheBrush"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  train_split: "train"
+  val_split: "test"
+  train_samples_per_epoch: 2000
+  val_samples: 200
+
+model:
+  name: "vae_finetune"
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  subfolder: "vae"
+  in_channels: 3
+  out_channels: 1
+  freeze_encoder: false
+  sample_mode: "sample"
+  scaling_factor: 0.18215
+  aux_classifier: true
+  num_classes: 3
+  dropout: 0.1
+  gradient_checkpointing: true
+  input_rescale: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 10
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  save_best: true
+  save_latest: true
+  early_stopping_patience: 4
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20

@@ -20,6 +20,8 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [2. Pretrained EfficientNet Backbone (Default UNet Multi-Scale Decoder)](#2-pretrained-efficientnet-backbone-default-unet-multi-scale-decoder)
   - [3. EfficientNet 'Sacrifice of Pixel' Architecture](#3-efficientnet-sacrifice-of-pixel-architecture)
   - [4. SAM3 + QLoRA Architecture](#4-sam3--qlora-architecture)
+  - [5. Finetuned Diffusion VAE (SD1.5 AutoencoderKL)](#5-finetuned-diffusion-vae-sd15-autoencoderkl)
+  - [6. Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)](#6-diffusion-multi-noise-feature-decoder-diffusion-diff)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -54,6 +56,8 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Standard UNet**: Modular depth, configurable channel dimensions, bilinear or transposed convolutions.
   - **Pretrained EfficientNet-UNet**: Leverage ImageNet pretrained CNN representations with multi-scale skip connections ($/2, /4, /8, /16, /32$) feeding into a progressive decoder.
   - **Sacrifice of Pixel Mode**: Uses **only the final bottleneck feature map** ($8 \times 8$ or $7 \times 7$), routes through a single Linear layer, and zooms out to match full image resolution.
+  - **Finetuned Diffusion VAE (SD1.5 AutoencoderKL)**: Adapts pretrained latent diffusion VAE to decode compressed latent representations directly into binary tampering mask space with end-to-end or decoder-only fine-tuning.
+  - **Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)**: Advanced latent perturbation forensics extracting $z_0$, adding noise across multiple diffusion timesteps, computing frozen diffuser predicted noise and sinusoidal schedule embeddings ($t, \sigma$), concatenated into high-dimensional $Z$ decoded by a fully configurable trainable decoder.
 - **Continuous Master Reports & Automatic Checkpoint Continuation**:
   - **Automatic Repository Checkpoint Discovery**: Automatically scans repository and output directories (`outputs/RUN/...`, `checkpoints/`, etc.) for existing checkpoints (`checkpoint_latest.pt`, `checkpoint_periodic.pt`, `checkpoint_best.pt`) and displays a highlighted on-screen notification with detailed resume metadata (epoch, global step, metric score).
   - **Hugging Face Model Repository Resumption**: Download and resume training or evaluation directly from Hugging Face Hub repositories (`--resume-repo <owner/repo>` or `--resume hf://<owner/repo>`).
@@ -282,6 +286,113 @@ Key features:
 - **PEFT LoRA Adapters**: Injects low-rank decomposition matrices ($r=8, \alpha=16$) into self-attention projection layers (`q_proj`, `v_proj`). Less than **0.5%** of total parameters are trainable.
 - **Hardware Compatibility**: Verified to fit and train on **12GB VRAM GPUs** (such as NVIDIA RTX 3060) with batch size 1 and gradient accumulation (e.g. 16 steps).
 - **Prompt Conditioning**: Defaults to text prompt `"tampered region"` to focus the DETR queries and mask decoder cross-attention on manipulated or inpainted artifacts.
+
+---
+
+### 5. Finetuned Diffusion VAE (SD1.5 AutoencoderKL)
+
+This architecture adapts a pretrained Variational Autoencoder from latent diffusion models (such as Stable Diffusion 1.5 `runwayml/stable-diffusion-v1-5` or `stabilityai/sd-vae-ft-mse`) for dense binary mask segmentation:
+
+```
+                      Input Image x in R^(B, 3, H, W)
+                                │
+                 ┌──────────────▼───────────────┐
+                 │     VAE Encoder (ResNet)     │
+                 └──────────────┬───────────────┘
+                                ▼
+                 Posterior Distribution q(z|x)
+                   - sample: z = mu + sigma * eps
+                   - mode:   z = mu
+                                │
+                 ┌──────────────┴───────────────┐
+                 │                              │
+         ┌───────▼──────────────┐       ┌───────▼────────────────────────┐
+         │ Auxiliary Classifier │       │ Latent Scaling (z * 0.18215)   │
+         │ AdaptivePool -> MLP  │       └───────┬────────────────────────┘
+         └───────┬──────────────┘               │
+                 ▼                              ▼
+        Class Logits (B, 3)     ┌────────────────────────────────────────┐
+                                │          VAE Decoder (8x Up)           │
+                                │  - ResNet UpBlocks + Attention         │
+                                │  - Adapted ConvOut: 128 -> out_channels│
+                                └───────────────┬────────────────────────┘
+                                                ▼
+                                   Binary Mask Logits (B, 1, H, W)
+```
+
+Key features:
+- **Pretrained Generative Prior**: Uses the rich semantic image priors captured by diffusion model VAE encoders trained on hundreds of millions of images.
+- **Direct Mask Projection**: Replaces the final RGB projection convolution (`conv_out: 128 -> 3`) with a dedicated binary mask projection layer (`128 -> 1`).
+- **Flexible Fine-Tuning**: Supports end-to-end training (`freeze_encoder: false`) or freezing the encoder to train only the decoder (`freeze_encoder: true`).
+- **Automatic Sizing & Normalization**: Automatically handles reflection padding if input dimensions are not divisible by 8, and maps inputs to the expected $[-1, 1]$ range.
+
+---
+
+### 6. Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)
+
+A state-of-the-art forensic architecture analyzing how images respond to generative diffusion denoising dynamics across multiple perturbation scales:
+
+```
+                                Input Real Image x (B, 3, H, W)
+                                               │
+                                ┌──────────────▼───────────────┐
+                                │      Frozen VAE Encoder      │ (requires_grad = False)
+                                └──────────────┬───────────────┘
+                                               ▼
+                                      Latent z0 (B, 4, H/8, W/8)
+                                               │
+               ┌───────────────────────────────┴───────────────────────────────┐
+               │                                                               │
+   [Timestep t_1: e.g. 100]                                        [Timestep t_K: e.g. 500]
+               │                                                               │
+     Add Noise: eps_1 ~ N(0, I)                                      Add Noise: eps_K ~ N(0, I)
+     z_t1 = sqrt(a_bar1)*z0 + s_1*eps_1                              z_tK = sqrt(a_barK)*z0 + s_K*eps_K
+               │                                                               │
+  ┌────────────┴────────────┐                                     ┌────────────┴────────────┐
+  │  Frozen Diffuser UNet   │                                     │  Frozen Diffuser UNet   │
+  │  (requires_grad = False)│                                     │  (requires_grad = False)│
+  └────────────┬────────────┘                                     └────────────┬────────────┘
+               ▼                                                               ▼
+     Predicted Noise eps_hat_1                                       Predicted Noise eps_hat_K
+               │                                                               │
+     Sinusoidal Embeddings:                                          Sinusoidal Embeddings:
+       - t_emb:   Sinusoidal(t_1) -> (B, D_t, H/8, W/8)                - t_emb:   Sinusoidal(t_K) -> (B, D_t, H/8, W/8)
+       - sig_emb: Sinusoidal(s_1) -> (B, D_s, H/8, W/8)                - sig_emb: Sinusoidal(s_K) -> (B, D_s, H/8, W/8)
+               │                                                               │
+               └───────────────────────────────┬───────────────────────────────┘
+                                               ▼
+               ┌───────────────────────────────────────────────────────────────┐
+               │          Concatenate along Channel Dimension (dim=1):         │
+               │  Z = [z0, z_t1, eps_1, eps_hat_1, t_emb1, sig_emb1, ..., z_tK] │
+               │                 Shape: (B, C_Z, H/8, W/8)                     │
+               └───────────────────────────────┬───────────────────────────────┘
+                                               │
+                                ┌──────────────┴───────────────┐
+                                │                              │
+                        ┌───────▼──────────────┐       ┌───────▼────────────────────────┐
+                        │ Auxiliary Classifier │       │    Trainable Latent Decoder    │
+                        │ AdaptivePool -> MLP  │       │   (ONLY trainable parameters;  │
+                        └───────┬──────────────┘       │    entirely defined by config) │
+                                ▼                      │  - Multi-stage upsampling (8x) │
+                       Class Logits (B, 3)             │  - ResBlocks, Norm, Activation │
+                                                       │  - Final 1x1 ConvOut           │
+                                                       └───────────────┬────────────────┘
+                                                                       ▼
+                                                          Binary Mask Logits (B, 1, H, W)
+```
+
+Mathematical & Architectural Principles:
+1. **Latent Inversion**: The real image $x$ is encoded by the frozen VAE to obtain clean latent $z_0 \in \mathbb{R}^{B \times 4 \times H/8 \times W/8}$.
+2. **Multi-Scale Forward Diffusion Perturbations**: For a configurable set of timesteps $\{t_1, t_2, \dots, t_K\}$, standard Gaussian noise $\epsilon_k \sim \mathcal{N}(0, I)$ is added according to the diffusion schedule:
+   $$z_{t_k} = \sqrt{\bar{\alpha}_{t_k}} z_0 + \sqrt{1 - \bar{\alpha}_{t_k}} \epsilon_k$$
+   where $\sigma_k = \sqrt{1 - \bar{\alpha}_{t_k}}$ represents the noise standard deviation.
+3. **Frozen Diffuser Noise Prediction**: The frozen pretrained UNet diffuser estimates the injected noise $\hat{\epsilon}_k = \text{Diffuser}(z_{t_k}, t_k)$. Real vs. synthetic image regions exhibit distinct noise reconstruction errors ($\hat{\epsilon}_k - \epsilon_k$), exposing subtle generative fingerprint anomalies.
+4. **Sinusoidal Condition Embeddings**: Continuous scalar timesteps $t_k$ and noise deviations $\sigma_k$ are projected into sinusoidal harmonic vector embeddings of dimensions $D_t$ and $D_\sigma$:
+   $$\text{emb}_{2i}(s) = \sin\left( s \cdot \exp\left( - \frac{2i}{D} \ln(10000) \right) \right), \quad \text{emb}_{2i+1}(s) = \cos\left( s \cdot \exp\left( - \frac{2i}{D} \ln(10000) \right) \right)$$
+   and spatially broadcast across the latent grid to shape $(B, D, H/8, W/8)$.
+5. **High-Dimensional Latent Representation $Z$**: All components are concatenated along the channel axis:
+   $$Z = \left[ z_0, \; z_{t_1}, \; \epsilon_1, \; \hat{\epsilon}_1, \; (\hat{\epsilon}_1 - \epsilon_1), \; e_{t_1}, \; e_{\sigma_1}, \; \dots, \; z_{t_K}, \; \epsilon_K, \; \hat{\epsilon}_K, \; (\hat{\epsilon}_K - \epsilon_K), \; e_{t_K}, \; e_{\sigma_K} \right]$$
+6. **Strictly Trainable Decoder Defined by Config**: The VAE encoder and diffuser UNet are **completely frozen** (`requires_grad = False`). The decoder is a custom neural network whose architecture (channel progression, upsampling mode, norm layer, activation function, dropout, and residual blocks) is **fully defined and instantiated from configuration files**.
 
 ---
 
@@ -720,6 +831,54 @@ training:
   amp: false
 ```
 
+#### 4. Finetuned Diffusion VAE Configuration Example (`configs/sd_vae_finetune.yaml`)
+```yaml
+model:
+  name: "vae_finetune"
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  subfolder: "vae"
+  in_channels: 3
+  out_channels: 1
+  freeze_encoder: false                          # End-to-end VAE fine-tuning
+  sample_mode: "sample"                          # 'sample' during train, 'mode' during eval
+  scaling_factor: 0.18215
+  aux_classifier: true
+  num_classes: 3
+
+training:
+  learning_rate: 0.0001
+  amp: true
+```
+
+#### 5. Diffusion Multi-Noise Feature Decoder (`diffusion_diff`) Configuration Example (`configs/diffusion_diff.yaml`)
+```yaml
+model:
+  name: "diffusion_diff"
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  timesteps: [100, 250, 500]                     # Perturbation timesteps
+  timestep_embed_dim: 32                         # Sinusoidal timestep embedding size
+  sigma_embed_dim: 32                            # Sinusoidal noise deviation embedding size
+  include_noisy_latents: true
+  include_added_noise: true
+  include_predicted_noise: true
+  include_noise_diff: true
+  include_z0: true
+  # Configurable Trainable Decoder (ONLY component with trainable weights)
+  decoder:
+    channels: [256, 128, 64, 32]
+    upsample_mode: "bilinear"
+    norm_layer: "batchnorm"
+    activation: "silu"
+    dropout: 0.1
+    num_res_blocks: 1
+  aux_classifier: true
+  num_classes: 3
+
+training:
+  learning_rate: 0.0003
+  amp: true
+```
+
 ---
 
 ## Quickstart: How to Run
@@ -739,6 +898,12 @@ sid-train --config configs/experiments/efficientnet/efficientnet_b0_unet.yaml
 
 # Train EfficientNet with Sacrifice of Pixel mode
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
+
+# Train Finetuned Diffusion VAE
+sid-train --config configs/sd_vae_finetune.yaml
+
+# Train Diffusion-Diff (Multi-Noise Latent Feature Decoder)
+sid-train --config configs/diffusion_diff.yaml
 ```
 
 #### B. Multi-Experiment Suite (Continuous Reporting & Collision Skipping)
