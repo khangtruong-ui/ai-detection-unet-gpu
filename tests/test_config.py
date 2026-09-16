@@ -62,7 +62,7 @@ def test_all_experiment_configs_validity():
 
     for cfg_file in exp_configs:
         cfg = load_config(cfg_file)
-        assert cfg.data.dataset_name in ["KhangTruong/IMD2020", "KhangTruong/BeyondTheBrush", "saberzl/SID_Set"]
+        assert cfg.data.dataset_name in ["KhangTruong/IMD2020", "KhangTruong/BeyondTheBrush", "saberzl/SID_Set", "KhangTruong/COCO-inpainted"]
         assert cfg.data.streaming in [True, False]
         assert cfg.data.batch_size in [1, 2, 4, 8, 16, 32, 64, 128]
         # Ensure sample budgets are -1 for running all dataset

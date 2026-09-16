@@ -381,18 +381,41 @@ A state-of-the-art forensic architecture analyzing how images respond to generat
                                                           Binary Mask Logits (B, 1, H, W)
 ```
 
-Mathematical & Architectural Principles:
-1. **Latent Inversion**: The real image $x$ is encoded by the frozen VAE to obtain clean latent $z_0 \in \mathbb{R}^{B \times 4 \times H/8 \times W/8}$.
-2. **Multi-Scale Forward Diffusion Perturbations**: For a configurable set of timesteps $\{t_1, t_2, \dots, t_K\}$, standard Gaussian noise $\epsilon_k \sim \mathcal{N}(0, I)$ is added according to the diffusion schedule:
-   $$z_{t_k} = \sqrt{\bar{\alpha}_{t_k}} z_0 + \sqrt{1 - \bar{\alpha}_{t_k}} \epsilon_k$$
-   where $\sigma_k = \sqrt{1 - \bar{\alpha}_{t_k}}$ represents the noise standard deviation.
-3. **Frozen Diffuser Noise Prediction**: The frozen pretrained UNet diffuser estimates the injected noise $\hat{\epsilon}_k = \text{Diffuser}(z_{t_k}, t_k)$. Real vs. synthetic image regions exhibit distinct noise reconstruction errors ($\hat{\epsilon}_k - \epsilon_k$), exposing subtle generative fingerprint anomalies.
-4. **Sinusoidal Condition Embeddings**: Continuous scalar timesteps $t_k$ and noise deviations $\sigma_k$ are projected into sinusoidal harmonic vector embeddings of dimensions $D_t$ and $D_\sigma$:
-   $$\text{emb}_{2i}(s) = \sin\left( s \cdot \exp\left( - \frac{2i}{D} \ln(10000) \right) \right), \quad \text{emb}_{2i+1}(s) = \cos\left( s \cdot \exp\left( - \frac{2i}{D} \ln(10000) \right) \right)$$
-   and spatially broadcast across the latent grid to shape $(B, D, H/8, W/8)$.
-5. **High-Dimensional Latent Representation $Z$**: All components are concatenated along the channel axis:
-   $$Z = \left[ z_0, \; z_{t_1}, \; \epsilon_1, \; \hat{\epsilon}_1, \; (\hat{\epsilon}_1 - \epsilon_1), \; e_{t_1}, \; e_{\sigma_1}, \; \dots, \; z_{t_K}, \; \epsilon_K, \; \hat{\epsilon}_K, \; (\hat{\epsilon}_K - \epsilon_K), \; e_{t_K}, \; e_{\sigma_K} \right]$$
-6. **Strictly Trainable Decoder Defined by Config**: The VAE encoder and diffuser UNet are **completely frozen** (`requires_grad = False`). The decoder is a custom neural network whose architecture (channel progression, upsampling mode, norm layer, activation function, dropout, and residual blocks) is **fully defined and instantiated from configuration files**.
+#### Mathematical & Architectural Principles
+
+- **1. Latent Inversion**: The real image $x$ is encoded by the frozen VAE encoder to obtain clean latent $z_0 \in \mathbb{R}^{B \times 4 \times H/8 \times W/8}$.
+
+- **2. Multi-Scale Forward Diffusion Perturbations**: For a configurable set of discrete timesteps $\{t_1, t_2, \dots, t_K\}$, standard Gaussian noise $\epsilon_k \sim \mathcal{N}(0, I)$ is added according to the diffusion schedule:
+
+$$
+z_{t_k} = \sqrt{\bar{\alpha}_{t_k}} z_0 + \sqrt{1 - \bar{\alpha}_{t_k}} \, \epsilon_k
+$$
+
+where $\sigma_k = \sqrt{1 - \bar{\alpha}_{t_k}}$ represents the noise standard deviation at timestep $t_k$.
+
+- **3. Frozen Diffuser Noise Prediction**: The frozen pretrained UNet diffuser estimates the injected noise:
+
+$$
+\hat{\epsilon}_k = \mathrm{Diffuser}(z_{t_k}, t_k)
+$$
+
+Real versus synthetic image regions exhibit distinct noise reconstruction residuals $(\hat{\epsilon}_k - \epsilon_k)$, exposing subtle generative fingerprint anomalies.
+
+- **4. Sinusoidal Condition Embeddings**: Continuous scalar timesteps $t_k$ and noise deviations $\sigma_k$ are projected into sinusoidal harmonic vector embeddings of dimensions $D_t$ and $D_\sigma$:
+
+$$
+\mathrm{emb}_{2i}(s) = \sin\left( s \cdot 10000^{-2i/D} \right), \qquad \mathrm{emb}_{2i+1}(s) = \cos\left( s \cdot 10000^{-2i/D} \right)
+$$
+
+and spatially broadcast across the latent grid to shape $(B, D, H/8, W/8)$.
+
+- **5. High-Dimensional Latent Representation $Z$**: All components are concatenated along the channel axis:
+
+$$
+Z = \left[ z_0, \; z_{t_1}, \; \epsilon_1, \; \hat{\epsilon}_1, \; (\hat{\epsilon}_1 - \epsilon_1), \; e_{t_1}, \; e_{\sigma_1}, \; \dots, \; z_{t_K}, \; \epsilon_K, \; \hat{\epsilon}_K, \; (\hat{\epsilon}_K - \epsilon_K), \; e_{t_K}, \; e_{\sigma_K} \right]
+$$
+
+- **6. Strictly Trainable Decoder Defined by Config**: The VAE encoder and diffuser UNet are **completely frozen** (`requires_grad = False`). The decoder is a custom neural network whose architecture (channel progression, upsampling mode, norm layer, activation function, dropout, and residual blocks) is **fully defined and instantiated from configuration files**.
 
 ---
 

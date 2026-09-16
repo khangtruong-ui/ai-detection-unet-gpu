@@ -5,16 +5,16 @@ project:
   output_dir: "outputs/experiments/diffusion_diff"
 
 data:
-  dataset_name: "KhangTruong/BeyondTheBrush"
+  dataset_name: "KhangTruong/COCO-inpainted"
   streaming: true
   image_size: [256, 256]
   batch_size: 8
   num_workers: 4
   pin_memory: true
   train_split: "train"
-  val_split: "test"
-  test_split: "test"
-  eval_split: "test"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
   train_samples_per_epoch: -1
   val_samples_per_epoch: -1
   val_samples: -1
