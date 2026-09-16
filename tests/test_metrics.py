@@ -102,3 +102,93 @@ def test_classification_tracker():
     assert cm[1][1] == 1 # Target 1, Pred 1
     assert cm[1][0] == 1 # Target 1, Pred 0
     assert cm[2][2] == 1 # Target 2, Pred 2
+
+
+def test_segmentation_tracker_with_binary_and_prob_masks():
+    tracker = SegmentationMetricTracker(threshold=0.5)
+
+    # Clean authentic image with perfect zero binary mask
+    post_masks = torch.zeros(2, 1, 32, 32, dtype=torch.float32)
+    targets = torch.zeros(2, 1, 32, 32, dtype=torch.float32)
+    labels = torch.tensor([0, 0])
+
+    tracker.update(post_masks, targets, labels)
+    overall, per_label = tracker.compute()
+
+    assert overall["iou"] == 1.0
+    assert overall["dice"] == 1.0
+    assert overall["pixel_acc"] == 1.0
+    assert overall["precision"] == 1.0
+    assert overall["recall"] == 1.0
+    assert overall["specificity"] == 1.0
+    assert per_label[0]["iou"] == 1.0
+
+
+def test_soft_target_auroc():
+    # Soft target with fractional float values >= 0.5 (e.g. 0.8)
+    target = np.array([0.0, 0.8], dtype=np.float32)
+    pred = np.array([0.1, 0.9], dtype=np.float32)
+
+    auroc = compute_binary_auroc(pred, target)
+    assert auroc == 1.0
+
+
+def test_tied_predictions_auroc():
+    # Constant/tied predictions on mixed target
+    target = np.array([0.0, 1.0], dtype=np.float32)
+    pred = np.array([0.5, 0.5], dtype=np.float32)
+
+    auroc = compute_binary_auroc(pred, target)
+    assert auroc == 0.5
+
+
+def test_classification_tracker_2d_target_labels():
+    # 2D target tensor (B, 1) should not trigger broadcasting comparison bug
+    tracker = ClassificationMetricTracker(num_classes=3)
+    logits = torch.tensor([
+        [10.0, 0.0, 0.0],  # Pred 0, Target 0
+        [0.0, 10.0, 0.0],  # Pred 1, Target 1
+        [0.0, 0.0, 10.0],  # Pred 2, Target 2
+        [10.0, 0.0, 0.0],  # Pred 0, Target 1 (wrong)
+    ])
+    targets_2d = torch.tensor([[0], [1], [2], [1]])
+
+    tracker.update(logits, targets_2d)
+    metrics, cm = tracker.compute()
+
+    assert metrics["aux_accuracy"] == 0.75
+    assert len(cm) == 3
+
+
+def test_classification_tracker_absent_class_macro_f1():
+    # Dataset with only classes 0 and 2; perfectly predicted
+    tracker = ClassificationMetricTracker(num_classes=3)
+    logits = torch.tensor([
+        [10.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [0.0, 0.0, 10.0],
+        [0.0, 0.0, 10.0],
+    ])
+    targets = torch.tensor([0, 0, 2, 2])
+
+    tracker.update(logits, targets)
+    metrics, _ = tracker.compute()
+
+    assert metrics["aux_accuracy"] == 1.0
+    assert metrics["aux_macro_f1"] == 1.0
+
+
+def test_segmentation_tracker_dynamic_labels():
+    tracker = SegmentationMetricTracker(threshold=0.5)
+    preds = torch.full((1, 1, 16, 16), -10.0)
+    targets = torch.zeros(1, 1, 16, 16)
+    labels = torch.tensor([5])  # Unseen label index
+
+    tracker.update(preds, targets, labels)
+    _, per_label = tracker.compute()
+
+    assert 5 in per_label
+    assert per_label[5]["iou"] == 1.0
+    assert "precision" in per_label[5]
+    assert "recall" in per_label[5]
+    assert "specificity" in per_label[5]

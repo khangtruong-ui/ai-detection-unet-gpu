@@ -11,13 +11,16 @@ import torch
 from sklearn.metrics import roc_auc_score
 
 
+from scipy.stats import rankdata
+
+
 def compute_binary_auroc(
     pred_probs: Union[torch.Tensor, np.ndarray],
     target_mask: Union[torch.Tensor, np.ndarray],
 ) -> float:
     """
     Compute Area Under the Receiver Operating Characteristic (AUROC) curve on continuous pixel probabilities.
-    Robustly handles single-class masks (all-authentic or all-tampered).
+    Robustly handles single-class masks (all-authentic or all-tampered), soft labels, ties, and raw logits.
     """
     if isinstance(pred_probs, torch.Tensor):
         p = pred_probs.detach().cpu().numpy().astype(np.float64)
@@ -25,9 +28,17 @@ def compute_binary_auroc(
         p = np.asarray(pred_probs, dtype=np.float64)
 
     if isinstance(target_mask, torch.Tensor):
-        t = target_mask.detach().cpu().numpy().astype(np.int32)
+        t = target_mask.detach().cpu().numpy().astype(np.float64)
     else:
-        t = np.asarray(target_mask, dtype=np.int32)
+        t = np.asarray(target_mask, dtype=np.float64)
+
+    # Sanitize NaNs and Infs if any
+    p = np.nan_to_num(p, nan=0.0, posinf=1.0, neginf=0.0)
+    t = np.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
+
+    # If unnormalized logits are passed (values outside [0, 1]), convert to probabilities via sigmoid
+    if np.any(p < 0.0) or np.any(p > 1.0):
+        p = 1.0 / (1.0 + np.exp(-np.clip(p, -500.0, 500.0)))
 
     p_flat = p.flatten()
     t_flat = (t >= 0.5).flatten().astype(np.int32)
@@ -48,11 +59,9 @@ def compute_binary_auroc(
     try:
         return float(roc_auc_score(t_flat, p_flat))
     except Exception:
-        # Fallback to Mann-Whitney U calculation
-        order = np.argsort(p_flat)
-        ranks = np.empty_like(order, dtype=np.float64)
-        ranks[order] = np.arange(len(p_flat)) + 1
-        pos_rank_sum = np.sum(ranks[t_flat == 1])
+        # Fallback to Mann-Whitney U calculation using midranks for tied values
+        ranks = rankdata(p_flat)
+        pos_rank_sum = float(np.sum(ranks[t_flat == 1]))
         u_stat = pos_rank_sum - (n_pos * (n_pos + 1)) / 2.0
         return float(u_stat / (n_pos * n_neg))
 
@@ -66,30 +75,38 @@ def compute_binary_metrics(
     """
     Compute binary segmentation metrics for a single sample or batch,
     including Pixel F1 score and AUROC.
-    pred_mask: Float tensor/array with probabilities or binary values.
-    target_mask: Float/Int tensor/array in {0, 1}.
+    pred_mask: Float tensor/array with probabilities, logits, or binary values.
+    target_mask: Float/Int tensor/array in {0, 1} or continuous [0, 1].
     """
     if isinstance(pred_mask, torch.Tensor):
-        p_raw = pred_mask.detach().cpu().numpy()
-        p = (pred_mask >= threshold).cpu().numpy().astype(np.bool_)
+        p_raw = pred_mask.detach().cpu().numpy().astype(np.float64)
     else:
-        p_raw = np.asarray(pred_mask)
-        p = (pred_mask >= threshold).astype(np.bool_)
+        p_raw = np.asarray(pred_mask, dtype=np.float64)
 
     if isinstance(target_mask, torch.Tensor):
-        t_raw = target_mask.detach().cpu().numpy()
-        t = (target_mask >= threshold).cpu().numpy().astype(np.bool_)
+        t_raw = target_mask.detach().cpu().numpy().astype(np.float64)
     else:
-        t_raw = np.asarray(target_mask)
-        t = (target_mask >= threshold).astype(np.bool_)
+        t_raw = np.asarray(target_mask, dtype=np.float64)
+
+    p_raw = np.nan_to_num(p_raw, nan=0.0, posinf=1.0, neginf=0.0)
+    t_raw = np.nan_to_num(t_raw, nan=0.0, posinf=1.0, neginf=0.0)
+
+    # If unnormalized logits are provided (values outside [0, 1]), convert to probabilities via sigmoid
+    if np.any(p_raw < 0.0) or np.any(p_raw > 1.0):
+        p_probs = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -500.0, 500.0)))
+    else:
+        p_probs = p_raw
+
+    p = (p_probs >= threshold).astype(np.bool_)
+    t = (t_raw >= threshold).astype(np.bool_)
 
     p_flat = p.flatten()
     t_flat = t.flatten()
 
-    tp = np.sum(p_flat & t_flat)
-    fp = np.sum(p_flat & (~t_flat))
-    fn = np.sum((~p_flat) & t_flat)
-    tn = np.sum((~p_flat) & (~t_flat))
+    tp = int(np.sum(p_flat & t_flat))
+    fp = int(np.sum(p_flat & (~t_flat)))
+    fn = int(np.sum((~p_flat) & t_flat))
+    tn = int(np.sum((~p_flat) & (~t_flat)))
     total_pixels = float(len(t_flat))
 
     # Pixel Accuracy
@@ -113,7 +130,7 @@ def compute_binary_metrics(
     specificity = float(tn) / float(tn + fp) if (tn + fp) > 0 else 1.0
 
     # AUROC
-    auroc = compute_binary_auroc(p_raw, t_raw)
+    auroc = compute_binary_auroc(p_probs, t_raw)
 
     return {
         "iou": float(iou),
@@ -150,11 +167,11 @@ class SegmentationMetricTracker:
             "recall": 0.0,
             "specificity": 0.0,
         }
-        # Per-label accumulator
+        # Per-label accumulator (0: Real, 1: Fully AI, 2: Partially AI, plus dynamic labels)
         self.per_label_stats: Dict[int, Dict[str, Union[float, int]]] = {
-            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "count": 0},
-            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "count": 0},
-            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "count": 0},
+            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0},
+            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0},
+            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0},
         }
 
     def update(
@@ -162,12 +179,15 @@ class SegmentationMetricTracker:
         pred_masks: torch.Tensor,
         target_masks: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        is_logit: Optional[bool] = None,
     ):
         """
         Update tracker with batch predictions and ground truth.
         pred_masks: (B, 1, H, W) or (B, H, W)
         target_masks: (B, 1, H, W) or (B, H, W)
-        labels: (B,)
+        labels: (B,) or (B, 1)
+        is_logit: Optional bool. If True, applies sigmoid. If False, treats as probabilities/binary.
+                  If None, automatically detects based on value range (values outside [0, 1] indicate logits).
         """
         if pred_masks.dim() == 4 and pred_masks.size(1) == 1:
             pred_masks = pred_masks.squeeze(1)
@@ -175,7 +195,24 @@ class SegmentationMetricTracker:
             target_masks = target_masks.squeeze(1)
 
         b = pred_masks.size(0)
-        probs = torch.sigmoid(pred_masks) if pred_masks.dtype.is_floating_point else pred_masks
+
+        # Distinguish between raw logits and already probabilities/binary masks
+        pred_float = pred_masks.float()
+        if is_logit is True:
+            probs = torch.sigmoid(pred_float)
+        elif is_logit is False:
+            probs = pred_float
+        else:
+            # Auto-detect: if values fall outside [0, 1], they are raw logits requiring sigmoid
+            if (pred_float < 0.0).any() or (pred_float > 1.0).any():
+                probs = torch.sigmoid(pred_float)
+            else:
+                probs = pred_float
+
+        if labels is not None:
+            labels_flat = labels.view(-1)
+        else:
+            labels_flat = None
 
         for i in range(b):
             m = compute_binary_metrics(
@@ -187,15 +224,29 @@ class SegmentationMetricTracker:
             for k in self.metrics_sum:
                 self.metrics_sum[k] += m.get(k, 0.0)
 
-            if labels is not None:
-                lbl = int(labels[i].item())
-                if lbl in self.per_label_stats:
-                    self.per_label_stats[lbl]["iou_sum"] += m["iou"]
-                    self.per_label_stats[lbl]["dice_sum"] += m["dice"]
-                    self.per_label_stats[lbl]["f1_sum"] += m["f1"]
-                    self.per_label_stats[lbl]["auroc_sum"] += m["auroc"]
-                    self.per_label_stats[lbl]["pixel_acc_sum"] += m["pixel_acc"]
-                    self.per_label_stats[lbl]["count"] += 1
+            if labels_flat is not None and i < len(labels_flat):
+                lbl = int(labels_flat[i].item())
+                if lbl not in self.per_label_stats:
+                    self.per_label_stats[lbl] = {
+                        "iou_sum": 0.0,
+                        "dice_sum": 0.0,
+                        "f1_sum": 0.0,
+                        "auroc_sum": 0.0,
+                        "pixel_acc_sum": 0.0,
+                        "precision_sum": 0.0,
+                        "recall_sum": 0.0,
+                        "specificity_sum": 0.0,
+                        "count": 0,
+                    }
+                self.per_label_stats[lbl]["iou_sum"] += m["iou"]
+                self.per_label_stats[lbl]["dice_sum"] += m["dice"]
+                self.per_label_stats[lbl]["f1_sum"] += m["f1"]
+                self.per_label_stats[lbl]["auroc_sum"] += m["auroc"]
+                self.per_label_stats[lbl]["pixel_acc_sum"] += m["pixel_acc"]
+                self.per_label_stats[lbl]["precision_sum"] += m["precision"]
+                self.per_label_stats[lbl]["recall_sum"] += m["recall"]
+                self.per_label_stats[lbl]["specificity_sum"] += m["specificity"]
+                self.per_label_stats[lbl]["count"] += 1
 
     def compute(self) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]]]:
         """
@@ -220,6 +271,9 @@ class SegmentationMetricTracker:
                     "auroc": stats["auroc_sum"] / cnt,
                     "pixel_auroc": stats["auroc_sum"] / cnt,
                     "pixel_acc": stats["pixel_acc_sum"] / cnt,
+                    "precision": stats.get("precision_sum", 0.0) / cnt,
+                    "recall": stats.get("recall_sum", 0.0) / cnt,
+                    "specificity": stats.get("specificity_sum", 0.0) / cnt,
                     "samples": cnt,
                 }
             else:
@@ -231,6 +285,9 @@ class SegmentationMetricTracker:
                     "auroc": 0.0,
                     "pixel_auroc": 0.0,
                     "pixel_acc": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "specificity": 0.0,
                     "samples": 0,
                 }
 

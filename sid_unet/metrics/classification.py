@@ -23,26 +23,43 @@ class ClassificationMetricTracker:
         self.all_targets: List[int] = []
         self.all_probs: List[List[float]] = []
 
-    def update(self, class_logits: torch.Tensor, target_labels: torch.Tensor):
+    def update(
+        self,
+        class_logits: Union[torch.Tensor, np.ndarray],
+        target_labels: Union[torch.Tensor, np.ndarray, List[int]],
+    ):
         """
         class_logits: (B, num_classes)
-        target_labels: (B,)
+        target_labels: (B,) or (B, 1)
         """
-        probs = torch.softmax(class_logits, dim=1).detach().cpu().numpy()
+        if isinstance(class_logits, torch.Tensor):
+            probs = torch.softmax(class_logits, dim=1).detach().cpu().numpy()
+        else:
+            arr = np.asarray(class_logits, dtype=np.float64)
+            if (arr < 0.0).any() or (arr > 1.0).any() or not np.allclose(arr.sum(axis=-1), 1.0, atol=1e-3):
+                exp_arr = np.exp(arr - np.max(arr, axis=-1, keepdims=True))
+                probs = exp_arr / np.sum(exp_arr, axis=-1, keepdims=True)
+            else:
+                probs = arr
+
         preds = np.argmax(probs, axis=1).tolist()
-        targets = target_labels.detach().cpu().tolist()
+
+        if isinstance(target_labels, torch.Tensor):
+            targets = target_labels.detach().cpu().view(-1).tolist()
+        else:
+            targets = np.asarray(target_labels).reshape(-1).tolist()
 
         self.all_preds.extend(preds)
-        self.all_targets.extend(targets)
+        self.all_targets.extend([int(t) for t in targets])
         self.all_probs.extend(probs.tolist())
 
     def compute(self) -> Tuple[Dict[str, float], Optional[List[List[int]]]]:
         if not self.all_targets:
             return {}, None
 
-        y_true = np.array(self.all_targets)
-        y_pred = np.array(self.all_preds)
-        y_probs = np.array(self.all_probs)
+        y_true = np.asarray(self.all_targets, dtype=np.int64).reshape(-1)
+        y_pred = np.asarray(self.all_preds, dtype=np.int64).reshape(-1)
+        y_probs = np.asarray(self.all_probs, dtype=np.float64)
 
         # Accuracy
         acc = float(np.mean(y_true == y_pred))
@@ -53,18 +70,29 @@ class ClassificationMetricTracker:
             if 0 <= t < self.num_classes and 0 <= p < self.num_classes:
                 cm[t, p] += 1
 
-        # Macro F1
+        # Macro F1 (computed across active classes: present in ground truth or predicted)
         f1_scores = []
+        active_classes = []
         for c in range(self.num_classes):
-            tp = cm[c, c]
-            fp = cm[:, c].sum() - tp
-            fn = cm[c, :].sum() - tp
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            tp = int(cm[c, c])
+            fp = int(cm[:, c].sum() - tp)
+            fn = int(cm[c, :].sum() - tp)
+            support = tp + fn
+            predicted = tp + fp
+
+            precision = tp / predicted if predicted > 0 else 0.0
+            recall = tp / support if support > 0 else 0.0
             f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
             f1_scores.append(f1)
 
-        macro_f1 = float(np.mean(f1_scores))
+            # Class is active if present in ground truth or falsely predicted by model
+            if support > 0 or predicted > 0:
+                active_classes.append(c)
+
+        if active_classes:
+            macro_f1 = float(np.mean([f1_scores[c] for c in active_classes]))
+        else:
+            macro_f1 = float(np.mean(f1_scores)) if f1_scores else 0.0
 
         # Multi-class AUROC
         aux_auroc = 0.0
