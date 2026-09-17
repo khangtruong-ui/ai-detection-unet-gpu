@@ -31,6 +31,8 @@ model:
   vae_subfolder: "vae"
   unet_subfolder: "unet"
   diffuser_fp16: true
+  autoencoder_trainable: true
+  use_skip_connections: true
   # Multi-timestep noise perturbations
   timesteps: [100, 250, 500]
   timestep_embed_dim: 32
@@ -41,7 +43,7 @@ model:
   include_noise_diff: true
   include_z0: true
   scaling_factor: 0.18215
-  # Trainable Decoder defined by config (the only part with trainable parameters)
+  # Trainable Decoder defined by config
   decoder:
     channels: [256, 128, 64, 32]
     upsample_mode: "bilinear" # "bilinear", "transpose", or "pixelshuffle"

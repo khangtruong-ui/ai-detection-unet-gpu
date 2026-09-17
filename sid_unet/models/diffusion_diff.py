@@ -330,7 +330,7 @@ class DiffusionDiffModel(nn.Module):
     Diffusion Multi-Noise Latent Feature Model (Diffusion-Diff) for AI-Generated Synthetic Image Masking.
 
     Mechanism:
-      1. Real image x [B, 3, H, W] is passed through frozen VAE encoder -> latent z0 [B, 4, H/8, W/8].
+      1. Real image x [B, 3, H, W] is passed through VAE encoder (trainable = True by default) -> latent z0 [B, 4, H/8, W/8] and multi-scale skip features.
       2. For multiple configured timesteps (t_1, ..., t_K):
          - Add noise epsilon_k to z0 -> noisy versions z_{t_k}.
          - Pass noisy versions z_{t_k} through frozen diffuser UNet -> predicted noise eps_hat_k.
@@ -338,8 +338,8 @@ class DiffusionDiffModel(nn.Module):
       3. Concatenate all:
          [z0, z_{t_k}, epsilon_k, eps_hat_k, sinusoidal_embeddings(t_k), sinusoidal_embeddings(sigma_k)]
          into high-dimensional representation Z [B, C_Z, H/8, W/8].
-      4. Pass Z through a configurable trainable decoder that decodes back to binary mask logits.
-      5. The decoder (and optional auxiliary classifier) is the ONLY part with trainable parameters.
+      4. Pass Z through a configurable trainable decoder with multi-scale encoder skip fusions.
+      5. The VAE autoencoder and decoder (and optional auxiliary classifier) are trainable, while the diffuser UNet remains strictly frozen.
     """
 
     def __init__(
@@ -367,6 +367,7 @@ class DiffusionDiffModel(nn.Module):
         input_rescale: bool = True,
         use_skip_connections: bool = True,
         diffuser_fp16: bool = True,
+        autoencoder_trainable: bool = True,
         **kwargs: Any,
     ):
         super().__init__()
@@ -374,6 +375,7 @@ class DiffusionDiffModel(nn.Module):
         self.vae_subfolder = vae_subfolder
         self.unet_subfolder = unet_subfolder
         self.diffuser_fp16 = bool(kwargs.get("diffuser_fp16", diffuser_fp16))
+        self.autoencoder_trainable = bool(kwargs.get("autoencoder_trainable", kwargs.get("trainable_autoencoder", autoencoder_trainable)))
         self.timesteps = [int(t) for t in (timesteps or [100, 250, 500])]
         self.timestep_embed_dim = int(timestep_embed_dim)
         self.sigma_embed_dim = int(sigma_embed_dim)
@@ -425,9 +427,10 @@ class DiffusionDiffModel(nn.Module):
 
         # Determine encoder skip channels
         if self.use_skip_connections:
-            dummy_x = torch.zeros((1, in_channels, 64, 64))
-            _, dummy_skips = self._encode_with_skips(dummy_x)
-            skip_channels = [s.shape[1] for s in dummy_skips]
+            with torch.no_grad():
+                dummy_x = torch.zeros((1, in_channels, 64, 64))
+                _, dummy_skips = self._encode_with_skips(dummy_x)
+                skip_channels = [s.shape[1] for s in dummy_skips]
         else:
             skip_channels = None
 
@@ -577,18 +580,28 @@ class DiffusionDiffModel(nn.Module):
         return c
 
     def _enforce_freeze(self) -> None:
-        """Strictly freeze VAE and Diffuser parameters."""
-        for param in self.vae.parameters():
-            param.requires_grad = False
+        """Freeze parameters according to configuration."""
+        if not self.autoencoder_trainable:
+            for param in self.vae.parameters():
+                param.requires_grad = False
+            self.vae.eval()
+        else:
+            for param in self.vae.parameters():
+                param.requires_grad = True
+            self.vae.train()
+
+        # Diffuser UNet is strictly frozen
         for param in self.diffuser.parameters():
             param.requires_grad = False
-        self.vae.eval()
         self.diffuser.eval()
 
     def train(self, mode: bool = True):
-        """Keep frozen components in eval mode when training."""
+        """Set training mode for trainable components while keeping frozen diffuser in eval."""
         super().train(mode)
-        self.vae.eval()
+        if not self.autoencoder_trainable:
+            self.vae.eval()
+        else:
+            self.vae.train(mode)
         self.diffuser.eval()
         return self
 
@@ -605,8 +618,9 @@ class DiffusionDiffModel(nn.Module):
         return res
 
     def _encode_with_skips(self, x: torch.Tensor) -> Tuple[Any, List[torch.Tensor]]:
-        """Run frozen VAE encoder to obtain latent distribution and multi-scale skip features."""
-        with torch.no_grad():
+        """Run VAE encoder to obtain latent distribution and multi-scale skip features."""
+        grad_ctx = torch.enable_grad() if (self.training and self.autoencoder_trainable) else torch.no_grad()
+        with grad_ctx:
             sample = self.vae.encoder.conv_in(x)
             skips = [sample]
 
@@ -648,7 +662,10 @@ class DiffusionDiffModel(nn.Module):
             if skip_h2 is None:
                 skip_h2 = skips[1] if len(skips) > 1 else skips[0]
 
-            ordered_skips = [skip_h4.detach(), skip_h2.detach(), skip_h.detach()]
+            if self.training and self.autoencoder_trainable:
+                ordered_skips = [skip_h4, skip_h2, skip_h]
+            else:
+                ordered_skips = [skip_h4.detach(), skip_h2.detach(), skip_h.detach()]
             return posterior, ordered_skips
 
     def _preprocess_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
@@ -680,23 +697,30 @@ class DiffusionDiffModel(nn.Module):
 
         x_proc, orig_h, orig_w = self._preprocess_input(x)
 
-        # 1. Real image passed through frozen encoder to obtain latent z0 and encoder skips
+        # 1. Real image passed through encoder to obtain latent z0 and encoder skips
         if self.use_skip_connections:
             posterior, enc_skips = self._encode_with_skips(x_proc)
-            with torch.no_grad():
+            if self.training and self.autoencoder_trainable:
                 z0 = posterior.mode() * self.scaling_factor
+            else:
+                with torch.no_grad():
+                    z0 = posterior.mode() * self.scaling_factor
         else:
             enc_skips = None
-            with torch.no_grad():
+            if self.training and self.autoencoder_trainable:
                 posterior = self.vae.encode(x_proc).latent_dist
                 z0 = posterior.mode() * self.scaling_factor
+            else:
+                with torch.no_grad():
+                    posterior = self.vae.encode(x_proc).latent_dist
+                    z0 = posterior.mode() * self.scaling_factor
 
         _, _, h_z, w_z = z0.shape
 
         # Components to concatenate into high-dimensional Z
         z_components: List[torch.Tensor] = []
         if self.include_z0:
-            z_components.append(z0.detach())
+            z_components.append(z0 if (self.training and self.autoencoder_trainable) else z0.detach())
 
         # Prepare unconditioned text embeddings for conditional diffusers if needed
         cross_dim = getattr(self.diffuser.config, "cross_attention_dim", None)
@@ -738,7 +762,7 @@ class DiffusionDiffModel(nn.Module):
 
             # Append components for this timestep
             if self.include_noisy_latents:
-                z_components.append(z_tk.detach())
+                z_components.append(z_tk if (self.training and self.autoencoder_trainable) else z_tk.detach())
             if self.include_added_noise:
                 z_components.append(eps_k.detach())
             if self.include_predicted_noise:

@@ -24,6 +24,8 @@ model:
   vae_subfolder: "vae"
   unet_subfolder: "unet"
   diffuser_fp16: true
+  autoencoder_trainable: true
+  use_skip_connections: true
   timesteps: [100, 250, 500]
   timestep_embed_dim: 32
   sigma_embed_dim: 32

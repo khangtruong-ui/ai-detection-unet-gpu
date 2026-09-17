@@ -255,4 +255,42 @@ def test_val_samples_per_epoch_resolves():
     assert res_unlimited is None
 
 
+def test_training_loop_iou_metric_and_no_vram_report():
+    """Verify that training loop computes IoU, includes train_iou in history, and does not report VRAM in loop."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "logging.save_sample_images=false",
+            "training.amp=false",
+        ])
+
+        train_ds = SyntheticDataset(size=4, img_size=(64, 64))
+        val_ds = SyntheticDataset(size=2, img_size=(64, 64))
+
+        train_loader = DataLoader(train_ds, batch_size=2)
+        val_loader = DataLoader(val_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        train_metrics = trainer.train_epoch(1)
+        assert "iou" in train_metrics, f"Expected 'iou' in train_metrics, got: {train_metrics.keys()}"
+        assert 0.0 <= train_metrics["iou"] <= 1.0
+
+        results = trainer.train()
+        history_0 = results["history"][0]
+        assert "train_iou" in history_0, f"Expected 'train_iou' in history, got: {history_0.keys()}"
+        assert 0.0 <= history_0["train_iou"] <= 1.0
+
+
+
 

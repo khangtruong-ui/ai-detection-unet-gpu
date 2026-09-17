@@ -60,7 +60,7 @@ Directory Layout:
 
 | Configuration File | Model Architecture | Timesteps | Diffuser & VAE | Trainable Decoder | Loss | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/diffusion_diff/default.yaml) | `DiffusionDiffModel` | `[100, 250, 500]` | SD1.5 Frozen | `[256, 128, 64, 32]` Bilinear | Combined (BCE + Dice) + Aux (0.2) | Real image $x \to z_0$, inject noise at multiple timesteps, compute diffuser predicted noise $\hat{\epsilon}$ and sinusoidal embeddings ($t, \sigma$), concatenating into high-dimensional $Z$ with a trainable decoder. |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/diffusion_diff/default.yaml) | `DiffusionDiffModel` | `[100, 250, 500]` | Diffuser Frozen, VAE Trainable | `[256, 128, 64, 32]` Bilinear | Combined (BCE + Dice) + Aux (0.2) | Real image $x \to z_0$, inject noise at multiple timesteps, compute diffuser predicted noise $\hat{\epsilon}$ and sinusoidal embeddings ($t, \sigma$), concatenating into high-dimensional $Z$ with a trainable VAE autoencoder and decoder. |
 
 ---
 

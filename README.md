@@ -330,60 +330,70 @@ Key features:
 
 ### 6. Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)
 
-A state-of-the-art forensic architecture analyzing how images respond to generative diffusion denoising dynamics across multiple perturbation scales:
+A state-of-the-art forensic architecture analyzing how images respond to generative diffusion denoising dynamics across multiple perturbation scales, enhanced with UNet-style multi-scale skip connections and a trainable VAE autoencoder:
 
 ```
-                                Input Real Image x (B, 3, H, W)
-                                               │
-                                ┌──────────────▼───────────────┐
-                                │      Frozen VAE Encoder      │ (requires_grad = False)
-                                └──────────────┬───────────────┘
-                                               ▼
-                                      Latent z0 (B, 4, H/8, W/8)
-                                               │
-               ┌───────────────────────────────┴───────────────────────────────┐
-               │                                                               │
-   [Timestep t_1: e.g. 100]                                        [Timestep t_K: e.g. 500]
-               │                                                               │
-     Add Noise: eps_1 ~ N(0, I)                                      Add Noise: eps_K ~ N(0, I)
-     z_t1 = sqrt(a_bar1)*z0 + s_1*eps_1                              z_tK = sqrt(a_barK)*z0 + s_K*eps_K
-               │                                                               │
-  ┌────────────┴────────────┐                                     ┌────────────┴────────────┐
-  │  Frozen Diffuser UNet   │                                     │  Frozen Diffuser UNet   │
-  │  (requires_grad = False)│                                     │  (requires_grad = False)│
-  └────────────┬────────────┘                                     └────────────┬────────────┘
-               ▼                                                               ▼
-     Predicted Noise eps_hat_1                                       Predicted Noise eps_hat_K
-               │                                                               │
-     Sinusoidal Embeddings:                                          Sinusoidal Embeddings:
-       - t_emb:   Sinusoidal(t_1) -> (B, D_t, H/8, W/8)                - t_emb:   Sinusoidal(t_K) -> (B, D_t, H/8, W/8)
-       - sig_emb: Sinusoidal(s_1) -> (B, D_s, H/8, W/8)                - sig_emb: Sinusoidal(s_K) -> (B, D_s, H/8, W/8)
-               │                                                               │
-               └───────────────────────────────┬───────────────────────────────┘
-                                               ▼
-               ┌───────────────────────────────────────────────────────────────┐
-               │          Concatenate along Channel Dimension (dim=1):         │
-               │  Z = [z0, z_t1, eps_1, eps_hat_1, t_emb1, sig_emb1, ..., z_tK] │
-               │                 Shape: (B, C_Z, H/8, W/8)                     │
-               └───────────────────────────────┬───────────────────────────────┘
-                                               │
-                                ┌──────────────┴───────────────┐
-                                │                              │
-                        ┌───────▼──────────────┐       ┌───────▼────────────────────────┐
-                        │ Auxiliary Classifier │       │    Trainable Latent Decoder    │
-                        │ AdaptivePool -> MLP  │       │   (ONLY trainable parameters;  │
-                        └───────┬──────────────┘       │    entirely defined by config) │
-                                ▼                      │  - Multi-stage upsampling (8x) │
-                       Class Logits (B, 3)             │  - ResBlocks, Norm, Activation │
-                                                       │  - Final 1x1 ConvOut           │
-                                                       └───────────────┬────────────────┘
-                                                                       ▼
-                                                          Binary Mask Logits (B, 1, H, W)
+                                        Input Real Image x (B, 3, H, W)
+                                                       │
+                           ┌───────────────────────────┴───────────────────────────┐
+                           │            VAE Encoder (Trainable by Default)         │
+                           │                 (autoencoder_trainable = True)        │
+                           │  conv_in ──────────────┐                              │
+                           │    │                   │ Skip 3: (B, C_3, H, W)       │
+                           │  down_blocks[0] ─┐     │                              │
+                           │    │             │     │ Skip 2: (B, C_2, H/2, W/2)   │
+                           │  down_blocks[1]  │     │                              │
+                           │    │             │     │ Skip 1: (B, C_1, H/4, W/4)   │
+                           │  down_blocks[2]  │     │                              │
+                           │    │             │     │                              │
+                           │  mid_block       │     │                              │
+                           │    │             │     │                              │
+                           └────┼─────────────┼─────┼──────────────────────────────┘
+                                ▼             │     │
+                   Latent z0 (B, 4, H/8, W/8) │     │
+                                │             │     │
+        ┌───────────────────────┴─────────────┼─────┼───────────────────────┐
+        │                                     │     │                       │
+[Timestep t_1: e.g. 100]                      │     │           [Timestep t_K: e.g. 500]
+        │                                     │     │                       │
+ Add Noise: eps_1 ~ N(0, I)                   │     │            Add Noise: eps_K ~ N(0, I)
+ z_t1 = sqrt(a_bar1)*z0 + s_1*eps_1           │     │            z_tK = sqrt(a_barK)*z0 + s_K*eps_K
+        │                                     │     │                       │
+┌───────┴───────────────┐                     │     │           ┌───────────┴───────────┐
+│  Frozen Diffuser UNet │                     │     │           │  Frozen Diffuser UNet │
+│(requires_grad = False)│                     │     │           │(requires_grad = False)│
+└───────┬───────────────┘                     │     │           └───────────┬───────────┘
+        ▼                                     │     │                       ▼
+ Predicted Noise eps_hat_1                    │     │            Predicted Noise eps_hat_K
+        │                                     │     │                       │
+ Sinusoidal Embeddings:                       │     │            Sinusoidal Embeddings:
+  - t_emb:   Sinusoidal(t_1)                  │     │             - t_emb:   Sinusoidal(t_K)
+  - sig_emb: Sinusoidal(s_1)                  │     │             - sig_emb: Sinusoidal(s_K)
+        │                                     │     │                       │
+        └───────────────────────┬─────────────┼─────┼───────────────────────┘
+                                ▼             │     │
+        ┌─────────────────────────────────────┴─────┼───────────────────────┐
+        │        Concatenate along Channel:         │                       │
+        │ Z = [z0, z_t1, eps_1, eps_hat_1, ..., z_tK│                       │
+        │           Shape: (B, C_Z, H/8, W/8)       │                       │
+        └───────────────────────┬───────────────────┼───────────────────────┘
+                                │                   │
+                ┌───────────────┴──────────┐        │
+                │                          │        │
+        ┌───────▼──────────────┐   ┌───────▼────────┼──────────────────────────────────┐
+        │ Auxiliary Classifier │   │        Trainable Latent Decoder (UNet-style)      │
+        │ AdaptivePool -> MLP  │   │  Stage 1: H/8 -> H/4 ◄── Skip 1: (H/4, W/4)       │
+        └───────┬──────────────┘   │  Stage 2: H/4 -> H/2 ◄── Skip 2: (H/2, W/2)       │
+                ▼                  │  Stage 3: H/2 -> H   ◄── Skip 3: (H, W)           │
+       Class Logits (B, 3)         │  Final 1x1 ConvOut                                │
+                                   └────────────────┬──────────────────────────────────┘
+                                                    ▼
+                                       Binary Mask Logits (B, 1, H, W)
 ```
 
 #### Mathematical & Architectural Principles
 
-- **1. Latent Inversion**: The real image $x$ is encoded by the frozen VAE encoder to obtain clean latent $z_0 \in \mathbb{R}^{B \times 4 \times H/8 \times W/8}$.
+- **1. Latent Inversion & Multi-Scale Feature Extraction**: The input image $x$ is processed by the VAE encoder (trainable by default, `autoencoder_trainable = True`) to extract clean latent $z_0 \in \mathbb{R}^{B \times 4 \times H/8 \times W/8}$ and multi-scale intermediate skip features $\{s_{H/4}, s_{H/2}, s_H\}$.
 
 - **2. Multi-Scale Forward Diffusion Perturbations**: For a configurable set of discrete timesteps $\{t_1, t_2, \dots, t_K\}$, standard Gaussian noise $\epsilon_k \sim \mathcal{N}(0, I)$ is added according to the diffusion schedule:
 
@@ -415,7 +425,9 @@ $$
 Z = \left[ z_0, \; z_{t_1}, \; \epsilon_1, \; \hat{\epsilon}_1, \; (\hat{\epsilon}_1 - \epsilon_1), \; e_{t_1}, \; e_{\sigma_1}, \; \dots, \; z_{t_K}, \; \epsilon_K, \; \hat{\epsilon}_K, \; (\hat{\epsilon}_K - \epsilon_K), \; e_{t_K}, \; e_{\sigma_K} \right]
 $$
 
-- **6. Strictly Trainable Decoder Defined by Config**: The VAE encoder and diffuser UNet are **completely frozen** (`requires_grad = False`). The decoder is a custom neural network whose architecture (channel progression, upsampling mode, norm layer, activation function, dropout, and residual blocks) is **fully defined and instantiated from configuration files**.
+- **6. Multi-Scale Skip Connections**: To preserve sharp edge boundaries and prevent spatial resolution degradation during 8x latent downsampling, intermediate activation representations from the VAE encoder are routed directly to the decoder's upsampling stages via convolutional `SkipFusion` blocks at scales $H/4$, $H/2$, and $H$.
+
+- **7. Trainable VAE Autoencoder & Decoder with Frozen Diffuser Prior**: The VAE autoencoder is **trainable by default** (`autoencoder_trainable: true`), enabling end-to-end feature adaptation while the multi-billion parameter Diffuser UNet remains **strictly frozen** (`requires_grad = False`) for compute and VRAM efficiency. The decoder is fully configurable from YAML configurations (channel dimensions, upsampling modes, normalization layers, and activations).
 
 ---
 
@@ -878,6 +890,8 @@ training:
 model:
   name: "diffusion_diff"
   pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  autoencoder_trainable: true                    # VAE autoencoder fine-tuning (trainable by default)
+  use_skip_connections: true                    # UNet-style multi-scale encoder skip connections
   timesteps: [100, 250, 500]                     # Perturbation timesteps
   timestep_embed_dim: 32                         # Sinusoidal timestep embedding size
   sigma_embed_dim: 32                            # Sinusoidal noise deviation embedding size
@@ -886,7 +900,7 @@ model:
   include_predicted_noise: true
   include_noise_diff: true
   include_z0: true
-  # Configurable Trainable Decoder (ONLY component with trainable weights)
+  # Configurable Trainable Decoder
   decoder:
     channels: [256, 128, 64, 32]
     upsample_mode: "bilinear"

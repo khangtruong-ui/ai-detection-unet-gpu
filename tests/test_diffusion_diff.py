@@ -74,12 +74,14 @@ def test_diffusion_diff_shapes_without_aux_classifier():
     assert not isinstance(mask_logits, tuple)
 
 
-def test_diffusion_diff_trainable_parameters_strictly_decoder():
+def test_diffusion_diff_trainable_parameters_default_and_frozen():
     """
     CRITICAL TEST:
-    Verify that ONLY the decoder (and optional aux head) has trainable parameters,
-    and neither the VAE encoder nor the diffuser receives gradients.
+    Verify that by default autoencoder_trainable=True:
+    VAE and decoder have trainable parameters, while diffuser UNet is strictly frozen.
+    When autoencoder_trainable=False, VAE is also frozen.
     """
+    # 1. Default: autoencoder_trainable=True
     model = DiffusionDiffModel(
         use_dummy=True,
         dummy_vae_channels=(32, 64),
@@ -94,16 +96,18 @@ def test_diffusion_diff_trainable_parameters_strictly_decoder():
         aux_classifier=True,
         num_classes=3,
     )
+    assert model.autoencoder_trainable is True
 
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     frozen = [n for n, p in model.named_parameters() if not p.requires_grad]
 
-    # Every trainable param MUST belong to decoder or classifier_head
-    for name in trainable:
-        assert name.startswith(("decoder.", "classifier_head.")), f"Unexpected trainable parameter: {name}"
+    # VAE, Decoder, and ClassifierHead must be trainable
+    assert any(n.startswith("vae.") for n in trainable)
+    assert any(n.startswith("decoder.") for n in trainable)
+    assert any(n.startswith("classifier_head.") for n in trainable)
 
-    # Base models MUST be frozen
-    assert any(n.startswith("vae.") for n in frozen)
+    # Diffuser MUST be strictly frozen
+    assert all(not n.startswith("diffuser.") for n in trainable)
     assert any(n.startswith("diffuser.") for n in frozen)
 
     x = torch.randn(2, 3, 64, 64)
@@ -111,15 +115,30 @@ def test_diffusion_diff_trainable_parameters_strictly_decoder():
     loss = mask_logits.sum() + class_logits.sum()
     loss.backward()
 
-    # VAE and Diffuser parameters MUST NOT have gradients
+    # Diffuser parameters MUST NOT have gradients
     for n, p in model.named_parameters():
-        if n.startswith(("vae.", "diffuser.")):
-            assert p.grad is None, f"Frozen parameter {n} unexpectedly received gradients!"
+        if n.startswith("diffuser."):
+            assert p.grad is None, f"Frozen diffuser parameter {n} unexpectedly received gradients!"
 
-    # Decoder and classifier head parameters MUST have valid gradients
+    # Decoder, classifier head, and VAE parameters MUST have valid gradients
     for n, p in model.named_parameters():
         if n.startswith(("decoder.out_conv.", "classifier_head.")):
             assert p.grad is not None, f"Trainable parameter {n} missing gradient!"
+    vae_has_grad = any(p.grad is not None for n, p in model.named_parameters() if n.startswith("vae."))
+    assert vae_has_grad, "Trainable VAE missing gradients!"
+
+    # 2. autoencoder_trainable=False
+    frozen_ae_model = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        timesteps=[100],
+        autoencoder_trainable=False,
+    )
+    assert frozen_ae_model.autoencoder_trainable is False
+    frozen_trainable = [n for n, p in frozen_ae_model.named_parameters() if p.requires_grad]
+    assert not any(n.startswith("vae.") for n in frozen_trainable)
+    assert not any(n.startswith("diffuser.") for n in frozen_trainable)
 
 
 def test_diffusion_diff_decoder_config_options():
@@ -203,7 +222,7 @@ def test_diffusion_diff_build_model_and_checkpoint():
 
 
 def test_diffusion_diff_optimization_step():
-    """Verify optimizer step updates decoder weights while frozen weights are untouched."""
+    """Verify optimizer step updates decoder and trainable VAE weights while frozen diffuser weights are untouched."""
     model = DiffusionDiffModel(
         use_dummy=True,
         dummy_vae_channels=(32, 64),
@@ -212,11 +231,13 @@ def test_diffusion_diff_optimization_step():
         decoder_config={"channels": [32, 16]},
         aux_classifier=False,
     )
+    assert model.autoencoder_trainable is True
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
 
     initial_decoder_weight = model.decoder.out_conv.weight.clone()
     initial_vae_weight = list(model.vae.parameters())[0].clone()
+    initial_diffuser_weight = list(model.diffuser.parameters())[0].clone()
 
     x = torch.randn(2, 3, 64, 64)
     target = torch.ones(2, 1, 64, 64)
@@ -227,8 +248,10 @@ def test_diffusion_diff_optimization_step():
 
     # Decoder weight changed
     assert not torch.equal(model.decoder.out_conv.weight, initial_decoder_weight)
-    # Frozen VAE weight completely unchanged
-    assert torch.equal(list(model.vae.parameters())[0], initial_vae_weight)
+    # Trainable VAE weight updated
+    assert not torch.equal(list(model.vae.parameters())[0], initial_vae_weight)
+    # Frozen Diffuser weight completely untouched
+    assert torch.equal(list(model.diffuser.parameters())[0], initial_diffuser_weight)
 
 
 def test_diffusion_diff_skip_connections():
@@ -256,11 +279,12 @@ def test_diffusion_diff_skip_connections():
     loss.backward()
     for fusion in model_with_skips.decoder.skip_fusions:
         assert fusion.conv.weight.grad is not None
-    # Frozen VAE and UNet must still have no gradients
-    for p in model_with_skips.vae.parameters():
-        assert p.grad is None
+    # Frozen diffuser UNet must have no gradients
     for p in model_with_skips.diffuser.parameters():
         assert p.grad is None
+    # Trainable VAE must receive gradients
+    vae_grad_exists = any(p.grad is not None for p in model_with_skips.vae.parameters())
+    assert vae_grad_exists
 
     # 2. With skip connections disabled
     model_no_skips = DiffusionDiffModel(

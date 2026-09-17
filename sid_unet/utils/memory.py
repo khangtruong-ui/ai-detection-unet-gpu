@@ -84,7 +84,15 @@ def get_memory_summary(device: Optional[Union[str, torch.device]] = None) -> Dic
         max_reserved = torch.cuda.max_memory_reserved(dev_idx) / (1024 ** 2)
         props = torch.cuda.get_device_properties(dev_idx)
         total = props.total_memory / (1024 ** 2)
-        free = total - reserved
+
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+            free = free_bytes / (1024 ** 2)
+            total = total_bytes / (1024 ** 2)
+        except Exception:
+            free = max(0.0, total - reserved)
+
+        used = max(0.0, total - free)
 
         summary.update({
             "device_type": "cuda",
@@ -96,6 +104,7 @@ def get_memory_summary(device: Optional[Union[str, torch.device]] = None) -> Dic
             "max_reserved_mb": round(max_reserved, 2),
             "total_mb": round(total, 2),
             "free_mb": round(free, 2),
+            "used_mb": round(used, 2),
         })
     except Exception:
         pass
@@ -110,11 +119,15 @@ def format_memory_summary(device: Optional[Union[str, torch.device]] = None) -> 
     stats = get_memory_summary(device)
     if stats["device_type"] != "cuda":
         return "Memory: CPU"
+    used_mb = stats.get("used_mb", stats["total_mb"] - stats["free_mb"])
     return (
-        f"VRAM: {stats['allocated_mb']:.1f} MB allocated | "
+        f"VRAM: {used_mb:.1f}/{stats['total_mb']:.0f} MB used "
+        f"({stats['free_mb']:.1f} MB free) | "
+        f"PyTorch: {stats['allocated_mb']:.1f} MB allocated, "
         f"{stats['reserved_mb']:.1f} MB reserved | "
-        f"Peak: {stats['max_allocated_mb']:.1f} MB (Total: {stats['total_mb']:.0f} MB)"
+        f"Peak: {stats['max_allocated_mb']:.1f} MB"
     )
+
 
 
 def split_batch(batch: Dict[str, Any], micro_batch_size: int) -> List[Dict[str, Any]]:

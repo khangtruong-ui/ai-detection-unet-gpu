@@ -341,6 +341,20 @@ class Trainer:
 
         scaled_loss = loss / max(1.0, float(loss_divisor))
         self.scaler.scale(scaled_loss).backward()
+
+        # Compute training IoU metric on batch
+        with torch.no_grad():
+            mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+            if mask_logits is not None:
+                preds = (torch.sigmoid(mask_logits.detach()) >= 0.5)
+                targets = (masks >= 0.5)
+                preds_flat = preds.view(preds.size(0), -1)
+                targets_flat = targets.view(targets.size(0), -1)
+                intersection = (preds_flat & targets_flat).sum(dim=1).float()
+                union = (preds_flat | targets_flat).sum(dim=1).float()
+                ious = torch.where(union == 0, torch.ones_like(intersection), intersection / torch.clamp(union, min=1.0))
+                loss_dict["iou"] = float(ious.mean().item())
+
         return loss, loss_dict
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -446,11 +460,9 @@ class Trainer:
                 postfix_dict = {
                     "loss": f"{loss_val:.4f}",
                     "mask_loss": f"{loss_dict_batch.get('mask_loss', 0.0):.4f}",
+                    "iou": f"{loss_dict_batch.get('iou', 0.0):.4f}",
                     "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                 }
-                if self.device.type == "cuda" and self.log_memory:
-                    vram_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
-                    postfix_dict["vram"] = f"{vram_mb:.0f}MB"
                 pbar.set_postfix(postfix_dict)
 
             # Flush pending accumulated gradients if last step did not land on accumulation boundary
@@ -621,6 +633,7 @@ class Trainer:
                     "train_loss": float(train_metrics.get("total_loss", 0.0)),
                     "train_mask_loss": float(train_metrics.get("mask_loss", 0.0)),
                     "train_aux_loss": float(train_metrics.get("aux_loss", 0.0)),
+                    "train_iou": float(train_metrics.get("iou", 0.0)),
                     "val_loss": float(val_summary.get("val_total_loss", val_summary.get("val_loss", 0.0))),
                     "val_mask_loss": float(val_summary.get("val_mask_loss", 0.0)),
                     "val_aux_loss": float(val_summary.get("val_aux_loss", 0.0)),
@@ -665,6 +678,7 @@ class Trainer:
                 self.logger.info(
                     f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:.1f}s] - "
                     f"Train Loss: {train_metrics.get('total_loss', 0.0):.4f} - "
+                    f"Train IoU: {train_metrics.get('iou', 0.0):.4f} - "
                     f"Val Loss: {val_summary.get('val_total_loss', 0.0):.4f} - "
                     f"Val IoU: {val_summary.get('val_iou', 0.0):.4f} - "
                     f"Val F1: {val_summary.get('val_f1', val_summary.get('val_dice', 0.0)):.4f} - "

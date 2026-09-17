@@ -329,6 +329,9 @@ def build_model(config: Any) -> nn.Module:
         from sid_unet.models.diffusion_diff import DiffusionDiffModel, DEFAULT_DIFFUSION_CHECKPOINT
         ckpt_name = model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_DIFFUSION_CHECKPOINT))
         dec_cfg = model_cfg.get("decoder", {})
+        ae_cfg = model_cfg.get("autoencoder", {})
+        ae_trainable = ae_cfg.get("trainable", True) if isinstance(ae_cfg, dict) else True
+        ae_trainable = model_cfg.get("autoencoder_trainable", model_cfg.get("trainable_autoencoder", ae_trainable))
         return DiffusionDiffModel(
             pretrained_model_name_or_path=str(ckpt_name),
             vae_subfolder=model_cfg.get("vae_subfolder", "vae"),
@@ -353,6 +356,7 @@ def build_model(config: Any) -> nn.Module:
             input_rescale=bool(model_cfg.get("input_rescale", True)),
             use_skip_connections=bool(model_cfg.get("use_skip_connections", model_cfg.get("skip_connections", True))),
             diffuser_fp16=bool(model_cfg.get("diffuser_fp16", training_cfg.get("amp", True))),
+            autoencoder_trainable=bool(ae_trainable),
         )
 
     if any(k in model_name for k in ["vae_finetune", "diffusion_vae", "sd_vae"]) or (model_name == "vae"):
