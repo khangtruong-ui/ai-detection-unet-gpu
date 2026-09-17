@@ -17,6 +17,7 @@ from scipy.stats import rankdata
 def compute_binary_auroc(
     pred_probs: Union[torch.Tensor, np.ndarray],
     target_mask: Union[torch.Tensor, np.ndarray],
+    is_logit: Optional[bool] = None,
 ) -> float:
     """
     Compute Area Under the Receiver Operating Characteristic (AUROC) curve on continuous pixel probabilities.
@@ -36,8 +37,12 @@ def compute_binary_auroc(
     p = np.nan_to_num(p, nan=0.0, posinf=1.0, neginf=0.0)
     t = np.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
 
-    # If unnormalized logits are passed (values outside [0, 1]), convert to probabilities via sigmoid
-    if np.any(p < 0.0) or np.any(p > 1.0):
+    # Convert to probabilities via sigmoid if logits
+    if is_logit is True:
+        p = 1.0 / (1.0 + np.exp(-np.clip(p, -500.0, 500.0)))
+    elif is_logit is False:
+        pass
+    elif np.any(p < 0.0) or np.any(p > 1.0):
         p = 1.0 / (1.0 + np.exp(-np.clip(p, -500.0, 500.0)))
 
     p_flat = p.flatten()
@@ -71,6 +76,7 @@ def compute_binary_metrics(
     target_mask: Union[torch.Tensor, np.ndarray],
     threshold: float = 0.5,
     eps: float = 1e-7,
+    is_logit: Optional[bool] = None,
 ) -> Dict[str, float]:
     """
     Compute binary segmentation metrics for a single sample or batch,
@@ -91,8 +97,12 @@ def compute_binary_metrics(
     p_raw = np.nan_to_num(p_raw, nan=0.0, posinf=1.0, neginf=0.0)
     t_raw = np.nan_to_num(t_raw, nan=0.0, posinf=1.0, neginf=0.0)
 
-    # If unnormalized logits are provided (values outside [0, 1]), convert to probabilities via sigmoid
-    if np.any(p_raw < 0.0) or np.any(p_raw > 1.0):
+    # Convert to probabilities via sigmoid if logits
+    if is_logit is True:
+        p_probs = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -500.0, 500.0)))
+    elif is_logit is False:
+        p_probs = p_raw
+    elif np.any(p_raw < 0.0) or np.any(p_raw > 1.0):
         p_probs = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -500.0, 500.0)))
     else:
         p_probs = p_raw
@@ -130,7 +140,7 @@ def compute_binary_metrics(
     specificity = float(tn) / float(tn + fp) if (tn + fp) > 0 else 1.0
 
     # AUROC
-    auroc = compute_binary_auroc(p_probs, t_raw)
+    auroc = compute_binary_auroc(p_probs, t_raw, is_logit=False)
 
     return {
         "iou": float(iou),
@@ -219,6 +229,7 @@ class SegmentationMetricTracker:
                 probs[i],
                 target_masks[i],
                 threshold=self.threshold,
+                is_logit=False,
             )
             self.total_samples += 1
             for k in self.metrics_sum:

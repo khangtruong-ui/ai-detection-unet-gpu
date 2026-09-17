@@ -136,3 +136,38 @@ def test_vae_finetune_loss_integration():
     assert total_loss.item() > 0.0
     assert "mask_loss" in metrics
     assert "aux_loss" in metrics
+
+
+def test_vae_finetune_skip_connections():
+    """Verify UNet-style encoder-to-decoder skip connections in DiffusionVAEFinetune."""
+    # 1. Model with skip connections enabled (default)
+    model_with_skips = DiffusionVAEFinetune(
+        use_dummy=True,
+        dummy_channels=(32, 64),
+        use_skip_connections=True,
+        freeze_encoder=False,
+    )
+    assert model_with_skips.use_skip_connections is True
+    assert len(model_with_skips.skip_fusions) > 0
+
+    x = torch.randn(2, 3, 64, 64)
+    out_skips, _ = model_with_skips(x)
+    assert out_skips.shape == (2, 1, 64, 64)
+
+    # Test backward pass through skip fusions
+    loss = out_skips.sum()
+    loss.backward()
+    for fusion in model_with_skips.skip_fusions:
+        assert fusion.conv.weight.grad is not None
+
+    # 2. Model with skip connections disabled
+    model_no_skips = DiffusionVAEFinetune(
+        use_dummy=True,
+        dummy_channels=(32, 64),
+        use_skip_connections=False,
+    )
+    assert model_no_skips.use_skip_connections is False
+    assert len(model_no_skips.skip_fusions) == 0
+
+    out_no_skips, _ = model_no_skips(x)
+    assert out_no_skips.shape == (2, 1, 64, 64)

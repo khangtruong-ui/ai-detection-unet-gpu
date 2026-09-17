@@ -229,3 +229,50 @@ def test_diffusion_diff_optimization_step():
     assert not torch.equal(model.decoder.out_conv.weight, initial_decoder_weight)
     # Frozen VAE weight completely unchanged
     assert torch.equal(list(model.vae.parameters())[0], initial_vae_weight)
+
+
+def test_diffusion_diff_skip_connections():
+    """Verify UNet-style encoder skip connections in DiffusionDiffModel."""
+    # 1. With skip connections enabled (default)
+    model_with_skips = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        timesteps=[100],
+        decoder_config={"channels": [32, 16]},
+        use_skip_connections=True,
+        aux_classifier=False,
+    )
+    assert model_with_skips.use_skip_connections is True
+    assert model_with_skips.decoder.skip_fusions is not None
+    assert len(model_with_skips.decoder.skip_fusions) > 0
+
+    x = torch.randn(2, 3, 64, 64)
+    logits_skips = model_with_skips(x)
+    assert logits_skips.shape == (2, 1, 64, 64)
+
+    # Check that skip fusion parameters are trainable and receive gradients
+    loss = logits_skips.sum()
+    loss.backward()
+    for fusion in model_with_skips.decoder.skip_fusions:
+        assert fusion.conv.weight.grad is not None
+    # Frozen VAE and UNet must still have no gradients
+    for p in model_with_skips.vae.parameters():
+        assert p.grad is None
+    for p in model_with_skips.diffuser.parameters():
+        assert p.grad is None
+
+    # 2. With skip connections disabled
+    model_no_skips = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        timesteps=[100],
+        decoder_config={"channels": [32, 16]},
+        use_skip_connections=False,
+        aux_classifier=False,
+    )
+    assert model_no_skips.use_skip_connections is False
+    assert len(model_no_skips.decoder.skip_fusions) == 0
+    logits_no_skips = model_no_skips(x)
+    assert logits_no_skips.shape == (2, 1, 64, 64)

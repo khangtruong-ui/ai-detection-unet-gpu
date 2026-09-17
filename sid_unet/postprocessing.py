@@ -258,12 +258,15 @@ class MaskPostProcessor:
     def process_batch(
         self,
         masks: torch.Tensor,
+        is_logit: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
         """
         Process a batch of predicted masks.
 
         Args:
             masks: PyTorch tensor of shape [B, 1, H, W] or [B, H, W] containing logits or probabilities.
+            is_logit: Optional bool. If True, applies sigmoid. If False, treats as probabilities/binary.
+                      If None, auto-detects based on whether values fall outside [0, 1].
 
         Returns:
             Tuple of (processed_binary_tensor [B, 1, H, W] on same device/dtype, list of stats_dicts).
@@ -273,7 +276,11 @@ class MaskPostProcessor:
         b_sz = masks.size(0)
 
         # Sigmoid if values appear to be unnormalized logits
-        if masks.min() < 0.0 or masks.max() > 1.0:
+        if is_logit is True:
+            probs = torch.sigmoid(masks)
+        elif is_logit is False:
+            probs = masks
+        elif masks.min() < 0.0 or masks.max() > 1.0:
             probs = torch.sigmoid(masks)
         else:
             probs = masks

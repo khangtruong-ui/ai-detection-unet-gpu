@@ -485,7 +485,7 @@ class Trainer:
         else:
             mask_logits, class_logits = outputs, None
 
-        seg_tracker.update(mask_logits, masks, labels)
+        seg_tracker.update(mask_logits, masks, labels, is_logit=True)
         if class_logits is not None and labels is not None:
             cls_tracker.update(class_logits, labels)
 

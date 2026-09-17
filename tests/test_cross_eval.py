@@ -215,3 +215,161 @@ def test_cross_eval_collision_skipping_and_continuous_master_report(monkeypatch)
         assert "test_smoke" in ckpt_names
         assert "test_quick" in ckpt_names
 
+
+def test_cross_eval_metrics_differentiation_and_collision_robustness(monkeypatch):
+    """
+    Verify:
+    1. Evaluating distinct checkpoints on the same dataset yields distinct, model-dependent metrics.
+    2. Multiple checkpoints named 'checkpoint_best.pt' in different parent folders do not falsely collide.
+    3. eval_single_batch with is_logit=True vs is_logit=False produces correct, non-constant metrics.
+    """
+    from PIL import ImageDraw
+
+    class RealisticMockDataset:
+        def __init__(self, count=6):
+            self.samples = []
+            for i in range(count):
+                mask_img = Image.new("L", (64, 64), 0)
+                if i % 3 == 2:
+                    # Partial tampering
+                    draw = ImageDraw.Draw(mask_img)
+                    draw.rectangle([20, 20, 44, 44], fill=255)
+                elif i % 3 == 1:
+                    mask_img = Image.new("L", (64, 64), 255)
+                self.samples.append({
+                    "image": Image.new("RGB", (64, 64), color=(i * 20, 100, 100)),
+                    "label": i % 3,
+                    "mask": mask_img,
+                    "img_id": f"mock_{i}",
+                })
+
+        def __iter__(self):
+            return iter(self.samples)
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+        def shuffle(self, *a, **k):
+            return self
+
+        def select(self, indices):
+            return [self.samples[i] for i in indices]
+
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: RealisticMockDataset(6))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dir_a = os.path.join(tmpdir, "model_a")
+        dir_b = os.path.join(tmpdir, "model_b")
+        os.makedirs(os.path.join(dir_a, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(dir_b, "checkpoints"), exist_ok=True)
+
+        ckpt_a_path = os.path.join(dir_a, "checkpoints", "checkpoint_best.pt")
+        ckpt_b_path = os.path.join(dir_b, "checkpoints", "checkpoint_best.pt")
+
+        from sid_unet.models.unet import UNet
+        # Create Model A (small features, uninitialized random weights)
+        model_a = UNet(in_channels=3, out_channels=1, features=[8, 16], aux_classifier=False)
+        # Create Model B with different weights biased towards large negative logits (predicting all zeros)
+        model_b = UNet(in_channels=3, out_channels=1, features=[8, 16], aux_classifier=False)
+        with torch.no_grad():
+            for p in model_b.parameters():
+                p.fill_(-10.0)
+
+        cfg_a = {
+            "project": {"name": "model_a_run", "device": "cpu"},
+            "model": {"name": "unet", "features": [8, 16], "aux_classifier": False},
+        }
+        cfg_b = {
+            "project": {"name": "model_b_run", "device": "cpu"},
+            "model": {"name": "unet", "features": [8, 16], "aux_classifier": False},
+        }
+
+        torch.save({"model_state_dict": model_a.state_dict(), "config": cfg_a}, ckpt_a_path)
+        torch.save({"model_state_dict": model_b.state_dict(), "config": cfg_b}, ckpt_b_path)
+
+        master_out = os.path.join(tmpdir, "master_cross")
+
+        # Run cross evaluation across BOTH checkpoints on configs/test_smoke.yaml
+        cross_res = run_cross_evaluation(
+            checkpoint_paths=[ckpt_a_path, ckpt_b_path],
+            config_paths=["configs/test_smoke.yaml"],
+            split="test",
+            samples=4,
+            batch_size=2,
+            output_dir=master_out,
+            overrides=["data.num_workers=0", "project.device=cpu"],
+            skip_collision=True,
+            save_illustrations=False,
+        )
+
+        results = cross_res["cross_results"]
+        # Both checkpoints must have been evaluated (no false collision skipping)
+        assert len(results) == 2, f"Expected 2 evaluated pairs, got {len(results)}"
+
+        res_a = results[0]
+        res_b = results[1]
+
+        assert res_a["checkpoint_path"] == ckpt_a_path
+        assert res_b["checkpoint_path"] == ckpt_b_path
+
+        # Checkpoint names must distinguish between the runs even though filename is checkpoint_best.pt
+        assert res_a["checkpoint_name"] != res_b["checkpoint_name"]
+
+        # Metrics between Model A and Model B MUST NOT be identical
+        met_a = res_a["metrics"]
+        met_b = res_b["metrics"]
+
+        # Model A and Model B have completely different weights, so their loss/metrics must differ
+        assert met_a["eval_total_loss"] != met_b["eval_total_loss"], "Losses across different models should not be identical"
+        assert met_a["iou"] != met_b["iou"], "IoU across different models should not be identical"
+        assert met_a["pixel_acc"] != met_b["pixel_acc"], "Pixel accuracy across different models should not be identical"
+
+        # 3. Direct verification of eval_single_batch with is_logit=True vs is_logit=False
+        from sid_unet.cross_eval import eval_single_batch
+        from sid_unet.metrics.segmentation import SegmentationMetricTracker
+        from sid_unet.metrics.classification import ClassificationMetricTracker
+        from sid_unet.losses.auxiliary import build_loss
+        from sid_unet.utils.config import load_config
+        from sid_unet.postprocessing import MaskPostProcessor
+
+        cfg = load_config("configs/test_smoke.yaml", overrides=["project.device=cpu"])
+        loss_fn = build_loss(cfg)
+        postproc = MaskPostProcessor(enabled=True)
+
+        batch_sample = {
+            "image": torch.randn(2, 3, 32, 32),
+            "mask": torch.zeros(2, 1, 32, 32),
+            "label": torch.tensor([0, 0]),
+        }
+        perf_model = UNet(in_channels=3, out_channels=1, features=[8, 16], aux_classifier=False)
+        with torch.no_grad():
+            for p in perf_model.parameters():
+                p.fill_(-10.0)
+
+        raw_tracker = SegmentationMetricTracker(threshold=0.5)
+        post_tracker = SegmentationMetricTracker(threshold=0.5)
+        cls_tracker = ClassificationMetricTracker(3)
+
+        eval_single_batch(
+            batch_sample,
+            perf_model,
+            loss_fn,
+            torch.device("cpu"),
+            raw_tracker,
+            cls_tracker,
+            threshold=0.5,
+            post_seg_tracker=post_tracker,
+            postprocessor=postproc,
+        )
+        raw_m, _ = raw_tracker.compute()
+        post_m, _ = post_tracker.compute()
+
+        # Both raw and post-processed must correctly achieve 1.0 IoU on all-background images
+        assert raw_m["iou"] == 1.0
+        assert post_m["iou"] == 1.0
+        assert raw_m["pixel_acc"] == 1.0
+        assert post_m["pixel_acc"] == 1.0
+

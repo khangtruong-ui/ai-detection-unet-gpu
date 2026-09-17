@@ -4,6 +4,10 @@ import pytest
 import torch
 from PIL import Image
 
+pytest.importorskip("transformers", reason="SAM3 requires transformers")
+pytest.importorskip("peft", reason="SAM3 requires peft")
+pytest.importorskip("bitsandbytes", reason="SAM3 requires bitsandbytes")
+
 from sid_unet.models.sam3_qlora import SAM3QLoRA
 from sid_unet.models.unet import build_model
 from sid_unet.utils.config import ConfigDict

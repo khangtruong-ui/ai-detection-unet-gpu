@@ -258,6 +258,26 @@ def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
     return unique
 
 
+def resolve_checkpoint_name(checkpoint_path: str, ckpt_config: Optional[Any] = None) -> str:
+    """
+    Resolve a descriptive, collision-resistant checkpoint identifier.
+    Falls back to parent directory qualification if stem is generic (e.g. 'checkpoint_best').
+    """
+    ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
+    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    parent_folder = os.path.basename(os.path.dirname(ckpt_dir)) if os.path.basename(ckpt_dir) == "checkpoints" else os.path.basename(ckpt_dir)
+
+    if ckpt_config is not None:
+        raw_name = getattr(ckpt_config, "project", {}).get("name") if hasattr(getattr(ckpt_config, "project", {}), "get") else None
+        if raw_name and raw_name not in ("UNet_Training", "UNet_Experiment", "checkpoint_best", "checkpoint_latest", "default"):
+            return str(raw_name)
+
+    if ckpt_stem in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
+        if parent_folder and parent_folder not in ("outputs", "RUN", "models", ".", "checkpoints", ""):
+            return f"{parent_folder}_{ckpt_stem}"
+    return ckpt_stem
+
+
 def resolve_checkpoint_neighbor_dir(checkpoint_path: str) -> str:
     """
     Resolve directory adjacent / neighbor to the checkpoint folder.
@@ -303,27 +323,41 @@ def eval_single_batch(
         mask_logits, class_logits = outputs, None
 
     # 1. Baseline Raw UNet
-    raw_seg_tracker.update(mask_logits, masks, labels)
+    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True)
 
     # 2. Post-processed UNet
     post_masks = None
     if post_seg_tracker is not None and postprocessor is not None:
-        post_masks, _ = postprocessor.process_batch(mask_logits)
-        post_seg_tracker.update(post_masks, masks, labels)
+        post_masks, _ = postprocessor.process_batch(mask_logits, is_logit=True)
+        post_seg_tracker.update(post_masks, masks, labels, is_logit=False)
 
     # 3. SAM-Refined UNet
     sam_masks = None
     sam_change_metrics = []
     if sam_seg_tracker is not None and refiner is not None:
-        sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
-        sam_seg_tracker.update(sam_masks, masks, labels)
+        try:
+            sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits, is_logit=True)
+        except TypeError:
+            sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
+        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False)
 
     # 4. SAM + Post-Processing
     both_masks = None
     if both_seg_tracker is not None and postprocessor is not None:
-        base_for_both = sam_masks if sam_masks is not None else (refiner.refine_batch(images, mask_logits)[0] if refiner else mask_logits)
-        both_masks, _ = postprocessor.process_batch(base_for_both)
-        both_seg_tracker.update(both_masks, masks, labels)
+        if sam_masks is not None:
+            base_for_both = sam_masks
+            base_is_logit = False
+        elif refiner is not None:
+            try:
+                base_for_both = refiner.refine_batch(images, mask_logits, is_logit=True)[0]
+            except TypeError:
+                base_for_both = refiner.refine_batch(images, mask_logits)[0]
+            base_is_logit = False
+        else:
+            base_for_both = mask_logits
+            base_is_logit = True
+        both_masks, _ = postprocessor.process_batch(base_for_both, is_logit=base_is_logit)
+        both_seg_tracker.update(both_masks, masks, labels, is_logit=False)
 
     # 5. Classification tracker
     if class_logits is not None and labels is not None:
@@ -402,17 +436,7 @@ def evaluate_checkpoint_on_config(
         return_config=True,
     )
 
-    ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
-    parent_folder = os.path.basename(os.path.dirname(ckpt_dir)) if os.path.basename(ckpt_dir) == "checkpoints" else os.path.basename(ckpt_dir)
-
-    raw_name = ckpt_config.project.get("name") if hasattr(ckpt_config, "project") else None
-    if raw_name and raw_name not in ("UNet_Training", "UNet_Experiment", "checkpoint_best", "checkpoint_latest"):
-        ckpt_run_name = raw_name
-    elif parent_folder and parent_folder not in ("outputs", "RUN", "models", ".", "checkpoints"):
-        ckpt_run_name = parent_folder
-    else:
-        ckpt_run_name = ckpt_stem
+    ckpt_run_name = resolve_checkpoint_name(checkpoint_path, ckpt_config)
     cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
     cfg_proj_name = eval_config.project.get("name", cfg_stem)
 
@@ -689,15 +713,17 @@ def run_cross_evaluation(
         except Exception as e:
             logger.warning(f"Failed to load existing master cross-evaluation report from '{master_json_path}': {e}")
 
-    # Build collision lookup map
+    # Build collision lookup map (keyed by exact absolute paths and unique non-generic (cn, kn) pairs)
     existing_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for r in existing_cross_results:
         cp_abs = os.path.abspath(r.get("checkpoint_path", ""))
         kp_abs = os.path.abspath(r.get("config_path", ""))
-        cn = r.get("checkpoint_name", os.path.splitext(os.path.basename(cp_abs))[0])
+        cn = r.get("checkpoint_name") or resolve_checkpoint_name(cp_abs)
         kn = r.get("config_name", os.path.splitext(os.path.basename(kp_abs))[0])
-        existing_map[(cp_abs, kp_abs)] = r
-        existing_map[(cn, kn)] = r
+        if cp_abs and kp_abs:
+            existing_map[(cp_abs, kp_abs)] = r
+        if cn and kn and cn not in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
+            existing_map[(cn, kn)] = r
 
     all_cross_results: List[Dict[str, Any]] = []
     checkpoint_to_results: Dict[str, List[Dict[str, Any]]] = {}
@@ -707,11 +733,11 @@ def run_cross_evaluation(
 
     for ckpt_path in checkpoint_paths:
         checkpoint_to_results[ckpt_path] = []
+        cp_abs = os.path.abspath(ckpt_path)
+        cn = resolve_checkpoint_name(ckpt_path)
         for cfg_path in config_paths:
             run_idx += 1
-            cp_abs = os.path.abspath(ckpt_path)
             kp_abs = os.path.abspath(cfg_path)
-            cn = os.path.splitext(os.path.basename(ckpt_path))[0]
             kn = os.path.splitext(os.path.basename(cfg_path))[0]
 
             # Check for collision
@@ -719,8 +745,10 @@ def run_cross_evaluation(
             if skip_collision:
                 if (cp_abs, kp_abs) in existing_map:
                     existing_res = existing_map[(cp_abs, kp_abs)]
-                elif (cn, kn) in existing_map:
-                    existing_res = existing_map[(cn, kn)]
+                elif (cn, kn) in existing_map and cn not in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
+                    existing_cp = os.path.abspath(existing_map[(cn, kn)].get("checkpoint_path", ""))
+                    if existing_cp == cp_abs:
+                        existing_res = existing_map[(cn, kn)]
                 else:
                     # Check neighbor dir for saved per-config report
                     neighbor_dir = resolve_checkpoint_neighbor_dir(ckpt_path)

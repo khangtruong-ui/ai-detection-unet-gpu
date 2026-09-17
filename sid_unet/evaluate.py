@@ -228,27 +228,41 @@ def eval_single_batch(
         mask_logits, class_logits = outputs, None
 
     # 1. Update Raw UNet baseline tracker
-    raw_seg_tracker.update(mask_logits, masks, labels)
+    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True)
 
     # 2. Update Post-Processing tracker if enabled
     post_masks = None
     if post_seg_tracker is not None and postprocessor is not None:
-        post_masks, _ = postprocessor.process_batch(mask_logits)
-        post_seg_tracker.update(post_masks, masks, labels)
+        post_masks, _ = postprocessor.process_batch(mask_logits, is_logit=True)
+        post_seg_tracker.update(post_masks, masks, labels, is_logit=False)
 
     # 3. Update SAM Refinement tracker if enabled
     sam_masks = None
     sam_change_metrics = []
     if sam_seg_tracker is not None and refiner is not None:
-        sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
-        sam_seg_tracker.update(sam_masks, masks, labels)
+        try:
+            sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits, is_logit=True)
+        except TypeError:
+            sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
+        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False)
 
     # 4. Update combined SAM + Post-Processing tracker if both enabled
     both_masks = None
     if both_seg_tracker is not None and postprocessor is not None:
-        base_for_both = sam_masks if sam_masks is not None else (refiner.refine_batch(images, mask_logits)[0] if refiner else mask_logits)
-        both_masks, _ = postprocessor.process_batch(base_for_both)
-        both_seg_tracker.update(both_masks, masks, labels)
+        if sam_masks is not None:
+            base_for_both = sam_masks
+            base_is_logit = False
+        elif refiner is not None:
+            try:
+                base_for_both = refiner.refine_batch(images, mask_logits, is_logit=True)[0]
+            except TypeError:
+                base_for_both = refiner.refine_batch(images, mask_logits)[0]
+            base_is_logit = False
+        else:
+            base_for_both = mask_logits
+            base_is_logit = True
+        both_masks, _ = postprocessor.process_batch(base_for_both, is_logit=base_is_logit)
+        both_seg_tracker.update(both_masks, masks, labels, is_logit=False)
 
     # 5. Classification metrics
     if class_logits is not None and labels is not None:

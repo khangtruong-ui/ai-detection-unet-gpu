@@ -351,6 +351,7 @@ def build_model(config: Any) -> nn.Module:
             dummy_vae_channels=tuple(model_cfg.get("dummy_vae_channels", [32, 64])),
             dummy_unet_channels=tuple(model_cfg.get("dummy_unet_channels", [32, 64])),
             input_rescale=bool(model_cfg.get("input_rescale", True)),
+            use_skip_connections=bool(model_cfg.get("use_skip_connections", model_cfg.get("skip_connections", True))),
         )
 
     if any(k in model_name for k in ["vae_finetune", "diffusion_vae", "sd_vae"]) or (model_name == "vae"):
@@ -371,6 +372,7 @@ def build_model(config: Any) -> nn.Module:
             use_dummy=bool(model_cfg.get("use_dummy", False)),
             dummy_channels=tuple(model_cfg.get("dummy_channels", [32, 64])),
             input_rescale=bool(model_cfg.get("input_rescale", True)),
+            use_skip_connections=bool(model_cfg.get("use_skip_connections", model_cfg.get("skip_connections", True))),
         )
 
     return UNet(

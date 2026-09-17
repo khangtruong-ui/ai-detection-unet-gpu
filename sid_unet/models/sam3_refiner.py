@@ -286,8 +286,9 @@ class SAMRefiner:
 
     def refine_batch(
         self,
-        images: Union[List[Image.Image], torch.Tensor],
+        images: Union[torch.Tensor, List[Any]],
         mask_logits_or_probs: torch.Tensor,
+        is_logit: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
         """
         Refine a batch of predicted masks from UNet.
@@ -295,6 +296,8 @@ class SAMRefiner:
         Args:
             images: Batch of PyTorch image tensors [B, 3, H, W] or list of PIL Images.
             mask_logits_or_probs: PyTorch tensor of shape [B, 1, H, W] or [B, H, W].
+            is_logit: Optional bool. If True, applies sigmoid. If False, treats as probabilities.
+                      If None, auto-detects based on whether values fall outside [0, 1].
 
         Returns:
             Tuple of (refined_mask_logits_or_probs [B, 1, H, W] on same device, list of change_metrics).
@@ -303,7 +306,14 @@ class SAMRefiner:
         b_sz = mask_logits_or_probs.size(0)
 
         # Determine if inputs are logits or probabilities
-        probs = torch.sigmoid(mask_logits_or_probs) if (mask_logits_or_probs.min() < 0.0 or mask_logits_or_probs.max() > 1.0) else mask_logits_or_probs
+        if is_logit is True:
+            probs = torch.sigmoid(mask_logits_or_probs)
+        elif is_logit is False:
+            probs = mask_logits_or_probs
+        elif (mask_logits_or_probs.min() < 0.0 or mask_logits_or_probs.max() > 1.0):
+            probs = torch.sigmoid(mask_logits_or_probs)
+        else:
+            probs = mask_logits_or_probs
 
         refined_tensors = []
         metrics_list = []
