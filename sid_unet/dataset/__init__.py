@@ -14,6 +14,7 @@ from sid_unet.dataset.loader import (
     load_hf_dataset_robust,
     process_raw_sample,
     safe_dataloader_len,
+    BackgroundPrefetcher,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "load_hf_dataset_robust",
     "process_raw_sample",
     "safe_dataloader_len",
+    "BackgroundPrefetcher",
 ]

@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import itertools
 import os
+import queue
+import sys
+import threading
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image, ImageFile
@@ -19,6 +22,24 @@ from datasets import load_dataset as hf_load_dataset
 # Ensure PIL loads truncated/partial images without raising OSError
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# Optimize HuggingFace filesystem reads for large Parquet datasets (e.g. KhangTruong/COCO-inpainted).
+# PyArrow's interleaved column reads can thrash fsspec's default readahead cache (5MB),
+# resulting in 50k+ HTTP range requests and 120s+ freezes per row group transition.
+# Using blockcache with 16MB blocks resolves the 23-24 iteration stall.
+try:
+    from huggingface_hub.hf_file_system import HfFileSystemFile
+    _orig_hf_file_init = HfFileSystemFile.__init__
+
+    def _fast_hf_file_init(self, *args, **kwargs):
+        kwargs.setdefault("cache_type", "blockcache")
+        kwargs.setdefault("block_size", 16 * 1024 * 1024)
+        kwargs.setdefault("cache_options", {"nblocks": 32})
+        return _orig_hf_file_init(self, *args, **kwargs)
+
+    HfFileSystemFile.__init__ = _fast_hf_file_init
+except Exception:
+    pass
+
 
 def worker_init_fn(worker_id: int) -> None:
     """Worker initialization function to configure PIL for DataLoader workers."""
@@ -27,6 +48,156 @@ def worker_init_fn(worker_id: int) -> None:
 
 from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask, check_image_mask_mismatch
 from sid_unet.dataset.transforms import get_transforms, JointCompose
+
+
+_SENTINEL = object()
+
+
+class _ExceptionWrapper:
+    """Wraps an exception occurring in the prefetch thread to re-raise in the main thread."""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.exc_info = sys.exc_info()
+
+    def reraise(self) -> None:
+        if self.exc_info[1] is not None:
+            raise self.exc.with_traceback(self.exc_info[2])
+        raise self.exc
+
+
+class _BackgroundPrefetchIterator:
+    """
+    Iterator running DataLoader consumption in a dedicated background thread.
+    Allows GPU computation and Parquet HTTP/disk streaming to overlap concurrently,
+    while polling with a short timeout to catch KeyboardInterrupt (Ctrl+C) instantly.
+    """
+
+    def __init__(self, loader: Any, maxsize: int = 32):
+        self.loader = loader
+        self.maxsize = maxsize
+        self.queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._fetch_loop, daemon=True)
+        self._worker.start()
+
+    def _fetch_loop(self) -> None:
+        try:
+            for item in self.loader:
+                while not self._stop_event.is_set():
+                    try:
+                        self.queue.put(item, timeout=0.1)
+                        break
+                    except Exception:
+                        continue
+                if self._stop_event.is_set():
+                    break
+        except Exception as e:
+            if not self._stop_event.is_set():
+                try:
+                    self.queue.put(_ExceptionWrapper(e), timeout=0.1)
+                except Exception:
+                    pass
+        finally:
+            while not self._stop_event.is_set():
+                try:
+                    self.queue.put(_SENTINEL, timeout=0.1)
+                    break
+                except Exception:
+                    continue
+
+    def __iter__(self) -> _BackgroundPrefetchIterator:
+        return self
+
+    def __next__(self) -> Any:
+        while not self._stop_event.is_set():
+            try:
+                item = self.queue.get(timeout=0.2)
+            except Exception:
+                if not self._worker.is_alive() and (self.queue is None or self.queue.empty()):
+                    self.close()
+                    raise StopIteration
+                continue
+
+            if item is _SENTINEL:
+                self.close()
+                raise StopIteration
+            if isinstance(item, _ExceptionWrapper):
+                self.close()
+                item.reraise()
+            return item
+        raise StopIteration
+
+    def close(self) -> None:
+        """Signal worker to stop, drain queue, and close underlying dataset stream."""
+        if getattr(self, "_stop_event", None) is not None:
+            self._stop_event.set()
+        q = getattr(self, "queue", None)
+        if q is not None:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+        loader = getattr(self, "loader", None)
+        if loader is not None and hasattr(loader, "dataset") and hasattr(loader.dataset, "close"):
+            try:
+                loader.dataset.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class BackgroundPrefetcher:
+    """
+    Lightweight asynchronous prefetcher wrapper for PyTorch DataLoaders.
+    Pre-buffers batches on a background thread so training loops never wait on
+    remote Parquet row-group downloads or decompression boundaries.
+    """
+
+    def __init__(self, loader: Any, maxsize: int = 32):
+        self.loader = loader
+        self.maxsize = maxsize
+        self._active_iterator: Optional[_BackgroundPrefetchIterator] = None
+
+    def __iter__(self) -> _BackgroundPrefetchIterator:
+        self.close()
+        self._active_iterator = _BackgroundPrefetchIterator(self.loader, maxsize=self.maxsize)
+        return self._active_iterator
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    @property
+    def dataset(self) -> Any:
+        return self.loader.dataset
+
+    @property
+    def batch_size(self) -> Optional[int]:
+        return getattr(self.loader, "batch_size", None)
+
+    def close(self) -> None:
+        """Close active iterator and worker thread."""
+        if getattr(self, "_active_iterator", None) is not None:
+            try:
+                self._active_iterator.close()
+            except Exception:
+                pass
+            self._active_iterator = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.loader, name)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def process_raw_sample(
@@ -405,9 +576,20 @@ class SIDStreamingDataset(IterableDataset):
 
         return stream_iter
 
+    def close(self) -> None:
+        """Explicitly close the current active stream if supported."""
+        stream = getattr(self, "_current_stream", None)
+        if stream is not None and hasattr(stream, "close") and callable(stream.close):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._current_stream = None
+
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         import random
         stream = self._get_stream()
+        self._current_stream = stream
         # Maintain a lightweight reservoir/shuffle buffer on processed (resized) samples
         # Capped to 32 samples to prevent memory ballooning while providing local randomness
         target_buf_size = min(max(0, self.shuffle_buffer_size), 32) if self.resolved_split.lower() in ("train", "training") else 0
@@ -461,6 +643,7 @@ class SIDStreamingDataset(IterableDataset):
                     stream.close()
                 except Exception:
                     pass
+            self._current_stream = None
             del stream
 
 
@@ -589,13 +772,15 @@ def create_eval_dataloader(
             seed=seed,
             target_image_size=image_size,
         )
-        return DataLoader(
+        prefetch_batches = int(config.data.get("prefetch_batches", 16))
+        raw_loader = DataLoader(
             eval_dataset,
             batch_size=batch_size,
             num_workers=0,
             pin_memory=pin_memory,
             worker_init_fn=worker_init_fn,
         )
+        return BackgroundPrefetcher(raw_loader, maxsize=prefetch_batches)
     else:
         eval_dataset = SIDMapDataset(
             dataset_name=dataset_name,
@@ -696,20 +881,25 @@ def create_dataloaders(
             target_image_size=image_size,
         )
 
-        train_loader = DataLoader(
+        train_prefetch = int(config.data.get("prefetch_batches", 32))
+        val_prefetch = max(8, train_prefetch // 2)
+
+        raw_train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             num_workers=0,
             pin_memory=pin_memory,
             worker_init_fn=worker_init_fn,
         )
-        val_loader = DataLoader(
+        raw_val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             num_workers=0,
             pin_memory=pin_memory,
             worker_init_fn=worker_init_fn,
         )
+        train_loader = BackgroundPrefetcher(raw_train_loader, maxsize=train_prefetch)
+        val_loader = BackgroundPrefetcher(raw_val_loader, maxsize=val_prefetch)
     else:
         train_dataset = SIDMapDataset(
             dataset_name=dataset_name,

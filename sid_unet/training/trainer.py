@@ -266,6 +266,21 @@ class Trainer:
             "history": self.history,
         }
 
+    def close(self) -> None:
+        """Close and clean up data loaders and background prefetcher threads."""
+        for loader in (self.train_loader, self.val_loader, self.test_loader):
+            if loader is not None and hasattr(loader, "close") and callable(loader.close):
+                try:
+                    loader.close()
+                except Exception:
+                    pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _build_scheduler(self):
         if self.scheduler_name == "cosine":
             min_lr = float(self.config.training.get("min_lr", 1e-6))
@@ -611,6 +626,7 @@ class Trainer:
         history = list(self.history)
         best_val_score = self.ckpt_manager.best_score
         start_time = time.time()
+        self._current_epoch = self.start_epoch
 
         if self.start_epoch >= self.epochs:
             self.logger.info(
@@ -618,79 +634,53 @@ class Trainer:
                 "Skipping training loop and generating final evaluation report."
             )
         else:
-            for epoch in range(self.start_epoch + 1, self.epochs + 1):
-                epoch_start = time.time()
-                train_metrics = self.train_epoch(epoch)
+            try:
+                for epoch in range(self.start_epoch + 1, self.epochs + 1):
+                    self._current_epoch = epoch
+                    epoch_start = time.time()
+                    train_metrics = self.train_epoch(epoch)
 
-                # Run validation
-                val_summary, per_label_metrics, confusion_mat = self.validate(epoch)
+                    # Run validation
+                    val_summary, per_label_metrics, confusion_mat = self.validate(epoch)
 
-                # Record per-epoch history
-                current_lr = float(self.optimizer.param_groups[0]["lr"])
-                epoch_record = {
-                    "epoch": epoch,
-                    "lr": current_lr,
-                    "train_loss": float(train_metrics.get("total_loss", 0.0)),
-                    "train_mask_loss": float(train_metrics.get("mask_loss", 0.0)),
-                    "train_aux_loss": float(train_metrics.get("aux_loss", 0.0)),
-                    "train_iou": float(train_metrics.get("iou", 0.0)),
-                    "val_loss": float(val_summary.get("val_total_loss", val_summary.get("val_loss", 0.0))),
-                    "val_mask_loss": float(val_summary.get("val_mask_loss", 0.0)),
-                    "val_aux_loss": float(val_summary.get("val_aux_loss", 0.0)),
-                    "val_iou": float(val_summary.get("val_iou", 0.0)),
-                    "val_dice": float(val_summary.get("val_dice", 0.0)),
-                    "val_f1": float(val_summary.get("val_f1", val_summary.get("val_dice", 0.0))),
-                    "val_pixel_f1": float(val_summary.get("val_pixel_f1", val_summary.get("val_dice", 0.0))),
-                    "val_auroc": float(val_summary.get("val_auroc", val_summary.get("val_pixel_auroc", 0.0))),
-                    "val_pixel_auroc": float(val_summary.get("val_pixel_auroc", val_summary.get("val_auroc", 0.0))),
-                    "val_pixel_acc": float(val_summary.get("val_pixel_acc", 0.0)),
-                    "val_precision": float(val_summary.get("val_precision", 0.0)),
-                    "val_recall": float(val_summary.get("val_recall", 0.0)),
-                    "val_aux_accuracy": float(val_summary.get("val_aux_accuracy", val_summary.get("val_accuracy", 0.0))),
-                    "train_metrics": train_metrics,
-                    "val_metrics": val_summary,
-                }
-                history.append(epoch_record)
-                self.history = history
+                    # Record per-epoch history
+                    current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    epoch_record = {
+                        "epoch": epoch,
+                        "lr": current_lr,
+                        "train_loss": float(train_metrics.get("total_loss", 0.0)),
+                        "train_mask_loss": float(train_metrics.get("mask_loss", 0.0)),
+                        "train_aux_loss": float(train_metrics.get("aux_loss", 0.0)),
+                        "train_iou": float(train_metrics.get("iou", 0.0)),
+                        "val_loss": float(val_summary.get("val_total_loss", val_summary.get("val_loss", 0.0))),
+                        "val_mask_loss": float(val_summary.get("val_mask_loss", 0.0)),
+                        "val_aux_loss": float(val_summary.get("val_aux_loss", 0.0)),
+                        "val_iou": float(val_summary.get("val_iou", 0.0)),
+                        "val_dice": float(val_summary.get("val_dice", 0.0)),
+                        "val_f1": float(val_summary.get("val_f1", val_summary.get("val_dice", 0.0))),
+                        "val_pixel_f1": float(val_summary.get("val_pixel_f1", val_summary.get("val_dice", 0.0))),
+                        "val_auroc": float(val_summary.get("val_auroc", val_summary.get("val_pixel_auroc", 0.0))),
+                        "val_pixel_auroc": float(val_summary.get("val_pixel_auroc", val_summary.get("val_auroc", 0.0))),
+                        "val_pixel_acc": float(val_summary.get("val_pixel_acc", 0.0)),
+                        "val_precision": float(val_summary.get("val_precision", 0.0)),
+                        "val_recall": float(val_summary.get("val_recall", 0.0)),
+                        "val_aux_accuracy": float(val_summary.get("val_aux_accuracy", val_summary.get("val_accuracy", 0.0))),
+                        "train_metrics": train_metrics,
+                        "val_metrics": val_summary,
+                    }
+                    history.append(epoch_record)
+                    self.history = history
 
-                # Step scheduler
-                if self.scheduler is not None:
-                    if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        monitored_val = val_summary.get(self.ckpt_manager.metric_name, 0.0)
-                        self.scheduler.step(monitored_val)
-                    else:
-                        self.scheduler.step()
+                    # Step scheduler
+                    if self.scheduler is not None:
+                        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            monitored_val = val_summary.get(self.ckpt_manager.metric_name, 0.0)
+                            self.scheduler.step(monitored_val)
+                        else:
+                            self.scheduler.step()
 
-                # Save checkpoint
-                saved_paths = self.ckpt_manager.save(
-                    epoch=epoch,
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    scheduler=self.scheduler,
-                    metrics=val_summary,
-                    config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-                    step=self.global_step,
-                    scaler=self.scaler,
-                    history=history,
-                )
-
-                epoch_time = time.time() - epoch_start
-                self.logger.info(
-                    f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:.1f}s] - "
-                    f"Train Loss: {train_metrics.get('total_loss', 0.0):.4f} - "
-                    f"Train IoU: {train_metrics.get('iou', 0.0):.4f} - "
-                    f"Val Loss: {val_summary.get('val_total_loss', 0.0):.4f} - "
-                    f"Val IoU: {val_summary.get('val_iou', 0.0):.4f} - "
-                    f"Val F1: {val_summary.get('val_f1', val_summary.get('val_dice', 0.0)):.4f} - "
-                    f"Val AUROC: {val_summary.get('val_auroc', 0.0):.4f}"
-                )
-
-                if "best" in saved_paths:
-                    self.logger.info(f"⭐ New best model saved to {saved_paths['best']} (score: {self.ckpt_manager.best_score:.4f})")
-
-                # Check periodic checkpointing
-                if self.ckpt_manager.should_save_periodic(step=self.global_step):
-                    p_paths = self.ckpt_manager.save_periodic(
+                    # Save checkpoint
+                    saved_paths = self.ckpt_manager.save(
                         epoch=epoch,
                         model=self.model,
                         optimizer=self.optimizer,
@@ -701,13 +691,63 @@ class Trainer:
                         scaler=self.scaler,
                         history=history,
                     )
-                    self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Epoch {epoch})")
 
-                # Check early stopping
-                monitored_score = val_summary.get(self.ckpt_manager.metric_name, 0.0)
-                if self.early_stopping(monitored_score):
-                    self.logger.info(f"Early stopping triggered at epoch {epoch}!")
-                    break
+                    epoch_time = time.time() - epoch_start
+                    self.logger.info(
+                        f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:.1f}s] - "
+                        f"Train Loss: {train_metrics.get('total_loss', 0.0):.4f} - "
+                        f"Train IoU: {train_metrics.get('iou', 0.0):.4f} - "
+                        f"Val Loss: {val_summary.get('val_total_loss', 0.0):.4f} - "
+                        f"Val IoU: {val_summary.get('val_iou', 0.0):.4f} - "
+                        f"Val F1: {val_summary.get('val_f1', val_summary.get('val_dice', 0.0)):.4f} - "
+                        f"Val AUROC: {val_summary.get('val_auroc', 0.0):.4f}"
+                    )
+
+                    if "best" in saved_paths:
+                        self.logger.info(f"⭐ New best model saved to {saved_paths['best']} (score: {self.ckpt_manager.best_score:.4f})")
+
+                    # Check periodic checkpointing
+                    if self.ckpt_manager.should_save_periodic(step=self.global_step):
+                        p_paths = self.ckpt_manager.save_periodic(
+                            epoch=epoch,
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            metrics=val_summary,
+                            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                            step=self.global_step,
+                            scaler=self.scaler,
+                            history=history,
+                        )
+                        self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Epoch {epoch})")
+
+                    # Check early stopping
+                    monitored_score = val_summary.get(self.ckpt_manager.metric_name, 0.0)
+                    if self.early_stopping(monitored_score):
+                        self.logger.info(f"Early stopping triggered at epoch {epoch}!")
+                        break
+            except KeyboardInterrupt:
+                self.logger.warning(
+                    "⚠️ Training interrupted by user (KeyboardInterrupt). Saving emergency checkpoint..."
+                )
+                try:
+                    curr_ep = getattr(self, "_current_epoch", self.start_epoch)
+                    self.ckpt_manager.save_periodic(
+                        epoch=curr_ep,
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        scheduler=self.scheduler,
+                        metrics={"interrupted": True},
+                        config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                        step=self.global_step,
+                        scaler=self.scaler,
+                        history=history,
+                    )
+                    self.logger.info("Emergency checkpoint successfully saved to checkpoint_latest.pt and checkpoint_periodic.pt.")
+                except Exception as save_err:
+                    self.logger.error(f"Failed to save emergency checkpoint: {save_err}")
+                self.close()
+                raise
 
         total_time = time.time() - start_time
         self.logger.info(f"Training completed in {total_time/60:.2f} minutes.")
@@ -771,6 +811,7 @@ class Trainer:
 
         import gc
         gc.collect()
+        self.close()
 
         return {
             "run_name": self.config.project.get("name", "sid_unet"),

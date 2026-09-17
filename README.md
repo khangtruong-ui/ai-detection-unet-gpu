@@ -866,7 +866,7 @@ training:
   amp: false
 ```
 
-#### 4. Finetuned Diffusion VAE Configuration Example (`configs/sd_vae_finetune.yaml`)
+#### 4. Finetuned Diffusion VAE Configuration Example (`configs/experiments/sd_vae_finetune/default.yaml`)
 ```yaml
 model:
   name: "vae_finetune"
@@ -885,7 +885,7 @@ training:
   amp: true
 ```
 
-#### 5. Diffusion Multi-Noise Feature Decoder (`diffusion_diff`) Configuration Example (`configs/diffusion_diff.yaml`)
+#### 5. Diffusion Multi-Noise Feature Decoder (`diffusion_diff`) Configuration Example (`configs/experiments/diffusion_diff/default.yaml`)
 ```yaml
 model:
   name: "diffusion_diff"
@@ -937,10 +937,10 @@ sid-train --config configs/experiments/efficientnet/efficientnet_b0_unet.yaml
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
 
 # Train Finetuned Diffusion VAE
-sid-train --config configs/sd_vae_finetune.yaml
+sid-train --config configs/experiments/sd_vae_finetune/default.yaml
 
 # Train Diffusion-Diff (Multi-Noise Latent Feature Decoder)
-sid-train --config configs/diffusion_diff.yaml
+sid-train --config configs/experiments/diffusion_diff/default.yaml
 ```
 
 #### B. Multi-Experiment Suite (Continuous Reporting & Collision Skipping)
