@@ -6,6 +6,7 @@ and evaluation report generation.
 
 from __future__ import annotations
 
+import gc
 import os
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -322,6 +323,9 @@ class Trainer:
                     self.train_loader, self.val_loader = loaders
         except Exception as e:
             self.logger.warning(f"Auto batch sizing probe encountered warning: {e}")
+        finally:
+            clear_memory_cache(self.device)
+            gc.collect()
 
     def _step_batch_train(self, batch: Dict[str, Any], loss_divisor: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Execute forward pass and scaled backward pass for a single training batch/sub-batch."""
@@ -341,6 +345,9 @@ class Trainer:
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Run one training epoch with gradient accumulation and Out-Of-Memory (OOM) recovery."""
+        if self.empty_cache_per_epoch:
+            clear_memory_cache(self.device)
+
         self.model.train()
         metric_logger = MetricLogger()
         total_batches = safe_dataloader_len(self.train_loader)
@@ -351,12 +358,10 @@ class Trainer:
             leave=False,
         )
 
-        if self.empty_cache_per_epoch:
-            clear_memory_cache(self.device)
-
         self.optimizer.zero_grad()
         accum_steps = self.gradient_accumulation_steps
         step_in_epoch = 0
+        has_pending_grads = False
 
         try:
             for batch in pbar:
@@ -368,6 +373,7 @@ class Trainer:
                 try:
                     loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
                     loss_val = loss_t.item()
+                    has_pending_grads = True
                 except Exception as exc:
                     if is_oom_error(exc):
                         self.logger.warning(
@@ -376,6 +382,7 @@ class Trainer:
                         )
                         clear_memory_cache(self.device)
                         self.optimizer.zero_grad()
+                        has_pending_grads = False
 
                         # Split batch into smaller micro-batches
                         micro_bs = max(1, batch_size // 2)
@@ -387,6 +394,7 @@ class Trainer:
                                 _, s_dict = self._step_batch_train(sub_b, loss_divisor=sub_divisor)
                                 for k, v in s_dict.items():
                                     loss_dict_batch[k] = loss_dict_batch.get(k, 0.0) + (v / len(sub_batches))
+                                has_pending_grads = True
                             except Exception as sub_exc:
                                 if is_oom_error(sub_exc):
                                     # Fallback to single sample micro-batching
@@ -397,6 +405,7 @@ class Trainer:
                                         _, n_dict = self._step_batch_train(nano_b, loss_divisor=nano_divisor)
                                         for k, v in n_dict.items():
                                             loss_dict_batch[k] = loss_dict_batch.get(k, 0.0) + (v / (len(sub_batches) * len(nano_batches)))
+                                        has_pending_grads = True
                                 else:
                                     raise sub_exc
                         loss_val = loss_dict_batch.get("total_loss", 0.0)
@@ -410,7 +419,7 @@ class Trainer:
                 is_accum_boundary = (step_in_epoch % accum_steps == 0) or (
                     total_batches is not None and step_in_epoch == total_batches
                 )
-                if is_accum_boundary:
+                if is_accum_boundary and has_pending_grads:
                     if self.grad_clip > 0:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
@@ -418,6 +427,7 @@ class Trainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
+                    has_pending_grads = False
 
                 if self.ckpt_manager.should_save_periodic(step=self.global_step):
                     p_paths = self.ckpt_manager.save_periodic(
@@ -444,13 +454,14 @@ class Trainer:
                 pbar.set_postfix(postfix_dict)
 
             # Flush pending accumulated gradients if last step did not land on accumulation boundary
-            if step_in_epoch > 0 and step_in_epoch % accum_steps != 0:
+            if has_pending_grads:
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
+                has_pending_grads = False
         finally:
             pbar.close()
             del pbar

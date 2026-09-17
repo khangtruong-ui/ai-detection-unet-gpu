@@ -366,12 +366,14 @@ class DiffusionDiffModel(nn.Module):
         dummy_unet_channels: Tuple[int, ...] = (32, 64),
         input_rescale: bool = True,
         use_skip_connections: bool = True,
+        diffuser_fp16: bool = True,
         **kwargs: Any,
     ):
         super().__init__()
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.vae_subfolder = vae_subfolder
         self.unet_subfolder = unet_subfolder
+        self.diffuser_fp16 = bool(kwargs.get("diffuser_fp16", diffuser_fp16))
         self.timesteps = [int(t) for t in (timesteps or [100, 250, 500])]
         self.timestep_embed_dim = int(timestep_embed_dim)
         self.sigma_embed_dim = int(sigma_embed_dim)
@@ -527,6 +529,8 @@ class DiffusionDiffModel(nn.Module):
                 load_kwargs: Dict[str, Any] = {}
                 if subfolder:
                     load_kwargs["subfolder"] = subfolder
+                if self.diffuser_fp16 and torch.cuda.is_available():
+                    load_kwargs["torch_dtype"] = torch.float16
                 self.diffuser = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
             except Exception as e:
                 logger.warning(f"Could not load pretrained UNet: {e}. Using dummy UNet2DConditionModel...")
@@ -587,6 +591,18 @@ class DiffusionDiffModel(nn.Module):
         self.vae.eval()
         self.diffuser.eval()
         return self
+
+    def to(self, *args: Any, **kwargs: Any) -> "DiffusionDiffModel":
+        """Move model to device and cast frozen diffuser to half precision if on CUDA."""
+        res = super().to(*args, **kwargs)
+        if getattr(self, "diffuser_fp16", False):
+            try:
+                device = next(self.parameters()).device
+                if device.type == "cuda" and hasattr(self, "diffuser") and self.diffuser is not None:
+                    self.diffuser = self.diffuser.to(device=device, dtype=torch.float16)
+            except Exception:
+                pass
+        return res
 
     def _encode_with_skips(self, x: torch.Tensor) -> Tuple[Any, List[torch.Tensor]]:
         """Run frozen VAE encoder to obtain latent distribution and multi-scale skip features."""
@@ -706,9 +722,11 @@ class DiffusionDiffModel(nn.Module):
             t_tensor = torch.full((b_sz,), t_clamped, device=device, dtype=torch.long)
             with torch.no_grad():
                 diffuser_kwargs: Dict[str, Any] = {}
+                diff_dtype = next(self.diffuser.parameters()).dtype if list(self.diffuser.parameters()) else dtype
                 if uncond_emb is not None:
-                    diffuser_kwargs["encoder_hidden_states"] = uncond_emb
-                pred_eps = self.diffuser(z_tk, t_tensor, **diffuser_kwargs).sample.detach()
+                    diffuser_kwargs["encoder_hidden_states"] = uncond_emb.to(diff_dtype)
+                z_tk_input = z_tk.to(diff_dtype)
+                pred_eps = self.diffuser(z_tk_input, t_tensor, **diffuser_kwargs).sample.detach().to(dtype)
 
             # Sinusoidal embeddings of timestep and deviation (sigma)
             t_emb = sinusoidal_embedding(t_tensor.float(), dim=self.timestep_embed_dim)

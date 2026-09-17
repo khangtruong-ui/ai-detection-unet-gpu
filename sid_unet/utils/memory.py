@@ -274,9 +274,18 @@ def find_optimal_batch_size(
                 clear_memory_cache(device)
                 raise exc
 
-    # Restore original model mode
+    # Restore original model mode and thoroughly clean up probe resources
     if not orig_training:
         model.eval()
 
+    try:
+        del optimizer, scaler
+    except Exception:
+        pass
+
+    if hasattr(model, "zero_grad"):
+        model.zero_grad(set_to_none=True)
+
     clear_memory_cache(device)
+    gc.collect()
     return max(min_batch_size, safe_bs)

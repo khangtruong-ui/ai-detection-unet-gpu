@@ -381,10 +381,10 @@ class SIDStreamingDataset(IterableDataset):
         hf_ds, resolved = load_hf_dataset_robust(self.dataset_name, requested_split=self.split, streaming=True)
         self.resolved_split = resolved
 
-        # Light shard-level shuffle on the remote stream (keep raw sample buffer tiny <= 8 to avoid OOM on 4K images)
-        if self.shuffle_buffer_size > 0 and resolved.lower() in ("train", "training"):
-            if hasattr(hf_ds, "shuffle"):
-                hf_ds = hf_ds.shuffle(seed=self.seed, buffer_size=min(self.shuffle_buffer_size, 8))
+        # Note: Do NOT call hf_ds.shuffle() on remote multi-shard IterableDataset streams,
+        # as Hugging Face opens simultaneous HTTP readers across all shards (e.g. 62 parquet files),
+        # causing PyArrow and host memory to spike by >6 GB and trigger cgroup OOM kills.
+        # Shuffling is handled safely below via the local reservoir buffer on processed samples.
 
         worker_info = get_worker_info()
         if worker_info is not None and worker_info.num_workers > 1:
@@ -409,8 +409,8 @@ class SIDStreamingDataset(IterableDataset):
         import random
         stream = self._get_stream()
         # Maintain a lightweight reservoir/shuffle buffer on processed (resized) samples
-        # A processed 256x256 tensor is ~1 MB, compared to ~50 MB for raw 4000x3000 images!
-        target_buf_size = min(max(0, self.shuffle_buffer_size), 256) if self.resolved_split.lower() in ("train", "training") else 0
+        # Capped to 32 samples to prevent memory ballooning while providing local randomness
+        target_buf_size = min(max(0, self.shuffle_buffer_size), 32) if self.resolved_split.lower() in ("train", "training") else 0
         buf: List[Dict[str, Any]] = []
         rng = random.Random(self.seed)
 
@@ -439,6 +439,8 @@ class SIDStreamingDataset(IterableDataset):
                         f"Skipping corrupted sample during processing: {proc_err}"
                     )
                     continue
+                finally:
+                    del raw_sample
 
                 if target_buf_size > 1:
                     buf.append(processed)

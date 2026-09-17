@@ -9,8 +9,9 @@ data:
   streaming: true
   image_size: [256, 256]
   batch_size: 8
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
+  shuffle_buffer_size: 32
   train_split: "train"
   val_split: "validation"
   test_split: "validation"
@@ -29,6 +30,7 @@ model:
   pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
   vae_subfolder: "vae"
   unet_subfolder: "unet"
+  diffuser_fp16: true
   # Multi-timestep noise perturbations
   timesteps: [100, 250, 500]
   timestep_embed_dim: 32
