@@ -25,88 +25,26 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Optimize HuggingFace filesystem reads for large Parquet datasets (e.g. KhangTruong/COCO-inpainted).
 # PyArrow's interleaved column reads can thrash fsspec's default readahead cache (5MB),
 # resulting in 50k+ HTTP range requests and freezes per row group transition.
-# Using background blockcache with 32MB blocks and maxblocks=64 prefetches the next blocks
-# asynchronously in a background thread, preventing network latency stalls.
+# Using blockcache with 16MB blocks and maxblocks=64 caches row groups effectively
+# while avoiding network latency stalls.
 try:
     from huggingface_hub.hf_file_system import HfFileSystemFile
     _orig_hf_file_init = HfFileSystemFile.__init__
 
     def _fast_hf_file_init(self, *args, **kwargs):
-        kwargs.setdefault("cache_type", "background")
-        kwargs.setdefault("block_size", 32 * 1024 * 1024)
-        kwargs.setdefault("cache_options", {"maxblocks": 64})
+        kwargs.setdefault("cache_type", "blockcache")
+        kwargs.setdefault("block_size", 16 * 1024 * 1024)
+        if kwargs.get("cache_options") is None:
+            kwargs["cache_options"] = {"maxblocks": 64}
+        elif isinstance(kwargs["cache_options"], dict):
+            kwargs["cache_options"].setdefault("maxblocks", 64)
+            kwargs["cache_options"].pop("nblocks", None)
         return _orig_hf_file_init(self, *args, **kwargs)
 
     HfFileSystemFile.__init__ = _fast_hf_file_init
 except Exception:
     pass
 
-# Optimize PyArrow fragment scanning for streaming Parquet datasets.
-# HuggingFace datasets hardcodes batch_readahead=0 and fragment_readahead=0,
-# which causes synchronous I/O freezes every row group transition (e.g. every 23 iterations).
-# Setting batch_readahead=2 and fragment_readahead=1 enables PyArrow's C++ worker threads
-# to pre-read and decompress the next row groups concurrently while Python trains on the current batch.
-try:
-    from datasets.packaged_modules.parquet import parquet as _hf_parquet
-    import pyarrow as _pa
-    import pyarrow.dataset as _ds
-    import pyarrow.parquet as _pq
-    from packaging import version as _pkg_version
-    import gc as _gc
-
-    _orig_hf_generate_tables = _hf_parquet.Parquet._generate_tables
-
-    def _fast_hf_generate_tables(self, files, row_groups_list):
-        if self.config.features is not None and self.config.columns is not None:
-            if sorted(field.name for field in self.info.features.arrow_schema) != sorted(self.config.columns):
-                raise ValueError(
-                    f"Tried to load parquet data with columns '{self.config.columns}' with mismatching features '{self.info.features}'"
-                )
-        filter_expr = (
-            _pq.filters_to_expression(self.config.filters)
-            if isinstance(self.config.filters, list)
-            else self.config.filters
-        )
-        parquet_file_format = _ds.ParquetFileFormat(default_fragment_scan_options=self.config.fragment_scan_options)
-        for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
-            try:
-                with open(file, "rb") as f:
-                    parquet_fragment = parquet_file_format.make_fragment(f)
-                    fragment_is_closed = False
-                    try:
-                        if row_groups is not None:
-                            parquet_fragment = parquet_fragment.subset(row_group_ids=row_groups)
-                        if parquet_fragment.row_groups:
-                            batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
-                            for batch_idx, record_batch in enumerate(
-                                parquet_fragment.to_batches(
-                                    batch_size=batch_size,
-                                    columns=self.config.columns,
-                                    filter=filter_expr,
-                                    batch_readahead=2,
-                                    fragment_readahead=1,
-                                    use_threads=True,
-                                )
-                            ):
-                                pa_table = _pa.Table.from_batches([record_batch])
-                                yield _hf_parquet.Key(file_idx, batch_idx), self._cast_table(pa_table)
-                            fragment_is_closed = True
-                    finally:
-                        if not fragment_is_closed and _hf_parquet.datasets.config.PYARROW_VERSION <= _pkg_version.parse("24.0.0"):
-                            del parquet_fragment
-                            _gc.collect()
-            except (_pa.ArrowInvalid, ValueError) as e:
-                if self.config.on_bad_files == "error":
-                    _hf_parquet.logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
-                    raise
-                elif self.config.on_bad_files == "warn":
-                    _hf_parquet.logger.warning(f"Skipping bad file '{file}'. {type(e).__name__}: {e}`")
-                else:
-                    _hf_parquet.logger.debug(f"Skipping bad file '{file}'. {type(e).__name__}: {e}`")
-
-    _hf_parquet.Parquet._generate_tables = _fast_hf_generate_tables
-except Exception:
-    pass
 
 
 
@@ -772,12 +710,6 @@ class SIDStreamingDataset(IterableDataset):
                     raw_sample = next(prefetch_stream)
                 except StopIteration:
                     break
-                except Exception as stream_err:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        f"Skipping corrupted or unreadable sample in dataset stream: {stream_err}"
-                    )
-                    continue
 
                 try:
                     processed = process_raw_sample(
