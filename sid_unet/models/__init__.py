@@ -10,6 +10,12 @@ from sid_unet.models.diffusion_diff import (
     TrainableLatentDecoder,
     sinusoidal_embedding,
 )
+from sid_unet.models.diffusion_diff_v2 import (
+    DiffusionDiffV2Model,
+    DiffusionDiffV2,
+    TrainableLatentDecoderV2,
+    PerpendicularSkipFusion,
+)
 
 __all__ = [
     "UNet",
@@ -30,6 +36,10 @@ __all__ = [
     "DiffusionDiff",
     "TrainableLatentDecoder",
     "sinusoidal_embedding",
+    "DiffusionDiffV2Model",
+    "DiffusionDiffV2",
+    "TrainableLatentDecoderV2",
+    "PerpendicularSkipFusion",
 ]
 
 

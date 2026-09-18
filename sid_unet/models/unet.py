@@ -242,6 +242,8 @@ class UNet(nn.Module):
                 merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_qlora"
+            elif any(k.startswith("decoder.perp_fusions.") for k in state_dict.keys()):
+                merged["model"]["name"] = "diffusion_diff_v2"
             elif any(k.startswith(("decoder.", "diffuser.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "diffusion_diff"
             elif any(k.startswith("vae.") for k in state_dict.keys()):
@@ -323,6 +325,52 @@ def build_model(config: Any) -> nn.Module:
             dropout=float(model_cfg.get("dropout", 0.1)),
             bilinear=bool(model_cfg.get("bilinear", True)),
             gradient_checkpointing=ckpt_flag,
+        )
+
+    if any(k in model_name for k in ["diffusion_diff_v2", "diffusion-diff-v2", "diff_v2", "diffusion_diff2"]):
+        from sid_unet.models.diffusion_diff_v2 import DiffusionDiffV2Model, DEFAULT_DIFFUSION_CHECKPOINT
+        ckpt_name = model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_DIFFUSION_CHECKPOINT))
+        dec_cfg = model_cfg.get("decoder", {})
+        freeze_enc = model_cfg.get("freeze_encoder", True)
+        if "autoencoder_trainable" in model_cfg:
+            freeze_enc = not bool(model_cfg.get("autoencoder_trainable"))
+        elif "trainable_autoencoder" in model_cfg:
+            freeze_enc = not bool(model_cfg.get("trainable_autoencoder"))
+
+        use_enc_skips = bool(
+            model_cfg.get(
+                "use_encoder_skips",
+                model_cfg.get("use_skip_connections", model_cfg.get("skip_connections", False)),
+            )
+        )
+        use_perp_skips = bool(model_cfg.get("use_perpendicular_skips", model_cfg.get("perpendicular_skips", True)))
+
+        return DiffusionDiffV2Model(
+            pretrained_model_name_or_path=str(ckpt_name),
+            vae_subfolder=model_cfg.get("vae_subfolder", "vae"),
+            unet_subfolder=model_cfg.get("unet_subfolder", "unet"),
+            timesteps=model_cfg.get("timesteps", [100, 250, 500]),
+            timestep_embed_dim=int(model_cfg.get("timestep_embed_dim", 32)),
+            sigma_embed_dim=int(model_cfg.get("sigma_embed_dim", 32)),
+            include_noisy_latents=bool(model_cfg.get("include_noisy_latents", True)),
+            include_added_noise=bool(model_cfg.get("include_added_noise", True)),
+            include_predicted_noise=bool(model_cfg.get("include_predicted_noise", True)),
+            include_noise_diff=bool(model_cfg.get("include_noise_diff", True)),
+            include_z0=bool(model_cfg.get("include_z0", True)),
+            decoder_config=dec_cfg,
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            scaling_factor=float(model_cfg.get("scaling_factor", 0.18215)),
+            use_dummy=bool(model_cfg.get("use_dummy", False)),
+            dummy_vae_channels=tuple(model_cfg.get("dummy_vae_channels", [32, 64])),
+            dummy_unet_channels=tuple(model_cfg.get("dummy_unet_channels", [32, 64])),
+            input_rescale=bool(model_cfg.get("input_rescale", True)),
+            diffuser_fp16=bool(model_cfg.get("diffuser_fp16", training_cfg.get("amp", True))),
+            freeze_encoder=bool(freeze_enc),
+            use_encoder_skips=bool(use_enc_skips),
+            use_perpendicular_skips=bool(use_perp_skips),
         )
 
     if any(k in model_name for k in ["diffusion_diff", "diffusion_noise", "diffuser_noise", "diffusion_multistep", "latent_noise"]):

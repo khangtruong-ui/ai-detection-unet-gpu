@@ -8,6 +8,7 @@ Directory Layout:
 - **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/BeyondTheBrush`.
 - **`sd_vae_finetune/`**: Finetuned Stable Diffusion 1.5 VAE (AutoencoderKL) adapted for binary synthetic image mask segmentation.
 - **`diffusion_diff/`**: Diffusion multi-noise feature decoder combining multi-step perturbations, frozen diffuser noise predictions, and sinusoidal embeddings with a configurable trainable decoder.
+- **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
 
 ---
 
@@ -64,6 +65,14 @@ Directory Layout:
 
 ---
 
+## 6. Diffusion Multi-Noise Feature Decoder V2 (`diffusion_diff_v2`) (`configs/experiments/diffusion_diff_v2/`)
+
+| Configuration File | Model Architecture | Timesteps | Frozen & Trainable Components | Trainable Decoder | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/diffusion_diff_v2/default.yaml) | `DiffusionDiffV2Model` | `[100, 250, 500]` | Diffuser Frozen, Encoder Frozen, Parallel Decoder Frozen | `[256, 128, 64, 32]` Bilinear + Perpendicular Skips | Combined (BCE + Dice) + Aux (0.2) | Real image $x \to z_0$ with frozen encoder, no encoder skips, parallel frozen decoder decodes $z_0$ and injects multi-scale perpendicular skip features into trainable decoder fusing high-dimensional representation $Z$. |
+
+---
+
 ## How to Run
 
 ### 1. Training with SAM3 + QLoRA
@@ -91,11 +100,17 @@ sid-train --config configs/experiments/sd_vae_finetune/default.yaml
 sid-train --config configs/experiments/diffusion_diff/default.yaml
 ```
 
-### 6. Multi-Experiment Comparative Suite
+### 6. Training with Diffusion Multi-Noise Feature Decoder V2 (Diffusion-Diff-V2)
+```bash
+sid-train --config configs/experiments/diffusion_diff_v2/default.yaml
+```
+
+### 7. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
   configs/experiments/efficientnet/efficientnet_b0_unet.yaml \
   configs/experiments/sd_vae_finetune/default.yaml \
-  configs/experiments/diffusion_diff/default.yaml
+  configs/experiments/diffusion_diff/default.yaml \
+  configs/experiments/diffusion_diff_v2/default.yaml
 ```

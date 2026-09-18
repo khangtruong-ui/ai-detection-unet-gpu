@@ -22,6 +22,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [4. SAM3 + QLoRA Architecture](#4-sam3--qlora-architecture)
   - [5. Finetuned Diffusion VAE (SD1.5 AutoencoderKL)](#5-finetuned-diffusion-vae-sd15-autoencoderkl)
   - [6. Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)](#6-diffusion-multi-noise-feature-decoder-diffusion-diff)
+  - [7. Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)](#7-diffusion-multi-noise-latent-feature-decoder-v2-diffusion-diff-v2)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -58,6 +59,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Sacrifice of Pixel Mode**: Uses **only the final bottleneck feature map** ($8 \times 8$ or $7 \times 7$), routes through a single Linear layer, and zooms out to match full image resolution.
   - **Finetuned Diffusion VAE (SD1.5 AutoencoderKL)**: Adapts pretrained latent diffusion VAE to decode compressed latent representations directly into binary tampering mask space with end-to-end or decoder-only fine-tuning.
   - **Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)**: Advanced latent perturbation forensics extracting $z_0$, adding noise across multiple diffusion timesteps, computing frozen diffuser predicted noise and sinusoidal schedule embeddings ($t, \sigma$), concatenated into high-dimensional $Z$ decoded by a fully configurable trainable decoder.
+  - **Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)**: State-of-the-art dual-decoder generative perturbation architecture with **frozen VAE encoder by default**, **eliminated encoder-to-decoder skips by default**, and a **parallel pretrained, frozen VAE decoder** providing rich generative decoding priors through **perpendicular skip connections** directly into the trainable decoder.
 - **Continuous Master Reports & Automatic Checkpoint Continuation**:
   - **Automatic Repository Checkpoint Discovery**: Automatically scans repository and output directories (`outputs/RUN/...`, `checkpoints/`, etc.) for existing checkpoints (`checkpoint_latest.pt`, `checkpoint_periodic.pt`, `checkpoint_best.pt`) and displays a highlighted on-screen notification with detailed resume metadata (epoch, global step, metric score).
   - **Hugging Face Model Repository Resumption**: Download and resume training or evaluation directly from Hugging Face Hub repositories (`--resume-repo <owner/repo>` or `--resume hf://<owner/repo>`).
@@ -428,6 +430,110 @@ $$
 - **6. Multi-Scale Skip Connections**: To preserve sharp edge boundaries and prevent spatial resolution degradation during 8x latent downsampling, intermediate activation representations from the VAE encoder are routed directly to the decoder's upsampling stages via convolutional `SkipFusion` blocks at scales $H/4$, $H/2$, and $H$.
 
 - **7. Trainable VAE Autoencoder & Decoder with Frozen Diffuser Prior**: The VAE autoencoder is **trainable by default** (`autoencoder_trainable: true`), enabling end-to-end feature adaptation while the multi-billion parameter Diffuser UNet remains **strictly frozen** (`requires_grad = False`) for compute and VRAM efficiency. The decoder is fully configurable from YAML configurations (channel dimensions, upsampling modes, normalization layers, and activations).
+
+---
+
+### 7. Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)
+
+Diffusion-Diff-V2 advances the generative latent perturbation paradigm by decoupling generative representation decoding from encoder skips. By default, the **VAE encoder is frozen**, preventing degradation of pretrained latent manifold geometry. Rather than relying on contracting encoder skips, Diffusion-Diff-V2 introduces a **parallel pretrained, frozen VAE decoder** running side-by-side with the trainable decoder, injecting multi-scale generative decoding features through **perpendicular skip connections**:
+
+```
+                                      Input Real Image x (B, 3, H, W)
+                                                     │
+                          ┌──────────────────────────┴──────────────────────────┐
+                          │                Frozen VAE Encoder                   │
+                          │             (freeze_encoder = True)                 │
+                          │  Encoder Skips Default: Disabled (no skip)          │
+                          └──────────────────────────┬──────────────────────────┘
+                                                     ▼
+                                     Diffusion Latent z0 (B, 4, H/8, W/8)
+                                                     │
+               ┌─────────────────────────────────────┴─────────────────────────────────────┐
+               │                                                                           │
+               ▼                                                                           ▼
+   [Diffusion Perturbation & UNet]                                       [Parallel Pretrained Frozen Decoder]
+  For timesteps t_1, ..., t_K:                                                    (requires_grad = False)
+   - Add noise eps_k ~ N(0, I)                                                             │
+   - z_tk = sqrt(a_bar_k)*z0 + s_k*eps_k                                                   │
+   - Frozen Diffuser UNet -> pred_eps_k                                     z_in = z0 / scaling_factor
+   - Sinusoidal embeddings (t_k, sigma_k)                                                  │
+               │                                                                           ▼
+               ▼                                                              conv_in -> mid_block (H/8)
+  High-Dimensional Representation Z                                                        │
+   Z = [z0, z_t1, eps_1, eps_hat_1, ..., z_tK]                                             ▼
+   Shape: (B, C_Z, H/8, W/8)                                              UpBlock 0 (H/4) ──┐
+               │                                                                           │
+               ├─────────────────────────┐                                                 │ (Perpendicular Skip 1)
+               │                         │                                                 │
+       ┌───────▼──────────────┐  ┌───────▼────────────────────────────────────────┐        │
+       │ Auxiliary Classifier │  │        Trainable Latent Decoder V2             │        │
+       │ AdaptivePool -> MLP  │  │                                                │        │
+       └───────┬──────────────┘  │  Stage 0 (H/8 -> H/4) ◄─────────────────────────────────┘
+               ▼                 │    feat = PerpSkipFusion_0(feat, Frozen_H4)    │
+      Class Logits (B, 3)        │                                                │
+                                 │                                                │
+                                 │  Parallel Frozen UpBlock 1 (H/2) ──────────────┼────────┐
+                                 │                                                │        │ (Perpendicular Skip 2)
+                                 │  Stage 1 (H/4 -> H/2) ◄────────────────────────┴────────┘
+                                 │    feat = PerpSkipFusion_1(feat, Frozen_H2)    │
+                                 │                                                │
+                                 │                                                │
+                                 │  Parallel Frozen UpBlock 2 (H) ────────────────┼────────┐
+                                 │                                                │        │ (Perpendicular Skip 3)
+                                 │  Stage 2 (H/2 -> H)   ◄────────────────────────┴────────┘
+                                 │    feat = PerpSkipFusion_2(feat, Frozen_H)     │
+                                 │                                                │
+                                 │  Final 1x1 ConvOut                             │
+                                 └───────────────────────┬────────────────────────┘
+                                                         ▼
+                                          Binary Mask Logits (B, 1, H, W)
+```
+
+#### Mathematical & Architectural Principles
+
+- **1. Frozen Pretrained Latent Space**: The input image $x$ is mapped to latent space using the frozen VAE encoder (`freeze_encoder = True`, `requires_grad = False`):
+
+$$
+z_0 = \mu(x) \cdot s
+$$
+
+where $s = 0.18215$ is the latent scaling factor. Freezing the encoder prevents catastrophic forgetting of the rich semantic generative manifolds trained on large-scale natural image distributions.
+
+- **2. Elimination of Contracting Encoder Skips**: In standard UNet and Diffusion-Diff-V1, shallow spatial features from the contracting encoder bypass the latent bottleneck. In Diffusion-Diff-V2, encoder skips default to disabled (`use_encoder_skips = False`). This forces the model to rely strictly on generative perturbation discrepancies and pretrained decoding priors rather than low-level pixel color artifacts.
+
+- **3. Parallel Pretrained Generative Decoder**: The diffusion latent $z_0$ is unscaled and fed to the parallel frozen VAE decoder:
+
+$$
+z_{\text{in}} = \frac{z_0}{s}, \qquad s_0 = \mathrm{MidBlock}\left(\mathrm{ConvIn}\left(z_{\text{in}}\right)\right)
+$$
+
+At each progressive upsampling layer $j \in \{0, 1, 2\}$, intermediate latent reconstructions are extracted:
+
+$$
+F_j^{\text{frozen}} = \mathrm{UpBlock}_j\left(s_j\right)
+$$
+
+These feature maps contain the generative model's intrinsic multi-scale synthesis representations of clean natural imagery.
+
+- **4. Perpendicular Skip Connection Injection**: Rather than contracting from encoder to decoder (horizontal skip), the skip connection flows perpendicularly from the parallel frozen generative decoder into the trainable latent decoder:
+
+$$
+\text{Flow}: \quad z_0 \;\longrightarrow\; \text{Frozen Decoder} \;\longrightarrow\; F_j^{\text{frozen}} \;\xrightarrow{\text{Perpendicular Skip}}\; \text{Trainable Decoder Stage } j
+$$
+
+At each stage $j$, the trainable decoder fuses its intermediate feature map $h_j$ with the perpendicular skip $F_j^{\text{frozen}}$:
+
+$$
+h_j^{\text{fused}} = \sigma\left( \mathrm{Norm}\left( \mathrm{Conv}_{3\times3}\left( \left[ h_j, \; F_j^{\text{frozen}} \right] \right) \right) \right)
+$$
+
+- **5. Generative Perturbation & Diffuser Anomaly Cues**: Concurrently, $z_0$ undergoes multi-timestep forward diffusion perturbations $z_{t_k} = \sqrt{\bar{\alpha}_{t_k}} z_0 + \sqrt{1 - \bar{\alpha}_{t_k}} \epsilon_k$. The frozen diffuser UNet predicts $\hat{\epsilon}_k$, and residual anomalies $(\hat{\epsilon}_k - \epsilon_k)$ alongside harmonic schedule embeddings $(e_{t_k}, e_{\sigma_k})$ are concatenated to construct high-dimensional representation $Z$:
+
+$$
+Z = \left[ z_0, \; z_{t_1}, \; \epsilon_1, \; \hat{\epsilon}_1, \; (\hat{\epsilon}_1 - \epsilon_1), \; e_{t_1}, \; e_{\sigma_1}, \; \dots, \; z_{t_K}, \; \epsilon_K, \; \hat{\epsilon}_K, \; (\hat{\epsilon}_K - \epsilon_K), \; e_{t_K}, \; e_{\sigma_K} \right]
+$$
+
+- **6. Isolated Gradient Optimization**: Throughout training, the Diffuser UNet, VAE encoder, and parallel VAE decoder remain strictly frozen (`requires_grad = False`). Gradients backpropagate exclusively through the Trainable Decoder (including its perpendicular skip fusion layers) and the optional auxiliary classifier head.
 
 ---
 
@@ -916,6 +1022,38 @@ training:
   amp: true
 ```
 
+#### 6. Diffusion Multi-Noise Latent Feature Decoder V2 (`diffusion_diff_v2`) Configuration Example (`configs/experiments/diffusion_diff_v2/default.yaml`)
+```yaml
+model:
+  name: "diffusion_diff_v2"
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  freeze_encoder: true                           # VAE encoder frozen by default
+  use_encoder_skips: false                       # Encoder-to-trainable-decoder skips disabled by default
+  use_perpendicular_skips: true                  # Parallel frozen decoder perpendicular skips enabled
+  timesteps: [100, 250, 500]                     # Perturbation timesteps
+  timestep_embed_dim: 32                         # Sinusoidal timestep embedding size
+  sigma_embed_dim: 32                            # Sinusoidal noise deviation embedding size
+  include_noisy_latents: true
+  include_added_noise: true
+  include_predicted_noise: true
+  include_noise_diff: true
+  include_z0: true
+  # Configurable Trainable Decoder
+  decoder:
+    channels: [256, 128, 64, 32]
+    upsample_mode: "bilinear"
+    norm_layer: "batchnorm"
+    activation: "silu"
+    dropout: 0.1
+    num_res_blocks: 1
+  aux_classifier: true
+  num_classes: 3
+
+training:
+  learning_rate: 0.0003
+  amp: true
+```
+
 ---
 
 ## Quickstart: How to Run
@@ -941,6 +1079,9 @@ sid-train --config configs/experiments/sd_vae_finetune/default.yaml
 
 # Train Diffusion-Diff (Multi-Noise Latent Feature Decoder)
 sid-train --config configs/experiments/diffusion_diff/default.yaml
+
+# Train Diffusion-Diff-V2 (Parallel Frozen Decoder & Perpendicular Skips)
+sid-train --config configs/experiments/diffusion_diff_v2/default.yaml
 ```
 
 #### B. Multi-Experiment Suite (Continuous Reporting & Collision Skipping)
