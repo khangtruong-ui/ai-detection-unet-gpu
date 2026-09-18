@@ -24,21 +24,90 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Optimize HuggingFace filesystem reads for large Parquet datasets (e.g. KhangTruong/COCO-inpainted).
 # PyArrow's interleaved column reads can thrash fsspec's default readahead cache (5MB),
-# resulting in 50k+ HTTP range requests and 120s+ freezes per row group transition.
-# Using blockcache with 16MB blocks resolves the 23-24 iteration stall.
+# resulting in 50k+ HTTP range requests and freezes per row group transition.
+# Using background blockcache with 32MB blocks and maxblocks=64 prefetches the next blocks
+# asynchronously in a background thread, preventing network latency stalls.
 try:
     from huggingface_hub.hf_file_system import HfFileSystemFile
     _orig_hf_file_init = HfFileSystemFile.__init__
 
     def _fast_hf_file_init(self, *args, **kwargs):
-        kwargs.setdefault("cache_type", "blockcache")
-        kwargs.setdefault("block_size", 16 * 1024 * 1024)
-        kwargs.setdefault("cache_options", {"nblocks": 32})
+        kwargs.setdefault("cache_type", "background")
+        kwargs.setdefault("block_size", 32 * 1024 * 1024)
+        kwargs.setdefault("cache_options", {"maxblocks": 64})
         return _orig_hf_file_init(self, *args, **kwargs)
 
     HfFileSystemFile.__init__ = _fast_hf_file_init
 except Exception:
     pass
+
+# Optimize PyArrow fragment scanning for streaming Parquet datasets.
+# HuggingFace datasets hardcodes batch_readahead=0 and fragment_readahead=0,
+# which causes synchronous I/O freezes every row group transition (e.g. every 23 iterations).
+# Setting batch_readahead=2 and fragment_readahead=1 enables PyArrow's C++ worker threads
+# to pre-read and decompress the next row groups concurrently while Python trains on the current batch.
+try:
+    from datasets.packaged_modules.parquet import parquet as _hf_parquet
+    import pyarrow as _pa
+    import pyarrow.dataset as _ds
+    import pyarrow.parquet as _pq
+    from packaging import version as _pkg_version
+    import gc as _gc
+
+    _orig_hf_generate_tables = _hf_parquet.Parquet._generate_tables
+
+    def _fast_hf_generate_tables(self, files, row_groups_list):
+        if self.config.features is not None and self.config.columns is not None:
+            if sorted(field.name for field in self.info.features.arrow_schema) != sorted(self.config.columns):
+                raise ValueError(
+                    f"Tried to load parquet data with columns '{self.config.columns}' with mismatching features '{self.info.features}'"
+                )
+        filter_expr = (
+            _pq.filters_to_expression(self.config.filters)
+            if isinstance(self.config.filters, list)
+            else self.config.filters
+        )
+        parquet_file_format = _ds.ParquetFileFormat(default_fragment_scan_options=self.config.fragment_scan_options)
+        for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
+            try:
+                with open(file, "rb") as f:
+                    parquet_fragment = parquet_file_format.make_fragment(f)
+                    fragment_is_closed = False
+                    try:
+                        if row_groups is not None:
+                            parquet_fragment = parquet_fragment.subset(row_group_ids=row_groups)
+                        if parquet_fragment.row_groups:
+                            batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
+                            for batch_idx, record_batch in enumerate(
+                                parquet_fragment.to_batches(
+                                    batch_size=batch_size,
+                                    columns=self.config.columns,
+                                    filter=filter_expr,
+                                    batch_readahead=2,
+                                    fragment_readahead=1,
+                                    use_threads=True,
+                                )
+                            ):
+                                pa_table = _pa.Table.from_batches([record_batch])
+                                yield _hf_parquet.Key(file_idx, batch_idx), self._cast_table(pa_table)
+                            fragment_is_closed = True
+                    finally:
+                        if not fragment_is_closed and _hf_parquet.datasets.config.PYARROW_VERSION <= _pkg_version.parse("24.0.0"):
+                            del parquet_fragment
+                            _gc.collect()
+            except (_pa.ArrowInvalid, ValueError) as e:
+                if self.config.on_bad_files == "error":
+                    _hf_parquet.logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
+                    raise
+                elif self.config.on_bad_files == "warn":
+                    _hf_parquet.logger.warning(f"Skipping bad file '{file}'. {type(e).__name__}: {e}`")
+                else:
+                    _hf_parquet.logger.debug(f"Skipping bad file '{file}'. {type(e).__name__}: {e}`")
+
+    _hf_parquet.Parquet._generate_tables = _fast_hf_generate_tables
+except Exception:
+    pass
+
 
 
 def worker_init_fn(worker_id: int) -> None:
@@ -192,6 +261,93 @@ class BackgroundPrefetcher:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.loader, name)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _RawSamplePrefetchIterator:
+    """
+    Asynchronously pre-buffers raw samples from the streaming HuggingFace/PyArrow dataset.
+    Overlaps PyArrow row group extraction and HTTP fetching with sample decoding and transformation,
+    preventing 5s stalls at row group boundaries (e.g. every 23 iterations with batch size 8).
+    """
+
+    def __init__(self, stream: Iterator[Dict[str, Any]], maxsize: int = 64):
+        self.stream = stream
+        self.maxsize = maxsize
+        self.queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._fetch_loop, daemon=True)
+        self._worker.start()
+
+    def _fetch_loop(self) -> None:
+        try:
+            for item in self.stream:
+                while not self._stop_event.is_set():
+                    try:
+                        self.queue.put(item, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                if self._stop_event.is_set():
+                    break
+        except Exception as e:
+            if not self._stop_event.is_set():
+                try:
+                    self.queue.put(_ExceptionWrapper(e), timeout=0.2)
+                except Exception:
+                    pass
+        finally:
+            while not self._stop_event.is_set():
+                try:
+                    self.queue.put(_SENTINEL, timeout=0.1)
+                    break
+                except Exception:
+                    continue
+
+    def __iter__(self) -> _RawSamplePrefetchIterator:
+        return self
+
+    def __next__(self) -> Dict[str, Any]:
+        while not self._stop_event.is_set():
+            try:
+                item = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                if not self._worker.is_alive() and (self.queue is None or self.queue.empty()):
+                    self.close()
+                    raise StopIteration
+                continue
+
+            if item is _SENTINEL:
+                self.close()
+                raise StopIteration
+            if isinstance(item, _ExceptionWrapper):
+                self.close()
+                item.reraise()
+            return item
+        raise StopIteration
+
+    def close(self) -> None:
+        """Signal worker to stop, drain queue, and close underlying stream."""
+        if getattr(self, "_stop_event", None) is not None:
+            self._stop_event.set()
+        q = getattr(self, "queue", None)
+        if q is not None:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+        stream = getattr(self, "stream", None)
+        if stream is not None and hasattr(stream, "close") and callable(getattr(stream, "close", None)):
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def __del__(self) -> None:
         try:
@@ -577,7 +733,15 @@ class SIDStreamingDataset(IterableDataset):
         return stream_iter
 
     def close(self) -> None:
-        """Explicitly close the current active stream if supported."""
+        """Explicitly close the current active stream and raw prefetch iterator if supported."""
+        raw_iter = getattr(self, "_raw_prefetch_iter", None)
+        if raw_iter is not None and hasattr(raw_iter, "close") and callable(raw_iter.close):
+            try:
+                raw_iter.close()
+            except Exception:
+                pass
+        self._raw_prefetch_iter = None
+
         stream = getattr(self, "_current_stream", None)
         if stream is not None and hasattr(stream, "close") and callable(stream.close):
             try:
@@ -588,8 +752,14 @@ class SIDStreamingDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         import random
+        self.close()
         stream = self._get_stream()
         self._current_stream = stream
+        # Asynchronously prefetch raw samples from remote stream to overlap Parquet row group
+        # extraction with image transformation and decode on the CPU
+        prefetch_stream = _RawSamplePrefetchIterator(stream, maxsize=64)
+        self._raw_prefetch_iter = prefetch_stream
+
         # Maintain a lightweight reservoir/shuffle buffer on processed (resized) samples
         # Capped to 32 samples to prevent memory ballooning while providing local randomness
         target_buf_size = min(max(0, self.shuffle_buffer_size), 32) if self.resolved_split.lower() in ("train", "training") else 0
@@ -599,7 +769,7 @@ class SIDStreamingDataset(IterableDataset):
         try:
             while True:
                 try:
-                    raw_sample = next(stream)
+                    raw_sample = next(prefetch_stream)
                 except StopIteration:
                     break
                 except Exception as stream_err:
@@ -638,6 +808,9 @@ class SIDStreamingDataset(IterableDataset):
                     yield item
         finally:
             buf.clear()
+            if prefetch_stream is not None:
+                prefetch_stream.close()
+            self._raw_prefetch_iter = None
             if hasattr(stream, "close") and callable(getattr(stream, "close", None)):
                 try:
                     stream.close()
@@ -772,7 +945,7 @@ def create_eval_dataloader(
             seed=seed,
             target_image_size=image_size,
         )
-        prefetch_batches = int(config.data.get("prefetch_batches", 16))
+        prefetch_batches = int(config.data.get("prefetch_batches", 24))
         raw_loader = DataLoader(
             eval_dataset,
             batch_size=batch_size,
@@ -881,8 +1054,8 @@ def create_dataloaders(
             target_image_size=image_size,
         )
 
-        train_prefetch = int(config.data.get("prefetch_batches", 32))
-        val_prefetch = max(8, train_prefetch // 2)
+        train_prefetch = max(48, int(config.data.get("prefetch_batches", 48)))
+        val_prefetch = max(16, train_prefetch // 2)
 
         raw_train_loader = DataLoader(
             train_dataset,
