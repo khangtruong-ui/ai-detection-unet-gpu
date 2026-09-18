@@ -152,21 +152,51 @@ class Trainer:
             self.is_8bit_compatible = False
             self.compatibility_8bit_details = {}
 
-        # Validate 8-bit model quantization if requested
-        if getattr(loaded_model, "load_in_8bit", False):
-            if not self.is_8bit_compatible:
-                raise RuntimeError(
-                    f"Model configured with load_in_8bit=True, but 8-bit mode is not supported: "
-                    f"{self.compatibility_8bit_details.get('message')}"
-                )
-            self.logger.info("⚡ 8-bit Model Quantization Active (bitsandbytes load_in_8bit).")
-
-        # 4. Optimizer & Scheduler
+        # 3.2 Precision mode and GPU 16-bit configuration
         self.lr = float(config.training.get("learning_rate", 1e-3))
         self.weight_decay = float(config.training.get("weight_decay", 1e-4))
         self.opt_name = str(config.training.get("optimizer", "adamw")).lower()
         use_8bit_opt = bool(config.training.get("use_8bit_optimizer", False))
 
+        # Determine native GPU 16-bit AMP dtype (bfloat16 if supported, else float16)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                self.amp_dtype = torch.bfloat16
+                self.amp_dtype_str = "bfloat16"
+            else:
+                self.amp_dtype = torch.float16
+                self.amp_dtype_str = "float16"
+        else:
+            self.amp_dtype = torch.float32
+            self.amp_dtype_str = "float32"
+
+        # Default precision mode
+        self.precision_mode = "8bit" if (use_8bit_opt or "8bit" in self.opt_name) else "16bit"
+
+        # Validate 8-bit model quantization if requested
+        if getattr(loaded_model, "load_in_8bit", False):
+            if self.is_8bit_compatible:
+                self.logger.info("⚡ 8-bit Model Quantization Active (bitsandbytes load_in_8bit).")
+            else:
+                fallback = bool(config.training.get("fallback_on_unsupported_8bit", True)) or bool(
+                    config.training.get("fallback_to_16bit", True)
+                )
+                if fallback:
+                    self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                    self.logger.warning(
+                        f"⚠️ 8-Bit Model Quantization Fallback: load_in_8bit is not supported "
+                        f"({self.compatibility_8bit_details.get('message')}). "
+                        f"Falling back to GPU 16-bit mode ({self.amp_dtype_str} on {self.device})."
+                    )
+                    if self.device.type == "cuda":
+                        self.model = loaded_model.to(device=self.device, dtype=self.amp_dtype)
+                else:
+                    raise RuntimeError(
+                        f"Model configured with load_in_8bit=True, but 8-bit mode is not supported: "
+                        f"{self.compatibility_8bit_details.get('message')}"
+                    )
+
+        # 4. Optimizer & Scheduler
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable_params:
             trainable_params = list(self.model.parameters())
@@ -180,27 +210,46 @@ class Trainer:
 
         if is_8bit_opt_requested:
             if self.is_8bit_compatible:
-                import bitsandbytes as bnb
-                if "paged" in self.opt_name:
-                    self.optimizer = bnb.optim.PagedAdamW8bit(
-                        trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                try:
+                    import bitsandbytes as bnb
+                    if "paged" in self.opt_name:
+                        self.optimizer = bnb.optim.PagedAdamW8bit(
+                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                        )
+                        opt_label = "PagedAdamW8bit (with CPU paging)"
+                    else:
+                        self.optimizer = bnb.optim.AdamW8bit(
+                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                        )
+                        opt_label = "AdamW8bit"
+                    self.precision_mode = "8bit"
+                    self.logger.info(
+                        f"⚡ 8-Bit Optimizer Active: Initialized {opt_label} "
+                        f"(75% optimizer VRAM savings on {self.compatibility_8bit_details.get('device_name', self.device)})."
                     )
-                    opt_label = "PagedAdamW8bit (with CPU paging)"
-                else:
-                    self.optimizer = bnb.optim.AdamW8bit(
-                        trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                except Exception as opt_err:
+                    fallback = bool(config.training.get("fallback_on_unsupported_8bit", True)) or bool(
+                        config.training.get("fallback_to_16bit", True)
                     )
-                    opt_label = "AdamW8bit"
-                self.logger.info(
-                    f"⚡ 8-Bit Optimizer Active: Initialized {opt_label} "
-                    f"(75% optimizer VRAM savings on {self.compatibility_8bit_details.get('device_name', self.device)})."
-                )
+                    if fallback:
+                        self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                        self.logger.warning(
+                            f"⚠️ 8-Bit Optimizer initialization failed ({opt_err}). "
+                            f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
+                        )
+                        self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                    else:
+                        raise opt_err
             else:
-                fallback = bool(config.training.get("fallback_on_unsupported_8bit", True))
+                fallback = bool(config.training.get("fallback_on_unsupported_8bit", True)) or bool(
+                    config.training.get("fallback_to_16bit", True)
+                )
                 if fallback:
+                    self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
                     self.logger.warning(
-                        f"⚠️ 8-bit optimizer requested ('{self.opt_name}') but environment is incompatible: "
-                        f"{self.compatibility_8bit_details.get('message')}. Gracefully falling back to torch.optim.AdamW."
+                        f"⚠️ 8-Bit Training Mode Fallback: 8-bit optimizer requested ('{self.opt_name}'), but "
+                        f"{self.compatibility_8bit_details.get('message', 'environment is incompatible')}. "
+                        f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
                     )
                     self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
                 else:
@@ -220,7 +269,10 @@ class Trainer:
         self.scheduler = self._build_scheduler()
 
         # 5. Mixed Precision, Gradient Accumulation & Clipping
-        self.use_amp = bool(config.training.get("amp", True)) and self.device.type == "cuda"
+        # When falling back to GPU 16-bit mode or amp is enabled, ensure AMP is active on CUDA
+        configured_amp = bool(config.training.get("amp", True))
+        is_fallback_16bit = (self.precision_mode in ["gpu_16bit", "16bit"])
+        self.use_amp = (configured_amp or is_fallback_16bit) and self.device.type == "cuda"
         if hasattr(torch.amp, "GradScaler"):
             self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         else:
@@ -450,7 +502,7 @@ class Trainer:
         if labels is not None:
             labels = labels.to(self.device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             outputs = self.model(images)
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
@@ -623,7 +675,7 @@ class Trainer:
         if labels is not None:
             labels = labels.to(self.device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             outputs = self.model(images)
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
 

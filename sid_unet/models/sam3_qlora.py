@@ -128,6 +128,7 @@ class SAM3QLoRA(nn.Module):
         is_cuda = (self._target_device.type == "cuda") and torch.cuda.is_available()
         bnb_config = None
 
+        fallback_to_gpu_16bit = False
         if self.load_in_4bit and is_cuda:
             compute_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
             bnb_config = BitsAndBytesConfig(
@@ -138,18 +139,34 @@ class SAM3QLoRA(nn.Module):
             )
             device_map = "auto"
         elif self.load_in_8bit and is_cuda:
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-            device_map = "auto"
+            try:
+                from sid_unet.utils.compatibility import check_8bit_compatibility
+                is_ok, details = check_8bit_compatibility(device=self._target_device)
+                if not is_ok:
+                    raise RuntimeError(details.get("message", "8-bit environment incompatible"))
+                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+                device_map = "auto"
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ SAM3 8-bit quantization unavailable ({e}). "
+                    f"Falling back to GPU 16-bit mode (FP16/BF16 base model with LoRA on CUDA)."
+                )
+                bnb_config = None
+                device_map = None
+                fallback_to_gpu_16bit = True
         else:
             device_map = None
 
         # 3. Load base Sam3Model
         base_model = self._load_base_model(bnb_config=bnb_config, device_map=device_map)
 
-        # 4. Prepare for k-bit training if quantized
+        # 4. Prepare for k-bit training if quantized, or 16-bit GPU mode if falling back
         if bnb_config is not None:
             base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=False)
         else:
+            if is_cuda and (fallback_to_gpu_16bit or self.load_in_8bit):
+                compute_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+                base_model = base_model.to(dtype=compute_dtype, device=self._target_device)
             for p in base_model.parameters():
                 p.requires_grad = False
 

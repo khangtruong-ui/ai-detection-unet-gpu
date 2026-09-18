@@ -103,6 +103,10 @@ def check_8bit_compatibility(
     model_8bit_supported = cuda_available and bnb_installed and bnb_functional
     fp8_native_supported = cuda_available and fp8_hardware_supported and fp8_torch_supported
 
+    # Determine fallback target mode (explicitly GPU 16-bit mode when on CUDA)
+    bf16_ok = cuda_available and torch.cuda.is_bf16_supported()
+    fallback_precision = "BF16" if bf16_ok else "FP16"
+    fallback_target = f"GPU 16-Bit Mode (AMP {fallback_precision} + AdamW)" if cuda_available else "CPU 32-Bit Mode"
     overall_compatible = optimizer_8bit_supported
 
     # Formulate human-readable message
@@ -125,7 +129,7 @@ def check_8bit_compatibility(
             reasons.append("bitsandbytes is not installed (`pip install 'sid-unet[8bit]'`)")
         elif not bnb_functional:
             reasons.append(f"bitsandbytes CUDA kernel initialization failed: {bnb_error_msg}")
-        msg = f"8-bit training mode is unavailable: {'; '.join(reasons)}."
+        msg = f"8-bit training mode is unavailable: {'; '.join(reasons)}. Fallback will use {fallback_target}."
 
     details: Dict[str, Any] = {
         "compatible": overall_compatible,
@@ -143,6 +147,9 @@ def check_8bit_compatibility(
         "fp8_hardware_supported": fp8_hardware_supported,
         "fp8_torch_supported": fp8_torch_supported,
         "fp8_native_supported": fp8_native_supported,
+        "gpu_16bit_supported": cuda_available,
+        "gpu_16bit_bf16": bf16_ok,
+        "fallback_target": fallback_target,
         "supported_optimizers": (
             ["adamw8bit", "paged_adamw8bit", "adam8bit", "paged_adam8bit"] if optimizer_8bit_supported else []
         ),
@@ -165,6 +172,7 @@ def format_compatibility_table(details: Dict[str, Any]) -> str:
         bnb_status += " [CUDA Init Failed]"
     fp8_status = "Supported" if details.get("fp8_native_supported") else "Not Supported"
     opt_status = "Supported (AdamW8bit, PagedAdamW8bit)" if details.get("optimizer_8bit_supported") else "Not Supported"
+    fallback_str = details.get("fallback_target", "GPU 16-Bit Mode (AMP FP16/BF16)")
 
     lines = [
         "================================================================================",
@@ -175,6 +183,7 @@ def format_compatibility_table(details: Dict[str, Any]) -> str:
         f"  bitsandbytes Library: {bnb_status}",
         f"  8-Bit Optimizers    : {opt_status}",
         f"  FP8 Native Compute  : {fp8_status}",
+        f"  Fallback Mode       : {fallback_str}",
         "--------------------------------------------------------------------------------",
         f"  Summary: {details.get('message')}",
         "================================================================================",

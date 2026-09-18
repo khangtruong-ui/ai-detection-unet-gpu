@@ -858,7 +858,8 @@ The configuration file is divided into modular top-level sections:
 | `optimizer` | `str` | `"adamw"` | Optimization algorithm (`"adamw"`, `"adam"`, `"sgd"`, `"adamw8bit"`, `"paged_adamw8bit"`). |
 | `use_8bit_optimizer` | `bool` | `false` | Enables 8-bit AdamW optimizer via `bitsandbytes` (reduces optimizer memory by 75%). |
 | `check_8bit_compatibility` | `bool` | `true` | Automatically verifies CUDA, GPU compute capability, and `bitsandbytes` compatibility at training time. |
-| `fallback_on_unsupported_8bit` | `bool` | `true` | Gracefully falls back to standard AdamW if 8-bit optimizer is requested but unsupported. |
+| `fallback_to_16bit` | `bool` | `true` | Automatically falls back to **GPU 16-bit mode (AMP FP16/BF16)** if 8-bit mode is unsupported or fails. |
+| `fallback_on_unsupported_8bit` | `bool` | `true` | Alias for `fallback_to_16bit`. |
 | `scheduler` | `str` | `"cosine"` | Learning rate schedule (`"cosine"`, `"step"`, `"plateau"`, `"none"`). |
 | `warmup_epochs` | `int` | `1` | Number of epochs for linear learning rate warmup. |
 | `min_lr` | `float` | `1e-6` | Minimum learning rate floor reached at end of cosine decay. |

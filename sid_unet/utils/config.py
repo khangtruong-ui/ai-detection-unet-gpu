@@ -159,7 +159,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "optimizer": "adamw",         # 'adam', 'adamw', 'sgd', 'adamw8bit', 'paged_adamw8bit'
         "use_8bit_optimizer": False,  # If True, initializes 8-bit AdamW optimizer via bitsandbytes
         "check_8bit_compatibility": True, # Automatically verify 8-bit hardware and library compatibility
-        "fallback_on_unsupported_8bit": True, # Gracefully fall back to AdamW if 8-bit is requested but unsupported
+        "fallback_to_16bit": True,    # Automatically fall back to GPU 16-bit mode (AMP FP16/BF16) if 8-bit mode is unsupported or fails
+        "fallback_on_unsupported_8bit": True, # Alias for fallback_to_16bit
         "scheduler": "cosine",        # 'cosine', 'step', 'plateau', 'none'
         "warmup_epochs": 1,
         "min_lr": 1e-6,
