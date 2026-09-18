@@ -168,3 +168,85 @@ def test_raw_sample_prefetch_iterator_absorbs_row_group_stall():
     assert len(delays) == 16
     iterator.close()
 
+
+def test_parquet_fast_generate_tables_patch_and_readahead_params(monkeypatch):
+    """Verify that Parquet._generate_tables is patched to use _hf_xopen and PyArrow async readahead."""
+    from datasets.packaged_modules.parquet.parquet import Parquet, ParquetConfig
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    # Verify that Parquet._generate_tables is indeed the fast patched version
+    from sid_unet.dataset.loader import _fast_hf_generate_tables
+    assert Parquet._generate_tables == _fast_hf_generate_tables
+
+    # Create dummy parquet table and fragment
+    dummy_table = pa.Table.from_pydict({"image": [b"img1", b"img2"], "label": [0, 1]})
+    record_batch = dummy_table.to_batches()[0]
+
+    captured_to_batches_kwargs = {}
+
+    class DummyFragment:
+        def __init__(self):
+            self.row_groups = [type("RG", (), {"num_rows": 2})()]
+
+        def subset(self, row_group_ids):
+            return self
+
+        def to_batches(self, **kwargs):
+            captured_to_batches_kwargs.update(kwargs)
+            yield record_batch
+
+    class DummyFileFormat:
+        def make_fragment(self, f):
+            return DummyFragment()
+
+    monkeypatch.setattr(ds, "ParquetFileFormat", lambda *a, **kw: DummyFileFormat())
+
+    # Create dummy builder instance
+    builder = Parquet.__new__(Parquet)
+    builder.config = ParquetConfig(name="test_config")
+    builder.config.batch_size = None
+    builder.config.columns = None
+    builder.config.features = None
+    builder.config.filters = None
+    builder.config.fragment_scan_options = None
+    builder.config.on_bad_files = "error"
+    builder.info = type("Info", (), {"features": None})()
+
+    # Call _fast_hf_generate_tables on a mock file
+    with tempfile.NamedTemporaryFile("wb") as tmp_f:
+        tmp_f.write(b"dummy")
+        tmp_f.flush()
+
+        results = list(builder._generate_tables([tmp_f.name], [None]))
+        assert len(results) == 1
+        key, yielded_table = results[0]
+        assert len(yielded_table) == 2
+
+    # Verify that multi-layer async prefetching arguments were passed to PyArrow
+    assert captured_to_batches_kwargs.get("batch_readahead") == 2
+    assert captured_to_batches_kwargs.get("fragment_readahead") == 1
+    assert captured_to_batches_kwargs.get("use_threads") is True
+
+
+def test_hf_file_system_file_init_blockcache_options(monkeypatch):
+    """Verify that HfFileSystemFile is configured with blockcache, 16MB blocks, and cleans nblocks."""
+    import sid_unet.dataset.loader as loader_module
+
+    recorded_kwargs = {}
+
+    def mock_orig_init(self, *args, **kwargs):
+        recorded_kwargs.update(kwargs)
+        return None
+
+    monkeypatch.setattr(loader_module, "_orig_hf_file_init", mock_orig_init)
+
+    dummy_self = type("DummyHfFile", (), {})()
+    loader_module._fast_hf_file_init(dummy_self, fs=None, path="test.parquet", cache_options={"nblocks": 10})
+
+    assert recorded_kwargs.get("cache_type") == "blockcache"
+    assert recorded_kwargs.get("block_size") == 16 * 1024 * 1024
+    assert recorded_kwargs.get("cache_options", {}).get("maxblocks") == 64
+    assert "nblocks" not in recorded_kwargs.get("cache_options", {})
+
+

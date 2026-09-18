@@ -45,6 +45,75 @@ try:
 except Exception:
     pass
 
+# Optimize PyArrow fragment scanning for streaming Parquet datasets (e.g. KhangTruong/COCO-inpainted).
+# HuggingFace datasets hardcodes batch_readahead=0 and fragment_readahead=0, which forces synchronous
+# blocking network I/O every row group transition (e.g. every 23 iterations with batch size 8).
+# Setting batch_readahead=2 and fragment_readahead=1 with use_threads=True enables PyArrow's C++ worker
+# threads to pre-read and decompress upcoming row groups concurrently while Python trains on the current batch.
+# We use datasets' xopen to correctly resolve both local filesystem paths and remote hf:// URIs without FileNotFoundError.
+try:
+    from datasets.packaged_modules.parquet import parquet as _hf_parquet
+    from datasets.utils.file_utils import xopen as _hf_xopen
+    import pyarrow as _pa
+    import pyarrow.dataset as _ds
+    import pyarrow.parquet as _pq
+    from packaging import version as _pkg_version
+    import gc as _gc
+
+    _orig_hf_generate_tables = _hf_parquet.Parquet._generate_tables
+
+    def _fast_hf_generate_tables(self, files, row_groups_list):
+        if self.config.features is not None and self.config.columns is not None:
+            if sorted(field.name for field in self.info.features.arrow_schema) != sorted(self.config.columns):
+                raise ValueError(
+                    f"Tried to load parquet data with columns '{self.config.columns}' with mismatching features '{self.info.features}'"
+                )
+        filter_expr = (
+            _pq.filters_to_expression(self.config.filters)
+            if isinstance(self.config.filters, list)
+            else self.config.filters
+        )
+        parquet_file_format = _ds.ParquetFileFormat(default_fragment_scan_options=self.config.fragment_scan_options)
+        for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
+            try:
+                with _hf_xopen(file, "rb") as f:
+                    parquet_fragment = parquet_file_format.make_fragment(f)
+                    fragment_is_closed = False
+                    try:
+                        if row_groups is not None:
+                            parquet_fragment = parquet_fragment.subset(row_group_ids=row_groups)
+                        if parquet_fragment.row_groups:
+                            batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
+                            for batch_idx, record_batch in enumerate(
+                                parquet_fragment.to_batches(
+                                    batch_size=batch_size,
+                                    columns=self.config.columns,
+                                    filter=filter_expr,
+                                    batch_readahead=2,
+                                    fragment_readahead=1,
+                                    use_threads=True,
+                                )
+                            ):
+                                pa_table = _pa.Table.from_batches([record_batch])
+                                yield _hf_parquet.Key(file_idx, batch_idx), self._cast_table(pa_table)
+                            fragment_is_closed = True
+                    finally:
+                        if not fragment_is_closed and _hf_parquet.datasets.config.PYARROW_VERSION <= _pkg_version.parse("24.0.0"):
+                            del parquet_fragment
+                            _gc.collect()
+            except (_pa.ArrowInvalid, ValueError, OSError) as e:
+                if self.config.on_bad_files == "error":
+                    _hf_parquet.logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
+                    raise
+                elif self.config.on_bad_files == "warn":
+                    _hf_parquet.logger.warning(f"Skipping bad file '{file}'. {type(e).__name__}: {e}")
+                else:
+                    _hf_parquet.logger.debug(f"Skipping bad file '{file}'. {type(e).__name__}: {e}")
+
+    _hf_parquet.Parquet._generate_tables = _fast_hf_generate_tables
+except Exception:
+    pass
+
 
 
 
@@ -695,7 +764,7 @@ class SIDStreamingDataset(IterableDataset):
         self._current_stream = stream
         # Asynchronously prefetch raw samples from remote stream to overlap Parquet row group
         # extraction with image transformation and decode on the CPU
-        prefetch_stream = _RawSamplePrefetchIterator(stream, maxsize=64)
+        prefetch_stream = _RawSamplePrefetchIterator(stream, maxsize=128)
         self._raw_prefetch_iter = prefetch_stream
 
         # Maintain a lightweight reservoir/shuffle buffer on processed (resized) samples
