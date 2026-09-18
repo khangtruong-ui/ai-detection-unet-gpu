@@ -292,5 +292,61 @@ def test_training_loop_iou_metric_and_no_vram_report():
         assert 0.0 <= history_0["train_iou"] <= 1.0
 
 
+def test_tqdm_bar_postfix_format_and_network_reporting(monkeypatch):
+    """Verify tqdm bar reports exactly 1 loss, includes network speed, and omits redundant mask_loss."""
+    import tempfile
+    from unittest.mock import MagicMock
+    import tqdm
+
+    captured_postfix = []
+    orig_tqdm = tqdm.tqdm
+
+    class MockTqdm(orig_tqdm):
+        def set_postfix(self, ordered_dict=None, refresh=True, **kwargs):
+            if ordered_dict:
+                captured_postfix.append(dict(ordered_dict))
+            super().set_postfix(ordered_dict=ordered_dict, refresh=refresh, **kwargs)
+
+    monkeypatch.setattr(tqdm, "tqdm", MockTqdm)
+    import sid_unet.training.trainer as trainer_mod
+    monkeypatch.setattr(trainer_mod, "tqdm", MockTqdm)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "logging.save_sample_images=false",
+            "training.amp=false",
+        ])
+
+        train_ds = SyntheticDataset(size=4, img_size=(64, 64))
+        train_loader = DataLoader(train_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=train_loader,
+        )
+
+        trainer.train_epoch(1)
+        trainer.close()
+
+        assert len(captured_postfix) > 0
+        last_pf = captured_postfix[-1]
+        # Verify 1 loss only
+        assert "loss" in last_pf
+        assert "mask_loss" not in last_pf
+        # Verify network speed reporting
+        assert "net" in last_pf
+        assert "iou" in last_pf
+        assert "lr" in last_pf
+
+
+
 
 

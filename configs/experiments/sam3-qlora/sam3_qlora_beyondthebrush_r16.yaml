@@ -1,6 +1,6 @@
-# Configuration: SAM3 + QLoRA Higher Rank (r=16, alpha=32) on BeyondTheBrush
+# Configuration: SAM3 + QLoRA Higher Rank (r=16, alpha=32) on COCO-inpainted
 # Enhanced adaptation capacity attaching LoRA adapters to all attention projections (q, k, v, out)
-# with 4-bit NF4 quantization on KhangTruong/BeyondTheBrush.
+# with 4-bit NF4 quantization on KhangTruong/COCO-inpainted.
 
 project:
   name: "sid_sam3_qlora_beyondthebrush_r16"
@@ -9,17 +9,18 @@ project:
   output_dir: "outputs/RUN/sam3_qlora_beyondthebrush_r16"
 
 data:
-  dataset_name: "KhangTruong/BeyondTheBrush"
+  dataset_name: "KhangTruong/COCO-inpainted"
   streaming: true
   image_size: [256, 256]
   batch_size: 1
   num_workers: 2
   pin_memory: true
-  shuffle_buffer_size: 1000
+  prefetch_batches: 48
+  shuffle_buffer_size: 32
   train_split: "train"
   val_split: "validation"
-  test_split: "test"
-  eval_split: "test"
+  test_split: "validation"
+  eval_split: "validation"
   train_samples_per_epoch: -1
   val_samples_per_epoch: -1
   val_samples: -1
@@ -51,6 +52,7 @@ loss:
   mask_loss_type: "combined"
   bce_weight: 0.5
   dice_weight: 0.5
+  focal_weight: 0.5
   focal_gamma: 2.0
   focal_alpha: 0.25
   aux_loss_type: "cross_entropy"

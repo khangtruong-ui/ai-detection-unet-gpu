@@ -38,7 +38,14 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
 
     loss_desc = loss_cfg.get("mask_loss_type", "combined")
     if loss_desc == "combined":
-        loss_desc = f"Combined (BCE: {loss_cfg.get('bce_weight', 0.5)}, Dice: {loss_cfg.get('dice_weight', 0.5)})"
+        parts = []
+        if float(loss_cfg.get("bce_weight", 0.5)) > 0:
+            parts.append(f"BCE: {loss_cfg.get('bce_weight', 0.5)}")
+        if float(loss_cfg.get("dice_weight", 0.5)) > 0:
+            parts.append(f"Dice: {loss_cfg.get('dice_weight', 0.5)}")
+        if float(loss_cfg.get("focal_weight", 0.5)) > 0:
+            parts.append(f"Focal: {loss_cfg.get('focal_weight', 0.5)}")
+        loss_desc = f"Combined ({', '.join(parts)})" if parts else "Combined"
 
     post_cfg = config.get("post_processing", {})
     if post_cfg and post_cfg.get("enabled", True):

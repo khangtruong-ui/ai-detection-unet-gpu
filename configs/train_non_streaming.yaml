@@ -35,6 +35,7 @@ loss:
   mask_loss_type: "combined"
   bce_weight: 0.5
   dice_weight: 0.5
+  focal_weight: 0.5
   aux_loss_type: "cross_entropy"
   aux_weight: 0.2
 

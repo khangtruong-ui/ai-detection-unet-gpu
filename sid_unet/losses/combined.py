@@ -23,6 +23,7 @@ class CombinedMaskLoss(nn.Module):
         loss_type: str = "combined",  # 'bce', 'dice', 'focal', 'combined'
         bce_weight: float = 0.5,
         dice_weight: float = 0.5,
+        focal_weight: float = 0.5,
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
     ):
@@ -30,6 +31,7 @@ class CombinedMaskLoss(nn.Module):
         self.loss_type = loss_type.lower()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
 
         self.bce = BCELoss()
         self.dice = DiceLoss()
@@ -52,11 +54,27 @@ class CombinedMaskLoss(nn.Module):
             loss = self.focal(logits, targets)
             metrics["focal_loss"] = loss.item()
         elif self.loss_type == "combined":
-            l_bce = self.bce(logits, targets)
-            l_dice = self.dice(logits, targets)
-            loss = self.bce_weight * l_bce + self.dice_weight * l_dice
-            metrics["bce_loss"] = l_bce.item()
-            metrics["dice_loss"] = l_dice.item()
+            loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            has_term = False
+            if self.bce_weight > 0:
+                l_bce = self.bce(logits, targets)
+                loss = loss + self.bce_weight * l_bce
+                metrics["bce_loss"] = l_bce.item()
+                has_term = True
+            if self.dice_weight > 0:
+                l_dice = self.dice(logits, targets)
+                loss = loss + self.dice_weight * l_dice
+                metrics["dice_loss"] = l_dice.item()
+                has_term = True
+            if self.focal_weight > 0:
+                l_focal = self.focal(logits, targets)
+                loss = loss + self.focal_weight * l_focal
+                metrics["focal_loss"] = l_focal.item()
+                has_term = True
+            if not has_term:
+                l_bce = self.bce(logits, targets)
+                loss = l_bce
+                metrics["bce_loss"] = l_bce.item()
         else:
             raise ValueError(f"Unknown mask_loss_type: {self.loss_type}")
 

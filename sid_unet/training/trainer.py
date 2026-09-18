@@ -33,6 +33,7 @@ from sid_unet.utils.memory import (
 )
 from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
+from sid_unet.utils.network import NetworkSpeedMonitor, BottleneckDetector
 
 def parse_checkpoint_period(training_cfg: Any) -> float:
     """Parse checkpoint period from config, defaulting to 3600 seconds (1 hour)."""
@@ -182,6 +183,28 @@ class Trainer:
         self.history: list = []
         self.log_interval = int(config.logging.get("log_interval", 20))
 
+        # 5. Network Speed & Pipeline Bottleneck Monitoring
+        logging_cfg = config.get("logging", {}) if hasattr(config, "get") else getattr(config, "logging", {})
+        measure_net = logging_cfg.get("measure_network", True) if hasattr(logging_cfg, "get") else getattr(logging_cfg, "measure_network", True)
+        if measure_net:
+            method = str(logging_cfg.get("network_measure_method", "io_counters") if hasattr(logging_cfg, "get") else "io_counters")
+            active_url = str(logging_cfg.get("network_probe_url", "https://huggingface.co") if hasattr(logging_cfg, "get") else "https://huggingface.co")
+            check_interval = float(logging_cfg.get("bottleneck_check_interval", 30.0) if hasattr(logging_cfg, "get") else 30.0)
+            self.network_monitor = NetworkSpeedMonitor(
+                interval=1.0,
+                method=method,
+                active_url=active_url,
+            )
+            self.bottleneck_detector = BottleneckDetector(
+                network_monitor=self.network_monitor,
+                logger=self.logger,
+                check_interval=check_interval,
+            )
+            self.network_monitor.start()
+        else:
+            self.network_monitor = None
+            self.bottleneck_detector = None
+
     def resume_from_checkpoint(
         self,
         checkpoint_path: str,
@@ -267,7 +290,12 @@ class Trainer:
         }
 
     def close(self) -> None:
-        """Close and clean up data loaders and background prefetcher threads."""
+        """Close and clean up data loaders, background prefetcher threads, and network monitor."""
+        if hasattr(self, "network_monitor") and self.network_monitor is not None:
+            try:
+                self.network_monitor.stop()
+            except Exception:
+                pass
         for loader in (self.train_loader, self.val_loader, self.test_loader):
             if loader is not None and hasattr(loader, "close") and callable(loader.close):
                 try:
@@ -392,8 +420,12 @@ class Trainer:
         step_in_epoch = 0
         has_pending_grads = False
 
+        prev_batch_end_time = time.perf_counter()
         try:
             for batch in pbar:
+                data_time = time.perf_counter() - prev_batch_end_time
+                compute_start_time = time.perf_counter()
+
                 step_in_epoch += 1
                 batch_size = len(batch["image"])
                 loss_dict_batch = {}
@@ -472,9 +504,16 @@ class Trainer:
                     )
                     self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Step {self.global_step}, Epoch {epoch})")
 
+                compute_time = time.perf_counter() - compute_start_time
+                prev_batch_end_time = time.perf_counter()
+
+                if self.bottleneck_detector is not None:
+                    self.bottleneck_detector.record_step(data_time=data_time, compute_time=compute_time)
+
+                net_str = self.network_monitor.get_speed_str() if self.network_monitor is not None else "0.0 MB/s"
                 postfix_dict = {
                     "loss": f"{loss_val:.4f}",
-                    "mask_loss": f"{loss_dict_batch.get('mask_loss', 0.0):.4f}",
+                    "net": net_str,
                     "iou": f"{loss_dict_batch.get('iou', 0.0):.4f}",
                     "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                 }

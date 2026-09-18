@@ -51,7 +51,69 @@ def test_combined_and_total_loss():
     assert "mask_loss" in metrics_dict
     assert "aux_loss" in metrics_dict
     assert "total_loss" in metrics_dict
+    assert "focal_loss" in metrics_dict
 
     loss.backward()
     assert mask_logits.grad is not None
     assert class_logits.grad is not None
+
+
+def test_combined_mask_loss_with_focal():
+    # Combined with BCE, Dice, and Focal
+    loss_fn = CombinedMaskLoss(
+        loss_type="combined",
+        bce_weight=0.5,
+        dice_weight=0.5,
+        focal_weight=0.5,
+    )
+    logits = torch.randn(2, 1, 32, 32, requires_grad=True)
+    targets = torch.randint(0, 2, (2, 1, 32, 32)).float()
+    loss, metrics = loss_fn(logits, targets)
+
+    assert loss.item() > 0.0
+    assert "bce_loss" in metrics
+    assert "dice_loss" in metrics
+    assert "focal_loss" in metrics
+    assert "mask_loss" in metrics
+    loss.backward()
+    assert logits.grad is not None
+
+
+def test_combined_mask_loss_without_bce():
+    # Combined with BCE completely removed (bce_weight=0.0)
+    loss_fn = CombinedMaskLoss(
+        loss_type="combined",
+        bce_weight=0.0,
+        dice_weight=0.5,
+        focal_weight=0.5,
+    )
+    logits = torch.randn(2, 1, 32, 32, requires_grad=True)
+    targets = torch.randint(0, 2, (2, 1, 32, 32)).float()
+    loss, metrics = loss_fn(logits, targets)
+
+    assert loss.item() > 0.0
+    assert "bce_loss" not in metrics
+    assert "dice_loss" in metrics
+    assert "focal_loss" in metrics
+    assert "mask_loss" in metrics
+    loss.backward()
+    assert logits.grad is not None
+
+
+def test_build_loss_focal_weight():
+    from sid_unet.losses.auxiliary import build_loss
+
+    cfg = {
+        "loss": {
+            "mask_loss_type": "combined",
+            "bce_weight": 0.0,
+            "dice_weight": 0.7,
+            "focal_weight": 0.8,
+        },
+        "model": {"aux_classifier": False},
+    }
+    loss_mod = build_loss(cfg)
+    assert loss_mod.mask_loss_fn.bce_weight == 0.0
+    assert loss_mod.mask_loss_fn.dice_weight == 0.7
+    assert loss_mod.mask_loss_fn.focal_weight == 0.8
+

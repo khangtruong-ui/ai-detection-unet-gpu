@@ -23,6 +23,7 @@ class SIDTotalLoss(nn.Module):
         mask_loss_type: str = "combined",
         bce_weight: float = 0.5,
         dice_weight: float = 0.5,
+        focal_weight: float = 0.5,
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
         aux_classifier: bool = True,
@@ -34,6 +35,7 @@ class SIDTotalLoss(nn.Module):
             loss_type=mask_loss_type,
             bce_weight=bce_weight,
             dice_weight=dice_weight,
+            focal_weight=focal_weight,
             focal_gamma=focal_gamma,
             focal_alpha=focal_alpha,
         )
@@ -85,6 +87,7 @@ def build_loss(config: Any) -> SIDTotalLoss:
         mask_loss_type=loss_cfg.get("mask_loss_type", "combined"),
         bce_weight=float(loss_cfg.get("bce_weight", 0.5)),
         dice_weight=float(loss_cfg.get("dice_weight", 0.5)),
+        focal_weight=float(loss_cfg.get("focal_weight", 0.5)),
         focal_gamma=float(loss_cfg.get("focal_gamma", 2.0)),
         focal_alpha=float(loss_cfg.get("focal_alpha", 0.25)),
         aux_classifier=bool(model_cfg.get("aux_classifier", True)),

@@ -5,7 +5,7 @@ This directory contains organized configurations designed for higher throughput,
 Directory Layout:
 - **`unet_scratch/`**: Standard UNet architectures trained from scratch with varying widths, depths, loss formulations, and resolution budgets.
 - **`efficientnet/`**: Pretrained EfficientNet backbones with UNet multi-scale feature skip connections or the **Sacrifice of Pixel** linear-zoom architecture.
-- **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/BeyondTheBrush`.
+- **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/COCO-inpainted`.
 - **`sd_vae_finetune/`**: Finetuned Stable Diffusion 1.5 VAE (AutoencoderKL) adapted for binary synthetic image mask segmentation.
 - **`diffusion_diff/`**: Diffusion multi-noise feature decoder combining multi-step perturbations, frozen diffuser noise predictions, and sinusoidal embeddings with a configurable trainable decoder.
 - **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
@@ -16,10 +16,10 @@ Directory Layout:
 
 | Configuration File | Model & Quantization | Dataset & Mode | LoRA Config | Loss | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [`sam3_qlora_beyondthebrush_b1.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=8, \alpha=16$ ($q, v$) | Combined (BCE + Dice) | Baseline parameter-efficient fine-tuning on 12GB GPUs with gradient accumulation steps 16. |
-| [`sam3_qlora_beyondthebrush_r16.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_r16.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=16, \alpha=32$ ($q, k, v, out$) | Combined (BCE + Dice) | Expanded adaptation capacity across all attention projection layers. |
-| [`sam3_qlora_beyondthebrush_focal.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_focal.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=8, \alpha=16$ ($q, v$) | Focal ($\gamma=2.0, \alpha=0.25$) | Hard-mining loss addressing extreme foreground-background mask imbalance in subtle inpainting boundaries. |
-| [`sam3_qlora_beyondthebrush_dice.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_dice.yaml) | SAM3 + 4-bit NF4 QLoRA | BeyondTheBrush (streaming) | $r=8, \alpha=16$ ($q, v$) | Dice | Soft Sørensen-Dice direct optimization for sharp mask boundary overlap. |
+| [`sam3_qlora_beyondthebrush_b1.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=8, \alpha=16$ ($q, v$) | Combined (BCE + Dice + Focal) | Baseline parameter-efficient fine-tuning on 12GB GPUs with gradient accumulation steps 16. |
+| [`sam3_qlora_beyondthebrush_r16.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_r16.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=16, \alpha=32$ ($q, k, v, out$) | Combined (BCE + Dice + Focal) | Expanded adaptation capacity across all attention projection layers. |
+| [`sam3_qlora_beyondthebrush_focal.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_focal.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=8, \alpha=16$ ($q, v$) | Focal ($\gamma=2.0, \alpha=0.25$) | Hard-mining loss addressing extreme foreground-background mask imbalance in subtle inpainting boundaries. |
+| [`sam3_qlora_beyondthebrush_dice.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_dice.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=8, \alpha=16$ ($q, v$) | Dice | Soft Sørensen-Dice direct optimization for sharp mask boundary overlap. |
 
 ---
 

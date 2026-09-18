@@ -1,4 +1,4 @@
-# Configuration: SAM3 + QLoRA with Binary Focal Loss on BeyondTheBrush
+# Configuration: SAM3 + QLoRA with Binary Focal Loss on COCO-inpainted
 # Addresses severe foreground-background mask imbalance where tampered areas occupy small fractions of the image.
 # Uses Binary Focal Loss (gamma=2.0, alpha=0.25) with 4-bit NF4 quantization.
 
@@ -9,17 +9,18 @@ project:
   output_dir: "outputs/RUN/sam3_qlora_beyondthebrush_focal"
 
 data:
-  dataset_name: "KhangTruong/BeyondTheBrush"
+  dataset_name: "KhangTruong/COCO-inpainted"
   streaming: true
   image_size: [256, 256]
   batch_size: 1
   num_workers: 2
   pin_memory: true
-  shuffle_buffer_size: 1000
+  prefetch_batches: 48
+  shuffle_buffer_size: 32
   train_split: "train"
   val_split: "validation"
-  test_split: "test"
-  eval_split: "test"
+  test_split: "validation"
+  eval_split: "validation"
   train_samples_per_epoch: -1
   val_samples_per_epoch: -1
   val_samples: -1

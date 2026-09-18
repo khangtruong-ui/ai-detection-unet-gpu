@@ -146,6 +146,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mask_loss_type": "combined", # 'bce', 'dice', 'focal', 'combined'
         "bce_weight": 0.5,
         "dice_weight": 0.5,
+        "focal_weight": 0.5,
         "focal_gamma": 2.0,
         "focal_alpha": 0.25,
         "aux_loss_type": "cross_entropy",
@@ -175,6 +176,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "logging": {
         "log_interval": 20,           # Log training metrics every N steps
         "log_memory": True,           # Log GPU memory allocation info
+        "measure_network": True,      # Real-time network speed measuring and bottleneck detection
     },
     "post_processing": {
         "enabled": True,              # Enable mask post-processing by default
