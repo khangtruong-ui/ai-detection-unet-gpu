@@ -107,6 +107,24 @@ def parse_args():
         help="Enable activation gradient checkpointing in UNet to save VRAM",
     )
     parser.add_argument(
+        "--use-8bit-optimizer",
+        "--use_8bit_optimizer",
+        "--8bit-optimizer",
+        "--8bit",
+        dest="use_8bit_optimizer",
+        action="store_true",
+        default=False,
+        help="Enable 8-bit AdamW optimizer via bitsandbytes (saves 75% optimizer VRAM)",
+    )
+    parser.add_argument(
+        "--check-8bit",
+        "--check_8bit",
+        dest="check_8bit",
+        action="store_true",
+        default=False,
+        help="Check 8-bit hardware and library compatibility and print diagnostic report before training",
+    )
+    parser.add_argument(
         "--override",
         nargs="*",
         default=[],
@@ -385,9 +403,19 @@ def train_single_run(
 
 def main():
     args = parse_args()
+
+    if getattr(args, "check_8bit", False):
+        from sid_unet.utils.compatibility import check_8bit_compatibility, format_compatibility_table
+        _, details = check_8bit_compatibility(verbose=False)
+        print("\n" + format_compatibility_table(details) + "\n")
+        return
+
     config_paths = args.config if isinstance(args.config, list) else [args.config]
 
     overrides = list(args.override)
+    if getattr(args, "use_8bit_optimizer", False):
+        overrides.append("training.use_8bit_optimizer=true")
+        overrides.append("training.optimizer=adamw8bit")
     if args.batch_size is not None:
         overrides.append(f"data.batch_size={args.batch_size}")
     if args.auto_batch_size is True:

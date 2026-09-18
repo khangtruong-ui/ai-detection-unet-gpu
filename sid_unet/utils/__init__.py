@@ -20,6 +20,14 @@ from sid_unet.utils.network import (
     get_network_rx_bytes,
 )
 
+from sid_unet.utils.compatibility import (
+    check_8bit_compatibility,
+    format_compatibility_table,
+    validate_8bit_environment,
+    installation_check_8bit,
+    cli_check_8bit,
+)
+
 __all__ = [
     "ConfigDict",
     "load_config",
@@ -44,6 +52,11 @@ __all__ = [
     "BottleneckStatus",
     "format_network_speed",
     "get_network_rx_bytes",
+    "check_8bit_compatibility",
+    "format_compatibility_table",
+    "validate_8bit_environment",
+    "installation_check_8bit",
+    "cli_check_8bit",
 ]
 
 

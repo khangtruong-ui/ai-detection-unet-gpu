@@ -26,6 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+8bit = [
+    "bitsandbytes>=0.41.0",
+    "accelerate>=0.25.0",
+]
 diffusion = [
     "diffusers>=0.25.0",
     "accelerate>=0.25.0",
@@ -62,6 +66,7 @@ sid-eval = "sid_unet.evaluate:cli_main"
 sid-cross-eval = "sid_unet.cross_eval:cli_main"
 sid-predict = "sid_unet.predict:cli_main"
 sid-illu = "sid_unet.illustration:cli_main"
+sid-check-8bit = "sid_unet.utils.compatibility:cli_check_8bit"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -34,6 +34,7 @@ from sid_unet.utils.memory import (
 from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
 from sid_unet.utils.network import NetworkSpeedMonitor, BottleneckDetector
+from sid_unet.utils.compatibility import check_8bit_compatibility
 
 def parse_checkpoint_period(training_cfg: Any) -> float:
     """Parse checkpoint period from config, defaulting to 3600 seconds (1 hour)."""
@@ -127,16 +128,87 @@ class Trainer:
         self.val_loader = val_loader
         self.test_loader = test_loader
 
+        # 3.1 Automatic 8-Bit Compatibility Verification at Training Time
+        auto_check_8bit = bool(config.training.get("check_8bit_compatibility", True))
+        if auto_check_8bit:
+            self.is_8bit_compatible, self.compatibility_8bit_details = check_8bit_compatibility(
+                device=self.device,
+                verbose=False,
+                custom_logger=self.logger,
+            )
+            if self.device.type == "cuda":
+                if self.is_8bit_compatible:
+                    self.logger.info(
+                        f"💻 8-Bit Hardware & Library Capability: Supported "
+                        f"({self.compatibility_8bit_details.get('device_name')}, "
+                        f"{self.compatibility_8bit_details.get('compute_capability_str')}, "
+                        f"bitsandbytes v{self.compatibility_8bit_details.get('bitsandbytes_version')})"
+                    )
+                else:
+                    self.logger.debug(
+                        f"💻 8-bit capability check result: {self.compatibility_8bit_details.get('message')}"
+                    )
+        else:
+            self.is_8bit_compatible = False
+            self.compatibility_8bit_details = {}
+
+        # Validate 8-bit model quantization if requested
+        if getattr(loaded_model, "load_in_8bit", False):
+            if not self.is_8bit_compatible:
+                raise RuntimeError(
+                    f"Model configured with load_in_8bit=True, but 8-bit mode is not supported: "
+                    f"{self.compatibility_8bit_details.get('message')}"
+                )
+            self.logger.info("⚡ 8-bit Model Quantization Active (bitsandbytes load_in_8bit).")
+
         # 4. Optimizer & Scheduler
         self.lr = float(config.training.get("learning_rate", 1e-3))
         self.weight_decay = float(config.training.get("weight_decay", 1e-4))
-        self.opt_name = config.training.get("optimizer", "adamw").lower()
+        self.opt_name = str(config.training.get("optimizer", "adamw")).lower()
+        use_8bit_opt = bool(config.training.get("use_8bit_optimizer", False))
 
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable_params:
             trainable_params = list(self.model.parameters())
 
-        if self.opt_name == "adam":
+        # Support explicit 8-bit optimizer names or use_8bit_optimizer flag
+        is_8bit_opt_requested = use_8bit_opt or self.opt_name in [
+            "adamw8bit", "adamw_8bit", "8bit_adamw", "8bit_adam",
+            "adam8bit", "adam_8bit", "paged_adamw8bit", "paged_adamw_8bit",
+            "paged_adam8bit", "paged_adam_8bit", "8bit",
+        ]
+
+        if is_8bit_opt_requested:
+            if self.is_8bit_compatible:
+                import bitsandbytes as bnb
+                if "paged" in self.opt_name:
+                    self.optimizer = bnb.optim.PagedAdamW8bit(
+                        trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                    )
+                    opt_label = "PagedAdamW8bit (with CPU paging)"
+                else:
+                    self.optimizer = bnb.optim.AdamW8bit(
+                        trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                    )
+                    opt_label = "AdamW8bit"
+                self.logger.info(
+                    f"⚡ 8-Bit Optimizer Active: Initialized {opt_label} "
+                    f"(75% optimizer VRAM savings on {self.compatibility_8bit_details.get('device_name', self.device)})."
+                )
+            else:
+                fallback = bool(config.training.get("fallback_on_unsupported_8bit", True))
+                if fallback:
+                    self.logger.warning(
+                        f"⚠️ 8-bit optimizer requested ('{self.opt_name}') but environment is incompatible: "
+                        f"{self.compatibility_8bit_details.get('message')}. Gracefully falling back to torch.optim.AdamW."
+                    )
+                    self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                else:
+                    raise RuntimeError(
+                        f"8-bit optimizer '{self.opt_name}' requested but environment is incompatible: "
+                        f"{self.compatibility_8bit_details.get('message')}"
+                    )
+        elif self.opt_name == "adam":
             self.optimizer = torch.optim.Adam(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
         elif self.opt_name == "sgd":
             self.optimizer = torch.optim.SGD(trainable_params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)

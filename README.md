@@ -698,8 +698,16 @@ Install in editable mode using `pip` or `uv`:
 # Clone and enter directory
 cd /workspace
 
-# Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu)
+# Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu, sid-check-8bit)
 pip install -e .
+
+# Or with 8-bit training dependencies (bitsandbytes):
+pip install -e ".[8bit]"
+
+# Run automated 8-bit hardware and library compatibility check:
+sid-check-8bit
+# or via training CLI:
+python -m sid_unet.train --check-8bit
 
 # Or using uv (compatible with torch>=2.5.0, preserving your existing PyTorch installation):
 uv pip install -e .
@@ -847,7 +855,10 @@ The configuration file is divided into modular top-level sections:
 | `epochs` | `int` | `10` | Maximum number of training epochs. |
 | `learning_rate` | `float` | `0.001` | Initial base learning rate for optimizer. |
 | `weight_decay` | `float` | `0.0001` | L2 weight regularization penalty. |
-| `optimizer` | `str` | `"adamw"` | Optimization algorithm (`"adamw"`, `"adam"`, `"sgd"`). |
+| `optimizer` | `str` | `"adamw"` | Optimization algorithm (`"adamw"`, `"adam"`, `"sgd"`, `"adamw8bit"`, `"paged_adamw8bit"`). |
+| `use_8bit_optimizer` | `bool` | `false` | Enables 8-bit AdamW optimizer via `bitsandbytes` (reduces optimizer memory by 75%). |
+| `check_8bit_compatibility` | `bool` | `true` | Automatically verifies CUDA, GPU compute capability, and `bitsandbytes` compatibility at training time. |
+| `fallback_on_unsupported_8bit` | `bool` | `true` | Gracefully falls back to standard AdamW if 8-bit optimizer is requested but unsupported. |
 | `scheduler` | `str` | `"cosine"` | Learning rate schedule (`"cosine"`, `"step"`, `"plateau"`, `"none"`). |
 | `warmup_epochs` | `int` | `1` | Number of epochs for linear learning rate warmup. |
 | `min_lr` | `float` | `1e-6` | Minimum learning rate floor reached at end of cosine decay. |
