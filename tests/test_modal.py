@@ -25,7 +25,10 @@ from sid_unet.modal_runner import (
     DEFAULT_TEST_GPU,
     DEFAULT_TRAIN_GPU,
     DEFAULT_VOLUME_NAME,
+    DEFAULT_HF_SECRET_NAME,
+    check_hf_token_status,
     ensure_modal_authenticated,
+    get_hf_secret,
     get_or_create_volume,
     get_volume_output_dir,
     has_local_gpu,
@@ -467,4 +470,78 @@ def test_smart_progress_bar_manual_update_and_context_manager():
         assert "UpdatedDesc [Step 5/5 (100.0%)]" in records[-1]
     finally:
         test_logger.removeHandler(handler)
+
+
+# ==============================================================================
+# Hugging Face Authentication & Secret Tests
+# ==============================================================================
+
+def test_huggingface_secret_configuration():
+    """Verify default HF secret name is 'huggingface' and get_hf_secret returns valid Modal Secret."""
+    assert DEFAULT_HF_SECRET_NAME == "huggingface"
+    sec = get_hf_secret()
+    assert sec is not None
+
+
+def test_check_hf_token_status_from_env():
+    """Verify check_hf_token_status detects HF_TOKEN from environment."""
+    with patch.dict(os.environ, {"HF_TOKEN": "hf_dummytesttoken123456789"}, clear=True):
+        status = check_hf_token_status()
+        assert status["authenticated"] is True
+        assert "HF_TOKEN" in status["source"]
+        assert status["token_preview"] is not None
+
+
+def test_check_hf_token_status_without_token():
+    """Verify check_hf_token_status indicates Modal Secret fallback when no local token exists."""
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("os.path.isfile", return_value=False):
+            status = check_hf_token_status()
+            assert status["authenticated"] is False
+            assert "Modal Secret" in status["source"]
+            assert status["secret_name"] == "huggingface"
+
+
+def test_cli_hf_token_argument_parsing():
+    """Verify --hf-token argument is parsed correctly by train and eval CLIs."""
+    test_train_args = ["sid-train", "--config", "configs/test_smoke.yaml", "--hf-token", "hf_mycustomtoken"]
+    with patch("sys.argv", test_train_args):
+        parsed_train = train_parse_args()
+        assert parsed_train.hf_token == "hf_mycustomtoken"
+
+    test_eval_args = ["sid-eval", "--checkpoint", "checkpoint.pt", "--hf-token", "hf_mycustomtoken"]
+    with patch("sys.argv", test_eval_args):
+        parsed_eval = eval_parse_args()
+        assert parsed_eval.hf_token == "hf_mycustomtoken"
+
+
+def test_run_train_on_modal_propagates_hf_token():
+    """Verify run_train_on_modal sets HF_TOKEN in environment when passed via args."""
+    mock_args = argparse.Namespace(
+        config=["configs/test_smoke.yaml"],
+        modal_volume=DEFAULT_VOLUME_NAME,
+        modal_gpu="L40S",
+        hf_token="hf_test_token_propagation",
+        override=[],
+        output_dir="outputs/RUN/smoke",
+        resume=None,
+        resume_repo=None,
+        auto_resume=True,
+        skip_collision=True,
+        save_latest=None,
+        batch_size=None,
+        auto_batch_size=None,
+        val_samples_per_epoch=None,
+        checkpoint_period=None,
+        checkpoint_steps=None,
+    )
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("sid_unet.modal_runner.ensure_modal_authenticated", return_value=True):
+            with patch("sid_unet.modal_runner.get_or_create_volume"):
+                with patch("sid_unet.modal_runner.app.run"):
+                    with patch("sid_unet.modal_runner.train_remote_l40s.remote", return_value=[{"score": 0.9}]) as mock_remote:
+                        res = run_train_on_modal(mock_args)
+                        assert mock_remote.called
+                        assert os.environ.get("HF_TOKEN") == "hf_test_token_propagation"
+
 

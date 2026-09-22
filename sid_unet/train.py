@@ -261,6 +261,13 @@ def parse_args():
         default="sid-unet-data",
         help="Persistent Modal Volume name (default: sid-unet-data).",
     )
+    parser.add_argument(
+        "--hf-token",
+        "--hf_token",
+        type=str,
+        default=None,
+        help="Hugging Face API token for authenticated dataset streaming and model downloads.",
+    )
     return parser.parse_args()
 
 
@@ -453,6 +460,8 @@ def train_single_run(
 
 def main():
     args = parse_args()
+    if getattr(args, "hf_token", None):
+        os.environ["HF_TOKEN"] = args.hf_token
 
     # Modal execution routing:
     # 1. If --modal is passed -> execute on Modal

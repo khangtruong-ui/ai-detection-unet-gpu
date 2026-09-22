@@ -745,6 +745,10 @@ SID-UNet features first-class, seamless **Modal** cloud integration:
   - `/vol/outputs/RUN/{experiment}/reports/`
   - `/vol/outputs/RUN/{experiment}/illustrations/`
   - `/vol/test_outputs/` (for mock runs and test reports)
+- **Hugging Face Authentication & Persistent Cache**:
+  - Automatically attaches Modal Secret `huggingface` (containing `HF_TOKEN`) to all remote execution containers, ensuring authenticated access to Hugging Face Hub, high-speed streaming datasets without IP rate limits, and access to private/gated models.
+  - Caches all Hugging Face datasets and models in the persistent volume (`/vol/cache/huggingface`), eliminating duplicate downloads across container lifecycles.
+  - Seamlessly accepts `--hf-token <token>` via CLI or propagates local `HF_TOKEN` environment variables.
 - **Cost-Optimized GPU Selection**:
   - **Training Default (L40S)**: Defaults to **Nvidia L40S** ($1.95/hr, 733 BF16 TFLOPS, **$0.00266/TFLOP**) — the highest TFLOP-per-dollar efficiency on Modal strictly under $2.00/hr (over 3.3x more compute per dollar than A10G). Also supports **L4** ($0.80/hr, 242 TFLOPS, $0.00331/TFLOP), **A10G** ($1.10/hr), and **T4**.
   - **Cheap Testing Default (T4)**: Allocates cheap **Nvidia T4** GPUs (~$0.59/hr) for quick evaluation, smoke runs, unit test suites, and mock testing.
@@ -755,7 +759,7 @@ SID-UNet features first-class, seamless **Modal** cloud integration:
 ### Modal CLI (`sid-modal`)
 
 ```bash
-# Verify Modal authentication status
+# Verify Modal and Hugging Face authentication status
 sid-modal auth-check
 
 # Inspect or create the persistent Modal Volume

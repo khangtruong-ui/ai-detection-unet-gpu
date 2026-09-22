@@ -34,9 +34,40 @@ DEFAULT_TEST_DIR = f"{DEFAULT_MOUNT_PATH}/test_outputs"
 # - T4:   ~$0.59/hr, cheap testing / mock test GPU
 DEFAULT_TRAIN_GPU = "L40S"
 DEFAULT_TEST_GPU = "T4"
+DEFAULT_HF_SECRET_NAME = "huggingface"
 
 # Repo root directory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def check_hf_token_status() -> Dict[str, Any]:
+    """Inspect Hugging Face authentication availability locally and on Modal."""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    source = "environment (HF_TOKEN)" if token else None
+
+    if not token:
+        cache_token_path = os.path.expanduser("~/.cache/huggingface/token")
+        if os.path.isfile(cache_token_path):
+            try:
+                with open(cache_token_path, "r", encoding="utf-8") as f:
+                    t = f.read().strip()
+                    if t:
+                        token = t
+                        source = f"cache ({cache_token_path})"
+            except Exception:
+                pass
+
+    return {
+        "authenticated": bool(token),
+        "source": source or f"Modal Secret ('{DEFAULT_HF_SECRET_NAME}')",
+        "secret_name": DEFAULT_HF_SECRET_NAME,
+        "token_preview": f"{token[:6]}...{token[-4:]}" if token and len(token) > 10 else ("***" if token else None),
+    }
+
+
+def get_hf_secret(secret_name: str = DEFAULT_HF_SECRET_NAME) -> modal.Secret:
+    """Return Modal Secret reference for Hugging Face authentication."""
+    return modal.Secret.from_name(secret_name)
 
 
 def is_modal_authenticated() -> bool:
@@ -191,6 +222,7 @@ def create_modal_image() -> modal.Image:
             "torch>=2.1.0",
             "torchvision>=0.16.0",
             "datasets>=2.14.0",
+            "huggingface_hub>=0.20.0",
             "numpy>=1.22.0",
             "pillow>=9.0.0",
             "pyyaml>=6.0",
@@ -208,6 +240,8 @@ def create_modal_image() -> modal.Image:
             "MODAL_LOG_FORMAT": "PLAIN",
             "SID_PROGRESS_MODE": "clean",
             "PYTHONUNBUFFERED": "1",
+            "HF_HOME": "/vol/cache/huggingface",
+            "HF_DATASETS_CACHE": "/vol/cache/huggingface/datasets",
         })
     )
     # Add source code and configs
@@ -224,6 +258,7 @@ def create_modal_image() -> modal.Image:
 app = modal.App("sid-unet")
 image = create_modal_image()
 volume = modal.Volume.from_name(DEFAULT_VOLUME_NAME, create_if_missing=True)
+hf_secret = get_hf_secret(DEFAULT_HF_SECRET_NAME)
 
 
 # ==============================================================================
@@ -234,6 +269,7 @@ volume = modal.Volume.from_name(DEFAULT_VOLUME_NAME, create_if_missing=True)
     image=image,
     gpu="L40S",  # Cheapest price over TFLOPS under $2/hr: $1.95/hr for 733 BF16 TFLOPS ($0.00266/TFLOP)
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=86400,
 )
 def train_remote_l40s(
@@ -273,6 +309,7 @@ def train_remote_l40s(
     image=image,
     gpu="L4",  # High cost-efficiency Ada Lovelace GPU ($0.80/hr for 242 BF16 TFLOPS = $0.00331/TFLOP)
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=86400,
 )
 def train_remote_l4(
@@ -312,6 +349,7 @@ def train_remote_l4(
     image=image,
     gpu="A10G",
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=86400,
 )
 def train_remote_a10g(
@@ -351,6 +389,7 @@ def train_remote_a10g(
     image=image,
     gpu=DEFAULT_TEST_GPU,  # Cheap T4 GPU for testing/smoke runs
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=43200,
 )
 def train_remote_t4(
@@ -409,6 +448,20 @@ def _execute_train_remote(
     # Resolve output directory inside Modal volume
     suite_run_dir = get_volume_output_dir(output_dir, volume_mount_path=DEFAULT_MOUNT_PATH, default_subpath="outputs/RUN")
     os.makedirs(suite_run_dir, exist_ok=True)
+
+    # Configure Hugging Face authentication and persistent cache
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    hf_cache = os.environ.get("HF_HOME", "/vol/cache/huggingface")
+    os.makedirs(hf_cache, exist_ok=True)
+    if hf_token:
+        print(f"🔑 [Modal Container] Hugging Face authenticated via HF_TOKEN (cache: {hf_cache})")
+        try:
+            import huggingface_hub
+            huggingface_hub.login(token=hf_token, add_to_git_credential=False)
+        except Exception:
+            pass
+    else:
+        print(f"ℹ️ [Modal Container] Running without HF_TOKEN (cache: {hf_cache})")
 
     # Normalize config paths (check local or /root/configs)
     resolved_configs = []
@@ -500,6 +553,7 @@ def _execute_train_remote(
     image=image,
     gpu=DEFAULT_TEST_GPU,  # Cheap T4 GPU for evaluation / testing
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=7200,
 )
 def eval_remote_t4(
@@ -517,6 +571,17 @@ def eval_remote_t4(
 ) -> List[Dict[str, Any]]:
     """Execute model evaluation on Modal with cheap T4 GPU."""
     from sid_unet.evaluate import evaluate_single_checkpoint
+
+    # Configure Hugging Face authentication and persistent cache
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    hf_cache = os.environ.get("HF_HOME", "/vol/cache/huggingface")
+    os.makedirs(hf_cache, exist_ok=True)
+    if hf_token:
+        try:
+            import huggingface_hub
+            huggingface_hub.login(token=hf_token, add_to_git_credential=False)
+        except Exception:
+            pass
 
     # Resolve output directory inside Modal volume
     eval_out_dir = get_volume_output_dir(
@@ -563,6 +628,7 @@ def eval_remote_t4(
     image=image,
     gpu=DEFAULT_TEST_GPU,  # Cheap T4 GPU for testing
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=3600,
 )
 def run_pytest_remote_t4(
@@ -612,6 +678,7 @@ def run_pytest_remote_t4(
     image=image,
     gpu=DEFAULT_TEST_GPU,  # Cheap T4 GPU for mock tests
     volumes={DEFAULT_MOUNT_PATH: volume},
+    secrets=[hf_secret],
     timeout=600,
 )
 def mock_test_remote_t4() -> Dict[str, Any]:
@@ -703,11 +770,22 @@ def run_train_on_modal(
     ensure_modal_authenticated(exit_on_failure=True)
     get_or_create_volume(volume_name=getattr(args, "modal_volume", None) or volume_name)
 
+    # Propagate explicit CLI HF token to environment if provided
+    cli_token = getattr(args, "hf_token", None)
+    if cli_token:
+        os.environ["HF_TOKEN"] = cli_token
+
     chosen_gpu = (getattr(args, "modal_gpu", None) or gpu or DEFAULT_TRAIN_GPU).upper()
     config_paths = args.config if isinstance(args.config, list) else [args.config]
+    hf_info = check_hf_token_status()
 
     print(f"📦 Modal Volume: {getattr(args, 'modal_volume', None) or volume_name} (mount: {DEFAULT_MOUNT_PATH})")
     print(f"🖥️ Modal GPU: {chosen_gpu}")
+    print(f"🔑 Hugging Face Secret: attached '{DEFAULT_HF_SECRET_NAME}' (HF_TOKEN)")
+    if hf_info["authenticated"]:
+        print(f"   Local HF token detected: yes ({hf_info['source']})")
+    else:
+        print(f"   Runtime HF token: loaded via Modal Secret '{DEFAULT_HF_SECRET_NAME}'")
     print(f"📋 Configs: {config_paths}")
 
     remote_map = {
@@ -750,11 +828,21 @@ def run_eval_on_modal(
     ensure_modal_authenticated(exit_on_failure=True)
     get_or_create_volume(volume_name=getattr(args, "modal_volume", None) or volume_name)
 
+    cli_token = getattr(args, "hf_token", None)
+    if cli_token:
+        os.environ["HF_TOKEN"] = cli_token
+
     chosen_gpu = (getattr(args, "modal_gpu", None) or gpu or DEFAULT_TEST_GPU).upper()
     ckpts = args.checkpoint if isinstance(args.checkpoint, list) else [args.checkpoint]
+    hf_info = check_hf_token_status()
 
     print(f"📦 Modal Volume: {getattr(args, 'modal_volume', None) or volume_name} (mount: {DEFAULT_MOUNT_PATH})")
     print(f"🖥️ Modal GPU (cheap for testing): {chosen_gpu}")
+    print(f"🔑 Hugging Face Secret: attached '{DEFAULT_HF_SECRET_NAME}' (HF_TOKEN)")
+    if hf_info["authenticated"]:
+        print(f"   Local HF token detected: yes ({hf_info['source']})")
+    else:
+        print(f"   Runtime HF token: loaded via Modal Secret '{DEFAULT_HF_SECRET_NAME}'")
     print(f"🎯 Checkpoints: {ckpts}")
 
     with modal.enable_output():
@@ -855,6 +943,7 @@ def cli_main():
     train_p.add_argument("--gpu", type=str, default=DEFAULT_TRAIN_GPU, help="GPU type (e.g. A10G, T4)")
     train_p.add_argument("--volume", type=str, default=DEFAULT_VOLUME_NAME, help="Modal volume name")
     train_p.add_argument("--override", nargs="*", default=[], help="Config overrides")
+    train_p.add_argument("--hf-token", "--hf_token", type=str, default=None, help="Hugging Face API token")
 
     # Subcommand: eval
     eval_p = subparsers.add_parser("eval", help="Run evaluation/testing on Modal (cheap T4 GPU)")
@@ -865,6 +954,7 @@ def cli_main():
     eval_p.add_argument("--output-dir", type=str, default=None, help="Output directory")
     eval_p.add_argument("--gpu", type=str, default=DEFAULT_TEST_GPU, help="GPU type (default: cheap T4)")
     eval_p.add_argument("--volume", type=str, default=DEFAULT_VOLUME_NAME, help="Modal volume name")
+    eval_p.add_argument("--hf-token", "--hf_token", type=str, default=None, help="Hugging Face API token")
 
     # Subcommand: test
     test_p = subparsers.add_parser("test", help="Run pytest test suite on Modal (cheap T4 GPU)")
@@ -883,6 +973,12 @@ def cli_main():
         is_auth = is_modal_authenticated()
         if is_auth:
             print("✅ Modal is authenticated and ready to run jobs.")
+            hf_info = check_hf_token_status()
+            print(f"🔑 Hugging Face Secret: attached '{DEFAULT_HF_SECRET_NAME}' (HF_TOKEN)")
+            if hf_info["authenticated"]:
+                print(f"   Local HF token detected: yes ({hf_info['source']})")
+            else:
+                print(f"   Runtime HF token: loaded via Modal Secret '{DEFAULT_HF_SECRET_NAME}'")
             sys.exit(0)
         else:
             ensure_modal_authenticated(exit_on_failure=True)
