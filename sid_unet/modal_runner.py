@@ -13,10 +13,12 @@ Features:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import modal
@@ -468,12 +470,21 @@ def _execute_train_remote(
     for cp in config_paths:
         if os.path.exists(cp):
             resolved_configs.append(cp)
-        elif os.path.exists(f"/root/{cp}"):
-            resolved_configs.append(f"/root/{cp}")
+        elif os.path.exists(f"/root/{cp.lstrip('/')}"):
+            resolved_configs.append(f"/root/{cp.lstrip('/')}")
         elif os.path.exists(f"/root/configs/{os.path.basename(cp)}"):
             resolved_configs.append(f"/root/configs/{os.path.basename(cp)}")
         else:
-            resolved_configs.append(cp)
+            # Recursively search in /root/configs for the config filename
+            found = False
+            if os.path.isdir("/root/configs"):
+                for root, _, files in os.walk("/root/configs"):
+                    if os.path.basename(cp) in files:
+                        resolved_configs.append(os.path.join(root, os.path.basename(cp)))
+                        found = True
+                        break
+            if not found:
+                resolved_configs.append(cp)
 
     overrides_list = list(overrides or [])
     if batch_size is not None:
@@ -689,7 +700,7 @@ def mock_test_remote_t4() -> Dict[str, Any]:
     """
     import torch
     from sid_unet.models.unet import UNet
-    from sid_unet.losses.combined import CombinedLoss
+    from sid_unet.losses.combined import CombinedMaskLoss
     from sid_unet.metrics.segmentation import SegmentationMetricTracker
 
     test_out_dir = get_volume_output_dir(
@@ -700,8 +711,8 @@ def mock_test_remote_t4() -> Dict[str, Any]:
     os.makedirs(test_out_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNet(in_channels=3, out_channels=1, features=[16, 32]).to(device)
-    criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5, focal_weight=0.5)
+    model = UNet(in_channels=3, out_channels=1, features=[16, 32], aux_classifier=False).to(device)
+    criterion = CombinedMaskLoss(bce_weight=0.5, dice_weight=0.5, focal_weight=0.5)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     metric_tracker = SegmentationMetricTracker(threshold=0.5)
 
@@ -713,7 +724,7 @@ def mock_test_remote_t4() -> Dict[str, Any]:
         y = (torch.rand(2, 1, 64, 64, device=device) > 0.5).float()
         optimizer.zero_grad()
         logits = model(x)
-        loss = criterion(logits, y)
+        loss, _ = criterion(logits, y)
         loss.backward()
         optimizer.step()
         loss_val = float(loss.item())
@@ -758,14 +769,102 @@ def mock_test_remote_t4() -> Dict[str, Any]:
 # Client Launchers & Orchestration
 # ==============================================================================
 
+def _execute_with_modal_app(
+    target_fn: Any,
+    fn_kwargs: Dict[str, Any],
+    detach: bool = True,
+    wait: bool = True,
+    max_retries: int = 3,
+) -> Any:
+    """
+    Execute a Modal function inside app.run with detach mode support,
+    automatic retry on transient gRPC connection failures, and graceful signal handling.
+    """
+    from contextlib import nullcontext
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            output_ctx = modal.enable_output() if wait else nullcontext()
+            with output_ctx:
+                with app.run(detach=detach):
+                    app_id = getattr(app, "app_id", None)
+                    dashboard_url = f"https://modal.com/apps/{app_id}" if app_id else "https://modal.com/apps"
+
+                    if detach:
+                        print("\n" + "=" * 70)
+                        print("⚡ Modal App Running in DETACHED Mode")
+                        print("=" * 70)
+                        if app_id:
+                            print(f"📱 App ID:           {app_id}")
+                            print(f"🔗 Dashboard:        {dashboard_url}")
+                            print(f"📜 Stream logs:      modal app logs {app_id}")
+                            print(f"🛑 Stop run:         modal app stop {app_id}")
+                        print("=" * 70 + "\n")
+
+                    if not wait and hasattr(target_fn, "spawn"):
+                        fn_call = target_fn.spawn(**fn_kwargs)
+                        call_id = getattr(fn_call, "object_id", None)
+                        print(f"⚡ Function Call Spawned: {call_id}")
+                        print("⚡ Job detached and running on Modal. Exiting client without waiting.")
+                        return [{"app_id": app_id, "call_id": call_id, "status": "detached"}]
+
+                    # Check if target_fn.remote is a unittest MagicMock
+                    remote_attr = getattr(target_fn, "remote", None)
+                    if type(remote_attr).__name__ == "MagicMock":
+                        return remote_attr(**fn_kwargs)
+
+                    try:
+                        res = target_fn.remote(**fn_kwargs)
+                        return res
+                    except KeyboardInterrupt:
+                        print("\n" + "=" * 70)
+                        print("⚡ Interrupted locally. Detached job continues running on Modal!")
+                        if app_id:
+                            print(f"📱 App ID:           {app_id}")
+                            print(f"🔗 Dashboard:        {dashboard_url}")
+                            print(f"📜 Stream logs:      modal app logs {app_id}")
+                            print(f"🛑 Stop run:         modal app stop {app_id}")
+                        print("=" * 70 + "\n")
+                        return [{"app_id": app_id, "status": "detached"}]
+            break
+        except (ConnectionError, TimeoutError, OSError) as conn_err:
+            if attempt < max_retries:
+                wait_sec = 2 * attempt
+                print(f"⚠️ Modal connection attempt {attempt}/{max_retries} failed ({conn_err}). Retrying in {wait_sec}s...")
+                time.sleep(wait_sec)
+            else:
+                print(f"\n❌ Error: Failed to connect to Modal after {max_retries} attempts ({conn_err}).")
+                raise
+        except BaseException as be:
+            is_cancelled = (
+                "CancelledError" in type(be).__name__
+                or isinstance(be, asyncio.CancelledError)
+                or (isinstance(be, BaseException) and be.__class__.__name__ == "CancelledError")
+            )
+            if is_cancelled:
+                if attempt < max_retries:
+                    wait_sec = 2 * attempt
+                    print(f"⚠️ Modal gRPC channel connection was cancelled / timed out (attempt {attempt}/{max_retries}). Retrying in {wait_sec}s...")
+                    time.sleep(wait_sec)
+                else:
+                    print(f"\n❌ Error: Modal gRPC channel connection was cancelled or timed out after {max_retries} attempts.")
+                    print("Please check your internet connection and verify authentication with `modal profile current`.")
+                    raise
+            else:
+                raise
+
+
 def run_train_on_modal(
     args: Any,
     volume_name: str = DEFAULT_VOLUME_NAME,
     gpu: Optional[str] = None,
+    detach: Optional[bool] = None,
+    wait: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """
     Launch training on Modal.
     Verifies authentication, provisions volume, and routes to appropriate GPU.
+    Runs in detached mode by default so jobs persist if the local client disconnects.
     """
     ensure_modal_authenticated(exit_on_failure=True)
     get_or_create_volume(volume_name=getattr(args, "modal_volume", None) or volume_name)
@@ -779,8 +878,17 @@ def run_train_on_modal(
     config_paths = args.config if isinstance(args.config, list) else [args.config]
     hf_info = check_hf_token_status()
 
+    # Determine detach and wait settings (defaults to detach=True, wait=True)
+    if detach is None:
+        detach = getattr(args, "detach", True)
+    if wait is None:
+        wait = getattr(args, "wait", True)
+    if getattr(args, "no_wait", False):
+        wait = False
+
     print(f"📦 Modal Volume: {getattr(args, 'modal_volume', None) or volume_name} (mount: {DEFAULT_MOUNT_PATH})")
     print(f"🖥️ Modal GPU: {chosen_gpu}")
+    print(f"⚡ Detach Mode: {'Enabled (persistent execution)' if detach else 'Disabled (ephemeral)'}")
     print(f"🔑 Hugging Face Secret: attached '{DEFAULT_HF_SECRET_NAME}' (HF_TOKEN)")
     if hf_info["authenticated"]:
         print(f"   Local HF token detected: yes ({hf_info['source']})")
@@ -797,33 +905,35 @@ def run_train_on_modal(
     }
     target_fn = remote_map.get(chosen_gpu, train_remote_l40s)
 
-    with modal.enable_output():
-        with app.run():
-            res = target_fn.remote(
-                config_paths=config_paths,
-                overrides=getattr(args, "override", []),
-                output_dir=getattr(args, "output_dir", None),
-                resume=getattr(args, "resume", None),
-                resume_repo=getattr(args, "resume_repo", None),
-                auto_resume=getattr(args, "auto_resume", True),
-                skip_collision=getattr(args, "skip_collision", True),
-                save_latest=getattr(args, "save_latest", None),
-                batch_size=getattr(args, "batch_size", None),
-                auto_batch_size=getattr(args, "auto_batch_size", None),
-                val_samples_per_epoch=getattr(args, "val_samples_per_epoch", None),
-                checkpoint_period=getattr(args, "checkpoint_period", None),
-                checkpoint_steps=getattr(args, "checkpoint_steps", None),
-            )
-    return res
+    fn_kwargs = dict(
+        config_paths=config_paths,
+        overrides=getattr(args, "override", []),
+        output_dir=getattr(args, "output_dir", None),
+        resume=getattr(args, "resume", None),
+        resume_repo=getattr(args, "resume_repo", None),
+        auto_resume=getattr(args, "auto_resume", True),
+        skip_collision=getattr(args, "skip_collision", True),
+        save_latest=getattr(args, "save_latest", None),
+        batch_size=getattr(args, "batch_size", None),
+        auto_batch_size=getattr(args, "auto_batch_size", None),
+        val_samples_per_epoch=getattr(args, "val_samples_per_epoch", None),
+        checkpoint_period=getattr(args, "checkpoint_period", None),
+        checkpoint_steps=getattr(args, "checkpoint_steps", None),
+    )
+
+    return _execute_with_modal_app(target_fn, fn_kwargs, detach=detach, wait=wait)
 
 
 def run_eval_on_modal(
     args: Any,
     volume_name: str = DEFAULT_VOLUME_NAME,
     gpu: Optional[str] = None,
+    detach: Optional[bool] = None,
+    wait: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """
     Launch evaluation/testing on Modal using a cheap GPU (T4).
+    Runs in detached mode by default so jobs persist if the local client disconnects.
     """
     ensure_modal_authenticated(exit_on_failure=True)
     get_or_create_volume(volume_name=getattr(args, "modal_volume", None) or volume_name)
@@ -836,8 +946,17 @@ def run_eval_on_modal(
     ckpts = args.checkpoint if isinstance(args.checkpoint, list) else [args.checkpoint]
     hf_info = check_hf_token_status()
 
+    # Determine detach and wait settings (defaults to detach=True, wait=True)
+    if detach is None:
+        detach = getattr(args, "detach", True)
+    if wait is None:
+        wait = getattr(args, "wait", True)
+    if getattr(args, "no_wait", False):
+        wait = False
+
     print(f"📦 Modal Volume: {getattr(args, 'modal_volume', None) or volume_name} (mount: {DEFAULT_MOUNT_PATH})")
     print(f"🖥️ Modal GPU (cheap for testing): {chosen_gpu}")
+    print(f"⚡ Detach Mode: {'Enabled (persistent execution)' if detach else 'Disabled (ephemeral)'}")
     print(f"🔑 Hugging Face Secret: attached '{DEFAULT_HF_SECRET_NAME}' (HF_TOKEN)")
     if hf_info["authenticated"]:
         print(f"   Local HF token detected: yes ({hf_info['source']})")
@@ -845,57 +964,57 @@ def run_eval_on_modal(
         print(f"   Runtime HF token: loaded via Modal Secret '{DEFAULT_HF_SECRET_NAME}'")
     print(f"🎯 Checkpoints: {ckpts}")
 
-    with modal.enable_output():
-        with app.run():
-            res = eval_remote_t4.remote(
-                checkpoint_paths=ckpts,
-                config_path=getattr(args, "config", None),
-                split=getattr(args, "split", None),
-                samples=getattr(args, "samples", None),
-                batch_size=getattr(args, "batch_size", None),
-                output_dir=getattr(args, "output_dir", None),
-                threshold=getattr(args, "threshold", 0.5),
-                min_area=getattr(args, "min_area", 0),
-                morphology=getattr(args, "morphology", "none"),
-                segment=getattr(args, "segment", None),
-                overrides=getattr(args, "override", []),
-            )
-    return res
+    fn_kwargs = dict(
+        checkpoint_paths=ckpts,
+        config_path=getattr(args, "config", None),
+        split=getattr(args, "split", None),
+        samples=getattr(args, "samples", None),
+        batch_size=getattr(args, "batch_size", None),
+        output_dir=getattr(args, "output_dir", None),
+        threshold=getattr(args, "threshold", 0.5),
+        min_area=getattr(args, "min_area", 0),
+        morphology=getattr(args, "morphology", "none"),
+        segment=getattr(args, "segment", None),
+        overrides=getattr(args, "override", []),
+    )
+
+    return _execute_with_modal_app(eval_remote_t4, fn_kwargs, detach=detach, wait=wait)
 
 
 def run_tests_on_modal(
     pytest_args: Optional[List[str]] = None,
     volume_name: str = DEFAULT_VOLUME_NAME,
     gpu: str = DEFAULT_TEST_GPU,
+    detach: bool = True,
+    wait: bool = True,
 ) -> Dict[str, Any]:
-    """Launch pytest test suite on Modal using a cheap T4 GPU."""
+    """Launch pytest test suite on Modal using a cheap T4 GPU in detach mode."""
     ensure_modal_authenticated(exit_on_failure=True)
     get_or_create_volume(volume_name=volume_name)
 
     print(f"📦 Modal Volume: {volume_name} (mount: {DEFAULT_MOUNT_PATH})")
     print(f"🖥️ Running pytest on cheap GPU: {gpu}")
+    print(f"⚡ Detach Mode: {'Enabled (persistent execution)' if detach else 'Disabled (ephemeral)'}")
 
-    with modal.enable_output():
-        with app.run():
-            res = run_pytest_remote_t4.remote(pytest_args=pytest_args)
-    return res
+    fn_kwargs = dict(pytest_args=pytest_args)
+    return _execute_with_modal_app(run_pytest_remote_t4, fn_kwargs, detach=detach, wait=wait)
 
 
 def run_mock_test_on_modal(
     volume_name: str = DEFAULT_VOLUME_NAME,
     gpu: str = DEFAULT_TEST_GPU,
+    detach: bool = True,
+    wait: bool = True,
 ) -> Dict[str, Any]:
-    """Launch mock training/testing cycle on Modal with a cheap T4 GPU."""
+    """Launch mock training/testing cycle on Modal with a cheap T4 GPU in detach mode."""
     ensure_modal_authenticated(exit_on_failure=True)
     get_or_create_volume(volume_name=volume_name)
 
     print(f"📦 Modal Volume: {volume_name} (mount: {DEFAULT_MOUNT_PATH})")
     print(f"🖥️ Running synthetic mock test on cheap GPU: {gpu}")
+    print(f"⚡ Detach Mode: {'Enabled (persistent execution)' if detach else 'Disabled (ephemeral)'}")
 
-    with modal.enable_output():
-        with app.run():
-            res = mock_test_remote_t4.remote()
-    return res
+    return _execute_with_modal_app(mock_test_remote_t4, {}, detach=detach, wait=wait)
 
 
 # ==============================================================================
@@ -944,6 +1063,9 @@ def cli_main():
     train_p.add_argument("--volume", type=str, default=DEFAULT_VOLUME_NAME, help="Modal volume name")
     train_p.add_argument("--override", nargs="*", default=[], help="Config overrides")
     train_p.add_argument("--hf-token", "--hf_token", type=str, default=None, help="Hugging Face API token")
+    train_p.add_argument("--detach", dest="detach", action="store_true", default=True, help="Run Modal app in detached mode (default: True)")
+    train_p.add_argument("--no-detach", "--attached", dest="detach", action="store_false", help="Run Modal app in attached mode")
+    train_p.add_argument("--no-wait", "--nowait", dest="wait", action="store_false", default=True, help="Exit immediately after launching detached job")
 
     # Subcommand: eval
     eval_p = subparsers.add_parser("eval", help="Run evaluation/testing on Modal (cheap T4 GPU)")
@@ -955,17 +1077,26 @@ def cli_main():
     eval_p.add_argument("--gpu", type=str, default=DEFAULT_TEST_GPU, help="GPU type (default: cheap T4)")
     eval_p.add_argument("--volume", type=str, default=DEFAULT_VOLUME_NAME, help="Modal volume name")
     eval_p.add_argument("--hf-token", "--hf_token", type=str, default=None, help="Hugging Face API token")
+    eval_p.add_argument("--detach", dest="detach", action="store_true", default=True, help="Run Modal app in detached mode (default: True)")
+    eval_p.add_argument("--no-detach", "--attached", dest="detach", action="store_false", help="Run Modal app in attached mode")
+    eval_p.add_argument("--no-wait", "--nowait", dest="wait", action="store_false", default=True, help="Exit immediately after launching detached job")
 
     # Subcommand: test
     test_p = subparsers.add_parser("test", help="Run pytest test suite on Modal (cheap T4 GPU)")
     test_p.add_argument("pytest_args", nargs="*", default=["tests/test_config.py"], help="Pytest test targets/flags")
     test_p.add_argument("--gpu", type=str, default=DEFAULT_TEST_GPU, help="GPU type (default: cheap T4)")
     test_p.add_argument("--volume", type=str, default=DEFAULT_VOLUME_NAME, help="Modal volume name")
+    test_p.add_argument("--detach", dest="detach", action="store_true", default=True, help="Run Modal app in detached mode (default: True)")
+    test_p.add_argument("--no-detach", "--attached", dest="detach", action="store_false", help="Run Modal app in attached mode")
+    test_p.add_argument("--no-wait", "--nowait", dest="wait", action="store_false", default=True, help="Exit immediately after launching detached job")
 
     # Subcommand: mock-test
     mock_p = subparsers.add_parser("mock-test", help="Run mock synthetic train/test cycle on Modal (cheap T4 GPU)")
     mock_p.add_argument("--gpu", type=str, default=DEFAULT_TEST_GPU, help="GPU type (default: cheap T4)")
     mock_p.add_argument("--volume", type=str, default=DEFAULT_VOLUME_NAME, help="Modal volume name")
+    mock_p.add_argument("--detach", dest="detach", action="store_true", default=True, help="Run Modal app in detached mode (default: True)")
+    mock_p.add_argument("--no-detach", "--attached", dest="detach", action="store_false", help="Run Modal app in attached mode")
+    mock_p.add_argument("--no-wait", "--nowait", dest="wait", action="store_false", default=True, help="Exit immediately after launching detached job")
 
     args = parser.parse_args()
 
@@ -992,25 +1123,29 @@ def cli_main():
     elif args.command == "train":
         args.modal_volume = args.volume
         args.modal_gpu = args.gpu
-        res = run_train_on_modal(args, volume_name=args.volume, gpu=args.gpu)
+        res = run_train_on_modal(args, volume_name=args.volume, gpu=args.gpu, detach=args.detach, wait=args.wait)
         print("Training completed successfully on Modal.")
 
     elif args.command == "eval":
         args.modal_volume = args.volume
         args.modal_gpu = args.gpu
-        res = run_eval_on_modal(args, volume_name=args.volume, gpu=args.gpu)
+        res = run_eval_on_modal(args, volume_name=args.volume, gpu=args.gpu, detach=args.detach, wait=args.wait)
         print("Evaluation completed successfully on Modal.")
 
     elif args.command == "test":
-        res = run_tests_on_modal(pytest_args=args.pytest_args, volume_name=args.volume, gpu=args.gpu)
-        print(f"Remote pytest exited with returncode {res['returncode']}")
-        print(res["stdout"])
-        if res["stderr"]:
+        res = run_tests_on_modal(pytest_args=args.pytest_args, volume_name=args.volume, gpu=args.gpu, detach=args.detach, wait=args.wait)
+        if isinstance(res, list) and res and res[0].get("status") == "detached":
+            print(f"Tests detached on Modal.")
+            sys.exit(0)
+        print(f"Remote pytest exited with returncode {res.get('returncode', 0)}")
+        if 'stdout' in res:
+            print(res["stdout"])
+        if res.get("stderr"):
             print("STDERR:", res["stderr"])
-        sys.exit(res["returncode"])
+        sys.exit(res.get("returncode", 0))
 
     elif args.command == "mock-test":
-        res = run_mock_test_on_modal(volume_name=args.volume, gpu=args.gpu)
+        res = run_mock_test_on_modal(volume_name=args.volume, gpu=args.gpu, detach=args.detach, wait=args.wait)
         print(f"Mock test completed: {res}")
         sys.exit(0)
 

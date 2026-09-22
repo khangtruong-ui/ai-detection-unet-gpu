@@ -268,6 +268,28 @@ def parse_args():
         default=None,
         help="Hugging Face API token for authenticated dataset streaming and model downloads.",
     )
+    parser.add_argument(
+        "--detach",
+        dest="detach",
+        action="store_true",
+        default=True,
+        help="Run Modal app in detached mode to persist execution even if the local terminal disconnects (default: True).",
+    )
+    parser.add_argument(
+        "--no-detach",
+        "--attached",
+        dest="detach",
+        action="store_false",
+        help="Run Modal app in attached/ephemeral mode (terminates when local client exits).",
+    )
+    parser.add_argument(
+        "--no-wait",
+        "--nowait",
+        dest="wait",
+        action="store_false",
+        default=True,
+        help="Do not wait for training to finish; exit immediately after detaching the Modal job.",
+    )
     return parser.parse_args()
 
 

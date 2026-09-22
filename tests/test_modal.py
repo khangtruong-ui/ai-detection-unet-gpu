@@ -545,3 +545,126 @@ def test_run_train_on_modal_propagates_hf_token():
                         assert os.environ.get("HF_TOKEN") == "hf_test_token_propagation"
 
 
+# ==============================================================================
+# Detach Mode Tests
+# ==============================================================================
+
+def test_train_and_eval_cli_detach_mode_defaults():
+    """Verify train and eval CLIs default to detach=True and wait=True."""
+    with patch("sys.argv", ["sid-train", "--config", "configs/test_smoke.yaml"]):
+        args = train_parse_args()
+        assert args.detach is True
+        assert args.wait is True
+
+    with patch("sys.argv", ["sid-eval", "--checkpoint", "checkpoint.pt"]):
+        args = eval_parse_args()
+        assert args.detach is True
+        assert args.wait is True
+
+
+def test_train_and_eval_cli_detach_flags_toggle():
+    """Verify --no-detach and --no-wait flags toggle detach and wait properly."""
+    with patch("sys.argv", ["sid-train", "--config", "configs/test_smoke.yaml", "--no-detach", "--no-wait"]):
+        args = train_parse_args()
+        assert args.detach is False
+        assert args.wait is False
+
+    with patch("sys.argv", ["sid-train", "--config", "configs/test_smoke.yaml", "--attached", "--nowait"]):
+        args = train_parse_args()
+        assert args.detach is False
+        assert args.wait is False
+
+    with patch("sys.argv", ["sid-eval", "--checkpoint", "checkpoint.pt", "--no-detach", "--no-wait"]):
+        args = eval_parse_args()
+        assert args.detach is False
+        assert args.wait is False
+
+
+def test_run_train_on_modal_runs_in_detach_mode_by_default():
+    """Verify run_train_on_modal executes app.run with detach=True."""
+    mock_args = argparse.Namespace(
+        config=["configs/test_smoke.yaml"],
+        modal_volume=DEFAULT_VOLUME_NAME,
+        modal_gpu="L40S",
+        override=[],
+        output_dir="outputs/RUN/smoke",
+        resume=None,
+        resume_repo=None,
+        auto_resume=True,
+        skip_collision=True,
+        save_latest=None,
+        batch_size=None,
+        auto_batch_size=None,
+        val_samples_per_epoch=None,
+        checkpoint_period=None,
+        checkpoint_steps=None,
+        detach=True,
+        wait=True,
+    )
+    with patch("sid_unet.modal_runner.ensure_modal_authenticated", return_value=True):
+        with patch("sid_unet.modal_runner.get_or_create_volume"):
+            with patch("sid_unet.modal_runner.app.run") as mock_app_run:
+                with patch("sid_unet.modal_runner.train_remote_l40s.remote", return_value=[{"score": 0.9}]) as mock_remote:
+                    res = run_train_on_modal(mock_args)
+                    mock_app_run.assert_called_with(detach=True)
+                    assert mock_remote.called
+
+
+def test_run_train_on_modal_no_wait_spawns_without_blocking():
+    """Verify run_train_on_modal with wait=False spawns the remote task and returns immediately."""
+    mock_args = argparse.Namespace(
+        config=["configs/test_smoke.yaml"],
+        modal_volume=DEFAULT_VOLUME_NAME,
+        modal_gpu="L40S",
+        override=[],
+        output_dir="outputs/RUN/smoke",
+        resume=None,
+        resume_repo=None,
+        auto_resume=True,
+        skip_collision=True,
+        save_latest=None,
+        batch_size=None,
+        auto_batch_size=None,
+        val_samples_per_epoch=None,
+        checkpoint_period=None,
+        checkpoint_steps=None,
+        detach=True,
+        wait=False,
+    )
+    mock_fc = MagicMock()
+    mock_fc.object_id = "fc-test12345"
+
+    with patch("sid_unet.modal_runner.ensure_modal_authenticated", return_value=True):
+        with patch("sid_unet.modal_runner.get_or_create_volume"):
+            with patch("sid_unet.modal_runner.app.run") as mock_app_run:
+                with patch("sid_unet.modal_runner.train_remote_l40s.spawn", return_value=mock_fc) as mock_spawn:
+                    res = run_train_on_modal(mock_args, wait=False)
+                    mock_app_run.assert_called_with(detach=True)
+                    assert mock_spawn.called
+                    assert res[0]["call_id"] == "fc-test12345"
+                    assert res[0]["status"] == "detached"
+
+
+def test_execute_with_modal_app_retries_on_connection_error():
+    """Verify _execute_with_modal_app retries on transient connection failure."""
+    from sid_unet.modal_runner import _execute_with_modal_app
+
+    mock_target = MagicMock()
+    mock_target.remote.return_value = [{"result": "success"}]
+
+    call_count = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ConnectionError("Transient gRPC handshake failure")
+        return MagicMock()
+
+    with patch("sid_unet.modal_runner.app.run", side_effect=fail_once):
+        with patch("time.sleep"):  # do not delay test
+            res = _execute_with_modal_app(mock_target, {}, detach=True, wait=True, max_retries=2)
+            assert call_count == 2
+
+
+
