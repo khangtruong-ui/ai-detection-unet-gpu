@@ -53,7 +53,7 @@ def test_test_configs_loading():
 
 def test_all_experiment_configs_validity():
     import glob
-    import torch
+    torch = pytest.importorskip("torch")
     from sid_unet.models.unet import build_model
     from sid_unet.losses.auxiliary import build_loss
 

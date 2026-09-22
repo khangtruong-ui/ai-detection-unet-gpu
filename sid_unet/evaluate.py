@@ -25,24 +25,37 @@ import glob
 import json
 import os
 import shutil
+import sys
 from typing import Any, Dict, List, Optional
-import numpy as np
-import torch
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from tqdm import tqdm
 
-from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
-from sid_unet.losses.auxiliary import build_loss
-from sid_unet.metrics.classification import ClassificationMetricTracker
-from sid_unet.metrics.segmentation import SegmentationMetricTracker
-from sid_unet.models.sam3_refiner import get_sam_refiner
-from sid_unet.models.unet import UNet
-from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
-from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
-from sid_unet.utils.logger import setup_logger
-from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
-from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_eval_ablation_bar_chart
-from sid_unet.utils.report import generate_evaluation_report, generate_multi_experiment_report
+try:
+    from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
+    from sid_unet.losses.auxiliary import build_loss
+    from sid_unet.metrics.classification import ClassificationMetricTracker
+    from sid_unet.metrics.segmentation import SegmentationMetricTracker
+    from sid_unet.models.sam3_refiner import get_sam_refiner
+    from sid_unet.models.unet import UNet
+    from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
+    from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
+    from sid_unet.utils.logger import setup_logger
+    from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
+    from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_eval_ablation_bar_chart
+    from sid_unet.utils.report import generate_evaluation_report, generate_multi_experiment_report
+except ImportError:
+    pass
 
 
 def parse_args():
@@ -185,6 +198,35 @@ def parse_args():
         dest="skip_collision",
         action="store_false",
         help="Disable collision checking and force re-evaluation of all checkpoints.",
+    )
+    # Modal execution flags
+    parser.add_argument(
+        "--modal",
+        action="store_true",
+        default=False,
+        help="Execute evaluation on Modal cloud GPU infrastructure.",
+    )
+    parser.add_argument(
+        "--local",
+        "--no-modal",
+        dest="local",
+        action="store_true",
+        default=False,
+        help="Force local evaluation execution (disables auto-defaulting to Modal when no local GPU exists).",
+    )
+    parser.add_argument(
+        "--modal-gpu",
+        "--modal_gpu",
+        type=str,
+        default="T4",
+        help="GPU type to allocate on Modal (default: cheap T4 for testing/evaluation).",
+    )
+    parser.add_argument(
+        "--modal-volume",
+        "--modal_volume",
+        type=str,
+        default="sid-unet-data",
+        help="Persistent Modal Volume name (default: sid-unet-data).",
     )
     return parser.parse_args()
 
@@ -752,6 +794,37 @@ def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
 
 def main():
     args = parse_args()
+
+    # Modal execution routing:
+    # 1. If --modal is passed -> execute on Modal
+    # 2. If --local is passed -> run locally
+    # 3. Default: if no local GPU is available -> default to Modal
+    from sid_unet.modal_runner import has_local_gpu, ensure_modal_authenticated, run_eval_on_modal
+
+    use_modal = getattr(args, "modal", False)
+    force_local = getattr(args, "local", False)
+
+    if not use_modal and not force_local:
+        if not has_local_gpu():
+            use_modal = True
+
+    if use_modal:
+        ensure_modal_authenticated(exit_on_failure=True)
+        print("\n" + "=" * 70)
+        if not has_local_gpu():
+            print("⚡ No local GPU detected. Defaulting to evaluation/testing on Modal (cheap T4 GPU)...")
+        else:
+            print("🚀 Launching evaluation/testing on Modal...")
+        print("=" * 70 + "\n")
+        return run_eval_on_modal(args)
+
+    if torch is None:
+        sys.stderr.write(
+            "\n❌ Error: Local evaluation requested or running locally, but PyTorch is not installed.\n"
+            "Please install GPU dependencies via `pip install -e '.[gpu]'` or run with `--modal`.\n\n"
+        )
+        sys.exit(1)
+
     raw_patterns = args.checkpoint if isinstance(args.checkpoint, list) else [args.checkpoint]
     checkpoint_paths = expand_checkpoint_patterns(raw_patterns)
 

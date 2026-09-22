@@ -24,16 +24,22 @@ try:
 except ImportError:
     pass
 
-from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+try:
+    from PIL import ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+except ImportError:
+    pass
 
-from sid_unet.postprocessing import (
-    MaskPostProcessor,
-    remove_small_components,
-    fill_mask_holes,
-    apply_morphology,
-    get_postprocessor_from_config,
-)
+try:
+    from sid_unet.postprocessing import (
+        MaskPostProcessor,
+        remove_small_components,
+        fill_mask_holes,
+        apply_morphology,
+        get_postprocessor_from_config,
+    )
+except ImportError:
+    pass
 
 __all__ = [
     "__version__",

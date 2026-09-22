@@ -16,40 +16,53 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import sys
 from typing import Any, Dict, List, Optional
-import numpy as np
-from PIL import ImageFile
-import torch
 
-# Ensure PIL handles truncated images during dataset loading and training
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
-from sid_unet.dataset.loader import create_dataloaders
-from sid_unet.training.trainer import Trainer
-from sid_unet.utils.checkpoint import (
-    find_auto_resume_checkpoint,
-    download_hf_checkpoint,
-    is_hf_repo_id,
-    inspect_checkpoint,
-    format_resume_notification,
-    format_no_resume_notification,
-)
+try:
+    from PIL import ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+except ImportError:
+    pass
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from sid_unet.utils.config import load_config, save_config
-from sid_unet.utils.logger import setup_logger
-from sid_unet.utils.plotting import plot_multi_experiment_curves
-from sid_unet.utils.report import generate_multi_experiment_report
-
+try:
+    from sid_unet.utils.logger import setup_logger
+    from sid_unet.utils.plotting import plot_multi_experiment_curves
+    from sid_unet.utils.report import generate_multi_experiment_report
+    from sid_unet.utils.checkpoint import (
+        find_auto_resume_checkpoint,
+        download_hf_checkpoint,
+        is_hf_repo_id,
+        inspect_checkpoint,
+        format_resume_notification,
+        format_no_resume_notification,
+    )
+except ImportError:
+    pass
 
 
 def set_seed(seed: int = 42):
     """Set deterministic seeds."""
     random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+    if np is not None:
+        np.random.seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
 
 def parse_args():
@@ -114,7 +127,7 @@ def parse_args():
         dest="use_8bit_optimizer",
         action="store_true",
         default=False,
-        help="Enable 8-bit AdamW optimizer via bitsandbytes (saves 75% optimizer VRAM)",
+        help="Enable 8-bit AdamW optimizer via bitsandbytes (saves 75%% optimizer VRAM)",
     )
     parser.add_argument(
         "--check-8bit",
@@ -219,6 +232,35 @@ def parse_args():
         action="store_false",
         help="Disable collision checking and force retraining/evaluation.",
     )
+    # Modal execution flags
+    parser.add_argument(
+        "--modal",
+        action="store_true",
+        default=False,
+        help="Execute training on Modal cloud GPU infrastructure.",
+    )
+    parser.add_argument(
+        "--local",
+        "--no-modal",
+        dest="local",
+        action="store_true",
+        default=False,
+        help="Force local training execution (disables auto-defaulting to Modal when no local GPU exists).",
+    )
+    parser.add_argument(
+        "--modal-gpu",
+        "--modal_gpu",
+        type=str,
+        default="A10G",
+        help="GPU type to allocate on Modal (e.g. 'A10G', 'T4', 'A100') (default: A10G).",
+    )
+    parser.add_argument(
+        "--modal-volume",
+        "--modal_volume",
+        type=str,
+        default="sid-unet-data",
+        help="Persistent Modal Volume name (default: sid-unet-data).",
+    )
     return parser.parse_args()
 
 
@@ -234,6 +276,14 @@ def train_single_run(
     skip_collision: bool = True,
 ) -> Dict[str, Any]:
     """Execute a single training experiment with its given config."""
+    if torch is None or np is None:
+        raise RuntimeError(
+            "Local training requires PyTorch and NumPy. "
+            "Please install full GPU dependencies via `pip install -e '.[gpu]'` or run with `--modal`."
+        )
+    from sid_unet.dataset.loader import create_dataloaders
+    from sid_unet.training.trainer import Trainer
+
     config = load_config(config_path, overrides=overrides or [])
 
     # Set random seed
@@ -403,6 +453,36 @@ def train_single_run(
 
 def main():
     args = parse_args()
+
+    # Modal execution routing:
+    # 1. If --modal is passed -> execute on Modal
+    # 2. If --local is passed -> run locally
+    # 3. Default: if no local GPU is available -> default to Modal
+    from sid_unet.modal_runner import has_local_gpu, ensure_modal_authenticated, run_train_on_modal
+
+    use_modal = getattr(args, "modal", False)
+    force_local = getattr(args, "local", False)
+
+    if not use_modal and not force_local:
+        if not has_local_gpu():
+            use_modal = True
+
+    if use_modal:
+        ensure_modal_authenticated(exit_on_failure=True)
+        print("\n" + "=" * 70)
+        if not has_local_gpu():
+            print("⚡ No local GPU detected. Defaulting to training on Modal...")
+        else:
+            print("🚀 Launching training on Modal as requested...")
+        print("=" * 70 + "\n")
+        return run_train_on_modal(args)
+
+    if torch is None:
+        sys.stderr.write(
+            "\n❌ Error: Local execution requested or running locally, but PyTorch is not installed.\n"
+            "Please install GPU dependencies via `pip install -e '.[gpu]'` or run with `--modal`.\n\n"
+        )
+        sys.exit(1)
 
     if getattr(args, "check_8bit", False):
         from sid_unet.utils.compatibility import check_8bit_compatibility, format_compatibility_table

@@ -692,14 +692,32 @@ Both training (`sid-train`) and evaluation (`sid-eval`, `sid-cross-eval`) native
 
 ## Installation
 
-Install in editable mode using `pip` or `uv`:
+### 1. Lightweight Installation (When GPU is Not Available Locally - Modal Only)
+
+When working on a local machine, laptop, or CPU-only environment without a local CUDA GPU, install only the lightweight facilities required to configure, launch, and monitor jobs on **Modal cloud GPUs**:
 
 ```bash
 # Clone and enter directory
-cd /workspace
+git clone https://github.com/khangtruong-ui/ai-detection-unet-gpu.git
+cd ai-detection-unet-gpu
 
-# Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu, sid-check-8bit)
+# Installs only lightweight Modal execution facilities (Modal, PyYAML, Click, Tabulate, Tqdm)
+# No massive multi-gigabyte CUDA/PyTorch wheels needed locally!
 pip install -e .
+# or explicitly:
+pip install -e ".[modal]"
+
+# Verify Modal authentication
+sid-modal auth-check
+```
+
+### 2. Local GPU Installation (For Local CUDA Training & Inference)
+
+To train or evaluate locally using local NVIDIA GPUs:
+
+```bash
+# Install local GPU dependencies (PyTorch, Torchvision, Datasets, Diffusers, etc.)
+pip install -e ".[gpu]"
 
 # Or with 8-bit training dependencies (bitsandbytes):
 pip install -e ".[8bit]"
@@ -709,13 +727,60 @@ sid-check-8bit
 # or via training CLI:
 python -m sid_unet.train --check-8bit
 
-# Or using uv (compatible with torch>=2.5.0, preserving your existing PyTorch installation):
-uv pip install -e .
-
 # With development and testing dependencies:
 pip install -e ".[dev]"
-# or:
-uv pip install -e ".[dev]"
+```
+
+---
+
+## Modal Cloud GPU Integration
+
+SID-UNet features first-class, seamless **Modal** cloud integration:
+
+- **Authentication Detection**: Detects if Modal credentials exist (`modal setup` or `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`). If unauthenticated, execution halts immediately with clear instructions.
+- **Automatic GPU Fallback**: If no local CUDA GPU is available, `sid-train` and `sid-eval` automatically default to executing on Modal!
+- **Persistent Volume Management**: Automatically provisions the persistent Modal Volume (`sid-unet-data`, mounted at `/vol`) if it does not already exist.
+- **Organized Volume Storage**: Outputs and checkpoints are structured predictably inside the volume:
+  - `/vol/outputs/RUN/{experiment}/checkpoints/`
+  - `/vol/outputs/RUN/{experiment}/reports/`
+  - `/vol/outputs/RUN/{experiment}/illustrations/`
+  - `/vol/test_outputs/` (for mock runs and test reports)
+- **Cheap GPU for Testing / Mock Tests**: Allocates cheap **Nvidia T4** GPUs (~$0.59/hr) for evaluation, test suites, and mock testing, while allocating **A10G** or user-specified GPUs for heavy training.
+
+### Modal CLI (`sid-modal`)
+
+```bash
+# Verify Modal authentication status
+sid-modal auth-check
+
+# Inspect or create the persistent Modal Volume
+sid-modal volume-info
+
+# Run training on Modal (A10G by default, or specify --gpu)
+sid-modal train --config configs/train_streaming.yaml
+sid-modal train --config configs/test_smoke.yaml --gpu T4
+
+# Run evaluation on Modal (cheap T4 GPU by default)
+sid-modal eval --checkpoint outputs/RUN/unet_wide_b32/checkpoints/checkpoint_best.pt
+
+# Run pytest test suite on Modal using a cheap T4 GPU
+sid-modal test
+
+# Run synthetic mock training/testing cycle on Modal using cheap T4 GPU
+sid-modal mock-test
+```
+
+### Automatic Modal Defaulting
+
+```bash
+# When on a machine without a local GPU, this automatically routes to Modal!
+sid-train --config configs/train_streaming.yaml
+
+# Force running locally (disabling Modal default)
+sid-train --config configs/test_smoke.yaml --local
+
+# Force running on Modal explicitly
+sid-train --config configs/test_smoke.yaml --modal
 ```
 
 ---

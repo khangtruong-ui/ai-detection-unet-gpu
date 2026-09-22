@@ -9,13 +9,19 @@ from __future__ import annotations
 import logging
 import sys
 from typing import Any, Dict, Optional, Tuple, Union
-import torch
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger("sid_unet.utils.compatibility")
 
 
 def check_8bit_compatibility(
-    device: Optional[Union[str, torch.device]] = None,
+    device: Optional[Union[str, Any]] = None,
     verbose: bool = False,
     custom_logger: Optional[Any] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
@@ -38,14 +44,14 @@ def check_8bit_compatibility(
         Tuple of (is_compatible: bool, details_dict: dict)
     """
     log = custom_logger or logger
-    cuda_available = torch.cuda.is_available()
+    cuda_available = torch.cuda.is_available() if torch is not None else False
     device_name = "None"
     compute_capability = (0, 0)
     device_index = 0
     fp8_hardware_supported = False
-    fp8_torch_supported = hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e5m2")
+    fp8_torch_supported = (hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e5m2")) if torch is not None else False
 
-    if cuda_available:
+    if cuda_available and torch is not None:
         try:
             if device is not None:
                 dev = torch.device(device)
@@ -192,7 +198,7 @@ def format_compatibility_table(details: Dict[str, Any]) -> str:
 
 
 def validate_8bit_environment(
-    device: Optional[Union[str, torch.device]] = None,
+    device: Optional[Union[str, Any]] = None,
     raise_error: bool = False,
     custom_logger: Optional[Any] = None,
 ) -> bool:
