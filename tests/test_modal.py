@@ -472,6 +472,185 @@ def test_smart_progress_bar_manual_update_and_context_manager():
         test_logger.removeHandler(handler)
 
 
+def test_smart_progress_bar_streaming_dataset_without_len():
+    """
+    Verify SmartProgressBar handles iterables whose __len__ raises TypeError
+    (e.g., PyTorch DataLoader wrapping SIDStreamingDataset when max_samples is None)
+    without crashing in clean logging mode.
+    """
+    class MockStreamingIterable:
+        def __init__(self, count: int = 5):
+            self.count = count
+
+        def __iter__(self):
+            for i in range(self.count):
+                yield {"step": i}
+
+        def __len__(self):
+            raise TypeError("'SIDStreamingDataset' object has no len() when max_samples is None")
+
+    test_logger = logging.getLogger("test_streaming_logger")
+    test_logger.setLevel(logging.INFO)
+    records = []
+
+    class TestHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = TestHandler()
+    test_logger.addHandler(handler)
+
+    try:
+        mock_stream = MockStreamingIterable(count=4)
+
+        # 1. Test with explicit total=None (as returned by safe_dataloader_len)
+        pbar1 = create_progress_bar(
+            mock_stream,
+            desc="Epoch 1/10 [Train]",
+            total=None,
+            log_interval=1,
+            min_interval=0.0,
+            mode="clean",
+            logger=test_logger,
+        )
+        assert pbar1.total is None
+        items1 = []
+        for batch in pbar1:
+            items1.append(batch)
+            pbar1.set_postfix({"loss": "0.1234", "iou": "0.8500"})
+        pbar1.close()
+
+        assert len(items1) == 4
+        assert len(records) >= 4
+        assert "Epoch 1/10 [Train] [Step 1]" in records[0]
+        assert "loss: 0.1234" in records[0]
+        assert "%" not in records[0]  # Indeterminate progress bar has no percentage
+
+        records.clear()
+
+        # 2. Test without passing total argument (default None)
+        pbar2 = create_progress_bar(
+            mock_stream,
+            desc="Epoch 1/10 [Train]",
+            log_interval=1,
+            min_interval=0.0,
+            mode="clean",
+            logger=test_logger,
+        )
+        assert pbar2.total is None
+        items2 = list(pbar2)
+        assert len(items2) == 4
+        assert len(records) >= 4
+        assert "Epoch 1/10 [Train] [Step 4]" in records[-1]
+
+        records.clear()
+
+        # 3. Test with negative total (e.g. total=-1 from train_samples_per_epoch: -1)
+        pbar3 = create_progress_bar(
+            mock_stream,
+            desc="Epoch 1/10 [Train]",
+            total=-1,
+            log_interval=1,
+            min_interval=0.0,
+            mode="clean",
+            logger=test_logger,
+        )
+        assert pbar3.total is None
+        items3 = list(pbar3)
+        assert len(items3) == 4
+        assert len(records) >= 4
+    finally:
+        test_logger.removeHandler(handler)
+
+
+def test_smart_progress_bar_streaming_dataset_tqdm_mode():
+    """Verify SmartProgressBar handles iterables raising TypeError on __len__ in tqdm mode."""
+    class MockStreamingIterable:
+        def __iter__(self):
+            yield from [1, 2, 3]
+
+        def __len__(self):
+            raise TypeError("'SIDStreamingDataset' object has no len() when max_samples is None")
+
+    mock_stream = MockStreamingIterable()
+    pbar = create_progress_bar(
+        mock_stream,
+        desc="TqdmStreamTest",
+        total=None,
+        mode="tqdm",
+    )
+    assert pbar.total is None
+    items = list(pbar)
+    assert items == [1, 2, 3]
+
+
+def test_smart_progress_bar_generator_without_len():
+    """Verify SmartProgressBar handles generator iterables lacking __len__ attribute entirely."""
+    def gen():
+        for i in range(3):
+            yield i
+
+    test_logger = logging.getLogger("test_gen_logger")
+    test_logger.setLevel(logging.INFO)
+    records = []
+
+    class TestHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = TestHandler()
+    test_logger.addHandler(handler)
+
+    try:
+        pbar = create_progress_bar(
+            gen(),
+            desc="GenTest",
+            log_interval=1,
+            min_interval=0.0,
+            mode="clean",
+            logger=test_logger,
+        )
+        assert pbar.total is None
+        items = list(pbar)
+        assert items == [0, 1, 2]
+        assert len(records) >= 3
+        assert "GenTest [Step 3]" in records[-1]
+    finally:
+        test_logger.removeHandler(handler)
+
+
+def test_smart_progress_bar_manual_update_without_total():
+    """Verify SmartProgressBar works as context manager with manual updates when total is None."""
+    test_logger = logging.getLogger("test_manual_none_logger")
+    test_logger.setLevel(logging.INFO)
+    records = []
+
+    class TestHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = TestHandler()
+    test_logger.addHandler(handler)
+
+    try:
+        with create_progress_bar(
+            total=None,
+            desc="ManualIndeterminate",
+            log_interval=1,
+            min_interval=0.0,
+            mode="clean",
+            logger=test_logger,
+        ) as pbar:
+            assert pbar.total is None
+            for _ in range(3):
+                pbar.update(1)
+        assert len(records) >= 3
+        assert "ManualIndeterminate [Step 3]" in records[-1]
+        assert "%" not in records[-1]
+    finally:
+        test_logger.removeHandler(handler)
+
+
 # ==============================================================================
 # Hugging Face Authentication & Secret Tests
 # ==============================================================================

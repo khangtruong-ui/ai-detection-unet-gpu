@@ -81,7 +81,16 @@ class SmartProgressBar:
     ):
         self.iterable = iterable
         self.desc = desc or "Progress"
-        self.total = total if total is not None else (len(iterable) if hasattr(iterable, "__len__") else None)
+        if total is not None and total > 0:
+            self.total = total
+        elif iterable is not None:
+            try:
+                cand = len(iterable)
+                self.total = cand if cand > 0 else None
+            except (TypeError, NotImplementedError, AttributeError):
+                self.total = None
+        else:
+            self.total = None
         self.leave = leave
         self.logger = logger or logging.getLogger("SID_UNet")
         self.log_interval = max(1, log_interval)

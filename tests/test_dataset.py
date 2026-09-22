@@ -237,6 +237,23 @@ def test_safe_dataloader_len_and_streaming_len():
 
     assert safe_dataloader_len(None) is None
 
+    # Test BackgroundPrefetcher and create_progress_bar integration with lenless loader
+    from sid_unet.dataset.loader import BackgroundPrefetcher
+    from sid_unet.utils.logger import create_progress_bar
+
+    bg_lenless = BackgroundPrefetcher(dl_lenless)
+    assert hasattr(bg_lenless, "__len__")
+    assert safe_dataloader_len(bg_lenless) is None
+
+    pbar_dl = create_progress_bar(dl_lenless, total=safe_dataloader_len(dl_lenless))
+    assert pbar_dl.total is None
+
+    pbar_bg = create_progress_bar(bg_lenless, total=safe_dataloader_len(bg_lenless))
+    assert pbar_bg.total is None
+
+    pbar_bg_default = create_progress_bar(bg_lenless)
+    assert pbar_bg_default.total is None
+
     # Test SIDStreamingDataset __len__
     ds_with_max = SIDStreamingDataset(max_samples=50)
     assert len(ds_with_max) == 50
