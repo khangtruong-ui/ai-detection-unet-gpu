@@ -251,8 +251,8 @@ def parse_args():
         "--modal-gpu",
         "--modal_gpu",
         type=str,
-        default="A10G",
-        help="GPU type to allocate on Modal (e.g. 'A10G', 'T4', 'A100') (default: A10G).",
+        default="L40S",
+        help="GPU type to allocate on Modal (e.g. 'L40S', 'L4', 'T4', 'A10G') (default: L40S - cheapest price/TFLOPS under $2/hr).",
     )
     parser.add_argument(
         "--modal-volume",

@@ -4,7 +4,7 @@ except ImportError:
     pass
 
 try:
-    from sid_unet.utils.logger import setup_logger, MetricLogger
+    from sid_unet.utils.logger import setup_logger, MetricLogger, SmartProgressBar, create_progress_bar, is_modal_environment
 except ImportError:
     pass
 

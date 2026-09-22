@@ -745,7 +745,12 @@ SID-UNet features first-class, seamless **Modal** cloud integration:
   - `/vol/outputs/RUN/{experiment}/reports/`
   - `/vol/outputs/RUN/{experiment}/illustrations/`
   - `/vol/test_outputs/` (for mock runs and test reports)
-- **Cheap GPU for Testing / Mock Tests**: Allocates cheap **Nvidia T4** GPUs (~$0.59/hr) for evaluation, test suites, and mock testing, while allocating **A10G** or user-specified GPUs for heavy training.
+- **Cost-Optimized GPU Selection**:
+  - **Training Default (L40S)**: Defaults to **Nvidia L40S** ($1.95/hr, 733 BF16 TFLOPS, **$0.00266/TFLOP**) — the highest TFLOP-per-dollar efficiency on Modal strictly under $2.00/hr (over 3.3x more compute per dollar than A10G). Also supports **L4** ($0.80/hr, 242 TFLOPS, $0.00331/TFLOP), **A10G** ($1.10/hr), and **T4**.
+  - **Cheap Testing Default (T4)**: Allocates cheap **Nvidia T4** GPUs (~$0.59/hr) for quick evaluation, smoke runs, unit test suites, and mock testing.
+- **Clean Cloud Progress Bar (Zero TQDM Carriage-Return Spam)**:
+  - Incorporates adaptive `SmartProgressBar` that detects Modal cloud execution (`is_modal_environment()`).
+  - Replaces rapid carriage-return (`\r`) terminal redraws with clean, periodic, single-line log entries (`[Step X/Y (Z%)] | loss: ... [00:10<01:20, 2.00 it/s]`), preventing thousands of lines of log clutter while preserving smooth live animation in local interactive TTYs.
 
 ### Modal CLI (`sid-modal`)
 
@@ -756,8 +761,9 @@ sid-modal auth-check
 # Inspect or create the persistent Modal Volume
 sid-modal volume-info
 
-# Run training on Modal (A10G by default, or specify --gpu)
+# Run training on Modal (L40S by default, or specify --gpu)
 sid-modal train --config configs/train_streaming.yaml
+sid-modal train --config configs/train_streaming.yaml --gpu L4
 sid-modal train --config configs/test_smoke.yaml --gpu T4
 
 # Run evaluation on Modal (cheap T4 GPU by default)

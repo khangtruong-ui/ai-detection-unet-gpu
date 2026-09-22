@@ -11,6 +11,7 @@ Tests for Modal cloud execution engine:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -36,6 +37,11 @@ from sid_unet.modal_runner import (
 )
 from sid_unet.train import parse_args as train_parse_args
 from sid_unet.evaluate import parse_args as eval_parse_args
+from sid_unet.utils.logger import (
+    SmartProgressBar,
+    create_progress_bar,
+    is_modal_environment,
+)
 
 
 # ==============================================================================
@@ -167,9 +173,9 @@ def test_get_volume_output_dir_test_outputs():
 # ==============================================================================
 
 def test_cheap_gpu_configuration():
-    """Verify default GPU allocation distinguishes cheap test GPU (T4) vs train GPU (A10G)."""
+    """Verify default GPU allocation distinguishes cheap test GPU (T4) vs high-efficiency train GPU (L40S)."""
     assert DEFAULT_TEST_GPU == "T4"
-    assert DEFAULT_TRAIN_GPU == "A10G"
+    assert DEFAULT_TRAIN_GPU == "L40S"
 
 
 def test_eval_uses_cheap_gpu_by_default():
@@ -180,12 +186,12 @@ def test_eval_uses_cheap_gpu_by_default():
         assert args.modal_gpu == "T4"
 
 
-def test_train_uses_a10g_by_default():
-    """Verify training defaults to standard A10G GPU."""
+def test_train_uses_l40s_by_default():
+    """Verify training defaults to L40S GPU (cheapest price over TFLOPS under $2/hr)."""
     test_args = ["sid-train", "--config", "configs/train_streaming.yaml"]
     with patch("sys.argv", test_args):
         args = train_parse_args()
-        assert args.modal_gpu == "A10G"
+        assert args.modal_gpu == "L40S"
 
 
 # ==============================================================================
@@ -323,3 +329,142 @@ def test_run_tests_on_modal_invokes_remote():
                     res = run_tests_on_modal(pytest_args=["tests/test_config.py"])
                     assert mock_remote.called
                     assert res["returncode"] == 0
+
+
+def test_run_train_on_modal_defaults_to_l40s():
+    """Verify run_train_on_modal defaults to train_remote_l40s."""
+    mock_args = argparse.Namespace(
+        config=["configs/test_smoke.yaml"],
+        modal_volume=DEFAULT_VOLUME_NAME,
+        modal_gpu="L40S",
+        override=[],
+        output_dir="outputs/RUN/smoke",
+        resume=None,
+        resume_repo=None,
+        auto_resume=True,
+        skip_collision=True,
+        save_latest=None,
+        batch_size=None,
+        auto_batch_size=None,
+        val_samples_per_epoch=None,
+        checkpoint_period=None,
+        checkpoint_steps=None,
+    )
+    with patch("sid_unet.modal_runner.ensure_modal_authenticated", return_value=True):
+        with patch("sid_unet.modal_runner.get_or_create_volume"):
+            with patch("sid_unet.modal_runner.app.run"):
+                with patch("sid_unet.modal_runner.train_remote_l40s.remote", return_value=[{"score": 0.95}]) as mock_remote:
+                    res = run_train_on_modal(mock_args)
+                    assert mock_remote.called
+                    assert res == [{"score": 0.95}]
+
+
+def test_run_train_on_modal_routes_to_l4():
+    """Verify run_train_on_modal routes to train_remote_l4 when requested."""
+    mock_args = argparse.Namespace(
+        config=["configs/test_smoke.yaml"],
+        modal_volume=DEFAULT_VOLUME_NAME,
+        modal_gpu="L4",
+        override=[],
+        output_dir="outputs/RUN/smoke",
+        resume=None,
+        resume_repo=None,
+        auto_resume=True,
+        skip_collision=True,
+        save_latest=None,
+        batch_size=None,
+        auto_batch_size=None,
+        val_samples_per_epoch=None,
+        checkpoint_period=None,
+        checkpoint_steps=None,
+    )
+    with patch("sid_unet.modal_runner.ensure_modal_authenticated", return_value=True):
+        with patch("sid_unet.modal_runner.get_or_create_volume"):
+            with patch("sid_unet.modal_runner.app.run"):
+                with patch("sid_unet.modal_runner.train_remote_l4.remote", return_value=[{"score": 0.93}]) as mock_remote:
+                    res = run_train_on_modal(mock_args, gpu="L4")
+                    assert mock_remote.called
+                    assert res == [{"score": 0.93}]
+
+
+# ==============================================================================
+# Progress Bar & Modal Environment Logging Tests
+# ==============================================================================
+
+def test_is_modal_environment_detection():
+    """Verify is_modal_environment correctly detects Modal env vars and modes."""
+    with patch.dict(os.environ, {"MODAL_TASK_ID": "task-12345"}, clear=True):
+        assert is_modal_environment() is True
+
+    with patch.dict(os.environ, {"MODAL_LOG_FORMAT": "PLAIN"}, clear=True):
+        assert is_modal_environment() is True
+
+    with patch.dict(os.environ, {"SID_PROGRESS_MODE": "clean"}, clear=True):
+        assert is_modal_environment() is True
+
+    with patch.dict(os.environ, {"SID_PROGRESS_MODE": "tqdm"}, clear=True):
+        assert is_modal_environment() is False
+
+
+def test_smart_progress_bar_clean_mode():
+    """Verify SmartProgressBar clean logging mode outputs periodic structured logs without \\r spam."""
+    test_logger = logging.getLogger("test_clean_logger")
+    test_logger.setLevel(logging.INFO)
+    records = []
+
+    class TestHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = TestHandler()
+    test_logger.addHandler(handler)
+
+    try:
+        items = list(range(10))
+        pbar = create_progress_bar(
+            items,
+            desc="CleanTest",
+            total=10,
+            log_interval=2,
+            min_interval=0.0,
+            mode="clean",
+            logger=test_logger,
+        )
+        for i in pbar:
+            pbar.set_postfix({"loss": f"{1.0 / (i + 1):.4f}"})
+
+        pbar.close()
+
+        assert len(records) > 0
+        # Check formatted message contents
+        first_log = records[0]
+        assert "CleanTest [Step" in first_log
+        assert "loss:" in first_log
+        assert "\r" not in first_log
+    finally:
+        test_logger.removeHandler(handler)
+
+
+def test_smart_progress_bar_manual_update_and_context_manager():
+    """Verify SmartProgressBar works as context manager with manual updates."""
+    test_logger = logging.getLogger("test_cm_logger")
+    test_logger.setLevel(logging.INFO)
+    records = []
+
+    class TestHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = TestHandler()
+    test_logger.addHandler(handler)
+
+    try:
+        with create_progress_bar(total=5, desc="ManualTest", log_interval=1, min_interval=0.0, mode="clean", logger=test_logger) as pbar:
+            pbar.set_description("UpdatedDesc")
+            for _ in range(5):
+                pbar.update(1)
+        assert len(records) >= 5
+        assert "UpdatedDesc [Step 5/5 (100.0%)]" in records[-1]
+    finally:
+        test_logger.removeHandler(handler)
+

@@ -38,9 +38,8 @@ try:
 except ImportError:
     torch = None
 
-from tqdm import tqdm
-
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
+from sid_unet.utils.logger import create_progress_bar, setup_logger
 try:
     from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
     from sid_unet.losses.auxiliary import build_loss
@@ -535,7 +534,14 @@ def evaluate_single_checkpoint(
 
     clear_memory_cache(device)
     eval_total = safe_dataloader_len(eval_loader)
-    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True)
+    pbar = create_progress_bar(
+        eval_loader,
+        desc=f"Evaluating [{run_name}] ({resolved_split})",
+        total=eval_total,
+        leave=True,
+        logger=logger,
+        log_interval=10,
+    )
     with torch.no_grad():
         for batch in pbar:
             b_sz = len(batch["image"])

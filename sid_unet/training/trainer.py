@@ -13,7 +13,6 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from sid_unet.dataset.loader import safe_dataloader_len
 from sid_unet.losses.auxiliary import SIDTotalLoss, build_loss
@@ -21,7 +20,7 @@ from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.training.callbacks import CheckpointManager, EarlyStopping
-from sid_unet.utils.logger import MetricLogger, setup_logger
+from sid_unet.utils.logger import MetricLogger, setup_logger, create_progress_bar
 from sid_unet.utils.memory import (
     auto_scale_batch_size_and_grad_accum,
     clear_memory_cache,
@@ -532,11 +531,13 @@ class Trainer:
         self.model.train()
         metric_logger = MetricLogger()
         total_batches = safe_dataloader_len(self.train_loader)
-        pbar = tqdm(
+        pbar = create_progress_bar(
             self.train_loader,
             desc=f"Epoch {epoch}/{self.epochs} [Train]",
             total=total_batches,
             leave=False,
+            logger=self.logger,
+            log_interval=getattr(self, "log_interval", 10),
         )
 
         self.optimizer.zero_grad()
@@ -712,7 +713,14 @@ class Trainer:
 
         desc_str = f"Epoch {epoch}/{self.epochs} [{split_name.title()}]" if epoch is not None else f"Evaluating [{split_name.title()}]"
         val_total = safe_dataloader_len(target_loader)
-        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False)
+        pbar = create_progress_bar(
+            target_loader,
+            desc=desc_str,
+            total=val_total,
+            leave=False,
+            logger=self.logger,
+            log_interval=getattr(self, "log_interval", 10),
+        )
 
         try:
             for batch in pbar:

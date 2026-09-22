@@ -28,8 +28,11 @@ DEFAULT_OUTPUT_DIR = f"{DEFAULT_MOUNT_PATH}/outputs"
 DEFAULT_RUNS_DIR = f"{DEFAULT_MOUNT_PATH}/outputs/RUN"
 DEFAULT_TEST_DIR = f"{DEFAULT_MOUNT_PATH}/test_outputs"
 
-# Cheap GPU for testing / mock tests vs standard GPU for training
-DEFAULT_TRAIN_GPU = "A10G"
+# Cost-effective GPUs on Modal:
+# - L40S: ~$1.95/hr, 733 BF16 TFLOPS ($0.00266/TFLOP - cheapest price over TFLOPS under $2/hr)
+# - L4:   ~$0.80/hr, 242 BF16 TFLOPS ($0.00331/TFLOP - ultra low cost Ada Lovelace)
+# - T4:   ~$0.59/hr, cheap testing / mock test GPU
+DEFAULT_TRAIN_GPU = "L40S"
 DEFAULT_TEST_GPU = "T4"
 
 # Repo root directory
@@ -201,6 +204,11 @@ def create_modal_image() -> modal.Image:
             "pytest-cov>=4.0.0",
             "bitsandbytes>=0.41.0",
         )
+        .env({
+            "MODAL_LOG_FORMAT": "PLAIN",
+            "SID_PROGRESS_MODE": "clean",
+            "PYTHONUNBUFFERED": "1",
+        })
     )
     # Add source code and configs
     if (PROJECT_ROOT / "sid_unet").is_dir():
@@ -224,7 +232,85 @@ volume = modal.Volume.from_name(DEFAULT_VOLUME_NAME, create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu=DEFAULT_TRAIN_GPU,
+    gpu="L40S",  # Cheapest price over TFLOPS under $2/hr: $1.95/hr for 733 BF16 TFLOPS ($0.00266/TFLOP)
+    volumes={DEFAULT_MOUNT_PATH: volume},
+    timeout=86400,
+)
+def train_remote_l40s(
+    config_paths: List[str],
+    overrides: Optional[List[str]] = None,
+    output_dir: Optional[str] = None,
+    resume: Optional[str] = None,
+    resume_repo: Optional[str] = None,
+    auto_resume: bool = True,
+    skip_collision: bool = True,
+    save_latest: Optional[bool] = None,
+    batch_size: Optional[int] = None,
+    auto_batch_size: Optional[bool] = None,
+    val_samples_per_epoch: Optional[int] = None,
+    checkpoint_period: Optional[float] = None,
+    checkpoint_steps: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Execute training on Modal with an L40S GPU (cheapest price/TFLOPS, ~$1.95/hr)."""
+    return _execute_train_remote(
+        config_paths=config_paths,
+        overrides=overrides,
+        output_dir=output_dir,
+        resume=resume,
+        resume_repo=resume_repo,
+        auto_resume=auto_resume,
+        skip_collision=skip_collision,
+        save_latest=save_latest,
+        batch_size=batch_size,
+        auto_batch_size=auto_batch_size,
+        val_samples_per_epoch=val_samples_per_epoch,
+        checkpoint_period=checkpoint_period,
+        checkpoint_steps=checkpoint_steps,
+    )
+
+
+@app.function(
+    image=image,
+    gpu="L4",  # High cost-efficiency Ada Lovelace GPU ($0.80/hr for 242 BF16 TFLOPS = $0.00331/TFLOP)
+    volumes={DEFAULT_MOUNT_PATH: volume},
+    timeout=86400,
+)
+def train_remote_l4(
+    config_paths: List[str],
+    overrides: Optional[List[str]] = None,
+    output_dir: Optional[str] = None,
+    resume: Optional[str] = None,
+    resume_repo: Optional[str] = None,
+    auto_resume: bool = True,
+    skip_collision: bool = True,
+    save_latest: Optional[bool] = None,
+    batch_size: Optional[int] = None,
+    auto_batch_size: Optional[bool] = None,
+    val_samples_per_epoch: Optional[int] = None,
+    checkpoint_period: Optional[float] = None,
+    checkpoint_steps: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Execute training on Modal with an L4 GPU (~$0.80/hr)."""
+    return _execute_train_remote(
+        config_paths=config_paths,
+        overrides=overrides,
+        output_dir=output_dir,
+        resume=resume,
+        resume_repo=resume_repo,
+        auto_resume=auto_resume,
+        skip_collision=skip_collision,
+        save_latest=save_latest,
+        batch_size=batch_size,
+        auto_batch_size=auto_batch_size,
+        val_samples_per_epoch=val_samples_per_epoch,
+        checkpoint_period=checkpoint_period,
+        checkpoint_steps=checkpoint_steps,
+    )
+
+
+@app.function(
+    image=image,
+    gpu="A10G",
     volumes={DEFAULT_MOUNT_PATH: volume},
     timeout=86400,
 )
@@ -624,40 +710,32 @@ def run_train_on_modal(
     print(f"🖥️ Modal GPU: {chosen_gpu}")
     print(f"📋 Configs: {config_paths}")
 
+    remote_map = {
+        "L40S": train_remote_l40s,
+        "L40": train_remote_l40s,
+        "L4": train_remote_l4,
+        "A10G": train_remote_a10g,
+        "T4": train_remote_t4,
+    }
+    target_fn = remote_map.get(chosen_gpu, train_remote_l40s)
+
     with modal.enable_output():
         with app.run():
-            if chosen_gpu == "T4":
-                res = train_remote_t4.remote(
-                    config_paths=config_paths,
-                    overrides=getattr(args, "override", []),
-                    output_dir=getattr(args, "output_dir", None),
-                    resume=getattr(args, "resume", None),
-                    resume_repo=getattr(args, "resume_repo", None),
-                    auto_resume=getattr(args, "auto_resume", True),
-                    skip_collision=getattr(args, "skip_collision", True),
-                    save_latest=getattr(args, "save_latest", None),
-                    batch_size=getattr(args, "batch_size", None),
-                    auto_batch_size=getattr(args, "auto_batch_size", None),
-                    val_samples_per_epoch=getattr(args, "val_samples_per_epoch", None),
-                    checkpoint_period=getattr(args, "checkpoint_period", None),
-                    checkpoint_steps=getattr(args, "checkpoint_steps", None),
-                )
-            else:
-                res = train_remote_a10g.remote(
-                    config_paths=config_paths,
-                    overrides=getattr(args, "override", []),
-                    output_dir=getattr(args, "output_dir", None),
-                    resume=getattr(args, "resume", None),
-                    resume_repo=getattr(args, "resume_repo", None),
-                    auto_resume=getattr(args, "auto_resume", True),
-                    skip_collision=getattr(args, "skip_collision", True),
-                    save_latest=getattr(args, "save_latest", None),
-                    batch_size=getattr(args, "batch_size", None),
-                    auto_batch_size=getattr(args, "auto_batch_size", None),
-                    val_samples_per_epoch=getattr(args, "val_samples_per_epoch", None),
-                    checkpoint_period=getattr(args, "checkpoint_period", None),
-                    checkpoint_steps=getattr(args, "checkpoint_steps", None),
-                )
+            res = target_fn.remote(
+                config_paths=config_paths,
+                overrides=getattr(args, "override", []),
+                output_dir=getattr(args, "output_dir", None),
+                resume=getattr(args, "resume", None),
+                resume_repo=getattr(args, "resume_repo", None),
+                auto_resume=getattr(args, "auto_resume", True),
+                skip_collision=getattr(args, "skip_collision", True),
+                save_latest=getattr(args, "save_latest", None),
+                batch_size=getattr(args, "batch_size", None),
+                auto_batch_size=getattr(args, "auto_batch_size", None),
+                val_samples_per_epoch=getattr(args, "val_samples_per_epoch", None),
+                checkpoint_period=getattr(args, "checkpoint_period", None),
+                checkpoint_steps=getattr(args, "checkpoint_steps", None),
+            )
     return res
 
 

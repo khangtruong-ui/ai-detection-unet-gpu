@@ -21,7 +21,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
-from tqdm import tqdm
+from sid_unet.utils.logger import create_progress_bar, setup_logger
 
 from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
 from sid_unet.losses.auxiliary import build_loss
@@ -477,11 +477,13 @@ def evaluate_checkpoint_on_config(
 
     clear_memory_cache(device)
     eval_total = safe_dataloader_len(eval_loader)
-    pbar = tqdm(
+    pbar = create_progress_bar(
         eval_loader,
         desc=f"Cross-Eval [{ckpt_run_name} x {cfg_proj_name}] ({resolved_split})",
         total=eval_total,
         leave=False,
+        logger=logger,
+        log_interval=10,
     )
 
     with torch.no_grad():
