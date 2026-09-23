@@ -488,19 +488,30 @@ class Trainer:
 
             self.logger.info(f"🔬 [DEBUG MODE] Diagnostic report saved to: {json_path} and {html_path}")
 
+            # 1. Report what was analyzed and verified healthy (briefly)
+            healthy = getattr(diag_report, "healthy_findings", [f for f in diag_report.findings if not f.is_actionable()])
+            if healthy:
+                self.logger.info(f"✅ [DEBUG MODE] Verified healthy learnability dimensions ({len(healthy)}):")
+                for f in healthy:
+                    mod_info = f" [{f.module}]" if f.module else ""
+                    self.logger.info(f"   ✓ [HEALTHY] {f.category.upper()}{mod_info}: {f.observation}")
+
+            # 2. Report actionable findings (warnings / critical anomalies)
             actionables = diag_report.actionable_findings
             if actionables:
-                self.logger.warning(f"⚠️ [DEBUG MODE] {len(actionables)} actionable finding(s) detected:")
+                self.logger.warning(f"⚠️ [DEBUG MODE] {len(actionables)} actionable learnability issue(s) detected:")
                 for f in actionables:
-                    self.logger.warning(f"   [{f.severity.upper()}] {f.category}: {f.observation}")
+                    mod_info = f" [{f.module}]" if f.module else ""
+                    self.logger.warning(f"   ! [{f.severity.upper()}] {f.category.upper()}{mod_info}: {f.observation}")
             else:
-                self.logger.info("✅ [DEBUG MODE] All diagnostic checks passed cleanly.")
+                self.logger.info("🎉 [DEBUG MODE] All learnability diagnostic checks passed cleanly with zero warnings.")
 
+            # 3. Report prioritized investigation targets if any
             targets = diag_report.get_investigation_targets()
-            if targets:
-                self.logger.info("🎯 [DEBUG MODE] Top investigation targets:")
+            if targets and actionables:
+                self.logger.info("🎯 [DEBUG MODE] Prioritized investigation targets:")
                 for idx, t in enumerate(targets[:3], 1):
-                    hypos = f" ({', '.join(t['hypotheses'][:2])})" if t['hypotheses'] else ""
+                    hypos = f" (Hypotheses: {', '.join(t['hypotheses'][:2])})" if t['hypotheses'] else ""
                     self.logger.info(f"   {idx}. [{t['max_severity'].upper()}] {t['target']}{hypos}")
 
             self.diagnostic_report = diag_report

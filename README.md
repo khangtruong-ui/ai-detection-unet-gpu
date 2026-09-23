@@ -34,6 +34,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [8. Continuous Master Reports & Collision Skipping](#8-continuous-master-reports--collision-skipping)
   - [9. Automated Visual Illustration (`sid-illu`) & Heatmap Generation](#9-automated-visual-illustration-sid-illu--heatmap-generation)
   - [10. Memory Management & OOM Dynamic Auto-Recovery](#10-memory-management--oom-dynamic-auto-recovery)
+  - [11. Runtime Learnability Diagnostics & Debug Mode (nn-toolbox)](#11-runtime-learnability-diagnostics--debug-mode-nn-toolbox)
 - [Installation](#installation)
 - [Project Structure](#project-structure)
 - [Configuration System](#configuration-system)
@@ -690,6 +691,48 @@ Both training (`sid-train`) and evaluation (`sid-eval`, `sid-cross-eval`) native
 
 ---
 
+### 11. Runtime Learnability Diagnostics & Debug Mode (nn-toolbox)
+
+Before committing hours or days to a full training run, SID-UNet provides an automated **runtime learnability diagnostic laboratory** powered by the **`nn-toolbox`** package.
+
+Rather than mere metric logging or basic syntax/shape validation (which fails automatically at runtime), this diagnostic evaluates **fundamental learning viability**:
+1. **Signal Propagation Viability**: Measures activation standard deviations across every encoder, bottleneck, and decoder block to ensure forward signals neither explode ($>20\times$ amplification) nor vanish ($<0.05\times$ attenuation).
+2. **Backward Gradient Flow & Reachability**: Verifies that 100% of trainable parameters receive active gradients, detecting detached subgraphs, broken autograd chains, and vanishing gradients.
+3. **True Parameter Update Dynamics**: Computes the actual displacement-to-weight ratio $||\Delta \theta|| / ||\theta||$ after an optimizer step. This separates raw gradient magnitude from actual parameter progress, flagging dead learning rates, frozen weights, or explosive parameter divergence.
+4. **Verified Healthy Confirmations**: Clearly and concisely reports every analyzed dimension that is operating stably, giving the practitioner immediate confidence that signal pathways and update dynamics are healthy.
+5. **Prioritized Actionable Hypotheses**: When anomalies are detected, the tool highlights the specific layer/parameter target, formulates cautious causal hypotheses (e.g. *saturated activation functions*, *excessive regularization*, *detached tensor logic*), and suggests targeted remediation steps.
+6. **Active Diagnostic Experiments (`--debug-mode deep`)**:
+   - **Tiny-Batch Memorization Capacity (`overfit_test`)**: Tests whether the architecture and optimizer can memorize $N=1, 8$ samples, distinguishing optimization/loss capability from dataset capacity constraints.
+   - **Logarithmic Learning Rate Sweep (`lr_sweep`)**: Probes loss response across $10^{-6}$ to $10^{-1}$ to identify the stable learning regime versus divergence or stagnation.
+   - **Train/Eval Mode Consistency (`train_eval_test`)**: Isolates differences between `model.train()` and `model.eval()` to detect improper normalization state shifts or stochastic bugs.
+
+#### Running Diagnostics via CLI:
+```bash
+# Light mode: Non-destructive telemetry (signal propagation, gradient flow, update ratios)
+sid-train --config configs/default.yaml --debug
+
+# Deep mode: Includes tiny-batch memorization experiments and learning rate sweeps
+sid-train --config configs/default.yaml --debug --debug-mode deep
+```
+
+#### Diagnostic Artifacts Generated:
+- **Interactive HTML Report**: `reports/diagnostics/diagnostic_report.html` (visual status cards, verified healthy checks, actionable issues table, and layer metric progression).
+- **Structured JSON Report**: `reports/diagnostics/diagnostic_report.json` (machine-readable telemetry, metrics, and investigation targets).
+
+#### Example Console Output:
+```text
+[INFO] 🔬 [DEBUG MODE] Initializing nn-toolbox diagnostic laboratory (Mode: LIGHT)...
+[INFO] 🔬 [DEBUG MODE] Diagnostic report saved to: reports/diagnostics/diagnostic_report.json and .html
+[INFO] ✅ [DEBUG MODE] Verified healthy learnability dimensions (4):
+[INFO]    ✓ [HEALTHY] FORWARD: Forward activation propagation is stable across 16 layer(s) (std range: 0.56 - 1.00).
+[INFO]    ✓ [HEALTHY] BACKWARD: Active gradient flow verified on 100% of trainable parameters (48/48, mean norm: 3.42e-02).
+[INFO]    ✓ [HEALTHY] OPTIMIZATION: Healthy parameter update ratio: ||Δθ||/||θ|| = 1.81e-02 (displacement norm: 4.59e-01).
+[INFO]    ✓ [HEALTHY] DATA: Input data is finite and non-constant (variance: 1.00e+00 range: [-4.37, 4.07]).
+[INFO] 🎉 [DEBUG MODE] All learnability diagnostic checks passed cleanly with zero warnings.
+```
+
+---
+
 ## Installation
 
 Install in editable mode using `pip` or `uv`:
@@ -701,8 +744,14 @@ cd /workspace
 # Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu, sid-check-8bit)
 pip install -e .
 
+# Or with debug diagnostics dependencies (nn-toolbox):
+pip install -e ".[debug]"
+
 # Or with 8-bit training dependencies (bitsandbytes):
 pip install -e ".[8bit]"
+
+# Or with all optional features:
+pip install -e ".[all]"
 
 # Run automated 8-bit hardware and library compatibility check:
 sid-check-8bit
@@ -876,6 +925,7 @@ The configuration file is divided into modular top-level sections:
 | `early_stopping_patience` | `int` | `5` | Epochs without validation metric improvement before halting training early. |
 | `early_stopping_metric` | `str` | `"val_iou"` | Target validation metric to monitor (`"val_iou"`, `"val_dice"`, `"val_loss"`). |
 | `early_stopping_mode` | `str` | `"max"` | Optimization direction: `"max"` (for IoU/Dice) or `"min"` (for Loss). |
+| `debug_mode` | `str` / `bool` | `false` | Automated learnability diagnostic mode via `nn-toolbox` (`"light"`, `"deep"`, or `false`). |
 
 #### `logging`
 | Field | Type | Default | Description |
@@ -1142,6 +1192,19 @@ sid-train --config configs/default.yaml --resume outputs/RUN/default/checkpoints
 # 4. Disable auto-resume to start a fresh training run from epoch 1
 sid-train --config configs/default.yaml --no-auto-resume
 ```
+
+#### D. Runtime Learnability Debugging (`--debug`, `--debug-mode`)
+Execute targeted diagnostic experiments before training to verify signal propagation, active gradient flow, update-to-weight displacement ratios, and memorization capacity:
+
+```bash
+# Fast non-destructive telemetry (forward signal scale, backward gradient flow, ||Δθ||/||θ||):
+sid-train --config configs/default.yaml --debug
+
+# Deep active laboratory (includes tiny-batch memorization & learning rate sweep):
+sid-train --config configs/default.yaml --debug --debug-mode deep
+```
+
+Reports are automatically generated and displayed in console, with permanent visual artifacts saved to `reports/diagnostics/diagnostic_report.html` and `reports/diagnostics/diagnostic_report.json`.
 
 ---
 
