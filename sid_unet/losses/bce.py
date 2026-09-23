@@ -27,6 +27,7 @@ class BCELoss(nn.Module):
                 logits = logits.unsqueeze(1)
 
         pos_wt = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
         return F.binary_cross_entropy_with_logits(
             logits, targets.float(), pos_weight=pos_wt, reduction=self.reduction
         )

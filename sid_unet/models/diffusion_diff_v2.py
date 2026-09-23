@@ -396,6 +396,10 @@ class DiffusionDiffV2Model(nn.Module):
         dec_dropout = float(dec_cfg.get("dropout", 0.0))
         dec_res_blocks = int(dec_cfg.get("num_res_blocks", 1))
 
+        # Normalization layer for concatenated high-dimensional Z representation
+        z_norm_type = dec_cfg.get("z_norm", dec_cfg.get("norm_layer", "groupnorm"))
+        self.z_norm = get_norm_layer(z_norm_type, self.total_z_channels)
+
         self.perp_mapping: List[Optional[int]] = []
         perp_skip_channels: Optional[List[int]] = None
         if self.use_perpendicular_skips:
@@ -790,6 +794,9 @@ class DiffusionDiffV2Model(nn.Module):
                     posterior = self.vae.encode(x_proc).latent_dist
                     z0 = posterior.mode() * self.scaling_factor
 
+        # Prevent runaway latent drift from destabilizing frozen diffuser UNet
+        z0 = torch.clamp(z0, min=-15.0, max=15.0)
+
         _, _, h_z, w_z = z0.shape
 
         # 2. Parallel frozen decoder: extract perpendicular skip features from diffusion latent z0
@@ -851,8 +858,9 @@ class DiffusionDiffV2Model(nn.Module):
             if self.sigma_embed_dim > 0:
                 z_components.append(sigma_spatial)
 
-        # 4. Concatenate along channel dimension to form high-dimensional Z
+        # 4. Concatenate along channel dimension to form high-dimensional Z and normalize
         z_high_dim = torch.cat(z_components, dim=1)
+        z_high_dim = self.z_norm(z_high_dim)
 
         # 5. Auxiliary classifier on Z representation if enabled
         class_logits = None

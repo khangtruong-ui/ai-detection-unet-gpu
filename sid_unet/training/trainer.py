@@ -585,6 +585,13 @@ class Trainer:
             outputs = self.model(images)
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
+        if not torch.isfinite(loss):
+            self.logger.warning(
+                f"⚠️ Non-finite loss encountered ({loss.item() if hasattr(loss, 'item') else loss}) at global step {self.global_step}. "
+                "Skipping backward pass to prevent gradient explosion."
+            )
+            return loss, loss_dict
+
         scaled_loss = loss / max(1.0, float(loss_divisor))
         self.scaler.scale(scaled_loss).backward()
 
@@ -684,11 +691,19 @@ class Trainer:
                     total_batches is not None and step_in_epoch == total_batches
                 )
                 if is_accum_boundary and has_pending_grads:
+                    grad_finite = True
                     if self.grad_clip > 0:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                        if not torch.isfinite(total_norm):
+                            self.logger.warning(
+                                f"⚠️ Non-finite gradient norm ({total_norm.item() if hasattr(total_norm, 'item') else total_norm}) detected at step {self.global_step}. "
+                                "Skipping optimizer update to prevent weight corruption."
+                            )
+                            grad_finite = False
 
-                    self.scaler.step(self.optimizer)
+                    if grad_finite:
+                        self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
                     has_pending_grads = False
@@ -724,10 +739,18 @@ class Trainer:
 
             # Flush pending accumulated gradients if last step did not land on accumulation boundary
             if has_pending_grads:
+                grad_finite = True
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-                self.scaler.step(self.optimizer)
+                    total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                    if not torch.isfinite(total_norm):
+                        self.logger.warning(
+                            f"⚠️ Non-finite gradient norm ({total_norm.item() if hasattr(total_norm, 'item') else total_norm}) detected at end of epoch {epoch}. "
+                            "Skipping flush optimizer update."
+                        )
+                        grad_finite = False
+                if grad_finite:
+                    self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
                 has_pending_grads = False

@@ -117,3 +117,24 @@ def test_build_loss_focal_weight():
     assert loss_mod.mask_loss_fn.dice_weight == 0.7
     assert loss_mod.mask_loss_fn.focal_weight == 0.8
 
+
+def test_loss_extreme_logits_stability():
+    """Verify that extreme logits (which could cause FP16 overflow) remain finite and non-NaN."""
+    bce = BCELoss()
+    focal = FocalLoss()
+
+    extreme_logits = torch.tensor([-1000.0, -100.0, -50.0, 0.0, 50.0, 100.0, 1000.0], requires_grad=True)
+    targets = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+
+    loss_bce = bce(extreme_logits, targets)
+    assert torch.isfinite(loss_bce)
+    loss_bce.backward()
+    assert torch.all(torch.isfinite(extreme_logits.grad))
+
+    extreme_logits.grad = None
+    loss_focal = focal(extreme_logits, targets)
+    assert torch.isfinite(loss_focal)
+    loss_focal.backward()
+    assert torch.all(torch.isfinite(extreme_logits.grad))
+
+

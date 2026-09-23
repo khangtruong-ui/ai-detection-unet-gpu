@@ -300,3 +300,37 @@ def test_diffusion_diff_skip_connections():
     assert len(model_no_skips.decoder.skip_fusions) == 0
     logits_no_skips = model_no_skips(x)
     assert logits_no_skips.shape == (2, 1, 64, 64)
+
+
+def test_diffusion_diff_z_normalization():
+    """Verify that z_norm normalizes high-dimensional representation Z properly."""
+    # 1. Default groupnorm z_norm
+    model = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        timesteps=[100, 250],
+        timestep_embed_dim=16,
+        sigma_embed_dim=16,
+        decoder_config={"channels": [32, 16], "norm_layer": "groupnorm"},
+    )
+    assert hasattr(model, "z_norm")
+    assert isinstance(model.z_norm, torch.nn.GroupNorm)
+
+    # 2. Configurable z_norm as batchnorm or layernorm
+    model_ln = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        timesteps=[100],
+        decoder_config={"channels": [32, 16], "z_norm": "layernorm"},
+    )
+    assert isinstance(model_ln.z_norm, torch.nn.GroupNorm)
+    assert model_ln.z_norm.num_groups == 1
+
+    # 3. Numerical forward pass produces finite normalized outputs
+    x = torch.randn(2, 3, 64, 64)
+    logits = model(x)
+    mask_logits = logits[0] if isinstance(logits, tuple) else logits
+    assert torch.all(torch.isfinite(mask_logits))
+

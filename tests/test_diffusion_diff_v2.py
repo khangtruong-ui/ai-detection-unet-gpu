@@ -335,3 +335,24 @@ def test_diffusion_diff_v2_optimization_step():
     assert torch.equal(list(model.vae.decoder.parameters())[0], initial_vae_decoder_weight)
     # Frozen diffuser weight untouched
     assert torch.equal(list(model.diffuser.parameters())[0], initial_diffuser_weight)
+
+
+def test_diffusion_diff_v2_z_normalization():
+    """Verify that z_norm normalizes high-dimensional representation Z properly in v2."""
+    model = DiffusionDiffV2Model(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        timesteps=[100, 250],
+        timestep_embed_dim=16,
+        sigma_embed_dim=16,
+        decoder_config={"channels": [32, 16], "norm_layer": "groupnorm"},
+    )
+    assert hasattr(model, "z_norm")
+    assert isinstance(model.z_norm, torch.nn.GroupNorm)
+
+    x = torch.randn(2, 3, 64, 64)
+    logits = model(x)
+    mask_logits = logits[0] if isinstance(logits, tuple) else logits
+    assert torch.all(torch.isfinite(mask_logits))
+

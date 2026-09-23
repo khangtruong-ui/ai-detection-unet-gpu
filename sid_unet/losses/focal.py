@@ -32,12 +32,15 @@ class FocalLoss(nn.Module):
             elif logits.dim() == 3 and targets.dim() == 4:
                 logits = logits.unsqueeze(1)
 
+        # Clamp logits to prevent FP16 overflow in exp/sigmoid/BCE
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
         probs = torch.sigmoid(logits)
         p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        p_t = torch.clamp(p_t, min=1e-7, max=1.0 - 1e-7)
         alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
 
-        focal_weight = alpha_t * torch.pow((1.0 - p_t), self.gamma)
+        focal_weight = alpha_t * torch.pow(torch.clamp(1.0 - p_t, min=0.0, max=1.0), self.gamma)
         loss = focal_weight * bce_loss
 
         if self.reduction == "mean":

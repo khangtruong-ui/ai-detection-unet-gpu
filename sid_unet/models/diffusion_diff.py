@@ -73,6 +73,8 @@ def get_norm_layer(norm_type: str, num_channels: int) -> nn.Module:
         while num_channels % num_groups != 0 and num_groups > 1:
             num_groups -= 1
         return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+    elif norm_type in ("layernorm", "layer_norm"):
+        return nn.GroupNorm(num_groups=1, num_channels=num_channels)
     elif norm_type in ("none", "identity", ""):
         return nn.Identity()
     else:
@@ -425,6 +427,10 @@ class DiffusionDiffModel(nn.Module):
         dec_dropout = float(dec_cfg.get("dropout", 0.0))
         dec_res_blocks = int(dec_cfg.get("num_res_blocks", 1))
 
+        # Normalization layer for concatenated high-dimensional Z representation
+        z_norm_type = dec_cfg.get("z_norm", dec_cfg.get("norm_layer", "groupnorm"))
+        self.z_norm = get_norm_layer(z_norm_type, self.total_z_channels)
+
         # Determine encoder skip channels
         if self.use_skip_connections:
             with torch.no_grad():
@@ -715,6 +721,9 @@ class DiffusionDiffModel(nn.Module):
                     posterior = self.vae.encode(x_proc).latent_dist
                     z0 = posterior.mode() * self.scaling_factor
 
+        # Prevent runaway latent drift from destabilizing frozen diffuser UNet
+        z0 = torch.clamp(z0, min=-15.0, max=15.0)
+
         _, _, h_z, w_z = z0.shape
 
         # Components to concatenate into high-dimensional Z
@@ -774,8 +783,9 @@ class DiffusionDiffModel(nn.Module):
             if self.sigma_embed_dim > 0:
                 z_components.append(sigma_spatial)
 
-        # 3. Concatenate along channel dimension to get high-dimensional Z
+        # 3. Concatenate along channel dimension to get high-dimensional Z and normalize
         z_high_dim = torch.cat(z_components, dim=1)
+        z_high_dim = self.z_norm(z_high_dim)
 
         # 4. Auxiliary classifier on Z representation if enabled
         class_logits = None
