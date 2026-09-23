@@ -114,7 +114,7 @@ def parse_args():
         dest="use_8bit_optimizer",
         action="store_true",
         default=False,
-        help="Enable 8-bit AdamW optimizer via bitsandbytes (saves 75% optimizer VRAM)",
+        help="Enable 8-bit AdamW optimizer via bitsandbytes (saves 75%% optimizer VRAM)",
     )
     parser.add_argument(
         "--check-8bit",
@@ -218,6 +218,23 @@ def parse_args():
         dest="skip_collision",
         action="store_false",
         help="Disable collision checking and force retraining/evaluation.",
+    )
+    # Debug mode flags (nn-toolbox)
+    parser.add_argument(
+        "--debug",
+        dest="debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode using nn-toolbox to automatically diagnose model, signals, and optimizer.",
+    )
+    parser.add_argument(
+        "--debug-mode",
+        "--debug_mode",
+        dest="debug_mode",
+        type=str,
+        choices=["light", "deep"],
+        default=None,
+        help="Diagnostic mode for nn-toolbox ('light' or 'deep'). Default: 'light' when --debug is passed.",
     )
     return parser.parse_args()
 
@@ -438,6 +455,9 @@ def main():
         overrides.append("training.save_latest=true")
     elif args.save_latest is False:
         overrides.append("training.save_latest=false")
+    if getattr(args, "debug", False) or getattr(args, "debug_mode", None):
+        dbg_mode = args.debug_mode or "light"
+        overrides.append(f"training.debug_mode={dbg_mode}")
 
     if len(config_paths) == 1:
         if args.output_dir:

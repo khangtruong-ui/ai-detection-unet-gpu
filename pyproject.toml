@@ -26,6 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+debug = [
+    "nn-toolbox>=0.1.0",
+]
 8bit = [
     "bitsandbytes>=0.41.0",
     "accelerate>=0.25.0",
@@ -58,6 +61,7 @@ all = [
     "bitsandbytes>=0.41.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "nn-toolbox>=0.1.0",
 ]
 
 [project.scripts]

@@ -283,6 +283,17 @@ class Trainer:
         self.empty_cache_per_epoch = bool(config.training.get("empty_cache_per_epoch", True))
         self.log_memory = bool(config.logging.get("log_memory", True))
 
+        # 5.1 Debug Mode Configuration (nn-toolbox)
+        raw_debug = config.training.get("debug_mode", config.training.get("debug", False))
+        if isinstance(raw_debug, bool):
+            self.debug_mode = "light" if raw_debug else False
+        elif isinstance(raw_debug, str) and raw_debug.lower() in ("true", "1", "yes", "light"):
+            self.debug_mode = "light"
+        elif isinstance(raw_debug, str) and raw_debug.lower() == "deep":
+            self.debug_mode = "deep"
+        else:
+            self.debug_mode = False
+
         # 6. Callbacks
         checkpoint_period = parse_checkpoint_period(config.training)
         checkpoint_steps = config.training.get("checkpoint_steps", config.training.get("checkpoint_interval_steps", None))
@@ -442,7 +453,64 @@ class Trainer:
         elif self.scheduler_name == "plateau":
             mode = "max" if self.config.training.get("early_stopping_mode", "max") == "max" else "min"
             return torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode=mode, factor=0.5, patience=2)
-        return None
+    def _run_debug_diagnostics(self) -> Optional[Any]:
+        """Run automated diagnostic session using nn-toolbox."""
+        mode_str = self.debug_mode if isinstance(self.debug_mode, str) else "light"
+        self.logger.info(f"🔬 [DEBUG MODE] Initializing nn-toolbox diagnostic laboratory (Mode: {mode_str.upper()})...")
+        try:
+            from nn_toolbox import diagnose
+
+            def _adapted_loss_fn(model_out, targets=None):
+                if targets is not None:
+                    loss, _ = self.loss_fn(model_out, targets)
+                else:
+                    out_t = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
+                    loss = out_t.float().sum()
+                return loss
+
+            diag_report = diagnose(
+                model=self.model,
+                dataloader=self.train_loader,
+                loss_fn=_adapted_loss_fn,
+                optimizer=self.optimizer,
+                mode=mode_str,
+                device=self.device,
+                verbose=True,
+            )
+
+            diag_dir = os.path.join(self.report_dir, "diagnostics")
+            os.makedirs(diag_dir, exist_ok=True)
+            json_path = os.path.join(diag_dir, "diagnostic_report.json")
+            html_path = os.path.join(diag_dir, "diagnostic_report.html")
+
+            diag_report.save_json(json_path)
+            diag_report.save_html(html_path)
+
+            self.logger.info(f"🔬 [DEBUG MODE] Diagnostic report saved to: {json_path} and {html_path}")
+
+            actionables = diag_report.actionable_findings
+            if actionables:
+                self.logger.warning(f"⚠️ [DEBUG MODE] {len(actionables)} actionable finding(s) detected:")
+                for f in actionables:
+                    self.logger.warning(f"   [{f.severity.upper()}] {f.category}: {f.observation}")
+            else:
+                self.logger.info("✅ [DEBUG MODE] All diagnostic checks passed cleanly.")
+
+            targets = diag_report.get_investigation_targets()
+            if targets:
+                self.logger.info("🎯 [DEBUG MODE] Top investigation targets:")
+                for idx, t in enumerate(targets[:3], 1):
+                    hypos = f" ({', '.join(t['hypotheses'][:2])})" if t['hypotheses'] else ""
+                    self.logger.info(f"   {idx}. [{t['max_severity'].upper()}] {t['target']}{hypos}")
+
+            self.diagnostic_report = diag_report
+            return diag_report
+        except ImportError:
+            self.logger.warning("⚠️ [DEBUG MODE] nn-toolbox package is not installed; skipping diagnostics.")
+            return None
+        except Exception as e:
+            self.logger.warning(f"⚠️ [DEBUG MODE] Diagnostic session encountered an error: {e}")
+            return None
 
     def _check_and_auto_scale_batch_size(self) -> None:
         """Probe GPU memory and scale down batch size / increase gradient accumulation steps if memory is tight."""
@@ -783,6 +851,10 @@ class Trainer:
         if self.device.type == "cuda":
             self.logger.info(f"Initial GPU memory: {format_memory_summary(self.device)}")
 
+        # Run Debug Diagnostics via nn-toolbox if enabled
+        if getattr(self, "debug_mode", False):
+            self._run_debug_diagnostics()
+
         # Auto-tune batch size if enabled and on GPU
         self._check_and_auto_scale_batch_size()
 
@@ -994,5 +1066,6 @@ class Trainer:
             "report_json_path": os.path.join(self.report_dir, "training_final_report.json"),
             "config": self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
             "report_data": report_data,
+            "diagnostic_report": getattr(self, "diagnostic_report", None),
         }
 
