@@ -334,3 +334,44 @@ def test_diffusion_diff_z_normalization():
     mask_logits = logits[0] if isinstance(logits, tuple) else logits
     assert torch.all(torch.isfinite(mask_logits))
 
+
+def test_diffusion_diff_vae_decoder_frozen():
+    """Verify that unused VAE decoder parameters remain frozen to prevent zero-gradient dead parameters."""
+    model = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        autoencoder_trainable=True,
+    )
+    # Trainable encoder
+    assert any(p.requires_grad for p in model.vae.encoder.parameters())
+    # Unused VAE decoder must be strictly frozen
+    assert all(not p.requires_grad for p in model.vae.decoder.parameters())
+
+    # After model.train(), vae.decoder should still stay in eval/frozen
+    model.train(True)
+    assert all(not p.requires_grad for p in model.vae.decoder.parameters())
+    assert not model.vae.decoder.training
+
+
+def test_diffusion_diff_eval_determinism_and_contiguity():
+    """Verify that evaluation mode is deterministic across calls and outputs are contiguous."""
+    model = DiffusionDiffModel(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+    )
+    model.eval()
+
+    # Test with non-multiple of 8 resolution to trigger padding and slicing
+    x = torch.randn(2, 3, 70, 70)
+    with torch.no_grad():
+        out1 = model(x)
+        out2 = model(x)
+
+    mask1 = out1[0] if isinstance(out1, tuple) else out1
+    mask2 = out2[0] if isinstance(out2, tuple) else out2
+
+    assert mask1.is_contiguous(), "Mask logits must be contiguous in memory"
+    assert torch.allclose(mask1, mask2, atol=1e-6), "Repeated evaluation passes on identical inputs must be deterministic"
+

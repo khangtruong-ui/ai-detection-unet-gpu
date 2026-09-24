@@ -233,3 +233,45 @@ def test_trainer_runtime_learnability_deep_mode_memorization():
         assert "train_eval" in diag_report.metrics
         te_metrics = diag_report.metrics["train_eval"]
         assert "relative_difference" in te_metrics
+
+
+def test_trainer_debug_diagnostics_diffusion_diff_v1_and_v2():
+    """Verify that nn-toolbox diagnostics run on DiffusionDiff v1 and v2 without critical crashes."""
+    from sid_unet.models.diffusion_diff import DiffusionDiffModel
+    from sid_unet.models.diffusion_diff_v2 import DiffusionDiffV2Model
+
+    for model_cls in [DiffusionDiffModel, DiffusionDiffV2Model]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = load_config("configs/test_smoke.yaml")
+            config.project.output_dir = tmpdir
+            config.training.epochs = 1
+            config.training.debug_mode = "light"
+            config.training.auto_batch_size = False
+            config.data.batch_size = 2
+
+            train_loader = _create_synthetic_loader(num_samples=4, image_size=64)
+            val_loader = _create_synthetic_loader(num_samples=4, image_size=64)
+
+            model = model_cls(
+                use_dummy=True,
+                dummy_vae_channels=(32, 64),
+                dummy_unet_channels=(32, 64),
+                timesteps=[100, 250],
+                timestep_embed_dim=16,
+                sigma_embed_dim=16,
+                decoder_config={"channels": [32, 16]},
+                aux_classifier=True,
+            )
+
+            trainer = Trainer(
+                config=config,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                model=model,
+            )
+
+            diag_report = trainer._run_debug_diagnostics()
+            assert diag_report is not None
+            assert hasattr(diag_report, "findings")
+            # Verify no unhandled crash / general exception finding
+            assert not any(f.category == "general" and f.severity == "critical" for f in diag_report.findings)

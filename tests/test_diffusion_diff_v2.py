@@ -356,3 +356,25 @@ def test_diffusion_diff_v2_z_normalization():
     mask_logits = logits[0] if isinstance(logits, tuple) else logits
     assert torch.all(torch.isfinite(mask_logits))
 
+
+def test_diffusion_diff_v2_eval_determinism_and_contiguity():
+    """Verify that v2 evaluation mode is deterministic across calls and outputs are contiguous."""
+    model = DiffusionDiffV2Model(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+    )
+    model.eval()
+
+    # Non-multiple of 8 triggers reflection padding and slicing
+    x = torch.randn(2, 3, 70, 70)
+    with torch.no_grad():
+        out1 = model(x)
+        out2 = model(x)
+
+    mask1 = out1[0] if isinstance(out1, tuple) else out1
+    mask2 = out2[0] if isinstance(out2, tuple) else out2
+
+    assert mask1.is_contiguous(), "Mask logits must be contiguous in memory"
+    assert torch.allclose(mask1, mask2, atol=1e-6), "Repeated evaluation passes on identical inputs must be deterministic"
+

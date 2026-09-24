@@ -536,7 +536,11 @@ $$
 
 - **6. Isolated Gradient Optimization**: Throughout training, the Diffuser UNet, VAE encoder, and parallel VAE decoder remain strictly frozen (`requires_grad = False`). Gradients backpropagate exclusively through the Trainable Decoder (including its perpendicular skip fusion layers) and the optional auxiliary classifier head.
 
----
+- **7. Deterministic Evaluation Mode**: In `model.eval()`, random noise perturbations are seeded deterministically via `torch.Generator(device=z0.device).manual_seed(t_clamped + 42)` instead of unseeded `torch.randn_like`. This guarantees bitwise reproducible validation metrics and eliminates stochastic jitter during evaluation while preserving true stochastic diffusion perturbation during `train()`.
+
+- **8. Memory Contiguity Guarantees**: Following spatial bilinear interpolation and resolution-matching cropping (`mask_logits[:, :, :orig_h, :orig_w]`), tensor representations are explicitly made contiguous via `.contiguous()`. This prevents downstream `RuntimeError` stride mismatches in loss functions, reshape operations, and GPU kernel fusions.
+
+- **9. Disconnected Subgraph Elimination in V1**: In `DiffusionDiffModel`, when `autoencoder_trainable = True`, only `self.vae.encoder` is set to trainable. `self.vae.decoder` remains strictly frozen (`requires_grad = False`, `eval()`). Because output synthesis is performed by `TrainableLatentDecoder`, this prevents 74 unused decoder layers from becoming disconnected, zero-gradient parameters in the autograd computation graph.
 
 ## Mechanisms & Architectural Principles
 
@@ -699,12 +703,16 @@ Rather than mere metric logging or basic syntax/shape validation (which fails au
 1. **Signal Propagation Viability**: Measures activation standard deviations across every encoder, bottleneck, and decoder block to ensure forward signals neither explode ($>20\times$ amplification) nor vanish ($<0.05\times$ attenuation).
 2. **Backward Gradient Flow & Reachability**: Verifies that 100% of trainable parameters receive active gradients, detecting detached subgraphs, broken autograd chains, and vanishing gradients.
 3. **True Parameter Update Dynamics**: Computes the actual displacement-to-weight ratio $||\Delta \theta|| / ||\theta||$ after an optimizer step. This separates raw gradient magnitude from actual parameter progress, flagging dead learning rates, frozen weights, or explosive parameter divergence.
-4. **Verified Healthy Confirmations**: Clearly and concisely reports every analyzed dimension that is operating stably, giving the practitioner immediate confidence that signal pathways and update dynamics are healthy.
-5. **Prioritized Actionable Hypotheses**: When anomalies are detected, the tool highlights the specific layer/parameter target, formulates cautious causal hypotheses (e.g. *saturated activation functions*, *excessive regularization*, *detached tensor logic*), and suggests targeted remediation steps.
-6. **Active Diagnostic Experiments (`--debug-mode deep`)**:
+4. **Structural Graph Connectivity & Disconnection Detection**: Pinpoints trainable parameters and submodules that are marked `requires_grad=True` but receive 0 gradients due to detached autograd pathways or unused submodules.
+5. **Inter-Branch Gradient Balance Tracking**: Evaluates scale-invariant RMS gradient distributions across distinct sub-networks (e.g., encoder vs decoder vs auxiliary heads) to detect branch starvation ($>500\times$ disparity).
+6. **Tensor Memory Layout & Contiguity Checks**: Verifies that intermediate and output representations maintain contiguous strides, preventing `.view()` crashes and CUDA kernel latency.
+7. **Verified Healthy Confirmations**: Clearly and concisely reports every analyzed dimension that is operating stably, giving the practitioner immediate confidence that signal pathways and update dynamics are healthy.
+8. **Prioritized Actionable Hypotheses**: When anomalies are detected, the tool highlights the specific layer/parameter target, formulates cautious causal hypotheses (e.g. *saturated activation functions*, *excessive regularization*, *detached tensor logic*), and suggests targeted remediation steps.
+9. **Active Diagnostic Experiments (`--debug-mode deep`)**:
    - **Tiny-Batch Memorization Capacity (`overfit_test`)**: Tests whether the architecture and optimizer can memorize $N=1, 8$ samples, distinguishing optimization/loss capability from dataset capacity constraints.
    - **Logarithmic Learning Rate Sweep (`lr_sweep`)**: Probes loss response across $10^{-6}$ to $10^{-1}$ to identify the stable learning regime versus divergence or stagnation.
    - **Train/Eval Mode Consistency (`train_eval_test`)**: Isolates differences between `model.train()` and `model.eval()` to detect improper normalization state shifts or stochastic bugs.
+   - **Evaluation Determinism & Drift (`eval_determinism_test`)**: Validates bitwise reproducible inferences across repeated forward passes under `model.eval()`.
 
 #### Running Diagnostics via CLI:
 ```bash

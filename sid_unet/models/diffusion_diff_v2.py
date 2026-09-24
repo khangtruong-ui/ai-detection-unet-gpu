@@ -826,7 +826,14 @@ class DiffusionDiffV2Model(nn.Module):
             sigma_val = torch.sqrt(torch.clamp(1.0 - alpha_bar, min=1e-8))
             sqrt_alpha_bar = torch.sqrt(alpha_bar)
 
-            eps_k = torch.randn_like(z0)
+            # Sample added noise epsilon_k
+            if self.training:
+                eps_k = torch.randn_like(z0)
+            else:
+                # Deterministic noise perturbation during evaluation for reproducible inference
+                gen = torch.Generator(device=z0.device).manual_seed(t_clamped + 42)
+                eps_k = torch.randn(z0.shape, generator=gen, device=z0.device, dtype=z0.dtype)
+
             z_tk = sqrt_alpha_bar * z0 + sigma_val * eps_k
 
             t_tensor = torch.full((b_sz,), t_clamped, device=device, dtype=torch.long)
@@ -870,8 +877,11 @@ class DiffusionDiffV2Model(nn.Module):
         # 6. Trainable Decoder: decodes Z, injecting perpendicular skips from the parallel frozen decoder
         mask_logits = self.decoder(z_high_dim, perp_skips=perp_skips, encoder_skips=enc_skips)
 
+        # Crop back to original dimensions if padded and ensure contiguous layout
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
-            mask_logits = mask_logits[:, :, :orig_h, :orig_w]
+            mask_logits = mask_logits[:, :, :orig_h, :orig_w].contiguous()
+        else:
+            mask_logits = mask_logits.contiguous()
 
         if self.aux_classifier:
             return mask_logits, class_logits

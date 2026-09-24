@@ -587,27 +587,58 @@ class DiffusionDiffModel(nn.Module):
 
     def _enforce_freeze(self) -> None:
         """Freeze parameters according to configuration."""
-        if not self.autoencoder_trainable:
-            for param in self.vae.parameters():
-                param.requires_grad = False
-            self.vae.eval()
-        else:
-            for param in self.vae.parameters():
-                param.requires_grad = True
-            self.vae.train()
-
         # Diffuser UNet is strictly frozen
         for param in self.diffuser.parameters():
             param.requires_grad = False
         self.diffuser.eval()
 
-    def train(self, mode: bool = True):
-        """Set training mode for trainable components while keeping frozen diffuser in eval."""
-        super().train(mode)
+        # VAE Decoder is unused in DiffusionDiff (which decodes via TrainableLatentDecoder),
+        # so keep it strictly frozen with requires_grad=False to avoid dead parameters
+        if hasattr(self.vae, "decoder"):
+            for param in self.vae.decoder.parameters():
+                param.requires_grad = False
+            self.vae.decoder.eval()
+        if getattr(self.vae, "post_quant_conv", None) is not None:
+            for param in self.vae.post_quant_conv.parameters():
+                param.requires_grad = False
+            self.vae.post_quant_conv.eval()
+
         if not self.autoencoder_trainable:
-            self.vae.eval()
+            if hasattr(self.vae, "encoder"):
+                for param in self.vae.encoder.parameters():
+                    param.requires_grad = False
+                self.vae.encoder.eval()
+            if getattr(self.vae, "quant_conv", None) is not None:
+                for param in self.vae.quant_conv.parameters():
+                    param.requires_grad = False
+                self.vae.quant_conv.eval()
         else:
-            self.vae.train(mode)
+            if hasattr(self.vae, "encoder"):
+                for param in self.vae.encoder.parameters():
+                    param.requires_grad = True
+                self.vae.encoder.train()
+            if getattr(self.vae, "quant_conv", None) is not None:
+                for param in self.vae.quant_conv.parameters():
+                    param.requires_grad = True
+                self.vae.quant_conv.train()
+
+    def train(self, mode: bool = True):
+        """Set training mode for trainable components while keeping frozen diffuser and vae decoder in eval."""
+        super().train(mode)
+        if hasattr(self.vae, "decoder"):
+            self.vae.decoder.eval()
+        if getattr(self.vae, "post_quant_conv", None) is not None:
+            self.vae.post_quant_conv.eval()
+        if not self.autoencoder_trainable:
+            if hasattr(self.vae, "encoder"):
+                self.vae.encoder.eval()
+            if getattr(self.vae, "quant_conv", None) is not None:
+                self.vae.quant_conv.eval()
+        else:
+            if hasattr(self.vae, "encoder"):
+                self.vae.encoder.train(mode)
+            if getattr(self.vae, "quant_conv", None) is not None:
+                self.vae.quant_conv.train(mode)
         self.diffuser.eval()
         return self
 
@@ -746,7 +777,12 @@ class DiffusionDiffModel(nn.Module):
             sqrt_alpha_bar = torch.sqrt(alpha_bar)
 
             # Sample added noise epsilon_k
-            eps_k = torch.randn_like(z0)
+            if self.training:
+                eps_k = torch.randn_like(z0)
+            else:
+                # Deterministic noise perturbation during evaluation for reproducible inference
+                gen = torch.Generator(device=z0.device).manual_seed(t_clamped + 42)
+                eps_k = torch.randn(z0.shape, generator=gen, device=z0.device, dtype=z0.dtype)
 
             # Noisy version z_{t_k}
             z_tk = sqrt_alpha_bar * z0 + sigma_val * eps_k
@@ -795,9 +831,11 @@ class DiffusionDiffModel(nn.Module):
         # 5. Trainable Decoder decodes Z back to binary mask space (fusing encoder skips if enabled)
         mask_logits = self.decoder(z_high_dim, skips=enc_skips)
 
-        # Crop back to original dimensions if padded
+        # Crop back to original dimensions if padded and ensure contiguous layout
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
-            mask_logits = mask_logits[:, :, :orig_h, :orig_w]
+            mask_logits = mask_logits[:, :, :orig_h, :orig_w].contiguous()
+        else:
+            mask_logits = mask_logits.contiguous()
 
         if self.aux_classifier:
             return mask_logits, class_logits

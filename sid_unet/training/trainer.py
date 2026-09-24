@@ -462,10 +462,25 @@ class Trainer:
 
             def _adapted_loss_fn(model_out, targets=None):
                 if targets is not None:
-                    loss, _ = self.loss_fn(model_out, targets)
+                    if isinstance(targets, dict):
+                        m_tgt = targets.get("mask", targets.get("masks"))
+                        l_tgt = targets.get("label", targets.get("labels"))
+                        loss, _ = self.loss_fn(model_out, m_tgt, l_tgt)
+                    elif isinstance(targets, (tuple, list)) and len(targets) >= 2:
+                        loss, _ = self.loss_fn(model_out, targets[0], targets[1])
+                    else:
+                        # targets is a single tensor (mask)
+                        if isinstance(model_out, (tuple, list)) and len(model_out) >= 2 and model_out[1] is not None:
+                            b_sz = model_out[1].shape[0]
+                            dummy_labels = torch.zeros(b_sz, dtype=torch.long, device=model_out[1].device)
+                            loss, _ = self.loss_fn(model_out, targets, dummy_labels)
+                        else:
+                            loss, _ = self.loss_fn(model_out, targets)
                 else:
-                    out_t = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
-                    loss = out_t.float().sum()
+                    if isinstance(model_out, (tuple, list)):
+                        loss = sum(t.float().sum() for t in model_out if t is not None and torch.is_tensor(t))
+                    else:
+                        loss = model_out.float().sum()
                 return loss
 
             diag_report = diagnose(
