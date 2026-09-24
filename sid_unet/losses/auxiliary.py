@@ -25,7 +25,8 @@ class SIDTotalLoss(nn.Module):
         dice_weight: float = 0.5,
         focal_weight: float = 0.5,
         focal_gamma: float = 2.0,
-        focal_alpha: float = 0.25,
+        focal_alpha: float = 0.75,
+        pos_weight: float = 1.0,
         aux_classifier: bool = True,
         aux_loss_type: str = "cross_entropy",
         aux_weight: float = 0.2,
@@ -38,6 +39,7 @@ class SIDTotalLoss(nn.Module):
             focal_weight=focal_weight,
             focal_gamma=focal_gamma,
             focal_alpha=focal_alpha,
+            pos_weight=pos_weight,
         )
         self.aux_classifier = aux_classifier
         self.aux_loss_type = aux_loss_type
@@ -89,7 +91,8 @@ def build_loss(config: Any) -> SIDTotalLoss:
         dice_weight=float(loss_cfg.get("dice_weight", 0.5)),
         focal_weight=float(loss_cfg.get("focal_weight", 0.5)),
         focal_gamma=float(loss_cfg.get("focal_gamma", 2.0)),
-        focal_alpha=float(loss_cfg.get("focal_alpha", 0.25)),
+        focal_alpha=float(loss_cfg.get("focal_alpha", 0.75)),
+        pos_weight=float(loss_cfg.get("pos_weight", 1.0)),
         aux_classifier=bool(model_cfg.get("aux_classifier", True)),
         aux_loss_type=loss_cfg.get("aux_loss_type", "cross_entropy"),
         aux_weight=float(loss_cfg.get("aux_weight", 0.2)),

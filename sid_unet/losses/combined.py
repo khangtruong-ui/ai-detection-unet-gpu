@@ -25,7 +25,8 @@ class CombinedMaskLoss(nn.Module):
         dice_weight: float = 0.5,
         focal_weight: float = 0.5,
         focal_gamma: float = 2.0,
-        focal_alpha: float = 0.25,
+        focal_alpha: float = 0.75,
+        pos_weight: float = 1.0,
     ):
         super().__init__()
         self.loss_type = loss_type.lower()
@@ -33,7 +34,7 @@ class CombinedMaskLoss(nn.Module):
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight
 
-        self.bce = BCELoss()
+        self.bce = BCELoss(pos_weight=pos_weight)
         self.dice = DiceLoss()
         self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
 

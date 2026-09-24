@@ -409,7 +409,8 @@ class DiffusionDiffV2Model(nn.Module):
         dec_res_blocks = int(dec_cfg.get("num_res_blocks", 1))
 
         # Normalization layer for concatenated high-dimensional Z representation
-        z_norm_type = dec_cfg.get("z_norm", dec_cfg.get("norm_layer", "groupnorm"))
+        # Default to groupnorm to avoid zeroing out sinusoidal embeddings that have zero spatial variance
+        z_norm_type = dec_cfg.get("z_norm", "groupnorm")
         self.z_norm = get_norm_layer(z_norm_type, self.total_z_channels)
 
         self.perp_mapping: List[Optional[int]] = []

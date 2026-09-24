@@ -138,3 +138,23 @@ def test_loss_extreme_logits_stability():
     assert torch.all(torch.isfinite(extreme_logits.grad))
 
 
+def test_focal_alpha_foreground_gradient_weight():
+    """Verify that focal alpha=0.75 properly weights minority foreground pixels."""
+    focal = FocalLoss(alpha=0.75, gamma=2.0)
+    logits = torch.zeros(2, 1, 10, 10, requires_grad=True)
+    # 2% foreground, 98% background
+    targets = torch.zeros(2, 1, 10, 10)
+    targets[:, :, :1, :1] = 1.0  # 2 pixels positive
+
+    loss = focal(logits, targets)
+    loss.backward()
+
+    # Logits on positive pixels should receive negative gradient (pulling logits towards positive values)
+    pos_grad = logits.grad[targets == 1.0]
+    neg_grad = logits.grad[targets == 0.0]
+    assert (pos_grad < 0).all()
+    # Magnitude of gradient on positive pixels should be significantly larger due to alpha=0.75 vs 0.25
+    assert pos_grad.abs().mean() > neg_grad.abs().mean()
+
+
+

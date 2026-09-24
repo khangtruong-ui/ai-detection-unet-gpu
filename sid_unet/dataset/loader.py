@@ -101,7 +101,7 @@ try:
                         if not fragment_is_closed and _hf_parquet.datasets.config.PYARROW_VERSION <= _pkg_version.parse("24.0.0"):
                             del parquet_fragment
                             _gc.collect()
-            except (_pa.ArrowInvalid, ValueError, OSError) as e:
+            except Exception as e:
                 if self.config.on_bad_files == "error":
                     _hf_parquet.logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
                     raise

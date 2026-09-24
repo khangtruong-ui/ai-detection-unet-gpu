@@ -9,6 +9,7 @@ Focuses on validating learnability diagnostics at runtime:
 5. Deep-mode active experiments (tiny-dataset memorization capacity, train/eval consistency).
 """
 
+import copy
 import json
 import os
 import tempfile
@@ -275,3 +276,54 @@ def test_trainer_debug_diagnostics_diffusion_diff_v1_and_v2():
             assert hasattr(diag_report, "findings")
             # Verify no unhandled crash / general exception finding
             assert not any(f.category == "general" and f.severity == "critical" for f in diag_report.findings)
+
+
+def test_trainer_debug_diagnostics_deep_mode_non_destructive():
+    """Verify that deep mode diagnostics on DiffusionDiffV2Model preserve model parameters and optimizer state."""
+    from sid_unet.models.diffusion_diff_v2 import DiffusionDiffV2Model
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_config("configs/test_smoke.yaml")
+        config.project.output_dir = tmpdir
+        config.training.epochs = 1
+        config.training.debug_mode = "deep"
+        config.training.auto_batch_size = False
+        config.data.batch_size = 2
+
+        train_loader = _create_synthetic_loader(num_samples=4, image_size=64)
+        val_loader = _create_synthetic_loader(num_samples=4, image_size=64)
+
+        model = DiffusionDiffV2Model(
+            use_dummy=True,
+            dummy_vae_channels=(32, 64),
+            dummy_unet_channels=(32, 64),
+            timesteps=[100, 250],
+            timestep_embed_dim=16,
+            sigma_embed_dim=16,
+            decoder_config={"channels": [32, 16], "norm_layer": "batchnorm"},
+            aux_classifier=True,
+        )
+
+        trainer = Trainer(
+            config=config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+        )
+
+        # Snapshot weights before diagnostics
+        saved_weights = {k: v.clone() for k, v in trainer.model.state_dict().items()}
+        saved_opt_state = copy.deepcopy(trainer.optimizer.state_dict())
+
+        diag_report = trainer._run_debug_diagnostics()
+        assert diag_report is not None
+        assert diag_report.mode == "deep"
+
+        # Verify weights and buffers were restored bitwise
+        current_weights = trainer.model.state_dict()
+        for k, v in saved_weights.items():
+            assert torch.equal(v, current_weights[k]), f"Weight/buffer {k} modified by deep diagnostics"
+
+        # Verify optimizer state restored
+        assert trainer.optimizer.state_dict() == saved_opt_state
+

@@ -351,6 +351,15 @@ def test_diffusion_diff_v2_z_normalization():
     assert hasattr(model, "z_norm")
     assert isinstance(model.z_norm, torch.nn.GroupNorm)
 
+    # When decoder norm_layer is batchnorm, z_norm must still default to GroupNorm
+    model_bn_dec = DiffusionDiffV2Model(
+        use_dummy=True,
+        dummy_vae_channels=(32, 64),
+        dummy_unet_channels=(32, 64),
+        decoder_config={"norm_layer": "batchnorm"},
+    )
+    assert isinstance(model_bn_dec.z_norm, torch.nn.GroupNorm)
+
     x = torch.randn(2, 3, 64, 64)
     logits = model(x)
     mask_logits = logits[0] if isinstance(logits, tuple) else logits

@@ -51,6 +51,7 @@ model:
     channels: [256, 128, 64, 32]
     upsample_mode: "bilinear" # "bilinear", "transpose", or "pixelshuffle"
     norm_layer: "batchnorm"   # "batchnorm", "groupnorm", or "none"
+    z_norm: "groupnorm"       # Normalization for high-dimensional concatenated Z (avoids zeroing out sinusoidal embeddings)
     activation: "silu"        # "silu", "relu", or "leaky_relu"
     dropout: 0.1
     num_res_blocks: 1
@@ -66,7 +67,8 @@ loss:
   dice_weight: 0.5
   focal_weight: 0.5
   focal_gamma: 2.0
-  focal_alpha: 0.25
+  focal_alpha: 0.75
+  pos_weight: 1.0
   aux_classifier: true
   aux_loss_type: "cross_entropy"
   aux_weight: 0.2

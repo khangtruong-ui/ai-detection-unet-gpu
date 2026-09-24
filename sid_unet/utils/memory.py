@@ -6,6 +6,7 @@ batch splitting for micro-batching, and automatic batch size finding.
 
 from __future__ import annotations
 
+import copy
 import gc
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -231,6 +232,7 @@ def find_optimal_batch_size(
     # Put model in train mode on target device
     orig_device = next(model.parameters()).device if list(model.parameters()) else device
     orig_training = model.training
+    orig_state = copy.deepcopy(model.state_dict())
     model = model.to(device)
     model.train()
 
@@ -243,62 +245,67 @@ def find_optimal_batch_size(
     c, h, w = sample_shape
     safe_bs = min_batch_size
 
-    for bs in candidates:
-        clear_memory_cache(device)
-        try:
-            # Generate dummy batch
-            images = torch.randn(bs, c, h, w, device=device)
-            masks = torch.zeros(bs, 1, h, w, device=device)
-            labels = torch.randint(0, num_classes, (bs,), device=device) if aux_classifier else None
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.amp.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
-                outputs = model(images)
-                if loss_fn is not None:
-                    loss, _ = loss_fn(outputs, masks, labels)
-                else:
-                    if isinstance(outputs, tuple):
-                        mask_out, cls_out = outputs
-                        loss = mask_out.mean() + (cls_out.mean() if cls_out is not None else 0.0)
-                    else:
-                        loss = outputs.mean()
-
-            scaler.scale(loss).backward()
-            optimizer.zero_grad(set_to_none=True)
-
-            # Cleanup dummy tensors
-            del images, masks, labels, outputs, loss
-            clear_memory_cache(device)
-
-            safe_bs = bs
-            if logger:
-                logger.info(f"✅ Batch size {bs} succeeded within device memory ({format_memory_summary(device)}).")
-            break
-
-        except Exception as exc:
-            if is_oom_error(exc):
-                if logger:
-                    logger.warning(f"⚠️ Batch size {bs} triggered OOM on {device}. Trying smaller candidate...")
-                clear_memory_cache(device)
-                optimizer.zero_grad(set_to_none=True)
-            else:
-                # If error is not memory related, raise it
-                clear_memory_cache(device)
-                raise exc
-
-    # Restore original model mode and thoroughly clean up probe resources
-    if not orig_training:
-        model.eval()
-
     try:
-        del optimizer, scaler
-    except Exception:
-        pass
+        for bs in candidates:
+            clear_memory_cache(device)
+            try:
+                # Generate dummy batch
+                images = torch.randn(bs, c, h, w, device=device)
+                masks = torch.zeros(bs, 1, h, w, device=device)
+                labels = torch.randint(0, num_classes, (bs,), device=device) if aux_classifier else None
 
-    if hasattr(model, "zero_grad"):
-        model.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
-    clear_memory_cache(device)
-    gc.collect()
+                with torch.amp.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+                    outputs = model(images)
+                    if loss_fn is not None:
+                        loss, _ = loss_fn(outputs, masks, labels)
+                    else:
+                        if isinstance(outputs, tuple):
+                            mask_out, cls_out = outputs
+                            loss = mask_out.mean() + (cls_out.mean() if cls_out is not None else 0.0)
+                        else:
+                            loss = outputs.mean()
+
+                scaler.scale(loss).backward()
+                optimizer.zero_grad(set_to_none=True)
+
+                # Cleanup dummy tensors
+                del images, masks, labels, outputs, loss
+                clear_memory_cache(device)
+
+                safe_bs = bs
+                if logger:
+                    logger.info(f"✅ Batch size {bs} succeeded within device memory ({format_memory_summary(device)}).")
+                break
+
+            except Exception as exc:
+                if is_oom_error(exc):
+                    if logger:
+                        logger.warning(f"⚠️ Batch size {bs} triggered OOM on {device}. Trying smaller candidate...")
+                    clear_memory_cache(device)
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    # If error is not memory related, raise it
+                    clear_memory_cache(device)
+                    raise exc
+    finally:
+        # Restore original model weights, running stats, and training mode
+        model.load_state_dict(orig_state)
+        if not orig_training:
+            model.eval()
+        else:
+            model.train()
+
+        try:
+            del optimizer, scaler
+        except Exception:
+            pass
+
+        if hasattr(model, "zero_grad"):
+            model.zero_grad(set_to_none=True)
+
+        clear_memory_cache(device)
+        gc.collect()
+
     return max(min_batch_size, safe_bs)
