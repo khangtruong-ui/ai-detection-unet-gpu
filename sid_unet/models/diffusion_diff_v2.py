@@ -65,6 +65,8 @@ class PerpendicularSkipFusion(nn.Module):
         if out_channels is None:
             out_channels = dec_channels
 
+        # Normalize perpendicular features before concatenation to match decoder activation scale
+        self.perp_norm = get_norm_layer(norm_layer, perp_channels)
         self.conv = nn.Conv2d(
             dec_channels + perp_channels,
             out_channels,
@@ -84,8 +86,12 @@ class PerpendicularSkipFusion(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+        perp_feat = self.perp_norm(perp_feat)
         fused = torch.cat([dec_feat, perp_feat], dim=1)
-        return self.dropout(self.act(self.norm(self.conv(fused))))
+        out = self.dropout(self.act(self.norm(self.conv(fused))))
+        if out.shape == dec_feat.shape:
+            return dec_feat + out
+        return out
 
 
 class EncoderSkipFusion(nn.Module):
@@ -107,6 +113,8 @@ class EncoderSkipFusion(nn.Module):
         if out_channels is None:
             out_channels = dec_channels
 
+        # Normalize encoder skip features before concatenation
+        self.skip_norm = get_norm_layer(norm_layer, skip_channels)
         self.conv = nn.Conv2d(
             dec_channels + skip_channels,
             out_channels,
@@ -126,8 +134,12 @@ class EncoderSkipFusion(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+        skip_feat = self.skip_norm(skip_feat)
         fused = torch.cat([dec_feat, skip_feat], dim=1)
-        return self.dropout(self.act(self.norm(self.conv(fused))))
+        out = self.dropout(self.act(self.norm(self.conv(fused))))
+        if out.shape == dec_feat.shape:
+            return dec_feat + out
+        return out
 
 
 class TrainableLatentDecoderV2(nn.Module):

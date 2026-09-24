@@ -206,6 +206,7 @@ class SkipFusion(nn.Module):
         if out_channels is None:
             out_channels = dec_channels
 
+        self.skip_norm = get_norm_layer(norm_layer, skip_channels)
         self.conv = nn.Conv2d(dec_channels + skip_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.norm = get_norm_layer(norm_layer, out_channels)
         self.act = get_activation(activation)
@@ -214,8 +215,12 @@ class SkipFusion(nn.Module):
     def forward(self, dec_feat: torch.Tensor, skip_feat: torch.Tensor) -> torch.Tensor:
         if dec_feat.shape[2:] != skip_feat.shape[2:]:
             skip_feat = F.interpolate(skip_feat, size=dec_feat.shape[2:], mode="bilinear", align_corners=False)
+        skip_feat = self.skip_norm(skip_feat)
         fused = torch.cat([dec_feat, skip_feat], dim=1)
-        return self.dropout(self.act(self.norm(self.conv(fused))))
+        out = self.dropout(self.act(self.norm(self.conv(fused))))
+        if out.shape == dec_feat.shape:
+            return dec_feat + out
+        return out
 
 
 class TrainableLatentDecoder(nn.Module):
