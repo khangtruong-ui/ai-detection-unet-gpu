@@ -236,6 +236,69 @@ def parse_args():
         default=None,
         help="Diagnostic mode for nn-toolbox ('light' or 'deep'). Default: 'light' when --debug is passed.",
     )
+    # Bootstrapping v1.0 flags
+    parser.add_argument(
+        "--run-bootstrap",
+        "--run_bootstrap",
+        "--bootstrap",
+        dest="run_bootstrap",
+        action="store_true",
+        default=None,
+        help="Enable Bootstrapping v1.0 kickstarting phase before normal training.",
+    )
+    parser.add_argument(
+        "--no-run-bootstrap",
+        "--no-bootstrap",
+        dest="run_bootstrap",
+        action="store_false",
+        help="Disable Bootstrapping v1.0 kickstarting phase.",
+    )
+    parser.add_argument(
+        "--bootstrap-epochs",
+        dest="bootstrap_epochs",
+        type=int,
+        default=None,
+        help="Number of epochs to run during Bootstrapping v1.0 kickstarting (e.g. 5).",
+    )
+    parser.add_argument(
+        "--bootstrap-examples",
+        "--bootstrap-samples",
+        dest="bootstrap_examples",
+        type=int,
+        default=None,
+        help="Number of samples to train on during Bootstrapping v1.0 (e.g. 512 or 2048).",
+    )
+    parser.add_argument(
+        "--bootstrap-lr",
+        "--bootstrap-learning-rate",
+        dest="bootstrap_lr",
+        type=float,
+        default=None,
+        help="Learning rate for Bootstrapping v1.0 optimizer.",
+    )
+    parser.add_argument(
+        "--bootstrap-strategy",
+        dest="bootstrap_strategy",
+        type=str,
+        choices=["auto", "backbone", "encoder", "except_head", "custom"],
+        default=None,
+        help="Freezing strategy during Bootstrapping v1.0 ('auto', 'backbone', 'encoder', 'except_head').",
+    )
+    parser.add_argument(
+        "--bootstrap-init",
+        "--bootstrap-initialization",
+        dest="bootstrap_init",
+        type=str,
+        default=None,
+        help="Initialization method for unfrozen components ('kaiming_normal', 'xavier_normal', 'none').",
+    )
+    parser.add_argument(
+        "--bootstrap-target-score",
+        dest="bootstrap_target_score",
+        type=float,
+        default=None,
+        help="Target score (IoU) to achieve before early releasing frozen parameters.",
+    )
     return parser.parse_args()
 
 
@@ -458,6 +521,24 @@ def main():
     if getattr(args, "debug", False) or getattr(args, "debug_mode", None):
         dbg_mode = args.debug_mode or "light"
         overrides.append(f"training.debug_mode={dbg_mode}")
+    if getattr(args, "run_bootstrap", None) is True:
+        overrides.append("bootstrapping.enabled=true")
+        overrides.append("bootstrapping.run_bootstrap=true")
+    elif getattr(args, "run_bootstrap", None) is False:
+        overrides.append("bootstrapping.enabled=false")
+        overrides.append("bootstrapping.run_bootstrap=false")
+    if getattr(args, "bootstrap_epochs", None) is not None:
+        overrides.append(f"bootstrapping.epochs={args.bootstrap_epochs}")
+    if getattr(args, "bootstrap_examples", None) is not None:
+        overrides.append(f"bootstrapping.num_samples={args.bootstrap_examples}")
+    if getattr(args, "bootstrap_lr", None) is not None:
+        overrides.append(f"bootstrapping.learning_rate={args.bootstrap_lr}")
+    if getattr(args, "bootstrap_strategy", None) is not None:
+        overrides.append(f"bootstrapping.freeze_strategy={args.bootstrap_strategy}")
+    if getattr(args, "bootstrap_init", None) is not None:
+        overrides.append(f"bootstrapping.initialization={args.bootstrap_init}")
+    if getattr(args, "bootstrap_target_score", None) is not None:
+        overrides.append(f"bootstrapping.target_score={args.bootstrap_target_score}")
 
     if len(config_paths) == 1:
         if args.output_dir:

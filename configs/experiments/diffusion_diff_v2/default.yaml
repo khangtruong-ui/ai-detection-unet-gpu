@@ -89,6 +89,21 @@ training:
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"
 
+bootstrapping:
+  enabled: false               # Default: no bootstrapping (set to true to enable Bootstrapping v1.0 kickstarting)
+  run_bootstrap: false         # Alias for enabled
+  epochs: 5                    # bootstrap_epochs: kickstart epochs on sample subset
+  num_samples: 512             # bootstrap_examples: sample subset size (e.g. 512, 1024, 2048)
+  batch_size: null             # Kickstart batch size (defaults to data.batch_size if null)
+  learning_rate: 0.0005        # Kickstart learning rate for decoder v2 & aux head
+  freeze_strategy: "auto"      # "auto" freezes VAE and Diffuser, trains decoder v2 & classifier
+  freeze_modules: []           # Custom module names if strategy="custom"
+  initialization: "kaiming_normal" # Calibrated initialization for trainable decoder v2
+  target_score: 0.50           # Target metric score to achieve before early release
+  min_loss_drop: 0.15          # Minimum relative loss drop (15%) for acceptable kickstart fit
+  early_stopping: true         # Early stop kickstarting once acceptable fit reached
+  patience: 3                  # Early stopping patience during kickstart
+
 logging:
   log_interval: 20
   log_memory: true

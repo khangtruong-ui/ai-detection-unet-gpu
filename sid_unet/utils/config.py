@@ -177,6 +177,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "early_stopping_metric": "val_iou",
         "early_stopping_mode": "max",
     },
+    "bootstrapping": {
+        "enabled": False,              # Default to no bootstrapping
+        "run_bootstrap": False,        # Alias for enabled
+        "epochs": 5,                   # bootstrap_epochs
+        "num_samples": 512,            # bootstrap_examples (e.g. 512, 1024, 2048)
+        "batch_size": None,            # Defaults to data batch_size if None
+        "learning_rate": None,         # Defaults to training learning_rate if None
+        "freeze_strategy": "auto",     # "auto", "backbone", "encoder", "except_head", "custom"
+        "freeze_modules": [],          # Custom module names to freeze if strategy="custom"
+        "initialization": "kaiming_normal", # "kaiming_normal", "kaiming_uniform", "xavier_normal", "xavier_uniform", "none"
+        "target_score": 0.50,          # Target score threshold to kickstart until
+        "min_loss_drop": 0.15,         # Minimum relative loss drop (15%) for acceptable fit
+        "early_stopping": True,        # Stop bootstrap early once acceptable fit reached
+        "patience": 3,                 # Bootstrap early stopping patience
+    },
     "logging": {
         "log_interval": 20,           # Log training metrics every N steps
         "log_memory": True,           # Log GPU memory allocation info

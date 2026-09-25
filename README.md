@@ -35,6 +35,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [9. Automated Visual Illustration (`sid-illu`) & Heatmap Generation](#9-automated-visual-illustration-sid-illu--heatmap-generation)
   - [10. Memory Management & OOM Dynamic Auto-Recovery](#10-memory-management--oom-dynamic-auto-recovery)
   - [11. Runtime Learnability Diagnostics & Debug Mode (nn-toolbox)](#11-runtime-learnability-diagnostics--debug-mode-nn-toolbox)
+  - [12. Model Kickstarting via Bootstrapping v1.0 (with nn-toolbox verification)](#12-model-kickstarting-via-bootstrapping-v10-with-nn-toolbox-verification)
 - [Installation](#installation)
 - [Project Structure](#project-structure)
 - [Configuration System](#configuration-system)
@@ -737,6 +738,72 @@ sid-train --config configs/default.yaml --debug --debug-mode deep
 [INFO]    ✓ [HEALTHY] OPTIMIZATION: Healthy parameter update ratio: ||Δθ||/||θ|| = 1.81e-02 (displacement norm: 4.59e-01).
 [INFO]    ✓ [HEALTHY] DATA: Input data is finite and non-constant (variance: 1.00e+00 range: [-4.37, 4.07]).
 [INFO] 🎉 [DEBUG MODE] All learnability diagnostic checks passed cleanly with zero warnings.
+```
+
+---
+
+### 12. Model Kickstarting via Bootstrapping v1.0 (with nn-toolbox verification)
+
+When initializing complex models (such as `DiffusionDiff`, `DiffusionDiffV2`, or deep UNet variants), training the entire network simultaneously from step 0 with random parameter initializations often destabilizes learned feature representations. Uncalibrated head gradients backpropagate through backbones or feature extractors, inducing representational drift or early gradient explosion.
+
+**Bootstrapping v1.0** solves this by providing a clean, staged kickstart process:
+1. **Calibrated Initialization**: Applies proper variance scaling (`kaiming_normal` with `fan_out`, `xavier_uniform`, etc.) to newly initialized or unfrozen layers while strictly zeroing biases.
+2. **Selective Upstream Freezing**: Temporarily freezes upstream feature extractors (e.g. encoder stages in UNet, or VAE encoder & Diffuser in DiffusionDiff/DiffusionDiffV2), isolating the task-specific prediction decoder and classifier heads.
+3. **Subset Kickstart Training**: Trains only the unfrozen parameters on a small sample subset (e.g. 512, 1024, or 2048 examples) for multiple epochs (`bootstrap_epochs`) until performing an acceptable fit and reaching a target score.
+4. **Diagnostic Verification via `nn-toolbox`**: Integrates with `nn-toolbox` to inspect:
+   - *Parameter Isolation*: Guarantees that frozen parameters received zero gradient leakage ($\nabla_{\theta_{\text{frozen}}} \mathcal{L} = 0$).
+   - *Loss Trajectory & Fit Verification*: Quantifies initial loss $\mathcal{L}_0$ vs final loss $\mathcal{L}_{\text{final}}$ on the kickstart subset, confirming relative loss drop $\ge 15\%$ or score $\ge \text{target\_score}$.
+   - *Divergence Safety*: Detects explosive activation or loss dynamics before committing to full training.
+5. **Early Parameter Release**: Once the kickstart phase achieves an acceptable fit, all frozen parameters are cleanly restored to their configured training state (`requires_grad = True` where appropriate), the optimizer is re-initialized, and normal full-scale training commences from a calibrated, well-conditioned state.
+
+#### Bootstrapping Configuration:
+Bootstrapping defaults to `false` in config files. Enable it and configure options in YAML or via CLI:
+
+```yaml
+bootstrapping:
+  enabled: true                # Set to true to kickstart before full training (default: false)
+  run_bootstrap: true          # Alias for enabled
+  epochs: 5                    # Number of kickstart epochs on sample subset (default: 5)
+  num_samples: 512             # Sample subset size: 512, 1024, or 2048 (default: 512)
+  batch_size: 8                # Kickstart batch size (defaults to data.batch_size if null)
+  learning_rate: 0.0005        # Warmup learning rate for kickstart phase
+  freeze_strategy: "auto"      # "auto", "backbone", "encoder", "except_head", "custom"
+  initialization: "kaiming_normal" # "kaiming_normal", "kaiming_uniform", "xavier_normal", "none"
+  target_score: 0.50           # Early stop kickstart when IoU/score reaches threshold
+  min_loss_drop: 0.15          # Relative loss drop (15%) considered acceptable fit
+  early_stopping: true         # Early stop kickstart once acceptable fit reached
+  patience: 3                  # Early stopping patience in kickstart phase
+```
+
+#### Running via CLI:
+```bash
+# Kickstart standard UNet with 512 examples for 5 epochs
+sid-train --config configs/default.yaml --run-bootstrap --bootstrap-epochs 5 --bootstrap-examples 512
+
+# Kickstart Diffusion-Diff v1 with calibrated decoder
+sid-train --config configs/experiments/diffusion_diff/diffusion_diff_bootstrap.yaml
+
+# Kickstart Diffusion-Diff-V2 with perpendicular skips
+sid-train --config configs/experiments/diffusion_diff_v2/diffusion_diff_v2_bootstrap.yaml
+```
+
+#### Example Kickstart Console Output:
+```text
+[INFO] ======================================================================
+[INFO] 🚀 [BOOTSTRAPPING v1.0] Commencing kickstart phase
+[INFO]    Configuration: epochs=5, samples=512, strategy='auto', init='kaiming_normal'
+[INFO]    Kickstart LR: 5.00e-04 | Target score: 0.50 | Min loss drop: 15.0%
+[INFO] ======================================================================
+[INFO] 🔒 [BOOTSTRAPPING v1.0] Frozen parameter tensors: 124 | Trainable tensors: 48
+[INFO] 📦 [BOOTSTRAPPING v1.0] Assembling kickstart sample pool (512 examples)...
+[INFO]    Epoch [1/5] - Kickstart Loss: 0.6521 (Drop: +0.0%) | Kickstart IoU: 0.3842
+[INFO]    Epoch [2/5] - Kickstart Loss: 0.4912 (Drop: +24.7%) | Kickstart IoU: 0.5210
+[INFO] 🎯 [BOOTSTRAPPING v1.0] Acceptable kickstart fit reached at epoch 2 (Loss drop: 24.7%, Score: 0.5210).
+[INFO] 🔬 [BOOTSTRAPPING v1.0] Consulting nn-toolbox to evaluate kickstart fit and isolation integrity...
+[INFO]    ✓ [nn-toolbox] [INFO] Bootstrapping v1.0 verified successful: Model achieved acceptable kickstart fit on 512 samples (2 epochs; loss: 0.6521 -> 0.4912, drop: 24.7%, score: 0.5210). Frozen parameters remained isolated and model is primed for full release.
+[INFO] 🔓 [BOOTSTRAPPING v1.0] Releasing all frozen parameters back to original configuration for normal training.
+[INFO] ✨ [BOOTSTRAPPING v1.0] Kickstarting complete. Total active parameters for normal training: 24,812,417
+[INFO] ======================================================================
 ```
 
 ---

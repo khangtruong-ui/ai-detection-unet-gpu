@@ -196,73 +196,8 @@ class Trainer:
                         f"{self.compatibility_8bit_details.get('message')}"
                     )
 
-        # 4. Optimizer & Scheduler
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        if not trainable_params:
-            trainable_params = list(self.model.parameters())
-
-        # Support explicit 8-bit optimizer names or use_8bit_optimizer flag
-        is_8bit_opt_requested = use_8bit_opt or self.opt_name in [
-            "adamw8bit", "adamw_8bit", "8bit_adamw", "8bit_adam",
-            "adam8bit", "adam_8bit", "paged_adamw8bit", "paged_adamw_8bit",
-            "paged_adam8bit", "paged_adam_8bit", "8bit",
-        ]
-
-        if is_8bit_opt_requested:
-            if self.is_8bit_compatible:
-                try:
-                    import bitsandbytes as bnb
-                    if "paged" in self.opt_name:
-                        self.optimizer = bnb.optim.PagedAdamW8bit(
-                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
-                        )
-                        opt_label = "PagedAdamW8bit (with CPU paging)"
-                    else:
-                        self.optimizer = bnb.optim.AdamW8bit(
-                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
-                        )
-                        opt_label = "AdamW8bit"
-                    self.precision_mode = "8bit"
-                    self.logger.info(
-                        f"⚡ 8-Bit Optimizer Active: Initialized {opt_label} "
-                        f"(75% optimizer VRAM savings on {self.compatibility_8bit_details.get('device_name', self.device)})."
-                    )
-                except Exception as opt_err:
-                    fallback = bool(config.training.get("fallback_on_unsupported_8bit", True)) or bool(
-                        config.training.get("fallback_to_16bit", True)
-                    )
-                    if fallback:
-                        self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
-                        self.logger.warning(
-                            f"⚠️ 8-Bit Optimizer initialization failed ({opt_err}). "
-                            f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
-                        )
-                        self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
-                    else:
-                        raise opt_err
-            else:
-                fallback = bool(config.training.get("fallback_on_unsupported_8bit", True)) or bool(
-                    config.training.get("fallback_to_16bit", True)
-                )
-                if fallback:
-                    self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
-                    self.logger.warning(
-                        f"⚠️ 8-Bit Training Mode Fallback: 8-bit optimizer requested ('{self.opt_name}'), but "
-                        f"{self.compatibility_8bit_details.get('message', 'environment is incompatible')}. "
-                        f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
-                    )
-                    self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
-                else:
-                    raise RuntimeError(
-                        f"8-bit optimizer '{self.opt_name}' requested but environment is incompatible: "
-                        f"{self.compatibility_8bit_details.get('message')}"
-                    )
-        elif self.opt_name == "adam":
-            self.optimizer = torch.optim.Adam(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
-        elif self.opt_name == "sgd":
-            self.optimizer = torch.optim.SGD(trainable_params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
-        else:
-            self.optimizer = torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+        self.use_8bit_opt = use_8bit_opt
+        self.optimizer = self._build_optimizer()
 
         self.epochs = int(config.training.get("epochs", 10))
         self.scheduler_name = config.training.get("scheduler", "cosine").lower()
@@ -293,6 +228,27 @@ class Trainer:
             self.debug_mode = "deep"
         else:
             self.debug_mode = False
+
+        # 5.2 Bootstrapping v1.0 Configuration
+        raw_boot = getattr(config, "bootstrapping", None)
+        if raw_boot is None and hasattr(config, "get"):
+            raw_boot = config.get("bootstrapping", None)
+        if raw_boot is None and hasattr(config, "training"):
+            raw_boot = getattr(config.training, "bootstrapping", config.training.get("bootstrapping", None) if hasattr(config.training, "get") else None)
+        if raw_boot is None:
+            raw_boot = {}
+        if isinstance(raw_boot, dict):
+            self.bootstrap_cfg = dict(raw_boot)
+        else:
+            self.bootstrap_cfg = raw_boot.to_dict() if hasattr(raw_boot, "to_dict") else {}
+
+        # Also support training.run_bootstrap / config.run_bootstrap shortcuts
+        if hasattr(config, "training") and (getattr(config.training, "run_bootstrap", False) or (hasattr(config.training, "get") and config.training.get("run_bootstrap", False))):
+            self.bootstrap_cfg["enabled"] = True
+        if hasattr(config, "get") and config.get("run_bootstrap", False):
+            self.bootstrap_cfg["enabled"] = True
+
+        self.bootstrap_results: Optional[Dict[str, Any]] = None
 
         # 6. Callbacks
         checkpoint_period = parse_checkpoint_period(config.training)
@@ -444,6 +400,75 @@ class Trainer:
         except Exception:
             pass
 
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            trainable_params = list(self.model.parameters())
+
+        use_8bit_opt = getattr(self, "use_8bit_opt", False) or bool(self.config.training.get("use_8bit_optimizer", False))
+        is_8bit_opt_requested = use_8bit_opt or self.opt_name in [
+            "adamw8bit", "adamw_8bit", "8bit_adamw", "8bit_adam",
+            "adam8bit", "adam_8bit", "paged_adamw8bit", "paged_adamw_8bit",
+            "paged_adam8bit", "paged_adam_8bit", "8bit",
+        ]
+
+        if is_8bit_opt_requested:
+            if getattr(self, "is_8bit_compatible", False):
+                try:
+                    import bitsandbytes as bnb
+                    if "paged" in self.opt_name:
+                        opt = bnb.optim.PagedAdamW8bit(
+                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                        )
+                        opt_label = "PagedAdamW8bit (with CPU paging)"
+                    else:
+                        opt = bnb.optim.AdamW8bit(
+                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                        )
+                        opt_label = "AdamW8bit"
+                    self.precision_mode = "8bit"
+                    self.logger.info(
+                        f"⚡ 8-Bit Optimizer Active: Initialized {opt_label} "
+                        f"(75% optimizer VRAM savings on {self.compatibility_8bit_details.get('device_name', self.device)})."
+                    )
+                    return opt
+                except Exception as opt_err:
+                    fallback = bool(self.config.training.get("fallback_on_unsupported_8bit", True)) or bool(
+                        self.config.training.get("fallback_to_16bit", True)
+                    )
+                    if fallback:
+                        self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                        self.logger.warning(
+                            f"⚠️ 8-Bit Optimizer initialization failed ({opt_err}). "
+                            f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
+                        )
+                        return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                    else:
+                        raise opt_err
+            else:
+                fallback = bool(self.config.training.get("fallback_on_unsupported_8bit", True)) or bool(
+                    self.config.training.get("fallback_to_16bit", True)
+                )
+                if fallback:
+                    self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                    self.logger.warning(
+                        f"⚠️ 8-Bit Training Mode Fallback: 8-bit optimizer requested ('{self.opt_name}'), but "
+                        f"{self.compatibility_8bit_details.get('message', 'environment is incompatible')}. "
+                        f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
+                    )
+                    return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                else:
+                    raise RuntimeError(
+                        f"8-bit optimizer '{self.opt_name}' requested but environment is incompatible: "
+                        f"{self.compatibility_8bit_details.get('message')}"
+                    )
+        elif self.opt_name == "adam":
+            return torch.optim.Adam(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+        elif self.opt_name == "sgd":
+            return torch.optim.SGD(trainable_params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
+        else:
+            return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+
     def _build_scheduler(self):
         if self.scheduler_name == "cosine":
             min_lr = float(self.config.training.get("min_lr", 1e-6))
@@ -490,6 +515,7 @@ class Trainer:
                 optimizer=self.optimizer,
                 mode=mode_str,
                 device=self.device,
+                bootstrapping=self.bootstrap_results,
                 verbose=True,
             )
 
@@ -900,6 +926,22 @@ class Trainer:
         if self.device.type == "cuda":
             self.logger.info(f"Initial GPU memory: {format_memory_summary(self.device)}")
 
+        # Bootstrapping v1.0 Kickstarting Phase
+        if getattr(self, "bootstrap_cfg", {}).get("enabled", False) or getattr(self, "bootstrap_cfg", {}).get("run_bootstrap", False):
+            from sid_unet.training.bootstrapping import run_bootstrapping_phase
+            self.bootstrap_results = run_bootstrapping_phase(
+                model=self.model,
+                train_loader=self.train_loader,
+                val_loader=self.val_loader,
+                loss_fn=self.loss_fn,
+                config=self.config,
+                logger=self.logger,
+                device=self.device,
+            )
+            # Rebuild optimizer and scheduler for normal training with all released parameters
+            self.optimizer = self._build_optimizer()
+            self.scheduler = self._build_scheduler()
+
         # Run Debug Diagnostics via nn-toolbox if enabled
         if getattr(self, "debug_mode", False):
             self._run_debug_diagnostics()
@@ -1116,5 +1158,6 @@ class Trainer:
             "config": self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
             "report_data": report_data,
             "diagnostic_report": getattr(self, "diagnostic_report", None),
+            "bootstrapping": getattr(self, "bootstrap_results", None),
         }
 

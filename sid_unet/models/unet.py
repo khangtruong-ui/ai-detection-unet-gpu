@@ -275,8 +275,15 @@ class UNet(nn.Module):
 
 
 def build_model(config: Any) -> nn.Module:
-    """Build model instance (UNet, EfficientNet, or SAM3-QLoRA) from configuration dict."""
-    model_cfg = config.get("model", {}) if hasattr(config, "get") else {}
+    """Build model instance from configuration dict or model section."""
+    if hasattr(config, "get") and "model" in config:
+        model_cfg = config.get("model", {})
+    elif hasattr(config, "model"):
+        model_cfg = getattr(config, "model")
+    elif isinstance(config, dict):
+        model_cfg = config
+    else:
+        model_cfg = {}
     training_cfg = config.get("training", {}) if hasattr(config, "get") else {}
     ckpt_flag = bool(
         model_cfg.get(
