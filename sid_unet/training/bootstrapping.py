@@ -99,46 +99,134 @@ def initialize_bootstrap_parameters(
                 nn.init.zeros_(module.bias)
 
 
+class BootstrapFreezeState(dict):
+    """Encapsulates model freeze state for Bootstrapping v1.0.
+
+    Supports both legacy key-lookup (`state[name] -> bool`) and channel stream masking metadata.
+    """
+
+    def __init__(
+        self,
+        strategy: str = "channel_stream",
+        stream_ratio: float = 0.5,
+        saved_requires_grad: Optional[Dict[str, bool]] = None,
+        saved_weights: Optional[Dict[str, torch.Tensor]] = None,
+        channel_masks: Optional[Dict[str, torch.Tensor]] = None,
+        hooks: Optional[List[Any]] = None,
+        active_stream_channels: int = 0,
+        frozen_tail_channels: int = 0,
+    ):
+        super().__init__(saved_requires_grad or {})
+        self.strategy = strategy
+        self.stream_ratio = stream_ratio
+        self.saved_requires_grad = saved_requires_grad or {}
+        self.saved_weights = saved_weights or {}
+        self.channel_masks = channel_masks or {}
+        self.hooks = hooks or []
+        self.active_stream_channels = active_stream_channels
+        self.frozen_tail_channels = frozen_tail_channels
+
+
 def apply_bootstrap_freeze(
     model: nn.Module,
-    strategy: str = "auto",
+    strategy: str = "channel_stream",
+    stream_ratio: float = 0.5,
     custom_modules: Optional[List[str]] = None,
-) -> Dict[str, bool]:
-    """Selectively freeze upstream model components (e.g. encoder/backbone) for kickstarting.
+    min_dim_for_split: int = 4,
+) -> BootstrapFreezeState:
+    """Selectively configure model freezing for the Bootstrapping v1.0 kickstarting phase.
 
-    Saves the exact original `requires_grad` state of each parameter so they can be
-    cleanly released upon kickstart completion.
+    Default Strategy:
+    - 'channel_stream' / 'dimension_stream' / 'auto':
+      Instead of coarsely freezing entire layers (which prevents gradients from reaching end-to-end),
+      freezes and zeroes out the last (1 - stream_ratio) channels of dimension D across all intermediate
+      linear and convolutional weight/bias matrices. This creates a calibrated, low-capacity sub-network
+      stream that runs strictly end-to-end from input to output with zero gradient leakage to frozen channels.
 
-    Strategies:
-    - 'auto': Architecture-aware detection:
-        * DiffusionDiff / DiffusionDiffV2: Freezes VAE encoder and Diffuser UNet;
-          keeps trainable decoder, z_norm, and auxiliary classifier head unfrozen.
-        * UNet: Freezes encoder stages (inc, down1-down4, features);
-          keeps decoder stages (up1-up4, outc) and auxiliary head unfrozen.
-        * DiffusionVAEFinetune: Freezes encoder; keeps decoder unfrozen.
-        * Generic: Freezes the first ~65% of parameter depth.
+    Alternative Strategies:
+    - 'whole_layer': Coarsely freezes entire encoder/backbone layers, training only heads/decoders.
     - 'backbone' or 'encoder': Freezes all layers matching encoder, backbone, vae, inc, down.
-    - 'except_head' or 'heads_only': Freezes everything except decoder, classifier, head, outc.
+    - 'except_head': Freezes everything except decoder, classifier, head, outc.
     - 'custom': Freezes layers matching names in `custom_modules`.
 
     Returns:
-        Dict[str, bool]: Mapping of parameter name -> original requires_grad state.
+        BootstrapFreezeState: Encapsulates freeze masks, saved tensors, and gradient hooks.
     """
-    saved_states: Dict[str, bool] = {}
+    saved_requires_grad: Dict[str, bool] = {}
     for name, param in model.named_parameters():
-        saved_states[name] = param.requires_grad
+        saved_requires_grad[name] = param.requires_grad
 
     strat = strategy.lower()
+    ratio = float(min(max(stream_ratio, 0.05), 1.0))
 
-    if strat == "auto":
+    channel_masks: Dict[str, torch.Tensor] = {}
+    saved_weights: Dict[str, torch.Tensor] = {}
+    hooks: List[Any] = []
+    active_stream_channels = 0
+    frozen_tail_channels = 0
+
+    if strat in ("channel_stream", "dimension_stream", "auto"):
+        # End-to-end channel stream masking across all trainable layers
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if param.dim() in (2, 4):  # Linear [out, in] or Conv2d [out, in, kH, kW]
+                D_out = param.shape[0]
+                D_in = param.shape[1]
+
+                # Only split dimensions greater than min_dim_for_split to protect raw input (RGB=3) and final heads (e.g. 1 mask or 3 classes)
+                K_out = max(1, int(D_out * ratio)) if D_out > min_dim_for_split else D_out
+                K_in = max(1, int(D_in * ratio)) if D_in > min_dim_for_split else D_in
+
+                if K_out < D_out or K_in < D_in:
+                    mask = torch.zeros_like(param.data)
+                    if param.dim() == 4:
+                        mask[:K_out, :K_in, ...] = 1.0
+                    else:
+                        mask[:K_out, :K_in] = 1.0
+
+                    channel_masks[name] = mask
+                    saved_weights[name] = param.data.clone()
+                    # Zero out frozen tail channels
+                    param.data.mul_(mask)
+                    # Register gradient hook to enforce zero gradient leakage into tail channels
+                    h = param.register_hook(lambda g, m=mask: g * m if g is not None else None)
+                    hooks.append(h)
+                    active_stream_channels += K_out
+                    frozen_tail_channels += (D_out - K_out)
+
+            elif param.dim() == 1 and param.shape[0] > min_dim_for_split:  # Bias or Norm parameter
+                D = param.shape[0]
+                K = max(1, int(D * ratio))
+                if K < D:
+                    mask = torch.zeros_like(param.data)
+                    mask[:K] = 1.0
+                    channel_masks[name] = mask
+                    saved_weights[name] = param.data.clone()
+                    param.data.mul_(mask)
+                    h = param.register_hook(lambda g, m=mask: g * m if g is not None else None)
+                    hooks.append(h)
+
+        return BootstrapFreezeState(
+            strategy="channel_stream",
+            stream_ratio=ratio,
+            saved_requires_grad=saved_requires_grad,
+            saved_weights=saved_weights,
+            channel_masks=channel_masks,
+            hooks=hooks,
+            active_stream_channels=active_stream_channels,
+            frozen_tail_channels=frozen_tail_channels,
+        )
+
+    # Legacy whole-layer freeze strategies
+    if strat == "whole_layer":
         model_cls_name = model.__class__.__name__.lower()
         if "diffusiondiff" in model_cls_name:
-            # Freeze vae and diffuser unet, keep decoder and classifier trainable
             for name, param in model.named_parameters():
                 if any(k in name for k in ["vae", "diffuser"]):
                     param.requires_grad = False
         elif "unet" in model_cls_name:
-            # Freeze UNet encoder stages, keep decoder and classifier trainable
             for name, param in model.named_parameters():
                 if any(k in name for k in ["inc", "down", "encoder", "backbone", "features"]):
                     param.requires_grad = False
@@ -147,7 +235,6 @@ def apply_bootstrap_freeze(
                 if any(k in name for k in ["encoder", "quant_conv"]):
                     param.requires_grad = False
         else:
-            # Generic fallback: freeze first 65% of parameter tensors
             param_list = list(model.named_parameters())
             cutoff = int(len(param_list) * 0.65)
             for idx, (name, param) in enumerate(param_list):
@@ -169,17 +256,65 @@ def apply_bootstrap_freeze(
             if any(cm in name for cm in custom_modules):
                 param.requires_grad = False
 
-    return saved_states
+    return BootstrapFreezeState(
+        strategy=strat,
+        stream_ratio=1.0,
+        saved_requires_grad=saved_requires_grad,
+        saved_weights={},
+        channel_masks={},
+        hooks=[],
+    )
 
 
 def release_bootstrap_freeze(
     model: nn.Module,
-    saved_states: Dict[str, bool],
+    saved_states: Union[BootstrapFreezeState, Dict[str, Any]],
+    release_mode: str = "restore",
 ) -> None:
-    """Release frozen parameters back to their configured pre-bootstrapping states."""
-    for name, param in model.named_parameters():
-        if name in saved_states:
-            param.requires_grad = saved_states[name]
+    """Release frozen channel stream or whole-layer parameters back to their full capacity state."""
+    # 1. Channel stream release
+    if isinstance(saved_states, BootstrapFreezeState):
+        for h in saved_states.hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        saved_states.hooks.clear()
+
+        # Restore or calibrate tail channels while strictly preserving the trained core stream
+        params_dict = dict(model.named_parameters())
+        for name, mask in saved_states.channel_masks.items():
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            orig_data = saved_states.saved_weights.get(name, None)
+            if orig_data is None:
+                continue
+
+            orig_data = orig_data.to(param.device)
+            mask = mask.to(param.device)
+
+            if release_mode == "restore":
+                param.data = param.data * mask + orig_data * (1.0 - mask)
+            elif release_mode == "calibrated":
+                tail_init = torch.empty_like(orig_data)
+                if param.dim() >= 2:
+                    nn.init.kaiming_normal_(tail_init, mode="fan_in")
+                else:
+                    nn.init.zeros_(tail_init)
+                param.data = param.data * mask + (tail_init * 0.1) * (1.0 - mask)
+            elif release_mode == "zero":
+                param.data = param.data * mask
+
+        # Restore original requires_grad status
+        for name, req_grad in saved_states.saved_requires_grad.items():
+            if name in params_dict:
+                params_dict[name].requires_grad = req_grad
+
+    elif isinstance(saved_states, dict):
+        for name, param in model.named_parameters():
+            if name in saved_states:
+                param.requires_grad = saved_states[name]
 
 
 def is_map_style_dataset(ds: Any) -> bool:
@@ -369,8 +504,10 @@ def run_bootstrapping_phase(
 
     epochs = int(boot_cfg.get("bootstrap_epochs", boot_cfg.get("epochs", 5)))
     num_samples = int(boot_cfg.get("bootstrap_examples", boot_cfg.get("num_samples", 512)))
-    freeze_strategy = str(boot_cfg.get("freeze_strategy", "auto"))
+    freeze_strategy = str(boot_cfg.get("freeze_strategy", boot_cfg.get("strategy", "channel_stream")))
     freeze_modules = boot_cfg.get("freeze_modules", None)
+    stream_ratio = float(boot_cfg.get("stream_ratio", boot_cfg.get("bootstrap_stream_ratio", 0.5)))
+    release_mode = str(boot_cfg.get("release_mode", "restore"))
     init_scheme = str(boot_cfg.get("initialization", "kaiming_normal"))
     target_score = boot_cfg.get("target_score", 0.50)
     target_score = float(target_score) if target_score is not None else None
@@ -389,12 +526,23 @@ def run_bootstrapping_phase(
 
     logger.info("=" * 70)
     logger.info("🚀 [BOOTSTRAPPING v1.0] Commencing kickstart phase")
-    logger.info(f"   Configuration: epochs={epochs}, samples={num_samples}, strategy='{freeze_strategy}', init='{init_scheme}'")
+    logger.info(f"   Configuration: epochs={epochs}, samples={num_samples}, strategy='{freeze_strategy}', stream_ratio={stream_ratio}, init='{init_scheme}'")
     logger.info(f"   Kickstart LR: {lr:.2e} | Target score: {target_score} | Min loss drop: {min_loss_drop*100:.1f}%")
     logger.info("=" * 70)
 
     # 1. Selectively freeze components and snapshot original requires_grad states
-    saved_states = apply_bootstrap_freeze(model, strategy=freeze_strategy, custom_modules=freeze_modules)
+    saved_states = apply_bootstrap_freeze(
+        model,
+        strategy=freeze_strategy,
+        stream_ratio=stream_ratio,
+        custom_modules=freeze_modules,
+    )
+
+    if hasattr(saved_states, "strategy") and saved_states.strategy == "channel_stream":
+        logger.info(
+            f"🌊 [BOOTSTRAPPING v1.0] Channel Stream Active: {saved_states.active_stream_channels} core channels trainable "
+            f"| {saved_states.frozen_tail_channels} tail channels frozen & zeroed across {len(saved_states.channel_masks)} layers."
+        )
 
     # 2. Calibrate unfrozen module weights
     initialize_bootstrap_parameters(model, initialization=init_scheme, unfrozen_only=True)
@@ -408,7 +556,7 @@ def run_bootstrapping_phase(
 
     if not trainable_tensors:
         logger.warning("⚠️ [BOOTSTRAPPING v1.0] No parameters are trainable during kickstart! Aborting kickstart phase.")
-        release_bootstrap_freeze(model, saved_states)
+        release_bootstrap_freeze(model, saved_states, release_mode=release_mode)
         return {
             "enabled": True,
             "run_bootstrap": True,
@@ -500,10 +648,18 @@ def run_bootstrapping_phase(
             loss.backward()
 
             # Verify freeze isolation during backward pass
-            for name, p in model.named_parameters():
-                if name in frozen_params and p.grad is not None:
-                    if float(p.grad.abs().sum().item()) > 1e-9:
-                        grad_leak = True
+            if hasattr(saved_states, "channel_masks") and saved_states.channel_masks:
+                for name, p in model.named_parameters():
+                    if name in saved_states.channel_masks and p.grad is not None:
+                        mask = saved_states.channel_masks[name]
+                        frozen_grad = p.grad * (1.0 - mask)
+                        if float(frozen_grad.abs().sum().item()) > 1e-9:
+                            grad_leak = True
+            else:
+                for name, p in model.named_parameters():
+                    if name in frozen_params and p.grad is not None:
+                        if float(p.grad.abs().sum().item()) > 1e-9:
+                            grad_leak = True
 
             torch.nn.utils.clip_grad_norm_(trainable_tensors, max_norm=1.0)
             opt.step()
@@ -555,6 +711,10 @@ def run_bootstrapping_phase(
     summary: Dict[str, Any] = {
         "enabled": True,
         "run_bootstrap": True,
+        "strategy": freeze_strategy,
+        "stream_ratio": stream_ratio,
+        "active_stream_channels": getattr(saved_states, "active_stream_channels", 0),
+        "frozen_tail_channels": getattr(saved_states, "frozen_tail_channels", 0),
         "initial_loss": float(initial_loss_val),
         "final_loss": float(final_loss),
         "loss_drop": float(loss_drop_final),
@@ -604,8 +764,8 @@ def run_bootstrapping_phase(
         summary["nn_toolbox_verified"] = acceptable_fit
 
     # 7. Release frozen parameters early, restoring original state for normal training
-    logger.info("🔓 [BOOTSTRAPPING v1.0] Releasing all frozen parameters back to original configuration for normal training.")
-    release_bootstrap_freeze(model, saved_states)
+    logger.info("🔓 [BOOTSTRAPPING v1.0] Releasing all frozen channel streams/parameters back to original configuration for normal training.")
+    release_bootstrap_freeze(model, saved_states, release_mode=release_mode)
 
     active_now = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"✨ [BOOTSTRAPPING v1.0] Kickstarting complete. Total active parameters for normal training: {active_now:,}")

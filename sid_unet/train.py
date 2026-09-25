@@ -280,9 +280,16 @@ def parse_args():
         "--bootstrap-strategy",
         dest="bootstrap_strategy",
         type=str,
-        choices=["auto", "backbone", "encoder", "except_head", "custom"],
+        choices=["channel_stream", "dimension_stream", "whole_layer", "auto", "backbone", "encoder", "except_head", "custom"],
         default=None,
-        help="Freezing strategy during Bootstrapping v1.0 ('auto', 'backbone', 'encoder', 'except_head').",
+        help="Freezing strategy during Bootstrapping v1.0 ('channel_stream', 'dimension_stream', 'whole_layer', 'auto', 'custom').",
+    )
+    parser.add_argument(
+        "--bootstrap-stream-ratio",
+        dest="bootstrap_stream_ratio",
+        type=float,
+        default=None,
+        help="Active channel stream ratio during Bootstrapping v1.0 (e.g. 0.5 for first 50% channels).",
     )
     parser.add_argument(
         "--bootstrap-init",
@@ -535,6 +542,8 @@ def main():
         overrides.append(f"bootstrapping.learning_rate={args.bootstrap_lr}")
     if getattr(args, "bootstrap_strategy", None) is not None:
         overrides.append(f"bootstrapping.freeze_strategy={args.bootstrap_strategy}")
+    if getattr(args, "bootstrap_stream_ratio", None) is not None:
+        overrides.append(f"bootstrapping.stream_ratio={args.bootstrap_stream_ratio}")
     if getattr(args, "bootstrap_init", None) is not None:
         overrides.append(f"bootstrapping.initialization={args.bootstrap_init}")
     if getattr(args, "bootstrap_target_score", None) is not None:

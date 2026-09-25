@@ -60,7 +60,8 @@ def test_bootstrap_default_config():
     assert boot_cfg["run_bootstrap"] is False
     assert boot_cfg["epochs"] == 5
     assert boot_cfg["num_samples"] == 512
-    assert boot_cfg["freeze_strategy"] == "auto"
+    assert boot_cfg["freeze_strategy"] == "channel_stream"
+    assert boot_cfg["stream_ratio"] == 0.5
     assert boot_cfg["initialization"] == "kaiming_normal"
 
 
@@ -129,7 +130,7 @@ def test_initialize_bootstrap_parameters():
 
 
 def test_apply_and_release_bootstrap_freeze_unet():
-    """Verify selective freezing and full release in UNet."""
+    """Verify channel stream freezing, zero gradient leakage, and full release in UNet."""
     model_cfg = {
         "name": "unet",
         "in_channels": 3,
@@ -141,29 +142,53 @@ def test_apply_and_release_bootstrap_freeze_unet():
     }
     model = build_model(model_cfg)
 
-    # Initially, all parameters should be trainable
-    all_trainable = all(p.requires_grad for p in model.parameters())
-    assert all_trainable
+    # 1. Channel stream strategy (default)
+    freeze_state = apply_bootstrap_freeze(model, strategy="channel_stream", stream_ratio=0.5)
+    assert freeze_state.strategy == "channel_stream"
+    assert freeze_state.stream_ratio == 0.5
+    assert len(freeze_state.channel_masks) > 0
+    assert freeze_state.active_stream_channels > 0
+    assert freeze_state.frozen_tail_channels > 0
 
-    # Apply auto bootstrap freeze: encoder frozen, decoder and classifier trainable
-    saved_states = apply_bootstrap_freeze(model, strategy="auto")
+    # Verify tail weights are strictly zeroed
+    params_dict = dict(model.named_parameters())
+    for name, mask in freeze_state.channel_masks.items():
+        p = params_dict[name]
+        tail_val = (p.data * (1.0 - mask)).abs().max().item()
+        assert tail_val == 0.0, f"Tail weights not zeroed in {name}"
 
-    frozen_params = [name for name, p in model.named_parameters() if not p.requires_grad]
-    trainable_params = [name for name, p in model.named_parameters() if p.requires_grad]
+    # End-to-end computation test: forward & backward pass
+    x = torch.randn(2, 3, 32, 32)
+    out = model(x)
+    out_t = out[0] if isinstance(out, (tuple, list)) else out
+    loss = out_t.sum()
+    loss.backward()
 
-    assert len(frozen_params) > 0, "Encoder layers should be frozen"
-    assert len(trainable_params) > 0, "Decoder/classifier layers should remain trainable"
-    assert any("inc" in name or "down" in name for name in frozen_params)
-    assert any("up" in name or "outc" in name or "classifier" in name for name in trainable_params)
+    # Verify zero gradient leakage into frozen tail channels
+    for name, mask in freeze_state.channel_masks.items():
+        p = params_dict[name]
+        if p.grad is not None:
+            tail_grad = (p.grad * (1.0 - mask)).abs().max().item()
+            assert tail_grad == 0.0, f"Gradient leakage into tail channels of {name}: {tail_grad}"
 
-    # Release bootstrap freeze: restore original trainable status
-    release_bootstrap_freeze(model, saved_states)
+    # Release bootstrap freeze: restore original tail weights and clean hooks
+    release_bootstrap_freeze(model, freeze_state, release_mode="restore")
+    assert len(freeze_state.hooks) == 0, "Backward hooks must be cleared on release"
     restored_all_trainable = all(p.requires_grad for p in model.parameters())
     assert restored_all_trainable, "All parameters should be released back to trainable"
 
+    # 2. Whole layer strategy (legacy/alternative option)
+    saved_states_layer = apply_bootstrap_freeze(model, strategy="whole_layer")
+    frozen_params = [name for name, p in model.named_parameters() if not p.requires_grad]
+    trainable_params = [name for name, p in model.named_parameters() if p.requires_grad]
+    assert len(frozen_params) > 0, "Encoder layers should be frozen in whole_layer strategy"
+    assert len(trainable_params) > 0, "Decoder/classifier layers should remain trainable"
+    release_bootstrap_freeze(model, saved_states_layer)
+    assert all(p.requires_grad for p in model.parameters())
+
 
 def test_apply_and_release_bootstrap_freeze_diffusion_diff():
-    """Verify selective freezing and release in DiffusionDiff."""
+    """Verify channel stream freezing and release in DiffusionDiff."""
     model_cfg = {
         "name": "diffusion_diff",
         "use_dummy": True,
@@ -175,28 +200,38 @@ def test_apply_and_release_bootstrap_freeze_diffusion_diff():
     }
     model = build_model(model_cfg)
 
-    # In model, vae was trainable, diffuser was frozen
+    # In model, vae was trainable, diffuser was permanently frozen
     assert any("vae" in name and p.requires_grad for name, p in model.named_parameters())
     assert all(not p.requires_grad for name, p in model.named_parameters() if "diffuser" in name)
 
-    saved_states = apply_bootstrap_freeze(model, strategy="auto")
+    freeze_state = apply_bootstrap_freeze(model, strategy="channel_stream", stream_ratio=0.5)
+    assert freeze_state.strategy == "channel_stream"
+    assert len(freeze_state.channel_masks) > 0
 
-    # During bootstrap: vae and diffuser frozen, decoder and classifier trainable
-    vae_frozen = all(not p.requires_grad for name, p in model.named_parameters() if "vae" in name)
-    diffuser_frozen = all(not p.requires_grad for name, p in model.named_parameters() if "diffuser" in name)
-    decoder_trainable = any("decoder" in name and p.requires_grad for name, p in model.named_parameters())
-    assert vae_frozen, "VAE must be frozen during kickstarting"
-    assert diffuser_frozen, "Diffuser must be frozen during kickstarting"
-    assert decoder_trainable, "Decoder must be trainable during kickstarting"
+    # Diffuser remains frozen, trainable layers receive channel masks
+    assert all(not p.requires_grad for name, p in model.named_parameters() if "diffuser" in name)
+
+    # Verify zero gradient leakage
+    x = torch.randn(2, 3, 32, 32)
+    out = model(x)
+    loss = out[0].sum() if isinstance(out, (tuple, list)) else out.sum()
+    loss.backward()
+
+    params_dict = dict(model.named_parameters())
+    for name, mask in freeze_state.channel_masks.items():
+        p = params_dict[name]
+        if p.grad is not None:
+            tail_grad = (p.grad * (1.0 - mask)).abs().max().item()
+            assert tail_grad == 0.0, f"Gradient leakage in {name}"
 
     # Release: vae restored to trainable, diffuser remains frozen
-    release_bootstrap_freeze(model, saved_states)
+    release_bootstrap_freeze(model, freeze_state)
     assert any("vae" in name and p.requires_grad for name, p in model.named_parameters())
     assert all(not p.requires_grad for name, p in model.named_parameters() if "diffuser" in name)
 
 
 def test_apply_and_release_bootstrap_freeze_diffusion_diff_v2():
-    """Verify selective freezing and release in DiffusionDiffV2."""
+    """Verify channel stream freezing and release in DiffusionDiffV2."""
     model_cfg = {
         "name": "diffusion_diff_v2",
         "use_dummy": True,
@@ -208,16 +243,25 @@ def test_apply_and_release_bootstrap_freeze_diffusion_diff_v2():
     }
     model = build_model(model_cfg)
 
-    saved_states = apply_bootstrap_freeze(model, strategy="auto")
+    freeze_state = apply_bootstrap_freeze(model, strategy="channel_stream", stream_ratio=0.5)
+    assert freeze_state.strategy == "channel_stream"
+    assert len(freeze_state.channel_masks) > 0
 
-    # During bootstrap: vae frozen, decoder trainable
-    vae_frozen = all(not p.requires_grad for name, p in model.named_parameters() if "vae" in name)
-    decoder_trainable = any("decoder" in name and p.requires_grad for name, p in model.named_parameters())
-    assert vae_frozen
-    assert decoder_trainable
+    # Forward & backward pass test
+    x = torch.randn(2, 3, 32, 32)
+    out = model(x)
+    loss = out[0].sum() if isinstance(out, (tuple, list)) else out.sum()
+    loss.backward()
+
+    params_dict = dict(model.named_parameters())
+    for name, mask in freeze_state.channel_masks.items():
+        p = params_dict[name]
+        if p.grad is not None:
+            tail_grad = (p.grad * (1.0 - mask)).abs().max().item()
+            assert tail_grad == 0.0
 
     # Release
-    release_bootstrap_freeze(model, saved_states)
+    release_bootstrap_freeze(model, freeze_state)
     assert any("vae" in name and p.requires_grad for name, p in model.named_parameters())
 
 

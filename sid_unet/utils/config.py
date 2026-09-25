@@ -184,7 +184,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "num_samples": 512,            # bootstrap_examples (e.g. 512, 1024, 2048)
         "batch_size": None,            # Defaults to data batch_size if None
         "learning_rate": None,         # Defaults to training learning_rate if None
-        "freeze_strategy": "auto",     # "auto", "backbone", "encoder", "except_head", "custom"
+        "freeze_strategy": "channel_stream", # "channel_stream" (default), "dimension_stream", "whole_layer", "custom"
+        "stream_ratio": 0.5,            # Active channel stream ratio (first 50% channels active, last 50% frozen & zeroed)
+        "release_mode": "restore",       # "restore", "calibrated", or "zero"
         "freeze_modules": [],          # Custom module names to freeze if strategy="custom"
         "initialization": "kaiming_normal", # "kaiming_normal", "kaiming_uniform", "xavier_normal", "xavier_uniform", "none"
         "target_score": 0.50,          # Target score threshold to kickstart until

@@ -76,7 +76,9 @@ bootstrapping:
   num_samples: 512             # Fit on 512 examples before full release
   batch_size: 8                # Kickstart micro-batch size
   learning_rate: 0.0005        # Warmup kickstart learning rate for decoder & aux classifier
-  freeze_strategy: "auto"      # Freezes VAE and Diffuser UNet, trains decoder & aux head
+  freeze_strategy: "channel_stream" # End-to-end channel stream: train first 50% channels, freeze & zero tail
+  stream_ratio: 0.5            # 50% core computation stream reaches end to end
+  release_mode: "restore"      # Restores tail weights upon kickstart completion
   initialization: "kaiming_normal" # Calibrated Kaiming normal initialization for conv layers
   target_score: 0.50           # Target IoU score threshold for early kickstart completion
   min_loss_drop: 0.15          # Require at least 15% relative loss reduction for acceptable fit

@@ -70,7 +70,9 @@ bootstrapping:
   num_samples: 512             # bootstrap_examples: sample subset size (e.g. 512, 1024, 2048)
   batch_size: null             # Kickstart batch size (defaults to data.batch_size if null)
   learning_rate: null          # Kickstart learning rate (defaults to training.learning_rate if null)
-  freeze_strategy: "auto"      # "auto", "backbone", "encoder", "except_head", "custom"
+  freeze_strategy: "channel_stream" # "channel_stream" (default: end-to-end stream), "dimension_stream", "whole_layer", "custom"
+  stream_ratio: 0.5            # Active core stream ratio (e.g. 0.5 = first 50% channels active, last 50% frozen & zeroed)
+  release_mode: "restore"      # "restore" (restore pre-bootstrap weights for tail), "calibrated", or "zero"
   freeze_modules: []           # Custom module name patterns to freeze when freeze_strategy="custom"
   initialization: "kaiming_normal" # "kaiming_normal", "kaiming_uniform", "xavier_normal", "xavier_uniform", "none"
   target_score: 0.50           # Target metric score to achieve before early release

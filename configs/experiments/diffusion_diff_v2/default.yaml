@@ -96,7 +96,9 @@ bootstrapping:
   num_samples: 512             # bootstrap_examples: sample subset size (e.g. 512, 1024, 2048)
   batch_size: null             # Kickstart batch size (defaults to data.batch_size if null)
   learning_rate: 0.0005        # Kickstart learning rate for decoder v2 & aux head
-  freeze_strategy: "auto"      # "auto" freezes VAE and Diffuser, trains decoder v2 & classifier
+  freeze_strategy: "channel_stream" # "channel_stream" (default: end-to-end stream), "whole_layer", "custom"
+  stream_ratio: 0.5            # Active core stream ratio (e.g. 0.5 = first 50% channels active, last 50% frozen & zeroed)
+  release_mode: "restore"      # "restore" (restore pre-bootstrap weights for tail), "calibrated", or "zero"
   freeze_modules: []           # Custom module names if strategy="custom"
   initialization: "kaiming_normal" # Calibrated initialization for trainable decoder v2
   target_score: 0.50           # Target metric score to achieve before early release
