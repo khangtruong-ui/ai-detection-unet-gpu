@@ -373,14 +373,14 @@ def test_dedicated_diffusion_diff_bootstrap_configs():
     assert cfg1.bootstrapping.enabled is True
     assert cfg1.bootstrapping.run_bootstrap is True
     assert cfg1.bootstrapping.num_samples == 512
-    assert cfg1.bootstrapping.epochs == 5
+    assert cfg1.bootstrapping.epochs == 30
 
     cfg2 = load_config(v2_cfg_path)
     assert cfg2.model.name == "diffusion_diff_v2"
     assert cfg2.bootstrapping.enabled is True
     assert cfg2.bootstrapping.run_bootstrap is True
     assert cfg2.bootstrapping.num_samples == 512
-    assert cfg2.bootstrapping.epochs == 5
+    assert cfg2.bootstrapping.epochs == 30
 
 
 def test_trainer_bootstrapping_streaming_mode():
@@ -418,3 +418,52 @@ def test_trainer_bootstrapping_streaming_mode():
         assert "bootstrapping" in results
         assert results["bootstrapping"]["enabled"] is True
         assert results["bootstrapping"]["epochs_trained"] == 2
+
+
+def test_bootstrap_zeroes_only_trainable_parameters():
+    """Verify that channel stream zeroing and initialization only affect trainable parameters."""
+    m = nn.Sequential(
+        nn.Conv2d(4, 16, kernel_size=3, padding=1),
+        nn.BatchNorm2d(16),
+        nn.ReLU(),
+        nn.Conv2d(16, 16, kernel_size=3, padding=1),
+    )
+
+    # Freeze second conv layer completely
+    m[3].weight.requires_grad = False
+    m[3].bias.requires_grad = False
+
+    orig_m3_weight = m[3].weight.data.clone()
+    orig_m3_bias = m[3].bias.data.clone()
+
+    freeze_state = apply_bootstrap_freeze(m, strategy="channel_stream", stream_ratio=0.5)
+
+    # Trainable parameters must receive channel masks; frozen parameters must NOT
+    assert "0.weight" in freeze_state.channel_masks
+    assert "0.bias" in freeze_state.channel_masks
+    assert "3.weight" not in freeze_state.channel_masks
+    assert "3.bias" not in freeze_state.channel_masks
+
+    # Frozen layer parameters must remain unchanged
+    assert torch.all(m[3].weight.data == orig_m3_weight)
+    assert torch.all(m[3].bias.data == orig_m3_bias)
+
+    # Initialize with channel masks and saved weights
+    initialize_bootstrap_parameters(
+        m,
+        initialization="kaiming_normal",
+        unfrozen_only=True,
+        channel_masks=freeze_state.channel_masks,
+        saved_weights=freeze_state.saved_weights,
+    )
+
+    # Tail channels of trainable parameters must be strictly zeroed
+    for name, mask in freeze_state.channel_masks.items():
+        p = dict(m.named_parameters())[name]
+        tail_val = (p.data * (1.0 - mask)).abs().max().item()
+        assert tail_val == 0.0, f"Tail weights in {name} not zeroed: {tail_val}"
+
+    # Frozen layer must still be completely untouched
+    assert torch.all(m[3].weight.data == orig_m3_weight)
+    assert torch.all(m[3].bias.data == orig_m3_bias)
+

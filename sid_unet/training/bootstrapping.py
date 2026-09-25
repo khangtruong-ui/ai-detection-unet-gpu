@@ -37,6 +37,8 @@ def initialize_bootstrap_parameters(
     initialization: str = "kaiming_normal",
     target_modules: Optional[List[str]] = None,
     unfrozen_only: bool = True,
+    channel_masks: Optional[Dict[str, torch.Tensor]] = None,
+    saved_weights: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     """Initialize unfrozen/trainable model components with calibrated variance.
 
@@ -97,6 +99,16 @@ def initialize_bootstrap_parameters(
                 nn.init.ones_(module.weight)
             if hasattr(module, "bias") and module.bias is not None and module.bias.requires_grad:
                 nn.init.zeros_(module.bias)
+
+    # Re-apply channel stream masks if present so tail weights remain strictly zeroed
+    if channel_masks:
+        params_dict = dict(model.named_parameters())
+        for name, mask in channel_masks.items():
+            if name in params_dict:
+                param = params_dict[name]
+                if saved_weights is not None:
+                    saved_weights[name] = param.data.clone()
+                param.data.mul_(mask.to(param.device))
 
 
 class BootstrapFreezeState(dict):
@@ -544,8 +556,14 @@ def run_bootstrapping_phase(
             f"| {saved_states.frozen_tail_channels} tail channels frozen & zeroed across {len(saved_states.channel_masks)} layers."
         )
 
-    # 2. Calibrate unfrozen module weights
-    initialize_bootstrap_parameters(model, initialization=init_scheme, unfrozen_only=True)
+    # 2. Calibrate unfrozen module weights and preserve zeroed tail channels on trainable parameters
+    initialize_bootstrap_parameters(
+        model,
+        initialization=init_scheme,
+        unfrozen_only=True,
+        channel_masks=getattr(saved_states, "channel_masks", None),
+        saved_weights=getattr(saved_states, "saved_weights", None),
+    )
 
     # Count parameters
     frozen_params = [name for name, p in model.named_parameters() if not p.requires_grad]

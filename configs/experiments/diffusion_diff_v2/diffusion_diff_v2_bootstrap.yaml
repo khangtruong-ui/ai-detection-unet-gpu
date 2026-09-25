@@ -76,7 +76,7 @@ loss:
 bootstrapping:
   enabled: true                # Enable Bootstrapping v1.0 kickstarting phase
   run_bootstrap: true          # Kickstart before full normal training
-  epochs: 5                    # Train for 5 epochs on kickstart subset
+  epochs: 30                   # Train for 30 epochs on kickstart subset
   num_samples: 512             # Fit on 512 examples before full release
   batch_size: 8                # Kickstart micro-batch size
   learning_rate: 0.0005        # Warmup kickstart learning rate for decoder v2 & aux classifier

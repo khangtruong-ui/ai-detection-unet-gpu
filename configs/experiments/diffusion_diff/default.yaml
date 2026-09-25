@@ -88,7 +88,7 @@ training:
 bootstrapping:
   enabled: false               # Default: no bootstrapping (set to true to enable Bootstrapping v1.0 kickstarting)
   run_bootstrap: false         # Alias for enabled
-  epochs: 5                    # bootstrap_epochs: kickstart epochs on sample subset
+  epochs: 30                   # bootstrap_epochs: kickstart epochs on sample subset
   num_samples: 512             # bootstrap_examples: sample subset size (e.g. 512, 1024, 2048)
   batch_size: null             # Kickstart batch size (defaults to data.batch_size if null)
   learning_rate: 0.0005        # Kickstart learning rate for decoder & aux head
