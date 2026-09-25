@@ -191,7 +191,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "initialization": "kaiming_normal", # "kaiming_normal", "kaiming_uniform", "xavier_normal", "xavier_uniform", "none"
         "target_score": 0.50,          # Target score threshold to kickstart until
         "min_loss_drop": 0.15,         # Minimum relative loss drop (15%) for acceptable fit
-        "early_stopping": True,        # Stop bootstrap early once acceptable fit reached
+        "early_stopping": False,       # Do not stop bootstrap early by default
         "patience": 3,                 # Bootstrap early stopping patience
     },
     "logging": {

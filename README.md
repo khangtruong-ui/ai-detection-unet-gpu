@@ -747,15 +747,15 @@ sid-train --config configs/default.yaml --debug --debug-mode deep
 When initializing complex models (such as `DiffusionDiff`, `DiffusionDiffV2`, or deep UNet variants), training the entire network simultaneously from step 0 with random parameter initializations often destabilizes learned feature representations. Rather than coarsely freezing entire layers (which cuts off gradient backpropagation across network depth), **Bootstrapping v1.0** establishes an **end-to-end channel stream**: for every weight tensor of dimension $D$ (linear matmul or conv filters), it freezes and zeroes out the last channels ($D - K$), allowing a calibrated core stream of computation ($K$ channels) to reach end-to-end through every layer from input to output.
 
 **Bootstrapping v1.0** kickstarts model training by:
-1. **End-to-End Channel Stream**: For linear layers and convolutions of dimension $D$, freezes and zeroes out the last channels ($[K, D)$) while keeping the first $K = \max(1, \lfloor D \times r_{\mathrm{stream}} \rfloor)$ channels active (configured via `stream_ratio`). This enables gradients to flow end-to-end across the full depth of the model within a low-capacity core subspace.
+1. **End-to-End Channel Stream**: For linear layers and convolutions of dimension $D$, freezes and zeroes out the tail channels in $[K, D)$ while keeping the first $K = \max(1, \lfloor D \times r_{\mathrm{stream}} \rfloor)$ channels active (configured via `stream_ratio`). This enables gradients to flow end-to-end across the full depth of the model within a low-capacity core subspace.
 2. **Calibrated Initialization**: Applies proper variance scaling (`kaiming_normal` with `fan_out`, `xavier_uniform`, etc.) to newly initialized or active stream layers while strictly zeroing biases.
 3. **Subset Kickstart Training**: Trains the active core stream on a small sample subset (e.g. 512, 1024, or 2048 examples) for multiple epochs (`bootstrap_epochs`) until performing an acceptable fit and reaching a target score.
 4. **Diagnostic Verification via `nn-toolbox`**: Integrates with `nn-toolbox` to inspect:
    - *Parameter & Channel Isolation*: Guarantees that frozen parameters and channel streams received zero gradient leakage:
      $$\nabla_{\theta_{\mathrm{frozen}}} \mathcal{L} = 0$$
-   - *Loss Trajectory & Fit Verification*: Quantifies initial loss $\mathcal{L}_0$ vs. final loss $\mathcal{L}_{\mathrm{final}}$ on the kickstart subset:
-     $$\Delta \mathcal{L} = \frac{\mathcal{L}_0 - \mathcal{L}_{\mathrm{final}}}{\mathcal{L}_0} \ge 15\%$$
-     confirming acceptable fit (relative loss drop $\ge 15\%$ or score $\ge$ `target_score`).
+   - *Loss Trajectory & Fit Verification*: Quantifies initial loss $\mathcal{L}(0)$ vs. final loss $\mathcal{L}(T)$ on the kickstart subset:
+     $$\Delta \mathcal{L} = \frac{\mathcal{L}(0) - \mathcal{L}(T)}{\mathcal{L}(0)} \ge 0.15$$
+     confirming acceptable fit (relative loss drop $\ge$ 15% or score $\ge$ `target_score`).
    - *Divergence Safety*: Detects explosive activation or loss dynamics before committing to full training.
 5. **Early Parameter Release**: Once the kickstart phase achieves an acceptable fit, all frozen tail channels and parameters are cleanly restored to their configured training state (`requires_grad = True` where appropriate), the optimizer is re-initialized for the full model, and normal full-scale training commences from a calibrated, well-conditioned state.
 
@@ -766,7 +766,7 @@ Bootstrapping defaults to `false` in config files. Enable it and configure optio
 bootstrapping:
   enabled: true                # Set to true to kickstart before full training (default: false)
   run_bootstrap: true          # Alias for enabled
-  epochs: 5                    # Number of kickstart epochs on sample subset (default: 5)
+  epochs: 30                   # Number of kickstart epochs on sample subset (default: 30 for diffusion-diff)
   num_samples: 512             # Sample subset size: 512, 1024, or 2048 (default: 512)
   batch_size: 8                # Kickstart batch size (defaults to data.batch_size if null)
   learning_rate: 0.0005        # Warmup learning rate for kickstart phase
@@ -774,9 +774,9 @@ bootstrapping:
   stream_ratio: 0.5            # Active core stream ratio (e.g. 0.5 = first 50% channels active, last 50% frozen & zeroed)
   release_mode: "restore"      # "restore" (restore pre-bootstrap weights for tail), "calibrated", or "zero"
   initialization: "kaiming_normal" # "kaiming_normal", "kaiming_uniform", "xavier_normal", "none"
-  target_score: 0.50           # Early stop kickstart when IoU/score reaches threshold
+  target_score: 0.50           # Target score threshold
   min_loss_drop: 0.15          # Relative loss drop (15%) considered acceptable fit
-  early_stopping: true         # Early stop kickstart once acceptable fit reached
+  early_stopping: false        # Do not stop kickstart early by default (set to true to enable early stopping)
   patience: 3                  # Early stopping patience in kickstart phase
 ```
 

@@ -63,6 +63,7 @@ def test_bootstrap_default_config():
     assert boot_cfg["freeze_strategy"] == "channel_stream"
     assert boot_cfg["stream_ratio"] == 0.5
     assert boot_cfg["initialization"] == "kaiming_normal"
+    assert boot_cfg["early_stopping"] is False
 
 
 def test_cli_bootstrap_argument_parsing(monkeypatch):
@@ -374,6 +375,7 @@ def test_dedicated_diffusion_diff_bootstrap_configs():
     assert cfg1.bootstrapping.run_bootstrap is True
     assert cfg1.bootstrapping.num_samples == 512
     assert cfg1.bootstrapping.epochs == 30
+    assert cfg1.bootstrapping.early_stopping is False
 
     cfg2 = load_config(v2_cfg_path)
     assert cfg2.model.name == "diffusion_diff_v2"
@@ -381,6 +383,7 @@ def test_dedicated_diffusion_diff_bootstrap_configs():
     assert cfg2.bootstrapping.run_bootstrap is True
     assert cfg2.bootstrapping.num_samples == 512
     assert cfg2.bootstrapping.epochs == 30
+    assert cfg2.bootstrapping.early_stopping is False
 
 
 def test_trainer_bootstrapping_streaming_mode():
@@ -466,4 +469,45 @@ def test_bootstrap_zeroes_only_trainable_parameters():
     # Frozen layer must still be completely untouched
     assert torch.all(m[3].weight.data == orig_m3_weight)
     assert torch.all(m[3].bias.data == orig_m3_bias)
+
+
+def test_bootstrap_no_early_stopping_by_default():
+    """Verify that bootstrapping runs for full epochs without stopping early when early_stopping=False."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_config("configs/test_smoke.yaml")
+        config.project.output_dir = tmpdir
+        config.training.epochs = 1
+        config.training.debug_mode = "light"
+        config.training.auto_batch_size = False
+        config.data.batch_size = 2
+
+        # Configure 4 bootstrap epochs with early_stopping=False and very easy thresholds
+        config.bootstrapping = {
+            "enabled": True,
+            "run_bootstrap": True,
+            "epochs": 4,
+            "num_samples": 6,
+            "freeze_strategy": "channel_stream",
+            "initialization": "kaiming_normal",
+            "target_score": 0.01,  # Trivial to reach
+            "min_loss_drop": 0.01, # Trivial to reach
+            "early_stopping": False, # Must NOT stop early
+        }
+
+        train_loader = _create_synthetic_loader(num_samples=6, image_size=32, batch_size=2)
+        val_loader = _create_synthetic_loader(num_samples=4, image_size=32, batch_size=2)
+
+        trainer = Trainer(
+            config=config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            loss_fn=SyntheticSegmentationLoss(),
+        )
+
+        results = trainer.train()
+        assert results is not None
+        assert "bootstrapping" in results
+        # Must have trained for all 4 epochs because early_stopping was False
+        assert results["bootstrapping"]["epochs_trained"] == 4
+
 

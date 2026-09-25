@@ -524,7 +524,7 @@ def run_bootstrapping_phase(
     target_score = boot_cfg.get("target_score", 0.50)
     target_score = float(target_score) if target_score is not None else None
     min_loss_drop = float(boot_cfg.get("min_loss_drop", 0.15))
-    early_stopping = bool(boot_cfg.get("early_stopping", True))
+    early_stopping = bool(boot_cfg.get("early_stopping", False))
     patience = int(boot_cfg.get("patience", 3))
     batch_size = boot_cfg.get("batch_size", None)
     lr = boot_cfg.get("learning_rate", boot_cfg.get("bootstrap_lr", None))
@@ -600,17 +600,64 @@ def run_bootstrapping_phase(
 
     # 4. Optimizer specifically for kickstarted parameters
     opt = torch.optim.AdamW(trainable_tensors, lr=lr, weight_decay=1e-4)
+    warmup_epochs = min(3, max(1, epochs // 5))
+
+    # Pre-evaluate initial baseline loss on the kickstart pool before training updates
+    model.eval()
+    init_loss_accum = 0.0
+    init_steps = 0
+    with torch.no_grad():
+        for init_b in boot_loader:
+            if isinstance(init_b, dict):
+                bx = init_b.get("image", init_b.get("input", init_b.get("x"))).to(device)
+                bm = init_b.get("mask", init_b.get("masks"))
+                bl = init_b.get("label", init_b.get("labels"))
+                if bm is not None and torch.is_tensor(bm):
+                    bm = bm.to(device)
+                if bl is not None and torch.is_tensor(bl):
+                    bl = bl.to(device)
+            elif isinstance(init_b, (tuple, list)):
+                bx = init_b[0].to(device)
+                bm = init_b[1].to(device) if len(init_b) > 1 and torch.is_tensor(init_b[1]) else None
+                bl = init_b[2].to(device) if len(init_b) > 2 and torch.is_tensor(init_b[2]) else None
+            else:
+                bx = init_b.to(device)
+                bm, bl = None, None
+
+            b_out = model(bx)
+            if bm is not None:
+                if bl is not None:
+                    b_l, _ = loss_fn(b_out, bm, bl)
+                else:
+                    b_l, _ = loss_fn(b_out, bm)
+            else:
+                b_l = loss_fn(b_out)
+            if isinstance(b_l, (tuple, list)):
+                b_l = b_l[0]
+            init_loss_accum += float(b_l.item())
+            init_steps += 1
+            if init_steps >= min(4, len(boot_loader) if hasattr(boot_loader, "__len__") else 4):
+                break
+    initial_loss = (init_loss_accum / max(1, init_steps)) if init_steps > 0 else None
+    model.train()
 
     # 5. Training loop across kickstart epochs
-    model.train()
     history = []
-    initial_loss = None
+    smoothed_loss = None
     best_loss = float("inf")
     best_score = 0.0
     stagnant_epochs = 0
+    consecutive_fit_epochs = 0
     grad_leak = False
+    min_bootstrap_epochs = min(epochs, max(2, min(5, epochs // 3)))
 
     for ep in range(1, epochs + 1):
+        # Linear learning rate warmup across early kickstart epochs to prevent gradient shocks
+        warmup_factor = min(1.0, float(ep) / float(max(1, warmup_epochs)))
+        current_lr = lr * (0.2 + 0.8 * warmup_factor)
+        for pg in opt.param_groups:
+            pg["lr"] = current_lr
+
         running_loss = 0.0
         running_iou = 0.0
         step_count = 0
@@ -688,17 +735,20 @@ def run_bootstrapping_phase(
         if initial_loss is None:
             initial_loss = avg_loss
 
-        cur_drop = (initial_loss - avg_loss) / initial_loss if initial_loss > 1e-8 else 0.0
+        # Exponential moving average smoothing of kickstart loss
+        smoothed_loss = avg_loss if smoothed_loss is None else (0.6 * smoothed_loss + 0.4 * avg_loss)
+        cur_drop = (initial_loss - smoothed_loss) / initial_loss if initial_loss > 1e-8 else 0.0
         best_score = max(best_score, avg_iou)
 
         logger.info(
-            f"   Epoch [{ep}/{epochs}] - Kickstart Loss: {avg_loss:.4f} (Drop: {cur_drop*100:+.1f}%) | "
+            f"   Epoch [{ep}/{epochs}] - Kickstart Loss: {avg_loss:.4f} (Smoothed: {smoothed_loss:.4f}, Drop: {cur_drop*100:+.1f}%) | "
             f"Kickstart IoU/Score: {avg_iou:.4f} | Best Score: {best_score:.4f}"
         )
 
         history.append({
             "epoch": ep,
             "loss": avg_loss,
+            "smoothed_loss": smoothed_loss,
             "iou": avg_iou,
             "loss_drop": cur_drop,
         })
@@ -713,12 +763,21 @@ def run_bootstrapping_phase(
         reached_target_score = (target_score is not None and best_score >= target_score)
         reached_loss_drop = (cur_drop >= min_loss_drop)
 
-        if early_stopping and (reached_loss_drop or reached_target_score) and ep >= 2:
-            logger.info(f"🎯 [BOOTSTRAPPING v1.0] Acceptable kickstart fit reached at epoch {ep} (Loss drop: {cur_drop*100:.1f}%, Score: {best_score:.4f}).")
+        if reached_loss_drop or reached_target_score:
+            consecutive_fit_epochs += 1
+        else:
+            consecutive_fit_epochs = 0
+
+        # Only stop early if explicitly configured and sustained across burn-in epochs
+        if early_stopping and consecutive_fit_epochs >= 2 and ep >= min_bootstrap_epochs:
+            logger.info(
+                f"🎯 [BOOTSTRAPPING v1.0] Acceptable kickstart fit reached and sustained for {consecutive_fit_epochs} epochs at epoch {ep} "
+                f"(Loss drop: {cur_drop*100:.1f}%, Score: {best_score:.4f})."
+            )
             break
 
-        if early_stopping and stagnant_epochs >= patience:
-            logger.info(f"⏹️ [BOOTSTRAPPING v1.0] Kickstart plateau reached at epoch {ep}; completing kickstarting early.")
+        if early_stopping and stagnant_epochs >= patience and ep >= min_bootstrap_epochs:
+            logger.info(f"🛑 [BOOTSTRAPPING v1.0] Kickstart plateau reached after {patience} stagnant epochs at epoch {ep}; completing kickstarting.")
             break
 
     final_loss = history[-1]["loss"] if history else initial_loss or 0.0

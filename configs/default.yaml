@@ -77,7 +77,7 @@ bootstrapping:
   initialization: "kaiming_normal" # "kaiming_normal", "kaiming_uniform", "xavier_normal", "xavier_uniform", "none"
   target_score: 0.50           # Target metric score to achieve before early release
   min_loss_drop: 0.15          # Minimum relative loss drop (15%) for acceptable kickstart fit
-  early_stopping: true         # Early stop kickstarting once acceptable fit reached
+  early_stopping: false        # Do not stop early by default in bootstrap
   patience: 3                  # Early stopping patience during kickstart
 
 logging:

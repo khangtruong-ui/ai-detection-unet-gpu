@@ -82,7 +82,7 @@ bootstrapping:
   initialization: "kaiming_normal" # Calibrated Kaiming normal initialization for conv layers
   target_score: 0.50           # Target IoU score threshold for early kickstart completion
   min_loss_drop: 0.15          # Require at least 15% relative loss reduction for acceptable fit
-  early_stopping: true         # Early stop kickstart upon reaching acceptable fit
+  early_stopping: false        # Do not stop early in bootstrap
   patience: 3                  # Early stopping patience in kickstart phase
 
 training:
