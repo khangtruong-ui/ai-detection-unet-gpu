@@ -14,7 +14,7 @@ import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 
 logger = logging.getLogger("sid_unet.bootstrapping")
 
@@ -182,54 +182,158 @@ def release_bootstrap_freeze(
             param.requires_grad = saved_states[name]
 
 
+def is_map_style_dataset(ds: Any) -> bool:
+    """Check if a dataset is a true map-style dataset supporting indexing and safe len()."""
+    if ds is None or isinstance(ds, IterableDataset):
+        return False
+    try:
+        # A map-style dataset must implement __len__ returning an int > 0
+        total_len = len(ds)
+        if not isinstance(total_len, int) or total_len <= 0:
+            return False
+        # And must support indexing without NotImplementedError, TypeError, or AttributeError
+        _ = ds[0]
+        return True
+    except (TypeError, NotImplementedError, AttributeError, IndexError, Exception):
+        return False
+
+
+def _unbatch_dict_sample(batch: Dict[str, Any], target_count: int, current_count: int) -> List[Dict[str, Any]]:
+    """Slice a batch dict into individual sample dictionaries."""
+    batch_size = None
+    if "image" in batch and hasattr(batch["image"], "shape"):
+        batch_size = batch["image"].shape[0]
+    elif "images" in batch and hasattr(batch["images"], "shape"):
+        batch_size = batch["images"].shape[0]
+    else:
+        for v in batch.values():
+            if isinstance(v, torch.Tensor) and v.ndim > 0:
+                batch_size = v.shape[0]
+                break
+            elif isinstance(v, (list, tuple)) and len(v) > 0:
+                batch_size = len(v)
+                break
+    if batch_size is None:
+        batch_size = 1
+
+    take = min(batch_size, target_count - current_count)
+    unbatched = [{} for _ in range(take)]
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == batch_size:
+            v_cpu = v.detach().cpu()
+            for i in range(take):
+                unbatched[i][k] = v_cpu[i].clone()
+        elif isinstance(v, (list, tuple)) and len(v) == batch_size:
+            for i in range(take):
+                unbatched[i][k] = v[i]
+        else:
+            for i in range(take):
+                unbatched[i][k] = v
+    return unbatched
+
+
+def _unbatch_sequence_sample(batch: Union[list, tuple], target_count: int, current_count: int) -> List[Any]:
+    """Slice a batch list/tuple into individual sample tuples."""
+    batch_size = None
+    for elem in batch:
+        if isinstance(elem, torch.Tensor) and elem.ndim > 0:
+            batch_size = elem.shape[0]
+            break
+        elif isinstance(elem, (list, tuple)) and len(elem) > 0:
+            batch_size = len(elem)
+            break
+    if batch_size is None:
+        batch_size = 1
+
+    take = min(batch_size, target_count - current_count)
+    is_tuple = isinstance(batch, tuple)
+    unbatched = [[] for _ in range(take)]
+    for elem in batch:
+        if isinstance(elem, torch.Tensor) and elem.ndim > 0 and elem.shape[0] == batch_size:
+            elem_cpu = elem.detach().cpu()
+            for i in range(take):
+                unbatched[i].append(elem_cpu[i].clone())
+        elif isinstance(elem, (list, tuple)) and len(elem) == batch_size:
+            for i in range(take):
+                unbatched[i].append(elem[i])
+        else:
+            for i in range(take):
+                unbatched[i].append(elem)
+    return [tuple(u) if is_tuple else u for u in unbatched]
+
+
 def create_bootstrap_loader(
-    train_loader: DataLoader,
+    train_loader: Any,
     num_samples: int = 512,
     batch_size: Optional[int] = None,
 ) -> DataLoader:
     """Extract a small sample subset (e.g. 512 or 2048 samples) for kickstarting.
 
-    Supports both map-style datasets and streaming/iterable datasets.
+    Supports both map-style datasets and streaming/iterable datasets (such as
+    SIDStreamingDataset or BackgroundPrefetcher).
     """
-    bs = batch_size or train_loader.batch_size or 8
-    dataset = train_loader.dataset
+    bs = batch_size or getattr(train_loader, "batch_size", None)
+    if bs is None and hasattr(train_loader, "loader"):
+        bs = getattr(train_loader.loader, "batch_size", None)
+    bs = bs or 8
 
-    # Map-style dataset with known length
-    if hasattr(dataset, "__len__"):
-        total_len = len(dataset)
-        sample_count = min(num_samples, total_len)
-        indices = list(range(sample_count))
-        subset = Subset(dataset, indices)
-        return DataLoader(
-            subset,
-            batch_size=bs,
-            shuffle=True,
-            num_workers=0,  # Avoid worker spawn overhead on tiny kickstart subset
-            pin_memory=False,
-        )
+    dataset = getattr(train_loader, "dataset", None)
+    if dataset is None and hasattr(train_loader, "loader"):
+        dataset = getattr(train_loader.loader, "dataset", None)
 
-    # Streaming / Iterable dataset: drain the first num_samples into in-memory list
-    collected = []
-    for batch in train_loader:
-        if isinstance(batch, dict):
-            b_sz = next(iter(batch.values())).shape[0] if hasattr(next(iter(batch.values())), "shape") else 1
-            for i in range(b_sz):
-                item = {k: v[i] if hasattr(v, "__getitem__") and hasattr(v, "shape") else v for k, v in batch.items()}
-                collected.append(item)
-                if len(collected) >= num_samples:
-                    break
-        elif isinstance(batch, (tuple, list)):
-            b_sz = batch[0].shape[0] if hasattr(batch[0], "shape") else 1
-            for i in range(b_sz):
-                item = tuple(elem[i] if hasattr(elem, "__getitem__") and hasattr(elem, "shape") else elem for elem in batch)
-                collected.append(item)
-                if len(collected) >= num_samples:
-                    break
-        else:
-            collected.append(batch)
+    # 1. Map-style dataset with confirmed random-access and valid length
+    if is_map_style_dataset(dataset):
+        try:
+            total_len = len(dataset)
+            sample_count = min(num_samples, total_len)
+            indices = list(range(sample_count))
+            subset = Subset(dataset, indices)
+            return DataLoader(
+                subset,
+                batch_size=bs,
+                shuffle=True,
+                num_workers=0,  # Avoid worker spawn overhead on tiny kickstart subset
+                pin_memory=False,
+            )
+        except Exception as e:
+            logger.debug(f"Map-style Subset creation failed: {e}; falling back to stream collection.")
 
-        if len(collected) >= num_samples:
-            break
+    # 2. Streaming / Iterable dataset or unindexed loader: drain up to num_samples into in-memory list
+    collected: List[Any] = []
+    try:
+        for batch in train_loader:
+            if isinstance(batch, dict):
+                samples = _unbatch_dict_sample(batch, num_samples, len(collected))
+                collected.extend(samples)
+            elif isinstance(batch, (tuple, list)):
+                samples = _unbatch_sequence_sample(batch, num_samples, len(collected))
+                collected.extend(samples)
+            elif isinstance(batch, torch.Tensor) and batch.ndim > 0:
+                b_sz = batch.shape[0]
+                take = min(b_sz, num_samples - len(collected))
+                b_cpu = batch.detach().cpu()
+                for i in range(take):
+                    collected.append(b_cpu[i].clone())
+            else:
+                collected.append(batch)
+
+            if len(collected) >= num_samples:
+                break
+    finally:
+        # Cleanly close background workers/threads (e.g. BackgroundPrefetcher or raw streams)
+        if hasattr(train_loader, "close") and callable(getattr(train_loader, "close", None)):
+            try:
+                train_loader.close()
+            except Exception:
+                pass
+        if dataset is not None and hasattr(dataset, "close") and callable(getattr(dataset, "close", None)):
+            try:
+                dataset.close()
+            except Exception:
+                pass
+
+    if not collected:
+        raise ValueError("Could not extract any samples from training loader for bootstrapping.")
 
     in_mem_ds = InMemoryListDataset(collected)
     return DataLoader(
@@ -322,6 +426,8 @@ def run_bootstrapping_phase(
     logger.info(f"📦 [BOOTSTRAPPING v1.0] Assembling kickstart sample pool ({num_samples} examples)...")
     try:
         boot_loader = create_bootstrap_loader(train_loader, num_samples=num_samples, batch_size=batch_size)
+        actual_samples = len(boot_loader.dataset) if hasattr(boot_loader, "dataset") and hasattr(boot_loader.dataset, "__len__") else num_samples
+        logger.info(f"✅ [BOOTSTRAPPING v1.0] Kickstart sample pool ready with {actual_samples} samples.")
     except Exception as e:
         logger.warning(f"⚠️ [BOOTSTRAPPING v1.0] Failed to build subset loader: {e}; falling back to standard loader")
         boot_loader = train_loader

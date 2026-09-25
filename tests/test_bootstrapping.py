@@ -222,7 +222,9 @@ def test_apply_and_release_bootstrap_freeze_diffusion_diff_v2():
 
 
 def test_create_bootstrap_loader():
-    """Verify subset DataLoader creation for both map-style and streaming loaders."""
+    """Verify subset DataLoader creation for map-style, streaming, and prefetcher loaders."""
+    from sid_unet.dataset.loader import BackgroundPrefetcher, SIDStreamingDataset
+
     # 1. Map-style loader
     x = torch.randn(50, 3, 32, 32)
     y = torch.randint(0, 2, (50, 1, 32, 32)).float()
@@ -239,6 +241,19 @@ def test_create_bootstrap_loader():
     batches = list(boot_loader2)
     collected_count = sum(b["image"].shape[0] for b in batches)
     assert collected_count == 10
+
+    # 3. SIDStreamingDataset with max_samples=None (verifies fix for 'has no len() when max_samples is None')
+    stream_ds = SIDStreamingDataset(dataset_name="mock", max_samples=None)
+    stream_loader = DataLoader(stream_ds, batch_size=4)
+    boot_loader3 = create_bootstrap_loader(stream_loader, num_samples=12, batch_size=4)
+    batches3 = list(boot_loader3)
+    assert sum(b["image"].shape[0] for b in batches3) == 12
+
+    # 4. BackgroundPrefetcher wrapping SIDStreamingDataset with max_samples=None
+    prefetcher = BackgroundPrefetcher(DataLoader(stream_ds, batch_size=4), maxsize=8)
+    boot_loader4 = create_bootstrap_loader(prefetcher, num_samples=16, batch_size=4)
+    batches4 = list(boot_loader4)
+    assert sum(b["image"].shape[0] for b in batches4) == 16
 
 
 def test_trainer_bootstrapping_e2e_with_nn_toolbox():
@@ -322,3 +337,40 @@ def test_dedicated_diffusion_diff_bootstrap_configs():
     assert cfg2.bootstrapping.run_bootstrap is True
     assert cfg2.bootstrapping.num_samples == 512
     assert cfg2.bootstrapping.epochs == 5
+
+
+def test_trainer_bootstrapping_streaming_mode():
+    """Verify kickstart training in Trainer when data.streaming is True and max_samples is None."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_config("configs/test_smoke.yaml")
+        config.project.output_dir = tmpdir
+        config.training.epochs = 1
+        config.training.debug_mode = "light"
+        config.training.auto_batch_size = False
+        config.data.batch_size = 2
+        config.data.streaming = True
+        config.data.dataset_name = "mock"
+        config.data.train_max_samples = None  # None mimics real streaming dataset without length
+        config.data.val_max_samples = 4
+
+        config.bootstrapping = {
+            "enabled": True,
+            "run_bootstrap": True,
+            "epochs": 2,
+            "num_samples": 6,
+            "freeze_strategy": "auto",
+            "initialization": "kaiming_normal",
+            "learning_rate": 1e-3,
+            "target_score": 0.0,
+            "min_loss_drop": 0.0,
+        }
+
+        from sid_unet.dataset.loader import create_dataloaders
+        train_loader, val_loader = create_dataloaders(config, include_test=False)
+        trainer = Trainer(config=config, train_loader=train_loader, val_loader=val_loader)
+
+        results = trainer.train()
+        assert results is not None
+        assert "bootstrapping" in results
+        assert results["bootstrapping"]["enabled"] is True
+        assert results["bootstrapping"]["epochs_trained"] == 2
