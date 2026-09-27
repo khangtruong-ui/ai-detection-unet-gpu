@@ -1023,6 +1023,26 @@ The configuration file is divided into modular top-level sections:
 | `morphology` | `str` | `"open_close"` | Morphological smoothing algorithm (`"open_close"`, `"open"`, `"close"`). |
 | `morph_kernel_size` | `int` | `3` | Structuring element kernel size for morphological operations. |
 
+#### `bootstrapping` (Model Kickstarting & Parameter Conditioning)
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `false` | Enables bootstrapping kickstart phase prior to normal full-scale training. |
+| `run_bootstrap` | `bool` | `false` | Alias for `enabled`. |
+| `epochs` | `int` | `5` | Number of kickstart epochs on sample subset (e.g. 5 for UNet, 30 for diffusion-diff). |
+| `num_samples` | `int` | `512` | Sample pool size extracted from training dataset (e.g. 512, 1024, or 2048). |
+| `batch_size` | `int` / `null` | `null` | Batch size during kickstart phase (`null` defaults to `data.batch_size`). |
+| `learning_rate` | `float` / `null` | `null` | Dedicated warmup learning rate for kickstart (`null` defaults to `training.learning_rate`). |
+| `freeze_strategy` | `str` | `"channel_stream"` | Parameter freezing strategy: `"channel_stream"` (default), `"dimension_stream"`, `"whole_layer"`, or `"custom"`. |
+| `stream_ratio` | `float` | `0.5` | Ratio of core active channels (e.g. 0.5 = first 50% channels active, last 50% frozen & zeroed). |
+| `release_mode` | `str` | `"restore"` | Parameter release mode upon kickstart completion: `"restore"`, `"calibrated"`, or `"zero"`. |
+| `freeze_modules` | `list[str]` | `[]` | Explicit module names to freeze if `freeze_strategy: "custom"`. |
+| `initialization` | `str` | `"kaiming_normal"` | Weight re-initialization scheme: `"kaiming_normal"`, `"kaiming_uniform"`, `"xavier_normal"`, `"xavier_uniform"`, or `"none"`. |
+| `target_score` | `float` | `0.50` | Target validation IoU threshold considered an acceptable kickstart fit. |
+| `min_loss_drop` | `float` | `0.15` | Minimum relative loss reduction (15%) required before considering kickstart converged. |
+| `early_stopping` | `bool` | `false` | Enables early stopping within the kickstart phase upon reaching acceptable fit. |
+| `patience` | `int` | `3` | Number of epochs without loss/score improvement before halting kickstart early. |
+
+
 ---
 
 ### 2. Checkpoint Timing & Resumption Parameters

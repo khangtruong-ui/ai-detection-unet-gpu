@@ -102,13 +102,16 @@ try:
                             del parquet_fragment
                             _gc.collect()
             except Exception as e:
+                _log = getattr(_hf_parquet, "logger", None)
+                if _log is not None:
+                    if self.config.on_bad_files == "error":
+                        _log.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
+                    elif self.config.on_bad_files == "warn":
+                        _log.warning(f"Skipping bad file '{file}'. {type(e).__name__}: {e}")
+                    else:
+                        _log.debug(f"Skipping bad file '{file}'. {type(e).__name__}: {e}")
                 if self.config.on_bad_files == "error":
-                    _hf_parquet.logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
                     raise
-                elif self.config.on_bad_files == "warn":
-                    _hf_parquet.logger.warning(f"Skipping bad file '{file}'. {type(e).__name__}: {e}")
-                else:
-                    _hf_parquet.logger.debug(f"Skipping bad file '{file}'. {type(e).__name__}: {e}")
 
     _hf_parquet.Parquet._generate_tables = _fast_hf_generate_tables
 except Exception:

@@ -41,6 +41,12 @@ def resolve_sam3_distil_checkpoint(
     if checkpoint_path is None or str(checkpoint_path).strip().lower() in ("none", "", "null"):
         return None
 
+    if checkpoint_path == DEFAULT_SAM3_DISTIL_CHECKPOINT:
+        if "efficientvit" in backbone_type.lower():
+            checkpoint_path = DEFAULT_EFFICIENTVIT_CHECKPOINT
+        else:
+            checkpoint_path = DEFAULT_TINYVIT_CHECKPOINT
+
     if os.path.exists(checkpoint_path):
         return os.path.abspath(checkpoint_path)
 
@@ -144,6 +150,9 @@ class SAM3DistilLoRA(nn.Module):
             self._target_device = torch.device(device)
         else:
             self._target_device = device
+
+        self._cached_text_outputs = None
+        self._cached_text_device = None
 
         self._init_model()
 
@@ -288,8 +297,26 @@ class SAM3DistilLoRA(nn.Module):
         # 4. Extract visual features for the whole batch
         backbone_out = self.base_model.backbone.forward_image(x_proc)
 
-        # 5. Extract text prompt embeddings once
-        text_outputs = self.base_model.backbone.forward_text([self.prompt_text], device=model_device)
+        # 5. Extract text prompt embeddings once (cached with safe cuDNN fallback)
+        if (
+            self._cached_text_outputs is None
+            or self._cached_text_device != model_device
+        ):
+            with torch.no_grad():
+                try:
+                    self._cached_text_outputs = self.base_model.backbone.forward_text(
+                        [self.prompt_text], device=model_device
+                    )
+                except RuntimeError as exc:
+                    if "FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc):
+                        with torch.backends.cudnn.flags(enabled=False):
+                            self._cached_text_outputs = self.base_model.backbone.forward_text(
+                                [self.prompt_text], device=model_device
+                            )
+                    else:
+                        raise exc
+                self._cached_text_device = model_device
+        text_outputs = self._cached_text_outputs
 
         # 6. Reusable find_stage
         find_stage = FindStage(

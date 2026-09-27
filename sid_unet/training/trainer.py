@@ -623,7 +623,14 @@ class Trainer:
             labels = labels.to(self.device, non_blocking=True)
 
         with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            outputs = self.model(images)
+            try:
+                outputs = self.model(images)
+            except RuntimeError as exc:
+                if "FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc):
+                    with torch.backends.cudnn.flags(enabled=False):
+                        outputs = self.model(images)
+                else:
+                    raise exc
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
         if not torch.isfinite(loss):
