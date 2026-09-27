@@ -240,6 +240,8 @@ class UNet(nn.Module):
             if any(k.startswith(("stage1.", "linear.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "efficientnet"
                 merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
+            elif any(k.startswith(("base_model.backbone.vision_backbone", "peft_model.base_model", "model.backbone.vision_backbone")) for k in state_dict.keys()):
+                merged["model"]["name"] = "sam3_distil"
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_qlora"
             elif any(k.startswith("decoder.perp_fusions.") for k in state_dict.keys()):
@@ -294,6 +296,40 @@ def build_model(config: Any) -> nn.Module:
 
     model_name = str(model_cfg.get("name", "unet")).lower()
     backbone = str(model_cfg.get("backbone", "")).lower()
+
+    if any(k in model_name for k in ["sam3_distil", "sam3-distil", "efficientsam3", "sam3distil"]) or (
+        ("sam3" in model_name or "sam3" in backbone) and any(b in backbone for b in ["tinyvit", "efficientvit", "repvit"])
+    ):
+        from sid_unet.models.sam3_distil import SAM3DistilLoRA, DEFAULT_SAM3_DISTIL_CHECKPOINT
+        ckpt_name = model_cfg.get(
+            "checkpoint_path",
+            model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_SAM3_DISTIL_CHECKPOINT))
+        )
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        bb_type = model_cfg.get("backbone", model_cfg.get("backbone_type", "tinyvit"))
+        if str(bb_type).startswith("sam3"):
+            bb_type = "tinyvit"
+        return SAM3DistilLoRA(
+            checkpoint_path=str(ckpt_name) if ckpt_name else None,
+            backbone_type=str(bb_type),
+            model_name=str(model_cfg.get("variant", model_cfg.get("model_variant", model_cfg.get("model_name", "11m")))),
+            text_encoder_type=model_cfg.get("text_encoder_type", "MobileCLIP-S0"),
+            text_encoder_context_length=int(model_cfg.get("text_encoder_context_length", 16)),
+            load_in_4bit=bool(model_cfg.get("load_in_4bit", False)),
+            load_in_8bit=bool(model_cfg.get("load_in_8bit", False)),
+            lora_r=int(model_cfg.get("lora_r", 16)),
+            lora_alpha=int(model_cfg.get("lora_alpha", 32)),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
+            lora_target_modules=model_cfg.get("lora_target_modules", None),
+            prompt_text=str(model_cfg.get("prompt_text", "tampered region")),
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            target_size=tuple(model_cfg.get("target_size", [1008, 1008])),
+            input_rescale=bool(model_cfg.get("input_rescale", True)),
+            device=dev_cfg,
+        )
 
     if "sam3" in model_name or "sam3" in backbone:
         from sid_unet.models.sam3_qlora import SAM3QLoRA, DEFAULT_SAM3_CHECKPOINT

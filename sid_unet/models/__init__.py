@@ -2,6 +2,7 @@ from sid_unet.models.unet import UNet, build_model
 from sid_unet.models.blocks import DoubleConv, Down, Up, OutConv, AuxiliaryClassifier
 from sid_unet.models.efficientnet import EfficientNetSegmentation
 from sid_unet.models.sam3_qlora import SAM3QLoRA
+from sid_unet.models.sam3_distil import SAM3DistilLoRA, SAM3Distil
 from sid_unet.models.sam3_refiner import SAMRefiner, get_sam_refiner
 from sid_unet.models.vae_finetune import DiffusionVAEFinetune, VAEFinetune, SDVAEFinetune
 from sid_unet.models.diffusion_diff import (
@@ -21,6 +22,8 @@ __all__ = [
     "UNet",
     "EfficientNetSegmentation",
     "SAM3QLoRA",
+    "SAM3DistilLoRA",
+    "SAM3Distil",
     "build_model",
     "DoubleConv",
     "Down",

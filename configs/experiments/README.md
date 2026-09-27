@@ -6,6 +6,7 @@ Directory Layout:
 - **`unet_scratch/`**: Standard UNet architectures trained from scratch with varying widths, depths, loss formulations, and resolution budgets.
 - **`efficientnet/`**: Pretrained EfficientNet backbones with UNet multi-scale feature skip connections or the **Sacrifice of Pixel** linear-zoom architecture.
 - **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/COCO-inpainted`.
+- **`sam3_distil/`**: Distilled EfficientSAM3 foundation model (TinyViT, EfficientViT backbones) with PEFT Low-Rank Adaptation (LoRA / QLoRA) trained in the diffusion-diff environment.
 - **`sd_vae_finetune/`**: Finetuned Stable Diffusion 1.5 VAE (AutoencoderKL) adapted for binary synthetic image mask segmentation.
 - **`diffusion_diff/`**: Diffusion multi-noise feature decoder combining multi-step perturbations, frozen diffuser noise predictions, and sinusoidal embeddings with a configurable trainable decoder.
 - **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
@@ -73,6 +74,17 @@ Directory Layout:
 
 ---
 
+## 7. SAM3-Distil (EfficientSAM3) + LoRA Configurations (`configs/experiments/sam3_distil/`)
+
+| Configuration File | Backbone & Model | LoRA Adaptation | Dataset & Mode | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/default.yaml) | EfficientSAM3 TinyViT-11m | LoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | Baseline distilled SAM3 adaptation using identical environment (batch size 8, grad accum 4, AdamW, cosine) to diffusion-diff. |
+| [`sam3_distil_tinyvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_tinyvit_lora.yaml) | EfficientSAM3 TinyViT-11m | LoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | Dedicated TinyViT LoRA targeting attention projections and DETR transformer layers with MobileCLIP-S0 text encoder. |
+| [`sam3_distil_efficientvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_efficientvit_lora.yaml) | EfficientSAM3 EfficientViT-b0 | LoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | High-speed mobile-efficient backbone adapted via LoRA for ultra-low inference latency. |
+| [`sam3_distil_qlora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_qlora.yaml) | EfficientSAM3 TinyViT-11m | 4-bit NF4 QLoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | 4-bit quantized base weights for minimal GPU VRAM consumption (~1.5GB - 2GB). |
+
+---
+
 ## How to Run
 
 ### 1. Training with SAM3 + QLoRA
@@ -80,37 +92,43 @@ Directory Layout:
 sid-train --config configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
 ```
 
-### 2. Training with Pretrained EfficientNet (Default UNet Mode)
+### 2. Training with SAM3-Distil + LoRA (Diffusion-Diff Environment)
+```bash
+sid-train --config configs/experiments/sam3_distil/default.yaml
+```
+
+### 3. Training with Pretrained EfficientNet (Default UNet Mode)
 ```bash
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_unet.yaml
 ```
 
-### 3. Training with 'Sacrifice of Pixel' Mode
+### 4. Training with 'Sacrifice of Pixel' Mode
 ```bash
 sid-train --config configs/experiments/efficientnet/efficientnet_b0_sacrifice_of_pixel.yaml
 ```
 
-### 4. Training with Finetuned Diffusion VAE
+### 5. Training with Finetuned Diffusion VAE
 ```bash
 sid-train --config configs/experiments/sd_vae_finetune/default.yaml
 ```
 
-### 5. Training with Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)
+### 6. Training with Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)
 ```bash
 sid-train --config configs/experiments/diffusion_diff/default.yaml
 ```
 
-### 6. Training with Diffusion Multi-Noise Feature Decoder V2 (Diffusion-Diff-V2)
+### 7. Training with Diffusion Multi-Noise Feature Decoder V2 (Diffusion-Diff-V2)
 ```bash
 sid-train --config configs/experiments/diffusion_diff_v2/default.yaml
 ```
 
-### 7. Multi-Experiment Comparative Suite
+### 8. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
   configs/experiments/efficientnet/efficientnet_b0_unet.yaml \
   configs/experiments/sd_vae_finetune/default.yaml \
   configs/experiments/diffusion_diff/default.yaml \
-  configs/experiments/diffusion_diff_v2/default.yaml
+  configs/experiments/diffusion_diff_v2/default.yaml \
+  configs/experiments/sam3_distil/default.yaml
 ```

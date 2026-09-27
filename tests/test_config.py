@@ -70,7 +70,10 @@ def test_all_experiment_configs_validity():
         assert cfg.data.val_samples == -1
 
         # Use fast tiny model for sam3 config loop testing
-        if "sam3" in str(cfg.model.name).lower():
+        if "sam3_distil" in str(cfg.model.name).lower():
+            cfg.model.checkpoint_path = None
+            cfg.model.load_in_4bit = False
+        elif "sam3" in str(cfg.model.name).lower():
             cfg.model.pretrained_model_name_or_path = "yujiepan/sam3-tiny-random"
             cfg.model.load_in_4bit = False
         elif "diffusion" in str(cfg.model.name).lower() or "vae" in str(cfg.model.name).lower():
@@ -87,7 +90,8 @@ def test_all_experiment_configs_validity():
 
         # Test forward pass with small batch
         h, w = cfg.data.image_size
-        x = torch.randn(2, 3, h, w)
+        dev = next(model.parameters()).device
+        x = torch.randn(2, 3, h, w, device=dev)
         out = model(x)
         if cfg.model.aux_classifier:
             assert isinstance(out, tuple)

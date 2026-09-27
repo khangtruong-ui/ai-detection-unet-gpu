@@ -1,0 +1,90 @@
+# Configuration: SAM3-Distil TinyViT-11m LoRA on COCO-inpainted
+# EfficientSAM3 with TinyViT backbone (11M params) + MobileCLIP-S0 text encoder.
+# Parameter-efficient fine-tuning via PEFT LoRA (r=16, alpha=32) on transformer & backbone attention projections.
+# Training environment mirrors diffusion-diff baseline with multi-worker prefetch and mixed precision.
+
+project:
+  name: "sam3_distil_tinyvit_lora"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/sam3_distil_tinyvit_lora"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 8
+  num_workers: 2
+  pin_memory: true
+  prefetch_batches: 48
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.25
+
+model:
+  name: "sam3_distil"
+  backbone: "tinyvit"
+  model_name: "11m"
+  checkpoint_path: "/workspace/sam3-distil/checkpoints/efficientsam3_ft/efficientsam3_tinyvit.pt"
+  text_encoder_type: "MobileCLIP-S0"
+  text_encoder_context_length: 16
+  prompt_text: "tampered region"
+  load_in_4bit: false
+  load_in_8bit: false
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules:
+    - "qkv"
+    - "qkv_proj"
+    - "out_proj"
+    - "proj"
+    - "linear1"
+    - "linear2"
+  aux_classifier: true
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+  target_size: [1008, 1008]
+  input_rescale: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  focal_weight: 0.5
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 10
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 4
+  save_best: true
+  save_latest: true
+  checkpoint_period: 1
+  early_stopping_patience: 4
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20
+  log_memory: true
