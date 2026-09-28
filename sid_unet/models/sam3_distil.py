@@ -151,8 +151,7 @@ class SAM3DistilLoRA(nn.Module):
         else:
             self._target_device = device
 
-        self._cached_text_outputs = None
-        self._cached_text_device = None
+        self._text_cache: Dict[Tuple[str, str], Dict[str, torch.Tensor]] = {}
 
         self._init_model()
 
@@ -298,25 +297,23 @@ class SAM3DistilLoRA(nn.Module):
         backbone_out = self.base_model.backbone.forward_image(x_proc)
 
         # 5. Extract text prompt embeddings once (cached with safe cuDNN fallback)
-        if (
-            self._cached_text_outputs is None
-            or self._cached_text_device != model_device
-        ):
+        cache_key = (self.prompt_text, str(model_device))
+        if cache_key not in self._text_cache:
             with torch.no_grad():
                 try:
-                    self._cached_text_outputs = self.base_model.backbone.forward_text(
+                    out_t = self.base_model.backbone.forward_text(
                         [self.prompt_text], device=model_device
                     )
                 except RuntimeError as exc:
                     if "FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc):
                         with torch.backends.cudnn.flags(enabled=False):
-                            self._cached_text_outputs = self.base_model.backbone.forward_text(
+                            out_t = self.base_model.backbone.forward_text(
                                 [self.prompt_text], device=model_device
                             )
                     else:
                         raise exc
-                self._cached_text_device = model_device
-        text_outputs = self._cached_text_outputs
+                self._text_cache[cache_key] = {k: v.clone() for k, v in out_t.items()}
+        text_outputs = {k: v.clone() for k, v in self._text_cache[cache_key].items()}
 
         # 6. Reusable find_stage
         find_stage = FindStage(
@@ -425,6 +422,12 @@ class SAM3DistilLoRA(nn.Module):
         mask_logits = outputs[0] if isinstance(outputs, tuple) else outputs
         probs = torch.sigmoid(mask_logits)
         return (probs >= threshold).float()
+
+    def clear_text_cache(self):
+        """Clear cached text prompt embeddings."""
+        self._text_cache.clear()
+        if hasattr(self.base_model, "backbone") and hasattr(self.base_model.backbone, "clear_text_cache"):
+            self.base_model.backbone.clear_text_cache()
 
     @classmethod
     def from_checkpoint(

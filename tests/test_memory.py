@@ -203,8 +203,8 @@ def test_gradient_accumulation_trainer():
         assert results["history"][0]["epoch"] == 1
 
 
-def test_oom_recovery_sub_batching_in_trainer(monkeypatch):
-    """Test that when a large batch triggers OOM, Trainer catches and recovers via micro-batching."""
+def test_oom_raises_in_train_epoch(monkeypatch):
+    """Test that when a batch triggers OOM in train_epoch, it raises immediately without micro-batch retry."""
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = load_config(overrides=[
             f"project.output_dir={tmpdir}",
@@ -229,19 +229,11 @@ def test_oom_recovery_sub_batching_in_trainer(monkeypatch):
             val_loader=val_loader,
         )
 
-        original_step = trainer._step_batch_train
-        oom_triggered = {"count": 0}
-
         def mock_step_batch_train(batch, loss_divisor=1.0):
-            # Trigger simulated OOM only if batch size is 4
-            if len(batch["image"]) == 4:
-                oom_triggered["count"] += 1
-                raise RuntimeError("CUDA out of memory. Tried to allocate 1.0 GiB")
-            return original_step(batch, loss_divisor)
+            raise RuntimeError("CUDA out of memory. Tried to allocate 1.0 GiB")
 
         monkeypatch.setattr(trainer, "_step_batch_train", mock_step_batch_train)
 
-        # Training should not crash, but should recover and complete!
-        results = trainer.train()
-        assert oom_triggered["count"] >= 1
-        assert "best_score" in results
+        # Training should raise the OOM error directly
+        with pytest.raises(RuntimeError, match="CUDA out of memory"):
+            trainer.train()

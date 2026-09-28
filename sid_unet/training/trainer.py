@@ -689,47 +689,9 @@ class Trainer:
                 loss_dict_batch = {}
                 loss_val = 0.0
 
-                try:
-                    loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
-                    loss_val = loss_t.item()
-                    has_pending_grads = True
-                except Exception as exc:
-                    if is_oom_error(exc):
-                        self.logger.warning(
-                            f"⚠️ Out-of-Memory (OOM) on batch size {batch_size} (Epoch {epoch}, Step {step_in_epoch})! "
-                            f"Clearing cache and recovering via micro-batching..."
-                        )
-                        clear_memory_cache(self.device)
-                        self.optimizer.zero_grad()
-                        has_pending_grads = False
-
-                        # Split batch into smaller micro-batches
-                        micro_bs = max(1, batch_size // 2)
-                        sub_batches = split_batch(batch, micro_batch_size=micro_bs)
-                        sub_divisor = len(sub_batches) * accum_steps
-
-                        for sub_b in sub_batches:
-                            try:
-                                _, s_dict = self._step_batch_train(sub_b, loss_divisor=sub_divisor)
-                                for k, v in s_dict.items():
-                                    loss_dict_batch[k] = loss_dict_batch.get(k, 0.0) + (v / len(sub_batches))
-                                has_pending_grads = True
-                            except Exception as sub_exc:
-                                if is_oom_error(sub_exc):
-                                    # Fallback to single sample micro-batching
-                                    clear_memory_cache(self.device)
-                                    nano_batches = split_batch(sub_b, micro_batch_size=1)
-                                    nano_divisor = len(nano_batches) * sub_divisor
-                                    for nano_b in nano_batches:
-                                        _, n_dict = self._step_batch_train(nano_b, loss_divisor=nano_divisor)
-                                        for k, v in n_dict.items():
-                                            loss_dict_batch[k] = loss_dict_batch.get(k, 0.0) + (v / (len(sub_batches) * len(nano_batches)))
-                                        has_pending_grads = True
-                                else:
-                                    raise sub_exc
-                        loss_val = loss_dict_batch.get("total_loss", 0.0)
-                    else:
-                        raise exc
+                loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
+                loss_val = loss_t.item()
+                has_pending_grads = True
 
                 metric_logger.update_dict(loss_dict_batch, n=batch_size)
                 self.global_step += 1
