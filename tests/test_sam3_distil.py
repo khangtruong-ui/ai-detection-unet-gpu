@@ -229,3 +229,33 @@ def test_sam3_distil_from_pretrained_and_hf_resolution(device):
         loaded_top = sid_unet.from_pretrained(ckpt_path, device=device)
         assert isinstance(loaded_top, SAM3DistilLoRA)
 
+
+def test_sam3_distil_missing_dependency_error():
+    """Verify informative ImportError when sam3 dependencies cannot be imported."""
+    from unittest.mock import patch
+
+    with patch.dict("sys.modules", {"sam3.model_builder": None}):
+        with pytest.raises(ImportError) as excinfo:
+            SAM3DistilLoRA(checkpoint_path=None)
+        assert "sam3-distil" in str(excinfo.value)
+        assert "einops" in str(excinfo.value)
+        assert "pycocotools" in str(excinfo.value)
+
+
+def test_pyproject_sam3_distil_dependencies():
+    """Verify that pyproject.toml optional-dependencies include einops and pycocotools."""
+    import tomllib
+
+    with open("pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+
+    optional_deps = data.get("project", {}).get("optional-dependencies", {})
+    sam3_deps = optional_deps.get("sam3-distil", [])
+    all_deps = optional_deps.get("all", [])
+
+    assert any(dep.startswith("einops") for dep in sam3_deps)
+    assert any(dep.startswith("pycocotools") for dep in sam3_deps)
+    assert any(dep.startswith("einops") for dep in all_deps)
+    assert any(dep.startswith("pycocotools") for dep in all_deps)
+
+

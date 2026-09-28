@@ -271,7 +271,7 @@ class SAM3DistilLoRA(nn.Module):
             from peft import LoraConfig, get_peft_model
         except ImportError as exc:
             raise ImportError(
-                "SAM3-Distil models require sam3-distil and peft. "
+                "SAM3-Distil models require sam3-distil, peft, and dependencies (including einops and pycocotools). "
                 "Please install them via `pip install 'sid-unet[sam3-distil]'`."
             ) from exc
 
