@@ -24,12 +24,12 @@ def compute_binary_auroc(
     Robustly handles single-class masks (all-authentic or all-tampered), soft labels, ties, and raw logits.
     """
     if isinstance(pred_probs, torch.Tensor):
-        p = pred_probs.detach().cpu().numpy().astype(np.float64)
+        p = pred_probs.detach().cpu().float().numpy().astype(np.float64)
     else:
         p = np.asarray(pred_probs, dtype=np.float64)
 
     if isinstance(target_mask, torch.Tensor):
-        t = target_mask.detach().cpu().numpy().astype(np.float64)
+        t = target_mask.detach().cpu().float().numpy().astype(np.float64)
     else:
         t = np.asarray(target_mask, dtype=np.float64)
 
@@ -85,12 +85,12 @@ def compute_binary_metrics(
     target_mask: Float/Int tensor/array in {0, 1} or continuous [0, 1].
     """
     if isinstance(pred_mask, torch.Tensor):
-        p_raw = pred_mask.detach().cpu().numpy().astype(np.float64)
+        p_raw = pred_mask.detach().cpu().float().numpy().astype(np.float64)
     else:
         p_raw = np.asarray(pred_mask, dtype=np.float64)
 
     if isinstance(target_mask, torch.Tensor):
-        t_raw = target_mask.detach().cpu().numpy().astype(np.float64)
+        t_raw = target_mask.detach().cpu().float().numpy().astype(np.float64)
     else:
         t_raw = np.asarray(target_mask, dtype=np.float64)
 
@@ -203,6 +203,7 @@ class SegmentationMetricTracker:
             pred_masks = pred_masks.squeeze(1)
         if target_masks.dim() == 4 and target_masks.size(1) == 1:
             target_masks = target_masks.squeeze(1)
+        target_masks = target_masks.float()
 
         b = pred_masks.size(0)
 

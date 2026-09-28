@@ -457,7 +457,7 @@ def run_illustration(
             else:
                 img_batch = img_tensor.to(target_device)
 
-            gt_mask_np = gt_mask_tensor.squeeze().cpu().numpy()
+            gt_mask_np = gt_mask_tensor.squeeze().float().cpu().numpy()
 
             sample_entry = {
                 "image": img_tensor.cpu(),
@@ -476,7 +476,7 @@ def run_illustration(
                 with torch.no_grad():
                     out = model(m_img_batch)
                     mask_logits = out[0] if isinstance(out, tuple) else out
-                    prob_map = torch.sigmoid(mask_logits).squeeze().cpu().numpy()
+                    prob_map = torch.sigmoid(mask_logits.float()).squeeze().cpu().numpy()
                     bin_mask = (prob_map >= threshold).astype(np.float32)
 
                 # Post-processing

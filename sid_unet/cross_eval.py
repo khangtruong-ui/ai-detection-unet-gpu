@@ -365,18 +365,18 @@ def eval_single_batch(
 
     # 6. Collect sample illustrations
     if collect_samples is not None and len(collect_samples) < max_collect:
-        raw_probs = torch.sigmoid(mask_logits)
+        raw_probs = torch.sigmoid(mask_logits.float())
         for i in range(b_size):
             if len(collect_samples) >= max_collect:
                 break
             img_item = images[i].detach().cpu()
-            gt_item = masks[i, 0].detach().cpu().numpy() if masks[i].ndim == 3 else masks[i].detach().cpu().numpy()
-            u_item = raw_probs[i, 0].detach().cpu().numpy() if raw_probs[i].ndim == 3 else raw_probs[i].detach().cpu().numpy()
+            gt_item = masks[i, 0].detach().cpu().float().numpy() if masks[i].ndim == 3 else masks[i].detach().cpu().float().numpy()
+            u_item = raw_probs[i, 0].detach().cpu().float().numpy() if raw_probs[i].ndim == 3 else raw_probs[i].detach().cpu().float().numpy()
 
-            p_item = post_masks[i, 0].detach().cpu().numpy() if post_masks is not None else None
-            s_item = sam_masks[i, 0].detach().cpu().numpy() if sam_masks is not None else None
+            p_item = post_masks[i, 0].detach().cpu().float().numpy() if (post_masks is not None and post_masks[i].ndim == 3) else (post_masks[i].detach().cpu().float().numpy() if post_masks is not None else None)
+            s_item = sam_masks[i, 0].detach().cpu().float().numpy() if (sam_masks is not None and sam_masks[i].ndim == 3) else (sam_masks[i].detach().cpu().float().numpy() if sam_masks is not None else None)
             if both_masks is not None:
-                f_item = both_masks[i, 0].detach().cpu().numpy()
+                f_item = both_masks[i, 0].detach().cpu().float().numpy() if both_masks[i].ndim == 3 else both_masks[i].detach().cpu().float().numpy()
             elif s_item is not None:
                 f_item = s_item
             elif p_item is not None:

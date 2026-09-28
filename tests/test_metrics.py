@@ -192,3 +192,41 @@ def test_segmentation_tracker_dynamic_labels():
     assert "precision" in per_label[5]
     assert "recall" in per_label[5]
     assert "specificity" in per_label[5]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_classification_tracker_low_precision_dtypes(dtype):
+    tracker = ClassificationMetricTracker(num_classes=3)
+    logits = torch.tensor([
+        [10.0, 0.0, 0.0],
+        [0.0, 10.0, 0.0],
+        [0.0, 0.0, 10.0],
+    ], dtype=dtype)
+    targets = torch.tensor([0, 1, 2])
+
+    tracker.update(logits, targets)
+    metrics, cm = tracker.compute()
+    assert metrics["aux_accuracy"] == 1.0
+    assert len(cm) == 3
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_segmentation_tracker_low_precision_dtypes(dtype):
+    tracker = SegmentationMetricTracker(threshold=0.5)
+    preds = torch.full((2, 1, 16, 16), -5.0, dtype=dtype)
+    targets = torch.zeros((2, 1, 16, 16), dtype=dtype)
+    labels = torch.tensor([0, 0])
+
+    tracker.update(preds, targets, labels)
+    overall, per_label = tracker.compute()
+    assert overall["iou"] == 1.0
+    assert per_label[0]["iou"] == 1.0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_compute_binary_metrics_low_precision_dtypes(dtype):
+    pred = torch.tensor([[0.1, 0.9], [0.2, 0.8]], dtype=dtype)
+    target = torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=dtype)
+    metrics = compute_binary_metrics(pred, target)
+    assert metrics["iou"] == 1.0
+    assert metrics["pixel_acc"] == 1.0

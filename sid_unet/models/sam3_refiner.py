@@ -228,8 +228,8 @@ class SAMRefiner:
                 target_sizes=[(h, w)],
             )
 
-            sam_masks = results[0]["masks"].detach().cpu().numpy()
-            scores = results[0]["scores"].detach().cpu().numpy()
+            sam_masks = results[0]["masks"].detach().cpu().float().numpy()
+            scores = results[0]["scores"].detach().cpu().float().numpy()
         except Exception as exc:
             logger.warning(f"SAM3 inference encountered error ({exc}), falling back to UNet mask.")
             return orig_binary_mask, {

@@ -230,9 +230,9 @@ def main():
                 else:
                     raise exc
 
-            probs = torch.sigmoid(mask_logits).cpu().numpy()
+            probs = torch.sigmoid(mask_logits.float()).cpu().numpy()
             if class_logits is not None:
-                class_probs = torch.softmax(class_logits, dim=1).cpu().numpy()
+                class_probs = torch.softmax(class_logits.float(), dim=1).cpu().numpy()
             else:
                 class_probs = None
 

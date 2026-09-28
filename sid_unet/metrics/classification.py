@@ -5,7 +5,7 @@ Includes accuracy, macro F1, AUROC, and confusion matrix.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
@@ -33,7 +33,7 @@ class ClassificationMetricTracker:
         target_labels: (B,) or (B, 1)
         """
         if isinstance(class_logits, torch.Tensor):
-            probs = torch.softmax(class_logits, dim=1).detach().cpu().numpy()
+            probs = torch.softmax(class_logits.float(), dim=1).detach().cpu().numpy()
         else:
             arr = np.asarray(class_logits, dtype=np.float64)
             if (arr < 0.0).any() or (arr > 1.0).any() or not np.allclose(arr.sum(axis=-1), 1.0, atol=1e-3):
