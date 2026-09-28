@@ -34,6 +34,21 @@ from sid_unet.postprocessing import (
     apply_morphology,
     get_postprocessor_from_config,
 )
+from sid_unet.models.unet import UNet, build_model
+from sid_unet.utils.checkpoint import download_hf_checkpoint, resolve_checkpoint_source
+
+
+def from_pretrained(
+    pretrained_model_name_or_path: str,
+    *args,
+    **kwargs,
+):
+    """Load a trained model (UNet, SAM3-Distil, etc.) from local file or Hugging Face Hub.
+
+    Automatically resolves and downloads checkpoints into the HF cache ($HF_HOME/hub).
+    """
+    return UNet.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
 
 __all__ = [
     "__version__",
@@ -42,4 +57,9 @@ __all__ = [
     "fill_mask_holes",
     "apply_morphology",
     "get_postprocessor_from_config",
+    "UNet",
+    "build_model",
+    "from_pretrained",
+    "download_hf_checkpoint",
+    "resolve_checkpoint_source",
 ]

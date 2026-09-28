@@ -19,6 +19,10 @@ HF_CHECKPOINT_CANDIDATES = [
     "checkpoint_best.pt",
     "pytorch_model.bin",
     "model.pt",
+    "efficientsam3_ft/efficientsam3_tinyvit.pt",
+    "efficientsam3_efficientvit.pt",
+    "efficientsam3_repvit.pt",
+    "sam3.pt",
 ]
 
 LOCAL_CHECKPOINT_PRIORITY = [
@@ -33,6 +37,8 @@ def is_hf_repo_id(identifier: str) -> bool:
 
     Recognizes:
       - 'username/repo-name' (when not an existing local directory or file)
+      - 'username/repo-name/filename.pt'
+      - 'username/repo-name:filename.pt'
       - 'hf://username/repo-name'
       - 'https://huggingface.co/username/repo-name'
     """
@@ -47,21 +53,23 @@ def is_hf_repo_id(identifier: str) -> bool:
     if os.path.exists(raw):
         return False
 
-    # Check for username/repo pattern with optional subfolder or tag
-    # Exclude Windows absolute paths (e.g. C:\...) and unix paths starting with / or ./ or ../
+    # Exclude common local relative and absolute directory prefixes
     if raw.startswith("/") or raw.startswith("./") or raw.startswith("../") or "\\" in raw:
         return False
 
-    # Strip subfolder/filename if syntax like 'owner/repo:checkpoint.pt'
+    for prefix in ["checkpoints/", "outputs/", "weights/", "runs/"]:
+        if raw.lower().startswith(prefix):
+            return False
+
     repo_part = raw.split(":", 1)[0]
     parts = repo_part.split("/")
-    if len(parts) == 2:
-        owner, repo = parts
+    if len(parts) >= 2:
+        owner, repo = parts[0], parts[1]
         if re.match(r"^[a-zA-Z0-9_\-\.]+$", owner) and re.match(r"^[a-zA-Z0-9_\-\.]+$", repo):
-            # Don't treat files like 'foo/bar.pt' as repo IDs if extension indicates file
-            ext = os.path.splitext(repo)[1].lower()
-            if ext in [".pt", ".pth", ".bin", ".safetensors", ".ckpt", ".yaml", ".yml", ".json"]:
-                return False
+            if len(parts) == 2:
+                ext = os.path.splitext(repo)[1].lower()
+                if ext in [".pt", ".pth", ".bin", ".safetensors", ".ckpt", ".yaml", ".yml", ".json"]:
+                    return False
             return True
 
     return False
@@ -72,6 +80,7 @@ def parse_hf_repo_uri(uri: str) -> Tuple[str, Optional[str]]:
 
     Examples:
       - 'hf://KhangTruong/sid-unet:checkpoint_best.pt' -> ('KhangTruong/sid-unet', 'checkpoint_best.pt')
+      - 'hf://KhangTruong/sid-unet/checkpoint_best.pt' -> ('KhangTruong/sid-unet', 'checkpoint_best.pt')
       - 'https://huggingface.co/KhangTruong/sid-unet' -> ('KhangTruong/sid-unet', None)
       - 'KhangTruong/sid-unet' -> ('KhangTruong/sid-unet', None)
       - 'KhangTruong/sid-unet:checkpoint_latest.pt' -> ('KhangTruong/sid-unet', 'checkpoint_latest.pt')
@@ -81,18 +90,20 @@ def parse_hf_repo_uri(uri: str) -> Tuple[str, Optional[str]]:
         cleaned = cleaned[5:]
     elif cleaned.startswith("https://huggingface.co/"):
         cleaned = cleaned[23:]
+        cleaned = re.sub(r"^(models/)?", "", cleaned)
+        cleaned = re.sub(r"/(resolve|blob)/[^/]+/", "/", cleaned)
 
-    filename = None
     if ":" in cleaned:
         repo_id, filename = cleaned.split(":", 1)
-        repo_id = repo_id.strip()
-        filename = filename.strip()
-    else:
-        repo_id = cleaned
+        return repo_id.strip().rstrip("/"), filename.strip().lstrip("/")
 
-    # Strip trailing slashes
-    repo_id = repo_id.rstrip("/")
-    return repo_id, filename
+    parts = cleaned.rstrip("/").split("/")
+    if len(parts) == 2:
+        return f"{parts[0]}/{parts[1]}", None
+    elif len(parts) > 2:
+        return f"{parts[0]}/{parts[1]}", "/".join(parts[2:])
+
+    return cleaned, None
 
 
 def download_hf_checkpoint(
@@ -100,6 +111,7 @@ def download_hf_checkpoint(
     filename: Optional[str] = None,
     cache_dir: Optional[str] = None,
     token: Optional[str] = None,
+    force_download: bool = False,
 ) -> Dict[str, Any]:
     """Download a checkpoint file from a Hugging Face Model Repository.
 
@@ -107,8 +119,9 @@ def download_hf_checkpoint(
         repo_id_or_uri: HF repository id (e.g. 'KhangTruong/sid-unet') or URI ('hf://...').
         filename: Checkpoint filename in the repo. If None, tries candidates:
                   checkpoint_latest.pt, checkpoint_periodic.pt, checkpoint_best.pt, model.pt, pytorch_model.bin.
-        cache_dir: Optional local directory to store downloaded checkpoint.
+        cache_dir: Optional local directory to store downloaded checkpoint ($HF_HOME/hub).
         token: Optional HF authentication token.
+        force_download: Whether to force re-download even if already cached.
 
     Returns:
         Dict containing downloaded 'checkpoint_path', 'repo_id', 'filename', and 'source'.
@@ -122,6 +135,9 @@ def download_hf_checkpoint(
         raise ImportError("huggingface_hub is required to resume from Hugging Face repository: " + str(e))
 
     filenames_to_try = [target_filename] if target_filename else HF_CHECKPOINT_CANDIDATES
+    effective_cache = cache_dir or os.environ.get("HF_HUB_CACHE") or (
+        os.path.join(os.environ["HF_HOME"], "hub") if "HF_HOME" in os.environ else None
+    )
 
     last_error = None
     for fname in filenames_to_try:
@@ -129,8 +145,9 @@ def download_hf_checkpoint(
             downloaded_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=fname,
-                cache_dir=cache_dir,
+                cache_dir=effective_cache,
                 token=token,
+                force_download=force_download,
             )
             return {
                 "checkpoint_path": downloaded_path,
@@ -148,6 +165,42 @@ def download_hf_checkpoint(
         f"Failed to locate or download any checkpoint from Hugging Face repository '{repo_id}'. "
         f"Tried files: {filenames_to_try}. Last error: {last_error}"
     )
+
+
+def resolve_checkpoint_source(
+    path_or_identifier: str,
+    cache_dir: Optional[str] = None,
+    token: Optional[str] = None,
+    force_download: bool = False,
+) -> str:
+    """Resolve a local path, directory, or Hugging Face Hub reference to a local file path.
+    
+    If the target is a Hugging Face repository ID or URI, it will be downloaded and cached
+    in the standard HF cache directory ($HF_HOME/hub).
+    """
+    if not path_or_identifier or not isinstance(path_or_identifier, str):
+        raise ValueError(f"Invalid checkpoint source: {path_or_identifier}")
+
+    raw = path_or_identifier.strip()
+    if os.path.isfile(raw):
+        return os.path.abspath(raw)
+
+    if os.path.isdir(raw):
+        for cand in LOCAL_CHECKPOINT_PRIORITY + ["model.pt", "pytorch_model.bin", "checkpoint.pt"]:
+            p = os.path.join(raw, cand)
+            if os.path.isfile(p):
+                return os.path.abspath(p)
+
+    for base in ["/workspace", os.getcwd()]:
+        cand = os.path.join(base, raw.lstrip("/"))
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+
+    if is_hf_repo_id(raw) or raw.startswith(("hf://", "https://huggingface.co/")):
+        hf_data = download_hf_checkpoint(raw, cache_dir=cache_dir, token=token, force_download=force_download)
+        return hf_data["checkpoint_path"]
+
+    return raw
 
 
 def inspect_checkpoint(checkpoint_path: str) -> Dict[str, Any]:

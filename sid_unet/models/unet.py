@@ -175,6 +175,37 @@ class UNet(nn.Module):
         return (probs >= threshold).float()
 
     @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *args,
+        device: Optional[Union[str, torch.device]] = None,
+        override_config: Optional[Union[Dict[str, Any], Any]] = None,
+        strict: Optional[bool] = None,
+        return_config: bool = False,
+        cache_dir: Optional[str] = None,
+        token: Optional[str] = None,
+        force_download: bool = False,
+        **kwargs: Any,
+    ) -> Union[UNet, Tuple[UNet, Any]]:
+        """Hugging Face style from_pretrained loader for UNet and derivative architectures.
+
+        Loads a checkpoint from local file path or Hugging Face repository ID/URI,
+        automatically downloading into the HF cache directory ($HF_HOME/hub).
+        """
+        return cls.from_checkpoint(
+            checkpoint_path=pretrained_model_name_or_path,
+            device=device,
+            override_config=override_config,
+            strict=strict,
+            return_config=return_config,
+            cache_dir=cache_dir,
+            token=token,
+            force_download=force_download,
+            **kwargs,
+        )
+
+    @classmethod
     def from_checkpoint(
         cls,
         checkpoint_path: str,
@@ -182,6 +213,10 @@ class UNet(nn.Module):
         override_config: Optional[Union[Dict[str, Any], Any]] = None,
         strict: Optional[bool] = None,
         return_config: bool = False,
+        cache_dir: Optional[str] = None,
+        token: Optional[str] = None,
+        force_download: bool = False,
+        **kwargs: Any,
     ) -> Union[UNet, Tuple[UNet, Any]]:
         """
         Load a trained UNet model from a checkpoint file (.pt).
@@ -189,18 +224,30 @@ class UNet(nn.Module):
         saved within the checkpoint's embedded configuration.
 
         Args:
-            checkpoint_path: Path to checkpoint .pt file.
+            checkpoint_path: Path to checkpoint .pt file or Hugging Face repository identifier/URI.
             device: Target device to move the model to (e.g. 'cpu', 'cuda', 'auto', or torch.device).
             override_config: Optional config dict or ConfigDict to override embedded config.
             strict: Whether to strictly enforce that the keys in state_dict match model keys.
             return_config: If True, returns a tuple (model, config_dict).
+            cache_dir: Optional custom Hugging Face cache directory ($HF_HOME/hub).
+            token: Optional Hugging Face authentication token.
+            force_download: Whether to force re-download even if already cached.
 
         Returns:
             UNet instance (eval mode by default), or (UNet, ConfigDict) if return_config=True.
         """
         import os
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        from sid_unet.utils.checkpoint import resolve_checkpoint_source
+
+        resolved_path = resolve_checkpoint_source(
+            checkpoint_path,
+            cache_dir=cache_dir,
+            token=token,
+            force_download=force_download,
+        )
+        if not os.path.exists(resolved_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path} (resolved to {resolved_path})")
+        checkpoint_path = resolved_path
 
         target_map = device if device not in (None, "auto") else ("cuda" if torch.cuda.is_available() else "cpu")
         import warnings
@@ -329,6 +376,9 @@ def build_model(config: Any) -> nn.Module:
             target_size=tuple(model_cfg.get("target_size", [1008, 1008])),
             input_rescale=bool(model_cfg.get("input_rescale", True)),
             device=dev_cfg,
+            cache_dir=model_cfg.get("cache_dir", None),
+            token=model_cfg.get("token", None),
+            force_download=bool(model_cfg.get("force_download", False)),
         )
 
     if "sam3" in model_name or "sam3" in backbone:

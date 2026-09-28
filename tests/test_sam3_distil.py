@@ -177,3 +177,55 @@ def test_sam3_distil_build_model_and_checkpoint(device):
         )
         assert isinstance(loaded_model, SAM3DistilLoRA)
         assert loaded_cfg.model.name == "sam3_distil"
+
+
+def test_sam3_distil_from_pretrained_and_hf_resolution(device):
+    """Verify SAM3DistilLoRA.from_pretrained and HF resolution logic."""
+    from sid_unet.models.sam3_distil import resolve_sam3_distil_checkpoint
+    from unittest.mock import patch
+    import sid_unet
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fake_ckpt = os.path.join(tmpdir, "fake_tinyvit.pt")
+        torch.save({"dummy": 1}, fake_ckpt)
+
+        # 1. Local path resolution
+        resolved = resolve_sam3_distil_checkpoint(fake_ckpt)
+        assert resolved == os.path.abspath(fake_ckpt)
+
+        # 2. HF Hub mock resolution
+        with patch("huggingface_hub.hf_hub_download", return_value=fake_ckpt) as mock_hf:
+            res_hf = resolve_sam3_distil_checkpoint("Simon7108528/EfficientSAM3:efficientsam3_ft/efficientsam3_tinyvit.pt")
+            assert res_hf == fake_ckpt
+            mock_hf.assert_called_once()
+
+    # 3. from_pretrained classmethod and sid_unet.from_pretrained
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"device": device},
+            "model": {
+                "name": "sam3_distil",
+                "backbone": "tinyvit",
+                "model_name": "11m",
+                "checkpoint_path": None,
+                "lora_r": 8,
+                "lora_alpha": 16,
+                "aux_classifier": True,
+            }
+        })
+        model = build_model(cfg)
+        ckpt_path = os.path.join(tmpdir, "test_ckpt.pt")
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "config": cfg.to_dict(),
+            "epoch": 1,
+        }, ckpt_path)
+
+        # Classmethod on UNet
+        loaded_unet = UNet.from_pretrained(ckpt_path, device=device)
+        assert isinstance(loaded_unet, SAM3DistilLoRA)
+
+        # Top-level sid_unet.from_pretrained
+        loaded_top = sid_unet.from_pretrained(ckpt_path, device=device)
+        assert isinstance(loaded_top, SAM3DistilLoRA)
+

@@ -23,17 +23,48 @@ DEFAULT_TINYVIT_CHECKPOINT = "/workspace/sam3-distil/checkpoints/efficientsam3_f
 DEFAULT_EFFICIENTVIT_CHECKPOINT = "/workspace/sam3-distil/checkpoints/efficientsam3_ft/efficientsam3_efficientvit.pt"
 DEFAULT_SAM3_DISTIL_CHECKPOINT = DEFAULT_TINYVIT_CHECKPOINT
 
+DEFAULT_EFFICIENTSAM3_HF_REPO = "Simon7108528/EfficientSAM3"
+DEFAULT_EFFICIENTSAM3_REPO = DEFAULT_EFFICIENTSAM3_HF_REPO
+
+BACKBONE_TO_HF_FILE = {
+    "tinyvit": "efficientsam3_ft/efficientsam3_tinyvit.pt",
+    "tiny_vit": "efficientsam3_ft/efficientsam3_tinyvit.pt",
+    "tv": "efficientsam3_ft/efficientsam3_tinyvit.pt",
+    "tvm": "efficientsam3_ft/efficientsam3_tinyvit.pt",
+    "efficientvit": "efficientsam3_ft/efficientsam3_efficientvit.pt",
+    "efficient_vit": "efficientsam3_ft/efficientsam3_efficientvit.pt",
+    "ev": "efficientsam3_ft/efficientsam3_efficientvit.pt",
+    "evm": "efficientsam3_ft/efficientsam3_efficientvit.pt",
+    "repvit": "efficientsam3_ft/efficientsam3_repvit.pt",
+    "rep_vit": "efficientsam3_ft/efficientsam3_repvit.pt",
+    "rv": "efficientsam3_ft/efficientsam3_repvit.pt",
+    "rvm": "efficientsam3_ft/efficientsam3_repvit.pt",
+}
+
+KNOWN_CHECKPOINT_FILENAMES = {
+    "efficientsam3_tinyvit.pt": (DEFAULT_EFFICIENTSAM3_HF_REPO, "efficientsam3_ft/efficientsam3_tinyvit.pt"),
+    "efficientsam3_efficientvit.pt": (DEFAULT_EFFICIENTSAM3_HF_REPO, "efficientsam3_ft/efficientsam3_efficientvit.pt"),
+    "efficientsam3_repvit.pt": (DEFAULT_EFFICIENTSAM3_HF_REPO, "efficientsam3_ft/efficientsam3_repvit.pt"),
+}
+
 
 def resolve_sam3_distil_checkpoint(
     checkpoint_path: Optional[str] = DEFAULT_SAM3_DISTIL_CHECKPOINT,
     backbone_type: str = "tinyvit",
+    cache_dir: Optional[str] = None,
+    token: Optional[str] = None,
+    force_download: bool = False,
 ) -> Optional[str]:
     """
-    Resolve checkpoint path with automated fallbacks to local repository paths.
+    Resolve checkpoint path with automated fallbacks to local repository paths and
+    Hugging Face Hub downloading with caching in the standard HF cache folder ($HF_HOME/hub).
 
     Args:
-        checkpoint_path: Explicit path or filename. If None or 'none', returns None.
+        checkpoint_path: Explicit path, filename, or HF repo ID/URI. If None or 'none', returns None.
         backbone_type: 'tinyvit', 'efficientvit', or 'repvit'.
+        cache_dir: Optional local directory to store downloaded checkpoint.
+        token: Optional HF authentication token.
+        force_download: Whether to force re-download from HF even if cached.
 
     Returns:
         Validated absolute path or None if no checkpoint is available or requested.
@@ -41,31 +72,64 @@ def resolve_sam3_distil_checkpoint(
     if checkpoint_path is None or str(checkpoint_path).strip().lower() in ("none", "", "null"):
         return None
 
-    if checkpoint_path == DEFAULT_SAM3_DISTIL_CHECKPOINT:
-        if "efficientvit" in backbone_type.lower():
-            checkpoint_path = DEFAULT_EFFICIENTVIT_CHECKPOINT
+    raw_path = str(checkpoint_path).strip()
+
+    # 1. Existing local file
+    if os.path.isfile(raw_path):
+        return os.path.abspath(raw_path)
+
+    # 2. Check relative to /workspace/sam3-distil or current working directory
+    for base in ["/workspace/sam3-distil", "/workspace", os.getcwd()]:
+        cand = os.path.join(base, raw_path.lstrip("/"))
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+
+    from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
+
+    # 3. Explicit HF repo ID or URI (e.g. 'Simon7108528/EfficientSAM3', 'hf://...')
+    if is_hf_repo_id(raw_path) or raw_path.startswith(("hf://", "https://huggingface.co/")):
+        try:
+            hf_res = download_hf_checkpoint(
+                repo_id_or_uri=raw_path,
+                filename=BACKBONE_TO_HF_FILE.get(backbone_type.lower(), "efficientsam3_ft/efficientsam3_tinyvit.pt") if ":" not in raw_path else None,
+                cache_dir=cache_dir,
+                token=token,
+            )
+            return hf_res["checkpoint_path"]
+        except Exception as exc:
+            logger.warning(f"Could not download checkpoint from HF repo '{raw_path}': {exc}")
+            return None
+
+    # 4. Check if filename matches a known checkpoint for automated HF Hub download into cache
+    basename = os.path.basename(raw_path)
+    if basename in KNOWN_CHECKPOINT_FILENAMES or raw_path in (DEFAULT_SAM3_DISTIL_CHECKPOINT, DEFAULT_TINYVIT_CHECKPOINT, DEFAULT_EFFICIENTVIT_CHECKPOINT):
+        if basename in KNOWN_CHECKPOINT_FILENAMES:
+            repo_id, hf_filename = KNOWN_CHECKPOINT_FILENAMES[basename]
         else:
-            checkpoint_path = DEFAULT_TINYVIT_CHECKPOINT
+            repo_id = DEFAULT_EFFICIENTSAM3_HF_REPO
+            hf_filename = BACKBONE_TO_HF_FILE.get(backbone_type.lower(), "efficientsam3_ft/efficientsam3_tinyvit.pt")
 
-    if os.path.exists(checkpoint_path):
-        return os.path.abspath(checkpoint_path)
-
-    # Check relative to /workspace/sam3-distil
-    workspace_cand = os.path.join("/workspace/sam3-distil", str(checkpoint_path).lstrip("/"))
-    if os.path.exists(workspace_cand):
-        return os.path.abspath(workspace_cand)
-
-    # Check default pre-distilled checkpoints
-    if "efficientvit" in backbone_type.lower():
-        cand = DEFAULT_EFFICIENTVIT_CHECKPOINT
-    else:
-        cand = DEFAULT_TINYVIT_CHECKPOINT
-
-    if os.path.exists(cand):
-        return os.path.abspath(cand)
+        logger.info(
+            f"Local checkpoint '{raw_path}' not found on disk. "
+            f"Fetching '{hf_filename}' from Hugging Face Hub '{repo_id}' into cache..."
+        )
+        try:
+            hf_res = download_hf_checkpoint(
+                repo_id_or_uri=repo_id,
+                filename=hf_filename,
+                cache_dir=cache_dir,
+                token=token,
+            )
+            return hf_res["checkpoint_path"]
+        except Exception as exc:
+            logger.warning(
+                f"Could not download checkpoint from Hugging Face Hub '{repo_id}/{hf_filename}': {exc}. "
+                "Proceeding with randomly initialized weights for demonstration or testing."
+            )
+            return None
 
     logger.warning(
-        f"⚠️ SAM3-Distil checkpoint '{checkpoint_path or cand}' not found on disk. "
+        f"⚠️ SAM3-Distil checkpoint '{checkpoint_path}' not found on disk or Hugging Face Hub. "
         "Proceeding with randomly initialized weights for demonstration or testing."
     )
     return None
@@ -77,7 +141,7 @@ class SAM3DistilLoRA(nn.Module):
     for binary mask segmentation and optional auxiliary classification.
 
     Args:
-        checkpoint_path: Path to pre-distilled EfficientSAM3 checkpoint (.pt).
+        checkpoint_path: Path to pre-distilled EfficientSAM3 checkpoint (.pt) or Hugging Face repo ID.
         backbone_type: Vision backbone architecture ('tinyvit', 'efficientvit', 'repvit').
         model_name: Backbone variant (e.g. '11m', 'b0', 'm1.1').
         text_encoder_type: Text encoder type (e.g. 'MobileCLIP-S0').
@@ -96,7 +160,39 @@ class SAM3DistilLoRA(nn.Module):
         target_size: Native input resolution for EfficientSAM3 (default: (1008, 1008)).
         input_rescale: Whether to normalize [0, 1] inputs to [-1, 1] (default: True).
         device: Target device (default: 'auto').
+        cache_dir: Optional custom Hugging Face cache directory.
+        token: Optional Hugging Face authentication token.
+        force_download: Whether to force re-download from Hugging Face Hub even if cached.
     """
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Optional[str] = None,
+        *args,
+        checkpoint_path: Optional[str] = None,
+        backbone_type: str = "tinyvit",
+        model_name: str = "11m",
+        cache_dir: Optional[str] = None,
+        token: Optional[str] = None,
+        device: Optional[Union[str, torch.device]] = "auto",
+        **kwargs: Any,
+    ) -> SAM3DistilLoRA:
+        """Hugging Face style from_pretrained loader for SAM3DistilLoRA.
+
+        Loads pre-distilled EfficientSAM3 weights from local disk or Hugging Face Hub,
+        automatically downloading into the HF cache folder ($HF_HOME/hub).
+        """
+        ckpt = pretrained_model_name_or_path or checkpoint_path or DEFAULT_SAM3_DISTIL_CHECKPOINT
+        return cls(
+            checkpoint_path=ckpt,
+            backbone_type=backbone_type,
+            model_name=model_name,
+            cache_dir=cache_dir,
+            token=token,
+            device=device,
+            **kwargs,
+        )
 
     def __init__(
         self,
@@ -119,6 +215,9 @@ class SAM3DistilLoRA(nn.Module):
         target_size: Tuple[int, int] = (1008, 1008),
         input_rescale: bool = True,
         device: Optional[Union[str, torch.device]] = "auto",
+        cache_dir: Optional[str] = None,
+        token: Optional[str] = None,
+        force_download: bool = False,
         **kwargs: Any,
     ):
         super().__init__()
@@ -142,6 +241,9 @@ class SAM3DistilLoRA(nn.Module):
         self.out_channels = out_channels
         self.target_size = tuple(target_size)
         self.input_rescale = input_rescale
+        self.cache_dir = cache_dir
+        self.token = token
+        self.force_download = force_download
 
         # Resolve device
         if device == "auto" or device is None:
@@ -174,7 +276,13 @@ class SAM3DistilLoRA(nn.Module):
             ) from exc
 
         # 1. Resolve checkpoint path
-        ckpt = resolve_sam3_distil_checkpoint(self.checkpoint_path, backbone_type=self.backbone_type)
+        ckpt = resolve_sam3_distil_checkpoint(
+            self.checkpoint_path,
+            backbone_type=self.backbone_type,
+            cache_dir=self.cache_dir,
+            token=self.token,
+            force_download=self.force_download,
+        )
 
         # 2. Build base EfficientSAM3 image model
         base_model = build_efficientsam3_image_model(
@@ -185,6 +293,9 @@ class SAM3DistilLoRA(nn.Module):
             text_encoder_context_length=self.text_encoder_context_length,
             device=str(self._target_device),
             eval_mode=False,
+            cache_dir=self.cache_dir,
+            token=self.token,
+            force_download=self.force_download,
         )
 
         # Freeze base model parameters
