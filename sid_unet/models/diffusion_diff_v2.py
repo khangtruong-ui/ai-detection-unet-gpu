@@ -79,6 +79,8 @@ class PerpendicularSkipFusion(nn.Module):
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, dec_feat: torch.Tensor, perp_feat: torch.Tensor) -> torch.Tensor:
+        if perp_feat.device != dec_feat.device or perp_feat.dtype != dec_feat.dtype:
+            perp_feat = perp_feat.to(device=dec_feat.device, dtype=dec_feat.dtype)
         if dec_feat.shape[2:] != perp_feat.shape[2:]:
             perp_feat = F.interpolate(
                 perp_feat,
@@ -127,6 +129,8 @@ class EncoderSkipFusion(nn.Module):
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, dec_feat: torch.Tensor, skip_feat: torch.Tensor) -> torch.Tensor:
+        if skip_feat.device != dec_feat.device or skip_feat.dtype != dec_feat.dtype:
+            skip_feat = skip_feat.to(device=dec_feat.device, dtype=dec_feat.dtype)
         if dec_feat.shape[2:] != skip_feat.shape[2:]:
             skip_feat = F.interpolate(
                 skip_feat,

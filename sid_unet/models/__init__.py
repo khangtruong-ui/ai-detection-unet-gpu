@@ -17,6 +17,10 @@ from sid_unet.models.diffusion_diff_v2 import (
     TrainableLatentDecoderV2,
     PerpendicularSkipFusion,
 )
+from sid_unet.models.diffusion_diff_minimized import (
+    DiffusionDiffMinimizedModel,
+    DiffusionDiffMinimized,
+)
 
 __all__ = [
     "UNet",
@@ -43,6 +47,9 @@ __all__ = [
     "DiffusionDiffV2",
     "TrainableLatentDecoderV2",
     "PerpendicularSkipFusion",
+    "DiffusionDiffMinimizedModel",
+    "DiffusionDiffMinimized",
 ]
+
 
 

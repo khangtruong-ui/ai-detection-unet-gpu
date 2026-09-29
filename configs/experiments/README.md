@@ -10,6 +10,8 @@ Directory Layout:
 - **`sd_vae_finetune/`**: Finetuned Stable Diffusion 1.5 VAE (AutoencoderKL) adapted for binary synthetic image mask segmentation.
 - **`diffusion_diff/`**: Diffusion multi-noise feature decoder combining multi-step perturbations, frozen diffuser noise predictions, and sinusoidal embeddings with a configurable trainable decoder.
 - **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
+- **`diffusion_diff_minimized/`**: Minimized ultra-fast diffusion-diff architecture using Segmind Tiny-SD (`segmind/tiny-sd`) in FP16 on CUDA with only 2 lines of computation (1 real latent, 1 chosen noisy latent from the diffusion model).
+
 
 ---
 
@@ -85,6 +87,15 @@ Directory Layout:
 
 ---
 
+## 8. Diffusion-Diff Minimized (`diffusion_diff_minimized`) (`configs/experiments/diffusion_diff_minimized/`)
+
+| Configuration File | Model Architecture | Timesteps | Diffuser & Base Model | Trainable Decoder | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/diffusion_diff_minimized/default.yaml) | `DiffusionDiffMinimizedModel` | `[250]` (1 noisy latent) | `segmind/tiny-sd` FP16 CUDA, Diffuser Frozen, Encoder Frozen, Parallel Decoder Frozen | `[256, 128, 64, 32]` Bilinear + Perpendicular Skips | Combined (BCE + Dice) + Aux (0.2) | Ultra-fast diffusion forensic architecture cutting compute time via `segmind/tiny-sd` and strictly 2 lines of computation (1 real latent, 1 chosen noisy latent from the diffusion model) with perpendicular skip injection. |
+| [`diffusion_diff_minimized_bootstrap.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/diffusion_diff_minimized/diffusion_diff_minimized_bootstrap.yaml) | `DiffusionDiffMinimizedModel` | `[250]` (1 noisy latent) | `segmind/tiny-sd` FP16 CUDA, Diffuser Frozen, Encoder Frozen, Parallel Decoder Frozen | `[256, 128, 64, 32]` Bilinear + Perpendicular Skips | Combined (BCE + Dice) + Aux (0.2) | Bootstrapping kickstart enabled (30 epochs on 512 samples with channel-stream freeze) prior to full training. |
+
+---
+
 ## How to Run
 
 ### 1. Training with SAM3 + QLoRA
@@ -122,7 +133,12 @@ sid-train --config configs/experiments/diffusion_diff/default.yaml
 sid-train --config configs/experiments/diffusion_diff_v2/default.yaml
 ```
 
-### 8. Multi-Experiment Comparative Suite
+### 8. Training with Diffusion-Diff Minimized (Ultra-Fast 2-Line Tiny-SD)
+```bash
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml
+```
+
+### 9. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
@@ -130,5 +146,7 @@ sid-train --configs \
   configs/experiments/sd_vae_finetune/default.yaml \
   configs/experiments/diffusion_diff/default.yaml \
   configs/experiments/diffusion_diff_v2/default.yaml \
+  configs/experiments/diffusion_diff_minimized/default.yaml \
   configs/experiments/sam3_distil/default.yaml
 ```
+

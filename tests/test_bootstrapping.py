@@ -266,6 +266,43 @@ def test_apply_and_release_bootstrap_freeze_diffusion_diff_v2():
     assert any("vae" in name and p.requires_grad for name, p in model.named_parameters())
 
 
+def test_apply_and_release_bootstrap_freeze_diffusion_diff_minimized():
+    """Verify channel stream freezing and release in DiffusionDiffMinimized."""
+    model_cfg = {
+        "name": "diffusion_diff_minimized",
+        "use_dummy": True,
+        "dummy_vae_channels": [32, 64],
+        "dummy_unet_channels": [32, 64],
+        "freeze_encoder": False,  # VAE trainable
+        "use_perpendicular_skips": True,
+        "timesteps": [250],
+        "decoder": {"channels": [64, 32, 16], "z_norm": "groupnorm"},
+    }
+    model = build_model(model_cfg)
+
+    freeze_state = apply_bootstrap_freeze(model, strategy="channel_stream", stream_ratio=0.5)
+    assert freeze_state.strategy == "channel_stream"
+    assert len(freeze_state.channel_masks) > 0
+
+    # Forward & backward pass test
+    x = torch.randn(2, 3, 32, 32)
+    out = model(x)
+    loss = out[0].sum() if isinstance(out, (tuple, list)) else out.sum()
+    loss.backward()
+
+    params_dict = dict(model.named_parameters())
+    for name, mask in freeze_state.channel_masks.items():
+        p = params_dict[name]
+        if p.grad is not None:
+            tail_grad = (p.grad * (1.0 - mask)).abs().max().item()
+            assert tail_grad == 0.0
+
+    # Release
+    release_bootstrap_freeze(model, freeze_state)
+    assert any("vae" in name and p.requires_grad for name, p in model.named_parameters())
+
+
+
 def test_create_bootstrap_loader():
     """Verify subset DataLoader creation for map-style, streaming, and prefetcher loaders."""
     from sid_unet.dataset.loader import BackgroundPrefetcher, SIDStreamingDataset
