@@ -9,7 +9,7 @@ data:
   streaming: false
   image_size: [256, 256]
   batch_size: 16
-  num_workers: 2
+  num_workers: -1
   pin_memory: true
   train_split: "train"
   val_split: "validation"
@@ -51,6 +51,11 @@ training:
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"
+
+hard_mining:
+  enabled: false
+  metric: "median"
+  reset_epochs: 5
 
 logging:
   log_interval: 20

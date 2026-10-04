@@ -9,7 +9,7 @@ data:
   streaming: true
   image_size: [256, 256]
   batch_size: 8
-  num_workers: 2
+  num_workers: -1
   pin_memory: true
   prefetch_batches: 48
   shuffle_buffer_size: 32
@@ -104,6 +104,12 @@ training:
   early_stopping_patience: 4
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"
+  use_hard_mining: true
+
+hard_mining:
+  enabled: true
+  metric: "median"
+  reset_epochs: 5
 
 logging:
   log_interval: 20

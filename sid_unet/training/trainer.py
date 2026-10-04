@@ -21,6 +21,7 @@ from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.training.callbacks import CheckpointManager, EarlyStopping
+from sid_unet.training.hard_mining import HardMiner
 from sid_unet.utils.logger import MetricLogger, setup_logger
 from sid_unet.utils.memory import (
     auto_scale_batch_size_and_grad_accum,
@@ -93,12 +94,19 @@ class Trainer:
     ):
         self.config = config
 
-        # 1. Device configuration
+        # 1. Device and Data Parallelism configuration
         dev_cfg = config.project.get("device", "auto")
         if dev_cfg == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(dev_cfg)
+
+        data_parallel_cfg = bool(config.training.get("data_parallel", True))
+        if torch.cuda.is_available() and self.device.type == "cuda" and data_parallel_cfg and str(dev_cfg) in ("auto", "cuda"):
+            self.num_gpus = max(1, torch.cuda.device_count())
+        else:
+            self.num_gpus = 1
+        self.is_data_parallel = (self.num_gpus > 1)
 
         # 2. Output and logging setup
         self.output_dir = config.project.get("output_dir", "outputs")
@@ -120,8 +128,23 @@ class Trainer:
         is_quantized = getattr(loaded_model, "load_in_4bit", False) or getattr(loaded_model, "load_in_8bit", False)
         if not is_quantized:
             self.model = loaded_model.to(self.device)
+            if self.is_data_parallel:
+                self.model = nn.DataParallel(self.model)
+                self.logger.info(
+                    f"🚀 Data Parallelism Active: nn.DataParallel enabled across {self.num_gpus} GPUs "
+                    f"(Device IDs: {list(range(self.num_gpus))})"
+                )
         else:
             self.model = loaded_model
+
+        # 3.0 Hard Example Mining Setup
+        self.hard_miner = HardMiner(config)
+        if self.hard_miner.enabled:
+            self.logger.info(
+                f"⛏️ Hard Example Mining Configured: metric={self.hard_miner.metric}, "
+                f"reset_epochs={self.hard_miner.reset_epochs} (Epoch 1 will run full training, "
+                f"epochs 2..{self.hard_miner.reset_epochs+1} will train on hard examples)"
+            )
 
         self.loss_fn = (loss_fn or build_loss(config)).to(self.device)
         self.train_loader = train_loader
@@ -294,7 +317,10 @@ class Trainer:
             self.network_monitor.start()
         else:
             self.network_monitor = None
-            self.bottleneck_detector = None
+    @property
+    def raw_model(self) -> nn.Module:
+        """Return unwrapped underlying nn.Module without DataParallel wrapper."""
+        return getattr(self.model, "module", self.model)
 
     def resume_from_checkpoint(
         self,
@@ -326,6 +352,14 @@ class Trainer:
         ckpt_meta = getattr(self.ckpt_manager, "last_loaded_checkpoint_info", {})
         if ckpt_meta.get("step") is not None:
             self.global_step = int(ckpt_meta["step"])
+
+        # Restore hard mining state if present
+        if "hard_mining" in ckpt_meta and ckpt_meta["hard_mining"] and hasattr(self, "hard_miner"):
+            self.hard_miner.load_state_dict(ckpt_meta["hard_mining"])
+            self.logger.info(
+                f"⛏️ [HARD MINING] State restored from checkpoint: Epoch {self.hard_miner.current_epoch}, "
+                f"Active: {self.hard_miner.is_active_epoch}, Hard Batches: {len(self.hard_miner.hard_batch_indices)}"
+            )
 
         # Restore best score in early stopping
         if self.ckpt_manager.best_score not in [float("-inf"), float("inf")]:
@@ -574,14 +608,14 @@ class Trainer:
 
         try:
             safe_bs = find_optimal_batch_size(
-                model=self.model,
+                model=self.raw_model,
                 loss_fn=self.loss_fn,
                 sample_shape=(3, img_size[0], img_size[1]),
                 device=self.device,
                 max_batch_size=current_bs,
                 min_batch_size=1,
                 use_amp=self.use_amp,
-                aux_classifier=getattr(self.model, "aux_classifier", True),
+                aux_classifier=getattr(self.raw_model, "aux_classifier", True),
                 num_classes=int(self.config.model.get("num_classes", 3)),
                 logger=self.logger,
             )
@@ -659,15 +693,19 @@ class Trainer:
         return loss, loss_dict
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Run one training epoch with gradient accumulation and Out-Of-Memory (OOM) recovery."""
+        """Run one training epoch with gradient accumulation, Out-Of-Memory (OOM) recovery, and hard example mining."""
         if self.empty_cache_per_epoch:
             clear_memory_cache(self.device)
 
         self.model.train()
         metric_logger = MetricLogger()
-        total_batches = safe_dataloader_len(self.train_loader)
+
+        # Hard Mining: configure epoch and wrap dataloader if active
+        self.hard_miner.start_epoch(epoch)
+        effective_loader = self.hard_miner.wrap_dataloader(self.train_loader)
+        total_batches = safe_dataloader_len(effective_loader)
         pbar = tqdm(
-            self.train_loader,
+            effective_loader,
             desc=f"Epoch {epoch}/{self.epochs} [Train]",
             total=total_batches,
             leave=False,
@@ -680,7 +718,7 @@ class Trainer:
 
         prev_batch_end_time = time.perf_counter()
         try:
-            for batch in pbar:
+            for batch_idx, batch in enumerate(pbar):
                 data_time = time.perf_counter() - prev_batch_end_time
                 compute_start_time = time.perf_counter()
 
@@ -692,6 +730,8 @@ class Trainer:
                 loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
                 loss_val = loss_t.item()
                 has_pending_grads = True
+
+                self.hard_miner.record_batch_loss(batch_idx, loss_val)
 
                 metric_logger.update_dict(loss_dict_batch, n=batch_size)
                 self.global_step += 1
@@ -729,6 +769,7 @@ class Trainer:
                         step=self.global_step,
                         scaler=self.scaler,
                         history=self.history,
+                        hard_mining=self.hard_miner.state_dict(),
                     )
                     self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Step {self.global_step}, Epoch {epoch})")
 
@@ -767,6 +808,12 @@ class Trainer:
         finally:
             pbar.close()
             del pbar
+            if hasattr(effective_loader, "close") and callable(effective_loader.close):
+                try:
+                    effective_loader.close()
+                except Exception:
+                    pass
+            self.hard_miner.end_epoch(epoch)
             if self.empty_cache_per_epoch:
                 clear_memory_cache(self.device)
 
@@ -985,6 +1032,7 @@ class Trainer:
                         step=self.global_step,
                         scaler=self.scaler,
                         history=history,
+                        hard_mining=self.hard_miner.state_dict(),
                     )
 
                     epoch_time = time.time() - epoch_start
@@ -1013,6 +1061,7 @@ class Trainer:
                             step=self.global_step,
                             scaler=self.scaler,
                             history=history,
+                            hard_mining=self.hard_miner.state_dict(),
                         )
                         self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Epoch {epoch})")
 
@@ -1037,6 +1086,7 @@ class Trainer:
                         step=self.global_step,
                         scaler=self.scaler,
                         history=history,
+                        hard_mining=self.hard_miner.state_dict(),
                     )
                     self.logger.info("Emergency checkpoint successfully saved to checkpoint_latest.pt and checkpoint_periodic.pt.")
                 except Exception as save_err:

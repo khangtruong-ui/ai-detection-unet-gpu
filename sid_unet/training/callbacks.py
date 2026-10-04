@@ -233,16 +233,18 @@ class CheckpointManager:
         step: Optional[int] = None,
         scaler: Optional[Any] = None,
         history: Optional[List[Dict[str, Any]]] = None,
+        hard_mining: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """Save a periodic checkpoint based on elapsed time or step count."""
         self.last_periodic_save_time = time.time()
         if step is not None:
             self.last_periodic_step = step
         cfg_dict = config or {}
+        model_to_save = getattr(model, "module", model)
         state = {
             "epoch": epoch,
             "step": step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "scaler_state_dict": scaler.state_dict() if (scaler is not None and hasattr(scaler, "state_dict")) else None,
@@ -252,6 +254,8 @@ class CheckpointManager:
             "history": history or [],
             "config": cfg_dict,
         }
+        if hard_mining is not None:
+            state["hard_mining"] = hard_mining
 
         periodic_path = os.path.join(self.checkpoint_dir, "checkpoint_periodic.pt")
         torch.save(state, periodic_path)
@@ -278,6 +282,7 @@ class CheckpointManager:
         step: Optional[int] = None,
         scaler: Optional[Any] = None,
         history: Optional[List[Dict[str, Any]]] = None,
+        hard_mining: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """Save checkpoints to disk."""
         current_score = metrics.get(self.metric_name, None)
@@ -285,10 +290,11 @@ class CheckpointManager:
             self.best_score = current_score
             self.best_epoch = epoch
 
+        model_to_save = getattr(model, "module", model)
         state = {
             "epoch": epoch,
             "step": step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "scaler_state_dict": scaler.state_dict() if (scaler is not None and hasattr(scaler, "state_dict")) else None,
@@ -298,6 +304,8 @@ class CheckpointManager:
             "history": history or [],
             "config": config,
         }
+        if hard_mining is not None:
+            state["hard_mining"] = hard_mining
 
         saved_paths = {}
 
@@ -450,6 +458,7 @@ class CheckpointManager:
             "best_epoch": self.best_epoch,
             "history": checkpoint.get("history", []) if isinstance(checkpoint, dict) else [],
             "metrics": checkpoint.get("metrics", {}) if isinstance(checkpoint, dict) else {},
+            "hard_mining": checkpoint.get("hard_mining") if isinstance(checkpoint, dict) else None,
             "checkpoint_path": checkpoint_path,
         }
         return epoch

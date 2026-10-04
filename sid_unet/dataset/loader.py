@@ -876,17 +876,78 @@ class SIDMapDataset(Dataset):
                 target_image_size=self.target_image_size,
                 split=self.split,
             )
-            return process_raw_sample(
+            sample_dict = process_raw_sample(
                 raw_sample,
                 transform=self.transform,
                 target_image_size=self.target_image_size,
             )
+            sample_dict["sample_idx"] = idx
+            return sample_dict
         raw_sample = self.data[idx]
-        return process_raw_sample(
+        sample_dict = process_raw_sample(
             raw_sample,
             transform=self.transform,
             target_image_size=self.target_image_size,
         )
+        sample_dict["sample_idx"] = idx
+        return sample_dict
+
+
+def resolve_num_workers(num_workers_cfg: Optional[Union[int, str]] = None) -> int:
+    """Resolve number of dataloader workers. -1 or negative defaults to number of CPU cores."""
+    if num_workers_cfg is None:
+        val = -1
+    else:
+        try:
+            val = int(num_workers_cfg)
+        except (ValueError, TypeError):
+            val = -1
+
+    if val < 0:
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except (AttributeError, NotImplementedError, OSError):
+            return max(1, os.cpu_count() or 1)
+    return val
+
+
+def resolve_batch_size(config: Any) -> int:
+    """
+    Resolve and scale batch size for multi-GPU data parallelism.
+    If multiple GPUs are available and data parallelism is enabled,
+    automatically multiplies data.batch_size with actual GPU numbers
+    so each device trains with at least batch size 1.
+    Preserves data.base_batch_size and sets data._batch_size_scaled to prevent double scaling.
+    """
+    if not hasattr(config, "data"):
+        return 16
+
+    base_bs = int(config.data.get("base_batch_size", config.data.get("batch_size", 16)))
+    if base_bs < 1:
+        base_bs = 1
+    config.data.base_batch_size = base_bs
+
+    if getattr(config.data, "_batch_size_scaled", False):
+        return int(config.data.batch_size)
+
+    dev_cfg = str(config.project.get("device", "auto")).lower() if hasattr(config, "project") else "auto"
+    data_parallel = True
+    if hasattr(config, "training"):
+        data_parallel = bool(config.training.get("data_parallel", True))
+
+    if torch.cuda.is_available() and dev_cfg in ("auto", "cuda") and data_parallel:
+        num_gpus = max(1, torch.cuda.device_count())
+    else:
+        num_gpus = 1
+
+    actual_bs = base_bs * num_gpus
+    config.data.batch_size = actual_bs
+    config.data.num_gpus = num_gpus
+    if hasattr(config, "training"):
+        config.training.num_gpus = num_gpus
+        config.training.data_parallel = (num_gpus > 1)
+    config.data._batch_size_scaled = True
+    return actual_bs
 
 
 def create_eval_dataloader(
@@ -914,7 +975,7 @@ def create_eval_dataloader(
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", False))
     batch_size = int(config.data.get("batch_size", 16))
-    num_workers = int(config.data.get("num_workers", 2))
+    num_workers = resolve_num_workers(config.data.get("num_workers", -1))
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
     seed = int(config.project.get("seed", 42))
@@ -997,8 +1058,8 @@ def create_dataloaders(
     if is_mock_dataset(dataset_name) or bool(config.data.get("mock", False)):
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", True))
-    batch_size = int(config.data.get("batch_size", 16))
-    num_workers = int(config.data.get("num_workers", 2))
+    batch_size = resolve_batch_size(config)
+    num_workers = resolve_num_workers(config.data.get("num_workers", -1))
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
     shuffle_buffer = int(config.data.get("shuffle_buffer_size", 1000))

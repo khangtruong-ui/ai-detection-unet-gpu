@@ -315,6 +315,7 @@ def test_create_dataloaders_mock_override():
         "data.val_samples_per_epoch=4",
         "data.test_samples=4",
         "data.image_size=[64, 64]",
+        "training.data_parallel=false",
     ])
 
     train_l, val_l, test_l = create_dataloaders(cfg_streaming, include_test=True)
@@ -340,6 +341,7 @@ def test_create_dataloaders_mock_override():
         "data.val_samples_per_epoch=4",
         "data.image_size=[64, 64]",
         "data.num_workers=0",
+        "training.data_parallel=false",
     ])
 
     train_map_l, val_map_l = create_dataloaders(cfg_map, include_test=False)

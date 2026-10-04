@@ -14,7 +14,7 @@ data:
   streaming: false              # Indexable Map Dataset mode
   image_size: [256, 256]
   batch_size: 16
-  num_workers: 4
+  num_workers: -1
   pin_memory: true
   train_split: "train"
   val_split: "validation"

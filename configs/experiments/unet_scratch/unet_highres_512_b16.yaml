@@ -14,7 +14,7 @@ data:
   streaming: false
   image_size: [512, 512]        # High resolution 512x512
   batch_size: 16
-  num_workers: 4
+  num_workers: -1
   pin_memory: true
   shuffle_buffer_size: 2000
   train_split: "train"

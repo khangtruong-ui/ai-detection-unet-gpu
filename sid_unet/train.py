@@ -306,6 +306,53 @@ def parse_args():
         default=None,
         help="Target score (IoU) to achieve before early releasing frozen parameters.",
     )
+    # Hard Mining flags
+    parser.add_argument(
+        "--hard-mining",
+        "--use-hard-mining",
+        "--hard_mining",
+        dest="hard_mining",
+        action="store_true",
+        default=None,
+        help="Enable hard example mining from epoch 2 based on loss >= median (default: False)",
+    )
+    parser.add_argument(
+        "--no-hard-mining",
+        dest="hard_mining",
+        action="store_false",
+        help="Disable hard example mining",
+    )
+    parser.add_argument(
+        "--hard-mining-epochs",
+        "--hard-mining-reset-epochs",
+        dest="hard_mining_reset_epochs",
+        type=int,
+        default=None,
+        help="Number of epochs of hard mining before forgetting and repeating full epoch (default: 5)",
+    )
+    parser.add_argument(
+        "--hard-mining-metric",
+        dest="hard_mining_metric",
+        type=str,
+        default=None,
+        help="Criterion for hard mining ('median' or 'mean', default: 'median')",
+    )
+    # Data Parallelism flags
+    parser.add_argument(
+        "--data-parallel",
+        "--data_parallel",
+        dest="data_parallel",
+        action="store_true",
+        default=None,
+        help="Enable multi-GPU DataParallel across all available GPUs (default: enabled if multiple GPUs exist)",
+    )
+    parser.add_argument(
+        "--no-data-parallel",
+        "--no_data_parallel",
+        dest="data_parallel",
+        action="store_false",
+        help="Disable multi-GPU DataParallel and train on single device",
+    )
     return parser.parse_args()
 
 
@@ -548,6 +595,20 @@ def main():
         overrides.append(f"bootstrapping.initialization={args.bootstrap_init}")
     if getattr(args, "bootstrap_target_score", None) is not None:
         overrides.append(f"bootstrapping.target_score={args.bootstrap_target_score}")
+    if getattr(args, "hard_mining", None) is True:
+        overrides.append("hard_mining.enabled=true")
+        overrides.append("training.use_hard_mining=true")
+    elif getattr(args, "hard_mining", None) is False:
+        overrides.append("hard_mining.enabled=false")
+        overrides.append("training.use_hard_mining=false")
+    if getattr(args, "hard_mining_reset_epochs", None) is not None:
+        overrides.append(f"hard_mining.reset_epochs={args.hard_mining_reset_epochs}")
+    if getattr(args, "hard_mining_metric", None) is not None:
+        overrides.append(f"hard_mining.metric={args.hard_mining_metric}")
+    if getattr(args, "data_parallel", None) is True:
+        overrides.append("training.data_parallel=true")
+    elif getattr(args, "data_parallel", None) is False:
+        overrides.append("training.data_parallel=false")
 
     if len(config_paths) == 1:
         if args.output_dir:

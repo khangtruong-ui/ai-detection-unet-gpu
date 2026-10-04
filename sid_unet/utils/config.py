@@ -112,7 +112,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "streaming": False,
         "image_size": [256, 256],
         "batch_size": 16,
-        "num_workers": 2,
+        "num_workers": -1,            # Default to -1 (automatically uses all available CPU cores)
         "pin_memory": True,
         "shuffle_buffer_size": 1000,
         "train_split": "train",
@@ -167,6 +167,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "grad_clip_norm": 1.0,
         "amp": True,                  # Automatic mixed precision
         "gradient_accumulation_steps": 1, # Number of micro-batches to accumulate before optimizer step
+        "data_parallel": True,        # Automatically enable DataParallel across visible GPUs if > 1
+        "use_hard_mining": False,     # Hard example mining starting from epoch 2
         "auto_batch_size": True,      # Automatically search and scale safe batch size to avoid OOM
         "empty_cache_per_epoch": True,# Free PyTorch memory allocator cache between epochs
         "save_best": True,
@@ -176,6 +178,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "early_stopping_patience": 5,
         "early_stopping_metric": "val_iou",
         "early_stopping_mode": "max",
+    },
+    "hard_mining": {
+        "enabled": False,              # Default: use_hard_mining=false
+        "metric": "median",            # Default criterion: median loss
+        "reset_epochs": 5,             # Reset after 5 epochs of hard mining (forget and repeat like epoch 1)
     },
     "bootstrapping": {
         "enabled": False,              # Default to no bootstrapping

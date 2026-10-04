@@ -9,7 +9,7 @@ data:
   streaming: false
   image_size: [256, 256]
   batch_size: 16
-  num_workers: 2
+  num_workers: -1
   pin_memory: true
   shuffle_buffer_size: 1000
   train_split: "train"
@@ -79,6 +79,11 @@ bootstrapping:
   min_loss_drop: 0.15          # Minimum relative loss drop (15%) for acceptable kickstart fit
   early_stopping: false        # Do not stop early by default in bootstrap
   patience: 3                  # Early stopping patience during kickstart
+
+hard_mining:
+  enabled: false               # Default: no hard mining (set to true to enable hard example mining from epoch 2)
+  metric: "median"             # "median" or "mean" loss threshold
+  reset_epochs: 5              # Reset hard mining and repeat full training after 5 epochs
 
 logging:
   log_interval: 20
