@@ -19,6 +19,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from datasets import load_dataset as hf_load_dataset
 
+from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_rank, get_world_size
+
 # Ensure PIL loads truncated/partial images without raising OSError
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -697,10 +699,18 @@ class SIDStreamingDataset(IterableDataset):
 
     def _get_mock_stream(self) -> Iterator[Dict[str, Any]]:
         limit = self.max_samples if (self.max_samples is not None and self.max_samples > 0) else 100
+        is_dist = is_dist_avail_and_initialized()
+        rank = get_rank() if is_dist else 0
+        world_size = get_world_size() if is_dist else 1
+
         worker_info = get_worker_info()
         num_workers = worker_info.num_workers if worker_info is not None else 1
         worker_id = worker_info.id if worker_info is not None else 0
-        idx = worker_id
+
+        global_worker_id = rank * num_workers + worker_id
+        total_global_workers = world_size * num_workers
+
+        idx = global_worker_id
         while idx < limit:
             yield generate_mock_raw_sample(
                 idx=idx,
@@ -708,7 +718,7 @@ class SIDStreamingDataset(IterableDataset):
                 split=self.split,
                 seed=self.seed,
             )
-            idx += num_workers
+            idx += total_global_workers
 
     def _get_stream(self) -> Iterator[Dict[str, Any]]:
         if is_mock_dataset(self.dataset_name):
@@ -722,6 +732,22 @@ class SIDStreamingDataset(IterableDataset):
         # as Hugging Face opens simultaneous HTTP readers across all shards (e.g. 62 parquet files),
         # causing PyArrow and host memory to spike by >6 GB and trigger cgroup OOM kills.
         # Shuffling is handled safely below via the local reservoir buffer on processed samples.
+
+        is_dist = is_dist_avail_and_initialized()
+        rank = get_rank() if is_dist else 0
+        world_size = get_world_size() if is_dist else 1
+
+        # Shard across distributed ranks if world_size > 1
+        if world_size > 1:
+            if hasattr(hf_ds, "n_shards") and hf_ds.n_shards >= world_size:
+                hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
+            elif hasattr(hf_ds, "shard") and callable(hf_ds.shard):
+                try:
+                    hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
+                except Exception:
+                    hf_ds = itertools.islice(hf_ds, rank, None, world_size)
+            else:
+                hf_ds = itertools.islice(hf_ds, rank, None, world_size)
 
         worker_info = get_worker_info()
         if worker_info is not None and worker_info.num_workers > 1:
@@ -914,8 +940,9 @@ def resolve_num_workers(num_workers_cfg: Optional[Union[int, str]] = None) -> in
 def resolve_batch_size(config: Any) -> int:
     """
     Resolve and scale batch size for multi-GPU data parallelism.
-    If multiple GPUs are available and data parallelism is enabled,
-    automatically multiplies data.batch_size with actual GPU numbers
+    In DistributedDataParallel (DDP) multi-process mode, each process trains on base_batch_size,
+    achieving an effective global batch size of base_batch_size * world_size across all ranks.
+    In single-process DataParallel mode, automatically multiplies data.batch_size with actual GPU numbers
     so each device trains with at least batch size 1.
     Preserves data.base_batch_size and sets data._batch_size_scaled to prevent double scaling.
     """
@@ -934,6 +961,17 @@ def resolve_batch_size(config: Any) -> int:
     data_parallel = True
     if hasattr(config, "training"):
         data_parallel = bool(config.training.get("data_parallel", True))
+
+    # DistributedDataParallel (DDP) multi-process mode
+    if is_dist_avail_and_initialized():
+        world_size = get_world_size()
+        config.data.batch_size = base_bs
+        config.data.num_gpus = world_size
+        if hasattr(config, "training"):
+            config.training.num_gpus = world_size
+            config.training.data_parallel = (world_size > 1)
+        config.data._batch_size_scaled = True
+        return base_bs
 
     if torch.cuda.is_available() and dev_cfg in ("auto", "cuda") and data_parallel:
         num_gpus = max(1, torch.cuda.device_count())
@@ -1027,9 +1065,19 @@ def create_eval_dataloader(
             max_samples=eval_max_samples,
             target_image_size=image_size,
         )
+        eval_sampler = None
+        if is_dist_avail_and_initialized():
+            eval_sampler = torch.utils.data.distributed.DistributedSampler(
+                eval_dataset,
+                num_replicas=get_world_size(),
+                rank=get_rank(),
+                shuffle=False,
+                seed=seed,
+            )
         return DataLoader(
             eval_dataset,
             batch_size=batch_size,
+            sampler=eval_sampler,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -1154,10 +1202,31 @@ def create_dataloaders(
             target_image_size=image_size,
         )
 
+        train_sampler = None
+        val_sampler = None
+        if is_dist_avail_and_initialized():
+            world_size = get_world_size()
+            rank = get_rank()
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=seed,
+            )
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                seed=seed,
+            )
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
             num_workers=num_workers,
             pin_memory=pin_memory,
             multiprocessing_context=mp_context,
@@ -1166,6 +1235,7 @@ def create_dataloaders(
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
+            sampler=val_sampler,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import sys
 from typing import Any, Dict, List, Optional
 import numpy as np
 from PIL import ImageFile
@@ -38,6 +39,15 @@ from sid_unet.utils.config import load_config, save_config
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.plotting import plot_multi_experiment_curves
 from sid_unet.utils.report import generate_multi_experiment_report
+from sid_unet.utils.distributed import (
+    init_distributed_mode,
+    cleanup_distributed,
+    is_dist_avail_and_initialized,
+    is_main_process,
+    get_rank,
+    get_world_size,
+    find_free_port,
+)
 
 
 
@@ -454,14 +464,15 @@ def train_single_run(
             resume_info = found
 
     # On-screen and logger notification
-    if resume_info:
-        msg = format_resume_notification(resume_info)
-        print(msg)
-        logger.info(msg)
-    elif auto_resume:
-        msg = format_no_resume_notification(output_dir)
-        print(msg)
-        logger.info(msg)
+    if is_main_process():
+        if resume_info:
+            msg = format_resume_notification(resume_info)
+            print(msg)
+            logger.info(msg)
+        elif auto_resume:
+            msg = format_no_resume_notification(output_dir)
+            print(msg)
+            logger.info(msg)
 
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     latest_ckpt = os.path.join(ckpt_dir, "checkpoint_latest.pt")
@@ -528,9 +539,10 @@ def train_single_run(
     results["config_path"] = config_path
     results["run_name"] = run_name
 
-    logger.info(f"Experiment '{results['run_name']}' finished successfully!")
-    logger.info(f"Best Score: {results['best_score']:.4f} (Epoch {results['best_epoch']})")
-    logger.info(f"Evaluation report: {results['report_path']}")
+    if is_main_process():
+        logger.info(f"Experiment '{results['run_name']}' finished successfully!")
+        logger.info(f"Best Score: {results['best_score']:.4f} (Epoch {results['best_epoch']})")
+        logger.info(f"Evaluation report: {results['report_path']}")
 
     return results
 
@@ -610,109 +622,150 @@ def main():
     elif getattr(args, "data_parallel", None) is False:
         overrides.append("training.data_parallel=false")
 
-    if len(config_paths) == 1:
-        if args.output_dir:
-            overrides.append(f"project.output_dir={args.output_dir}")
-        results = train_single_run(
-            config_path=config_paths[0],
-            overrides=overrides,
-            resume=args.resume,
-            resume_repo=args.resume_repo,
-            auto_resume=args.auto_resume,
-            run_idx=1,
-            total_runs=1,
-            base_output_dir=args.output_dir,
-            skip_collision=args.skip_collision,
-        )
-        return results
-
-    # Multi-experiment suite
-    parent_output_dir = args.output_dir
-    if not parent_output_dir:
-        for ov in overrides:
-            if ov.startswith("project.output_dir="):
-                parent_output_dir = ov.split("=", 1)[1].strip()
-                break
-    if not parent_output_dir:
-        parent_output_dir = "outputs"
-
-    norm = os.path.normpath(parent_output_dir)
-    suite_run_dir = parent_output_dir if os.path.basename(norm) == "RUN" else os.path.join(parent_output_dir, "RUN")
-
-    print("\n" + "=" * 70)
-    print(f"🚀 Launching Multi-Experiment Suite ({len(config_paths)} experiments)")
-    print(f"📁 Suite Output Directory: {suite_run_dir}")
-    print(f"⚡ Collision Detection / Skip: {args.skip_collision}")
-    print("=" * 70 + "\n")
-
-    all_results: List[Dict[str, Any]] = []
-
-    for i, cfg_path in enumerate(config_paths, 1):
-        cfg_name = os.path.splitext(os.path.basename(cfg_path))[0]
-        print(f"\n>>> Running Experiment [{i}/{len(config_paths)}]: {cfg_path} ({cfg_name})")
-        print("-" * 70)
-        res = train_single_run(
-            config_path=cfg_path,
-            overrides=overrides,
-            resume=args.resume if i == 1 else None,
-            resume_repo=args.resume_repo if i == 1 else None,
-            auto_resume=args.auto_resume,
-            run_idx=i,
-            total_runs=len(config_paths),
-            base_output_dir=suite_run_dir,
-            skip_collision=args.skip_collision,
-        )
-        all_results.append(res)
-
-    # Collect experiment histories and plot multi-run comparison curves
-    histories_dict = {}
-    for r in all_results:
-        exp_name = r.get("run_name", "Run")
-        if r.get("history"):
-            histories_dict[exp_name] = r["history"]
-
-    multi_curves_path = None
-    if histories_dict:
-        multi_curves_path = os.path.join(suite_run_dir, "multi_experiment_curves.png")
-        plot_multi_experiment_curves(
-            experiment_histories=histories_dict,
-            output_path=multi_curves_path,
-        )
-
-    # Generate and display continuous multi-experiment comparison report
-    combined_results = list(all_results)
-    multi_json_path = os.path.join(suite_run_dir, "multi_experiment_comparison.json")
-    if os.path.exists(multi_json_path):
-        try:
-            with open(multi_json_path, "r", encoding="utf-8") as f:
-                import json
-                data = json.load(f)
-                if isinstance(data, dict) and "experiments" in data:
-                    existing_runs = data["experiments"]
-                    curr_runs = {r.get("run_name") for r in all_results if r.get("run_name")}
-                    for er in existing_runs:
-                        if er.get("run_name") not in curr_runs:
-                            combined_results.append(er)
-        except Exception:
-            pass
-
-    multi_report = generate_multi_experiment_report(
-        experiment_results=combined_results,
-        output_dir=suite_run_dir,
-        report_name="multi_experiment_comparison",
-        multi_curves_path=multi_curves_path,
+    # Check if we should auto-launch multi-process DDP via torchrun
+    dp_disabled = (getattr(args, "data_parallel", None) is False) or any(
+        ov.startswith("training.data_parallel=false") or ov.startswith("project.device=cpu") or ov.startswith("training.data_parallel=False") for ov in overrides
     )
+    in_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ) or is_dist_avail_and_initialized()
+    in_pytest = ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
+    no_autospawn = bool(os.environ.get("SID_UNET_NO_AUTOSPAWN", False))
 
-    print("\n" + "=" * 70)
-    print("⭐ ALL EXPERIMENTS COMPLETED - SUMMARY REPORT")
-    print("=" * 70)
-    print(multi_report["summary_table"])
-    if multi_curves_path and os.path.exists(multi_curves_path):
-        print(f"Multi-Experiment comparison curves plot: {multi_curves_path}")
-    print(f"\nDetailed Markdown comparison: {os.path.join(suite_run_dir, 'multi_experiment_comparison.md')}")
-    print(f"Detailed JSON comparison: {os.path.join(suite_run_dir, 'multi_experiment_comparison.json')}\n")
+    if (
+        torch.cuda.is_available()
+        and torch.cuda.device_count() > 1
+        and not dp_disabled
+        and not in_dist
+        and not in_pytest
+        and not no_autospawn
+    ):
+        import subprocess
+        num_gpus = torch.cuda.device_count()
+        port = find_free_port()
+        cmd = [
+            sys.executable,
+            "-m", "torch.distributed.run",
+            f"--nproc_per_node={num_gpus}",
+            "--master_port", str(port),
+            "-m", "sid_unet.train",
+        ] + sys.argv[1:]
+        print(f"🚀 Auto-launching High-Performance Multi-GPU DistributedDataParallel (DDP) across {num_gpus} GPUs on port {port}...")
+        sys.stdout.flush()
+        ret = subprocess.run(cmd)
+        sys.exit(ret.returncode)
 
-    return all_results
+    # Initialize distributed mode if running under torchrun / distributed launcher
+    init_distributed_mode()
+
+    try:
+        if len(config_paths) == 1:
+            if args.output_dir:
+                overrides.append(f"project.output_dir={args.output_dir}")
+            results = train_single_run(
+                config_path=config_paths[0],
+                overrides=overrides,
+                resume=args.resume,
+                resume_repo=args.resume_repo,
+                auto_resume=args.auto_resume,
+                run_idx=1,
+                total_runs=1,
+                base_output_dir=args.output_dir,
+                skip_collision=args.skip_collision,
+            )
+            return results
+
+        # Multi-experiment suite
+        parent_output_dir = args.output_dir
+        if not parent_output_dir:
+            for ov in overrides:
+                if ov.startswith("project.output_dir="):
+                    parent_output_dir = ov.split("=", 1)[1].strip()
+                    break
+        if not parent_output_dir:
+            parent_output_dir = "outputs"
+
+        norm = os.path.normpath(parent_output_dir)
+        suite_run_dir = parent_output_dir if os.path.basename(norm) == "RUN" else os.path.join(parent_output_dir, "RUN")
+
+        if is_main_process():
+            print("\n" + "=" * 70)
+            print(f"🚀 Launching Multi-Experiment Suite ({len(config_paths)} experiments)")
+            print(f"📁 Suite Output Directory: {suite_run_dir}")
+            print(f"⚡ Collision Detection / Skip: {args.skip_collision}")
+            print("=" * 70 + "\n")
+
+        all_results: List[Dict[str, Any]] = []
+
+        for i, cfg_path in enumerate(config_paths, 1):
+            cfg_name = os.path.splitext(os.path.basename(cfg_path))[0]
+            if is_main_process():
+                print(f"\n>>> Running Experiment [{i}/{len(config_paths)}]: {cfg_path} ({cfg_name})")
+                print("-" * 70)
+            res = train_single_run(
+                config_path=cfg_path,
+                overrides=overrides,
+                resume=args.resume if i == 1 else None,
+                resume_repo=args.resume_repo if i == 1 else None,
+                auto_resume=args.auto_resume,
+                run_idx=i,
+                total_runs=len(config_paths),
+                base_output_dir=suite_run_dir,
+                skip_collision=args.skip_collision,
+            )
+            all_results.append(res)
+
+        multi_curves_path = None
+        multi_report = None
+        if is_main_process():
+            # Collect experiment histories and plot multi-run comparison curves
+            histories_dict = {}
+            for r in all_results:
+                exp_name = r.get("run_name", "Run")
+                if r.get("history"):
+                    histories_dict[exp_name] = r["history"]
+
+            if histories_dict:
+                multi_curves_path = os.path.join(suite_run_dir, "multi_experiment_curves.png")
+                plot_multi_experiment_curves(
+                    experiment_histories=histories_dict,
+                    output_path=multi_curves_path,
+                )
+
+            # Generate and display continuous multi-experiment comparison report
+            combined_results = list(all_results)
+            multi_json_path = os.path.join(suite_run_dir, "multi_experiment_comparison.json")
+            if os.path.exists(multi_json_path):
+                try:
+                    with open(multi_json_path, "r", encoding="utf-8") as f:
+                        import json
+                        data = json.load(f)
+                        if isinstance(data, dict) and "experiments" in data:
+                            existing_runs = data["experiments"]
+                            curr_runs = {r.get("run_name") for r in all_results if r.get("run_name")}
+                            for er in existing_runs:
+                                if er.get("run_name") not in curr_runs:
+                                    combined_results.append(er)
+                except Exception:
+                    pass
+
+            multi_report = generate_multi_experiment_report(
+                experiment_results=combined_results,
+                output_dir=suite_run_dir,
+                report_name="multi_experiment_comparison",
+                multi_curves_path=multi_curves_path,
+            )
+
+            print("\n" + "=" * 70)
+            print("⭐ ALL EXPERIMENTS COMPLETED - SUMMARY REPORT")
+            print("=" * 70)
+            print(multi_report["summary_table"])
+            if multi_curves_path and os.path.exists(multi_curves_path):
+                print(f"Multi-Experiment comparison curves plot: {multi_curves_path}")
+            print(f"\nDetailed Markdown comparison: {os.path.join(suite_run_dir, 'multi_experiment_comparison.md')}")
+            print(f"Detailed JSON comparison: {os.path.join(suite_run_dir, 'multi_experiment_comparison.json')}\n")
+
+        return all_results
+    finally:
+        cleanup_distributed()
 
 
 

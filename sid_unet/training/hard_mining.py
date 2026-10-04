@@ -241,6 +241,10 @@ class HardMiner:
                 # Default: median
                 threshold = float(np.median(losses_arr))
 
+            from sid_unet.utils.distributed import is_dist_avail_and_initialized, broadcast_scalar
+            if is_dist_avail_and_initialized():
+                threshold = broadcast_scalar(threshold, src=0)
+
             self.previous_median = threshold
 
             # Mark all batches with loss >= threshold as hard examples

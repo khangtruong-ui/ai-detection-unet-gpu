@@ -132,3 +132,114 @@ def test_data_parallel_trainer_execution():
         model_state = ckpt["model_state_dict"]
         for key in model_state.keys():
             assert not key.startswith("module."), f"Found module. prefix in key: {key}"
+
+
+def _ddp_trainer_worker(rank, world_size, port, tmpdir):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from sid_unet.utils.distributed import (
+        is_dist_avail_and_initialized,
+        get_rank,
+        get_world_size,
+        is_main_process,
+        reduce_dict,
+        broadcast_scalar,
+        cleanup_distributed,
+    )
+    from torch.utils.data.distributed import DistributedSampler
+
+    assert is_dist_avail_and_initialized() is True
+    assert get_rank() == rank
+    assert get_world_size() == world_size
+    assert is_main_process() == (rank == 0)
+
+    # Test reduce_dict
+    local_metrics = {"loss": 2.0 * (rank + 1), "steps": 1.0}
+    reduced = reduce_dict(local_metrics, average=True)
+    assert abs(reduced["loss"] - 3.0) < 1e-4
+
+    # Test broadcast_scalar
+    val = broadcast_scalar(42.0 if rank == 0 else 0.0, src=0)
+    assert val == 42.0
+
+    dataset = DummyDataset(size=16)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    train_loader = DataLoader(dataset, batch_size=4, sampler=sampler)
+    val_loader = DataLoader(dataset, batch_size=4, shuffle=False)
+
+    cfg = load_config("configs/test_smoke.yaml")
+    cfg.project.output_dir = tmpdir
+    cfg.data.num_workers = 0
+    cfg.data.batch_size = 4
+    cfg.training.epochs = 1
+    cfg.training.data_parallel = True
+    cfg.training.save_best = True
+    cfg.training.save_latest = True
+
+    trainer = Trainer(
+        config=cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+    )
+
+    assert trainer.is_distributed is True
+    assert isinstance(trainer.model, nn.parallel.DistributedDataParallel)
+    assert hasattr(trainer.raw_model, "inc")
+
+    # Run 1 epoch of training
+    metrics = trainer.train_epoch(1)
+    assert "total_loss" in metrics
+    assert metrics["total_loss"] > 0
+
+    # Save checkpoint
+    trainer.ckpt_manager.save(
+        epoch=1,
+        model=trainer.model,
+        optimizer=trainer.optimizer,
+        scheduler=trainer.scheduler,
+        metrics={"val_iou": 0.5},
+        config=trainer.config,
+        is_best=True,
+        hard_mining=trainer.hard_miner.state_dict(),
+    )
+
+    if rank == 0:
+        best_path = os.path.join(tmpdir, "checkpoints", "checkpoint_best.pt")
+        assert os.path.exists(best_path)
+        ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+        model_state = ckpt["model_state_dict"]
+        for key in model_state.keys():
+            assert not key.startswith("module."), f"Found module. prefix in key: {key}"
+
+    cleanup_distributed()
+
+
+def test_distributed_trainer_ddp_execution():
+    """Verify Trainer with DistributedDataParallel (DDP) across multiple GPU processes."""
+    num_gpus = torch.cuda.device_count()
+    if not torch.cuda.is_available() or num_gpus < 2:
+        pytest.skip("Test requires at least 2 CUDA GPUs")
+
+    from sid_unet.utils.distributed import find_free_port
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        port = find_free_port()
+        torch.multiprocessing.spawn(
+            _ddp_trainer_worker,
+            args=(num_gpus, port, tmpdir),
+            nprocs=num_gpus,
+            join=True,
+        )
+

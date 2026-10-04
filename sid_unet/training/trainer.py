@@ -9,11 +9,22 @@ from __future__ import annotations
 import gc
 import os
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from sid_unet.utils.distributed import (
+    is_dist_avail_and_initialized,
+    get_rank,
+    get_local_rank,
+    get_world_size,
+    is_main_process,
+    reduce_dict,
+    broadcast_scalar,
+)
 
 from sid_unet.dataset.loader import safe_dataloader_len
 from sid_unet.losses.auxiliary import SIDTotalLoss, build_loss
@@ -95,40 +106,75 @@ class Trainer:
         self.config = config
 
         # 1. Device and Data Parallelism configuration
-        dev_cfg = config.project.get("device", "auto")
-        if dev_cfg == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if is_dist_avail_and_initialized():
+            self.is_distributed = True
+            self.rank = get_rank()
+            self.local_rank = get_local_rank()
+            self.world_size = get_world_size()
+            self.is_main_process = is_main_process()
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            torch.cuda.set_device(self.device)
+            self.num_gpus = self.world_size
+            self.is_data_parallel = True
         else:
-            self.device = torch.device(dev_cfg)
+            self.is_distributed = False
+            self.rank = 0
+            self.local_rank = 0
+            self.world_size = 1
+            self.is_main_process = True
 
-        data_parallel_cfg = bool(config.training.get("data_parallel", True))
-        if torch.cuda.is_available() and self.device.type == "cuda" and data_parallel_cfg and str(dev_cfg) in ("auto", "cuda"):
-            self.num_gpus = max(1, torch.cuda.device_count())
-        else:
-            self.num_gpus = 1
-        self.is_data_parallel = (self.num_gpus > 1)
+            dev_cfg = config.project.get("device", "auto")
+            if dev_cfg == "auto":
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                self.device = torch.device(dev_cfg)
+
+            data_parallel_cfg = bool(config.training.get("data_parallel", True))
+            if torch.cuda.is_available() and self.device.type == "cuda" and data_parallel_cfg and str(dev_cfg) in ("auto", "cuda"):
+                self.num_gpus = max(1, torch.cuda.device_count())
+            else:
+                self.num_gpus = 1
+            self.is_data_parallel = (self.num_gpus > 1)
 
         # 2. Output and logging setup
         self.output_dir = config.project.get("output_dir", "outputs")
         self.checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
         self.log_dir = os.path.join(self.output_dir, "logs")
         self.report_dir = os.path.join(self.output_dir, "reports")
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        os.makedirs(self.log_dir, exist_ok=True)
-        os.makedirs(self.report_dir, exist_ok=True)
+        if self.is_main_process:
+            os.makedirs(self.output_dir, exist_ok=True)
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+            os.makedirs(self.log_dir, exist_ok=True)
+            os.makedirs(self.report_dir, exist_ok=True)
 
+        log_name = f"SID_Trainer_rank{self.rank}" if self.is_distributed else "SID_Trainer"
         self.logger = custom_logger or setup_logger(
-            name="SID_Trainer",
-            log_file=os.path.join(self.log_dir, "training.log"),
+            name=log_name,
+            log_file=os.path.join(self.log_dir, "training.log") if self.is_main_process else None,
         )
+        if self.is_distributed and not self.is_main_process and hasattr(self.logger, "setLevel"):
+            import logging
+            self.logger.setLevel(logging.WARNING)
 
         # 3. Model, Loss, DataLoaders
         loaded_model = model or build_model(config)
         is_quantized = getattr(loaded_model, "load_in_4bit", False) or getattr(loaded_model, "load_in_8bit", False)
         if not is_quantized:
             self.model = loaded_model.to(self.device)
-            if self.is_data_parallel:
+            if self.is_distributed:
+                find_unused = bool(config.training.get("find_unused_parameters", False))
+                self.model = nn.parallel.DistributedDataParallel(
+                    self.model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=find_unused,
+                )
+                if self.is_main_process:
+                    self.logger.info(
+                        f"🚀 Distributed Data Parallelism Active: DDP enabled across {self.world_size} ranks "
+                        f"(Rank {self.rank}, Local Rank {self.local_rank}, Device {self.device})"
+                    )
+            elif self.is_data_parallel:
                 self.model = nn.DataParallel(self.model)
                 self.logger.info(
                     f"🚀 Data Parallelism Active: nn.DataParallel enabled across {self.num_gpus} GPUs "
@@ -317,9 +363,11 @@ class Trainer:
             self.network_monitor.start()
         else:
             self.network_monitor = None
+            self.bottleneck_detector = None
+
     @property
     def raw_model(self) -> nn.Module:
-        """Return unwrapped underlying nn.Module without DataParallel wrapper."""
+        """Return unwrapped underlying nn.Module without DataParallel or DistributedDataParallel wrapper."""
         return getattr(self.model, "module", self.model)
 
     def resume_from_checkpoint(
@@ -607,18 +655,36 @@ class Trainer:
         img_size = tuple(self.config.data.get("image_size", [256, 256]))
 
         try:
-            safe_bs = find_optimal_batch_size(
-                model=self.raw_model,
-                loss_fn=self.loss_fn,
-                sample_shape=(3, img_size[0], img_size[1]),
-                device=self.device,
-                max_batch_size=current_bs,
-                min_batch_size=1,
-                use_amp=self.use_amp,
-                aux_classifier=getattr(self.raw_model, "aux_classifier", True),
-                num_classes=int(self.config.model.get("num_classes", 3)),
-                logger=self.logger,
-            )
+            if self.is_distributed:
+                if self.is_main_process:
+                    safe_bs = find_optimal_batch_size(
+                        model=self.raw_model,
+                        loss_fn=self.loss_fn,
+                        sample_shape=(3, img_size[0], img_size[1]),
+                        device=self.device,
+                        max_batch_size=current_bs,
+                        min_batch_size=1,
+                        use_amp=self.use_amp,
+                        aux_classifier=getattr(self.raw_model, "aux_classifier", True),
+                        num_classes=int(self.config.model.get("num_classes", 3)),
+                        logger=self.logger,
+                    )
+                else:
+                    safe_bs = current_bs
+                safe_bs = int(broadcast_scalar(float(safe_bs), src=0))
+            else:
+                safe_bs = find_optimal_batch_size(
+                    model=self.raw_model,
+                    loss_fn=self.loss_fn,
+                    sample_shape=(3, img_size[0], img_size[1]),
+                    device=self.device,
+                    max_batch_size=current_bs,
+                    min_batch_size=1,
+                    use_amp=self.use_amp,
+                    aux_classifier=getattr(self.raw_model, "aux_classifier", True),
+                    num_classes=int(self.config.model.get("num_classes", 3)),
+                    logger=self.logger,
+                )
 
             if safe_bs < current_bs:
                 adjusted_bs, adjusted_grad_accum = auto_scale_batch_size_and_grad_accum(
@@ -703,12 +769,20 @@ class Trainer:
         # Hard Mining: configure epoch and wrap dataloader if active
         self.hard_miner.start_epoch(epoch)
         effective_loader = self.hard_miner.wrap_dataloader(self.train_loader)
+
+        # Sync DistributedSampler epoch if present
+        if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+            self.train_loader.sampler.set_epoch(epoch)
+        elif hasattr(effective_loader, "sampler") and hasattr(effective_loader.sampler, "set_epoch"):
+            effective_loader.sampler.set_epoch(epoch)
+
         total_batches = safe_dataloader_len(effective_loader)
         pbar = tqdm(
             effective_loader,
             desc=f"Epoch {epoch}/{self.epochs} [Train]",
             total=total_batches,
             leave=False,
+            disable=not self.is_main_process,
         )
 
         self.optimizer.zero_grad()
@@ -727,7 +801,20 @@ class Trainer:
                 loss_dict_batch = {}
                 loss_val = 0.0
 
-                loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
+                is_accum_boundary = (step_in_epoch % accum_steps == 0) or (
+                    total_batches is not None and step_in_epoch == total_batches
+                )
+
+                # Avoid gradient synchronization across ranks on intermediate accumulation steps
+                no_sync = (
+                    self.is_distributed
+                    and hasattr(self.model, "no_sync")
+                    and accum_steps > 1
+                    and not is_accum_boundary
+                )
+                sync_context = self.model.no_sync() if no_sync else nullcontext()
+                with sync_context:
+                    loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
                 loss_val = loss_t.item()
                 has_pending_grads = True
 
@@ -737,9 +824,6 @@ class Trainer:
                 self.global_step += 1
 
                 # Step optimizer on gradient accumulation boundary
-                is_accum_boundary = (step_in_epoch % accum_steps == 0) or (
-                    total_batches is not None and step_in_epoch == total_batches
-                )
                 if is_accum_boundary and has_pending_grads:
                     grad_finite = True
                     if self.grad_clip > 0:
@@ -758,7 +842,7 @@ class Trainer:
                     self.optimizer.zero_grad()
                     has_pending_grads = False
 
-                if self.ckpt_manager.should_save_periodic(step=self.global_step):
+                if self.is_main_process and self.ckpt_manager.should_save_periodic(step=self.global_step):
                     p_paths = self.ckpt_manager.save_periodic(
                         epoch=epoch,
                         model=self.model,
@@ -800,6 +884,7 @@ class Trainer:
                             "Skipping flush optimizer update."
                         )
                         grad_finite = False
+
                 if grad_finite:
                     self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -818,6 +903,8 @@ class Trainer:
                 clear_memory_cache(self.device)
 
         averages = metric_logger.averages()
+        if self.is_distributed:
+            averages = reduce_dict(averages)
         return averages
 
     def _eval_batch_step(
@@ -871,7 +958,7 @@ class Trainer:
 
         desc_str = f"Epoch {epoch}/{self.epochs} [{split_name.title()}]" if epoch is not None else f"Evaluating [{split_name.title()}]"
         val_total = safe_dataloader_len(target_loader)
-        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False)
+        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False, disable=not self.is_main_process)
 
         try:
             for batch in pbar:
@@ -917,6 +1004,9 @@ class Trainer:
             summary[f"{prefix}{k}"] = v
         for k, v in cls_metrics.items():
             summary[f"{prefix}{k}"] = v
+
+        if self.is_distributed:
+            summary = reduce_dict(summary)
 
         return summary, per_label_seg_metrics, confusion_mat
 
@@ -1022,17 +1112,21 @@ class Trainer:
                             self.scheduler.step()
 
                     # Save checkpoint
-                    saved_paths = self.ckpt_manager.save(
-                        epoch=epoch,
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        metrics=val_summary,
-                        config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-                        step=self.global_step,
-                        scaler=self.scaler,
-                        history=history,
-                        hard_mining=self.hard_miner.state_dict(),
+                    saved_paths = (
+                        self.ckpt_manager.save(
+                            epoch=epoch,
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            metrics=val_summary,
+                            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                            step=self.global_step,
+                            scaler=self.scaler,
+                            history=history,
+                            hard_mining=self.hard_miner.state_dict(),
+                        )
+                        if self.is_main_process
+                        else {}
                     )
 
                     epoch_time = time.time() - epoch_start
@@ -1050,7 +1144,7 @@ class Trainer:
                         self.logger.info(f"⭐ New best model saved to {saved_paths['best']} (score: {self.ckpt_manager.best_score:.4f})")
 
                     # Check periodic checkpointing
-                    if self.ckpt_manager.should_save_periodic(step=self.global_step):
+                    if self.is_main_process and self.ckpt_manager.should_save_periodic(step=self.global_step):
                         p_paths = self.ckpt_manager.save_periodic(
                             epoch=epoch,
                             model=self.model,
@@ -1075,20 +1169,21 @@ class Trainer:
                     "⚠️ Training interrupted by user (KeyboardInterrupt). Saving emergency checkpoint..."
                 )
                 try:
-                    curr_ep = getattr(self, "_current_epoch", self.start_epoch)
-                    self.ckpt_manager.save_periodic(
-                        epoch=curr_ep,
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        metrics={"interrupted": True},
-                        config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-                        step=self.global_step,
-                        scaler=self.scaler,
-                        history=history,
-                        hard_mining=self.hard_miner.state_dict(),
-                    )
-                    self.logger.info("Emergency checkpoint successfully saved to checkpoint_latest.pt and checkpoint_periodic.pt.")
+                    if self.is_main_process:
+                        curr_ep = getattr(self, "_current_epoch", self.start_epoch)
+                        self.ckpt_manager.save_periodic(
+                            epoch=curr_ep,
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            metrics={"interrupted": True},
+                            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                            step=self.global_step,
+                            scaler=self.scaler,
+                            history=history,
+                            hard_mining=self.hard_miner.state_dict(),
+                        )
+                        self.logger.info("Emergency checkpoint successfully saved to checkpoint_latest.pt and checkpoint_periodic.pt.")
                 except Exception as save_err:
                     self.logger.error(f"Failed to save emergency checkpoint: {save_err}")
                 self.close()
@@ -1097,34 +1192,41 @@ class Trainer:
         total_time = time.time() - start_time
         self.logger.info(f"Training completed in {total_time/60:.2f} minutes.")
 
-        # Save raw history data (JSON and CSV)
-        history_paths = save_history_data(history, output_dir=self.report_dir, prefix="training_history")
-        self.logger.info(f"Training history saved to {history_paths.get('json')} and {history_paths.get('csv')}")
+        history_paths = {}
+        saved_curves = []
+        primary_curves_path = None
+        report_data = {}
 
-        # Generate publication-quality training curves graph (PNG, JPG, PDF)
-        curves_png_path = os.path.join(self.report_dir, "training_curves.png")
-        saved_curves = plot_training_curves(
-            history=history,
-            output_path=curves_png_path,
-            title_suffix=f"({self.config.project.get('name', 'UNet')})",
-            formats=["png", "pdf", "jpg"],
-        )
-        primary_curves_path = saved_curves[0] if saved_curves else curves_png_path
-        self.logger.info(f"📈 Training curves plotted and saved to: {primary_curves_path}")
+        if self.is_main_process:
+            # Save raw history data (JSON and CSV)
+            history_paths = save_history_data(history, output_dir=self.report_dir, prefix="training_history")
+            self.logger.info(f"Training history saved to {history_paths.get('json')} and {history_paths.get('csv')}")
+
+            # Generate publication-quality training curves graph (PNG, JPG, PDF)
+            curves_png_path = os.path.join(self.report_dir, "training_curves.png")
+            saved_curves = plot_training_curves(
+                history=history,
+                output_path=curves_png_path,
+                title_suffix=f"({self.config.project.get('name', 'UNet')})",
+                formats=["png", "pdf", "jpg"],
+            )
+            primary_curves_path = saved_curves[0] if saved_curves else curves_png_path
+            self.logger.info(f"📈 Training curves plotted and saved to: {primary_curves_path}")
 
         # Generate final validation evaluation report
         final_val_summary, final_per_label, final_cm = self.validate(epoch=self.epochs)
-        report_data = generate_evaluation_report(
-            overall_metrics=final_val_summary,
-            per_label_metrics=final_per_label,
-            confusion_matrix=final_cm,
-            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-            output_dir=self.report_dir,
-            report_name="training_final_report",
-            history=history,
-            curves_path=primary_curves_path,
-        )
-        self.logger.info(f"\n{report_data['markdown']}")
+        if self.is_main_process:
+            report_data = generate_evaluation_report(
+                overall_metrics=final_val_summary,
+                per_label_metrics=final_per_label,
+                confusion_matrix=final_cm,
+                config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                output_dir=self.report_dir,
+                report_name="training_final_report",
+                history=history,
+                curves_path=primary_curves_path,
+            )
+            self.logger.info(f"\n{report_data['markdown']}")
 
         # Optional test evaluation on best checkpoint
         test_results = None
@@ -1156,6 +1258,12 @@ class Trainer:
 
         import gc
         gc.collect()
+        if self.is_distributed and is_dist_avail_and_initialized():
+            import torch.distributed as dist
+            try:
+                dist.barrier()
+            except Exception:
+                pass
         self.close()
 
         return {
