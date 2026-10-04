@@ -139,3 +139,48 @@ class AuxiliaryClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_pooled = self.pool(x)
         return self.fc(x_pooled)
+
+
+def get_submodule_device_dtype(
+    module: nn.Module,
+    fallback_device: torch.device,
+    fallback_dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.device, torch.dtype]:
+    """
+    Safely determine the active device and dtype of a submodule, fully compatible
+    with torch.nn.DataParallel replicas where module.parameters() returns an empty generator.
+    """
+    if module is None:
+        return fallback_device, fallback_dtype
+
+    # 1. Direct or recursive parameters (non-replicated mode)
+    try:
+        p = next(module.parameters())
+        return p.device, p.dtype
+    except (StopIteration, Exception):
+        pass
+
+    # 2. Direct or recursive buffers
+    try:
+        b = next(module.buffers())
+        return b.device, b.dtype
+    except (StopIteration, Exception):
+        pass
+
+    # 3. Check _former_parameters (PyTorch DataParallel replica storage)
+    for m in module.modules():
+        former = getattr(m, "_former_parameters", None)
+        if former:
+            for p in former.values():
+                if p is not None and hasattr(p, "device") and hasattr(p, "dtype"):
+                    return p.device, p.dtype
+
+    # 4. Check for direct tensor attributes like weight / bias on submodules
+    for m in module.modules():
+        for attr in ("weight", "bias"):
+            t = getattr(m, attr, None)
+            if isinstance(t, torch.Tensor):
+                return t.device, t.dtype
+
+    return fallback_device, fallback_dtype
+

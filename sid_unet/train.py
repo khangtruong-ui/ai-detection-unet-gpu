@@ -289,7 +289,7 @@ def parse_args():
         dest="bootstrap_stream_ratio",
         type=float,
         default=None,
-        help="Active channel stream ratio during Bootstrapping v1.0 (e.g. 0.5 for first 50% channels).",
+        help="Active channel stream ratio during Bootstrapping v1.0 (e.g. 0.5 for first 50%% channels).",
     )
     parser.add_argument(
         "--bootstrap-init",

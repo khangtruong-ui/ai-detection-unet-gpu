@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sid_unet.models.blocks import get_submodule_device_dtype
+
 warnings.filterwarnings("ignore", message=".*memory_attention_rope_theta.*")
 warnings.filterwarnings("ignore", message=".*Importing from timm.models.layers.*")
 
@@ -382,7 +384,9 @@ class SAM3DistilLoRA(nn.Module):
         from sam3.model.data_misc import FindStage
 
         b_sz, _, orig_h, orig_w = x.shape
-        model_device = next(self.peft_model.parameters()).device
+        model_device, param_dtype = get_submodule_device_dtype(
+            self.peft_model, x.device, torch.float32
+        )
 
         # 1. Resize to native target size (1008, 1008)
         if (orig_h, orig_w) != self.target_size:
@@ -395,10 +399,6 @@ class SAM3DistilLoRA(nn.Module):
             x_proc = (x_proc - 0.5) / 0.5
 
         # 3. Match device and precision
-        param_dtype = next(
-            (p.dtype for p in self.peft_model.parameters() if p.is_floating_point()),
-            torch.float32,
-        )
         if param_dtype in (torch.float16, torch.bfloat16):
             x_proc = x_proc.to(device=model_device, dtype=param_dtype)
         else:

@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sid_unet.models.blocks import AuxiliaryClassifier
+from sid_unet.models.blocks import AuxiliaryClassifier, get_submodule_device_dtype
 from sid_unet.models.diffusion_diff import (
     DecoderUpsampleStage,
     ResidualConvBlock,
@@ -206,8 +206,9 @@ class DiffusionDiffMinimizedModel(nn.Module):
         self.z_norm = get_norm_layer(z_norm_type, self.total_z_channels)
 
         # Determine reference device and dtype from VAE
-        ref_device = next(self.vae.parameters()).device
-        ref_dtype = next(self.vae.parameters()).dtype
+        ref_device, ref_dtype = get_submodule_device_dtype(
+            self.vae, torch.device("cpu"), torch.float32
+        )
 
         self.perp_mapping: List[Optional[int]] = []
         perp_skip_channels: Optional[List[int]] = None
@@ -537,7 +538,7 @@ class DiffusionDiffMinimizedModel(nn.Module):
         res = super().to(*args, **kwargs)
         if getattr(self, "diffuser_fp16", False):
             try:
-                device = next(self.parameters()).device
+                device, _ = get_submodule_device_dtype(self, torch.device("cpu"), torch.float32)
                 if (
                     device.type == "cuda"
                     and hasattr(self, "diffuser")
@@ -656,8 +657,7 @@ class DiffusionDiffMinimizedModel(nn.Module):
 
         x_proc, orig_h, orig_w = self._preprocess_input(x)
 
-        vae_dtype = next(self.vae.parameters()).dtype
-        vae_device = next(self.vae.parameters()).device
+        vae_device, vae_dtype = get_submodule_device_dtype(self.vae, device, dtype)
 
         # Match device and dtype for VAE if needed
         x_vae = x_proc.to(device=vae_device, dtype=vae_dtype)
@@ -693,7 +693,9 @@ class DiffusionDiffMinimizedModel(nn.Module):
         perp_skips: Optional[List[torch.Tensor]] = None
         if self.use_perpendicular_skips:
             with torch.no_grad():
-                raw_frozen_feats = self._extract_frozen_decoder_features(z0.detach())
+                raw_frozen_feats = self._extract_frozen_decoder_features(
+                    z0.detach().to(device=vae_device, dtype=vae_dtype)
+                )
                 perp_skips = [
                     raw_frozen_feats[m].detach().to(device=device, dtype=dtype)
                     if (m is not None and m < len(raw_frozen_feats))
@@ -713,16 +715,7 @@ class DiffusionDiffMinimizedModel(nn.Module):
         # -------------------------------------------------------------
         # Line 2: Pick ONE noisy latent from the diffusion model
         # -------------------------------------------------------------
-        diff_dtype = (
-            next(self.diffuser.parameters()).dtype
-            if list(self.diffuser.parameters())
-            else dtype
-        )
-        diff_device = (
-            next(self.diffuser.parameters()).device
-            if list(self.diffuser.parameters())
-            else device
-        )
+        diff_device, diff_dtype = get_submodule_device_dtype(self.diffuser, device, dtype)
 
         cross_dim = getattr(self.diffuser.config, "cross_attention_dim", None)
         if cross_dim is not None:
@@ -791,26 +784,21 @@ class DiffusionDiffMinimizedModel(nn.Module):
         # High-Dimensional Representation Z Concatenation & Trainable Decoding
         # -------------------------------------------------------------
         z_high_dim = torch.cat(z_components, dim=1)
-        norm_dtype = (
-            next(self.z_norm.parameters()).dtype
-            if list(self.z_norm.parameters())
-            else dtype
-        )
-        norm_device = (
-            next(self.z_norm.parameters()).device
-            if list(self.z_norm.parameters())
-            else device
-        )
+        norm_device, norm_dtype = get_submodule_device_dtype(self.z_norm, device, dtype)
         z_high_dim = z_high_dim.to(device=norm_device, dtype=norm_dtype)
-        z_high_dim = self.z_norm(z_high_dim)
+        z_high_dim = self.z_norm(z_high_dim).to(device=device, dtype=dtype)
 
         class_logits = None
         if self.aux_classifier and self.classifier_head is not None:
-            class_logits = self.classifier_head(z_high_dim)
+            cls_device, cls_dtype = get_submodule_device_dtype(self.classifier_head, device, dtype)
+            class_logits = self.classifier_head(z_high_dim.to(device=cls_device, dtype=cls_dtype)).to(device=device, dtype=dtype)
 
+        dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
         mask_logits = self.decoder(
-            z_high_dim, perp_skips=perp_skips, encoder_skips=enc_skips
-        )
+            z_high_dim.to(device=dec_device, dtype=dec_dtype),
+            perp_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in perp_skips] if perp_skips else None,
+            encoder_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in enc_skips] if enc_skips else None,
+        ).to(device=device, dtype=dtype)
 
         # Crop back to original dimensions if padded and ensure contiguous layout
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:

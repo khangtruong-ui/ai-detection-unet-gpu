@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sid_unet.models.blocks import AuxiliaryClassifier
+from sid_unet.models.blocks import AuxiliaryClassifier, get_submodule_device_dtype
 from sid_unet.models.diffusion_diff import (
     DEFAULT_DIFFUSION_CHECKPOINT,
     DecoderUpsampleStage,
@@ -686,7 +686,7 @@ class DiffusionDiffV2Model(nn.Module):
         res = super().to(*args, **kwargs)
         if getattr(self, "diffuser_fp16", False):
             try:
-                device = next(self.parameters()).device
+                device, _ = get_submodule_device_dtype(self, torch.device("cpu"), torch.float32)
                 if device.type == "cuda" and hasattr(self, "diffuser") and self.diffuser is not None:
                     self.diffuser = self.diffuser.to(device=device, dtype=torch.float16)
             except Exception:
@@ -794,21 +794,25 @@ class DiffusionDiffV2Model(nn.Module):
         x_proc, orig_h, orig_w = self._preprocess_input(x)
 
         # 1. Real image passed through VAE encoder (frozen by default) to obtain diffusion latent z0
+        vae_device, vae_dtype = get_submodule_device_dtype(self.vae, device, dtype)
+        x_proc_vae = x_proc.to(device=vae_device, dtype=vae_dtype)
         if self.use_encoder_skips:
-            posterior, enc_skips = self._encode_with_skips(x_proc)
+            posterior, enc_skips = self._encode_with_skips(x_proc_vae)
             if self.training and not self.freeze_encoder:
                 z0 = posterior.mode() * self.scaling_factor
             else:
                 with torch.no_grad():
                     z0 = posterior.mode() * self.scaling_factor
+            if enc_skips is not None:
+                enc_skips = [s.to(device=device, dtype=dtype) for s in enc_skips]
         else:
             enc_skips = None
             if self.training and not self.freeze_encoder:
-                posterior = self.vae.encode(x_proc).latent_dist
+                posterior = self.vae.encode(x_proc_vae).latent_dist
                 z0 = posterior.mode() * self.scaling_factor
             else:
                 with torch.no_grad():
-                    posterior = self.vae.encode(x_proc).latent_dist
+                    posterior = self.vae.encode(x_proc_vae).latent_dist
                     z0 = posterior.mode() * self.scaling_factor
 
         # Prevent runaway latent drift from destabilizing frozen diffuser UNet
@@ -820,20 +824,29 @@ class DiffusionDiffV2Model(nn.Module):
         perp_skips: Optional[List[torch.Tensor]] = None
         if self.use_perpendicular_skips:
             with torch.no_grad():
-                raw_frozen_feats = self._extract_frozen_decoder_features(z0.detach())
+                raw_frozen_feats = self._extract_frozen_decoder_features(
+                    z0.detach().to(device=vae_device, dtype=vae_dtype)
+                )
                 perp_skips = [
-                    raw_frozen_feats[m].detach() if (m is not None and m < len(raw_frozen_feats)) else None
+                    raw_frozen_feats[m].detach().to(device=device, dtype=dtype)
+                    if (m is not None and m < len(raw_frozen_feats))
+                    else None
                     for m in self.perp_mapping
                 ]
 
         # 3. Multi-step perturbations and diffuser predictions
         z_components: List[torch.Tensor] = []
         if self.include_z0:
-            z_components.append(z0 if (self.training and not self.freeze_encoder) else z0.detach())
+            z_components.append(
+                z0.to(device=device, dtype=dtype)
+                if (self.training and not self.freeze_encoder)
+                else z0.detach().to(device=device, dtype=dtype)
+            )
 
+        diff_device, diff_dtype = get_submodule_device_dtype(self.diffuser, device, dtype)
         cross_dim = getattr(self.diffuser.config, "cross_attention_dim", None)
         if cross_dim is not None:
-            uncond_emb = torch.zeros((b_sz, 1, cross_dim), device=device, dtype=dtype)
+            uncond_emb = torch.zeros((b_sz, 1, cross_dim), device=diff_device, dtype=diff_dtype)
         else:
             uncond_emb = None
 
@@ -853,16 +866,15 @@ class DiffusionDiffV2Model(nn.Module):
 
             z_tk = sqrt_alpha_bar * z0 + sigma_val * eps_k
 
-            t_tensor = torch.full((b_sz,), t_clamped, device=device, dtype=torch.long)
+            t_tensor = torch.full((b_sz,), t_clamped, device=diff_device, dtype=torch.long)
             with torch.no_grad():
                 diffuser_kwargs: Dict[str, Any] = {}
-                diff_dtype = next(self.diffuser.parameters()).dtype if list(self.diffuser.parameters()) else dtype
                 if uncond_emb is not None:
-                    diffuser_kwargs["encoder_hidden_states"] = uncond_emb.to(diff_dtype)
-                z_tk_input = z_tk.to(diff_dtype)
-                pred_eps = self.diffuser(z_tk_input, t_tensor, **diffuser_kwargs).sample.detach().to(dtype)
+                    diffuser_kwargs["encoder_hidden_states"] = uncond_emb
+                z_tk_input = z_tk.to(device=diff_device, dtype=diff_dtype)
+                pred_eps = self.diffuser(z_tk_input, t_tensor, **diffuser_kwargs).sample.detach().to(device=device, dtype=dtype)
 
-            t_emb = sinusoidal_embedding(t_tensor.float(), dim=self.timestep_embed_dim)
+            t_emb = sinusoidal_embedding(t_tensor.to(device=device).float(), dim=self.timestep_embed_dim)
             t_spatial = expand_to_spatial(t_emb, h_z, w_z).to(dtype=dtype)
 
             sigma_tensor = torch.full((b_sz,), sigma_val.item(), device=device, dtype=torch.float32)
@@ -870,29 +882,40 @@ class DiffusionDiffV2Model(nn.Module):
             sigma_spatial = expand_to_spatial(sigma_emb, h_z, w_z).to(dtype=dtype)
 
             if self.include_noisy_latents:
-                z_components.append(z_tk if (self.training and not self.freeze_encoder) else z_tk.detach())
+                z_components.append(
+                    z_tk.to(device=device, dtype=dtype)
+                    if (self.training and not self.freeze_encoder)
+                    else z_tk.detach().to(device=device, dtype=dtype)
+                )
             if self.include_added_noise:
-                z_components.append(eps_k.detach())
+                z_components.append(eps_k.detach().to(device=device, dtype=dtype))
             if self.include_predicted_noise:
                 z_components.append(pred_eps)
             if self.include_noise_diff:
-                z_components.append((pred_eps - eps_k).detach())
+                z_components.append((pred_eps - eps_k.to(device=device, dtype=dtype)).detach())
             if self.timestep_embed_dim > 0:
                 z_components.append(t_spatial)
             if self.sigma_embed_dim > 0:
                 z_components.append(sigma_spatial)
 
         # 4. Concatenate along channel dimension to form high-dimensional Z and normalize
-        z_high_dim = torch.cat(z_components, dim=1)
-        z_high_dim = self.z_norm(z_high_dim)
+        norm_device, norm_dtype = get_submodule_device_dtype(self.z_norm, device, dtype)
+        z_high_dim = torch.cat(z_components, dim=1).to(device=norm_device, dtype=norm_dtype)
+        z_high_dim = self.z_norm(z_high_dim).to(device=device, dtype=dtype)
 
         # 5. Auxiliary classifier on Z representation if enabled
         class_logits = None
         if self.aux_classifier and self.classifier_head is not None:
-            class_logits = self.classifier_head(z_high_dim)
+            cls_device, cls_dtype = get_submodule_device_dtype(self.classifier_head, device, dtype)
+            class_logits = self.classifier_head(z_high_dim.to(device=cls_device, dtype=cls_dtype)).to(device=device, dtype=dtype)
 
         # 6. Trainable Decoder: decodes Z, injecting perpendicular skips from the parallel frozen decoder
-        mask_logits = self.decoder(z_high_dim, perp_skips=perp_skips, encoder_skips=enc_skips)
+        dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
+        mask_logits = self.decoder(
+            z_high_dim.to(device=dec_device, dtype=dec_dtype),
+            perp_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in perp_skips] if perp_skips else None,
+            encoder_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in enc_skips] if enc_skips else None,
+        ).to(device=device, dtype=dtype)
 
         # Crop back to original dimensions if padded and ensure contiguous layout
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:

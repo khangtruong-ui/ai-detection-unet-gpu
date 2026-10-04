@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sid_unet.models.blocks import get_submodule_device_dtype
+
 warnings.filterwarnings("ignore", message=".*memory_attention_rope_theta.*")
 
 class _TransformersDeprecationFilter(logging.Filter):
@@ -239,7 +241,9 @@ class SAM3QLoRA(nn.Module):
             If aux_classifier is True, returns Tuple[torch.Tensor, torch.Tensor] (mask_logits, cls_logits).
         """
         b_sz, _, orig_h, orig_w = x.shape
-        model_device = next(self.model.parameters()).device
+        model_device, param_dtype = get_submodule_device_dtype(
+            self.model, x.device, torch.float32
+        )
 
         # Resize to SAM3 native resolution if necessary
         if (orig_h, orig_w) != self.target_size:
@@ -249,10 +253,6 @@ class SAM3QLoRA(nn.Module):
 
         # Ensure correct tensor type and device
         # If model has half/bfloat16 parameters, cast input accordingly
-        param_dtype = next(
-            (p.dtype for p in self.model.parameters() if p.is_floating_point()),
-            torch.float32,
-        )
         if param_dtype in (torch.float16, torch.bfloat16):
             x_proc = x_proc.to(device=model_device, dtype=param_dtype)
         else:
