@@ -777,6 +777,10 @@ class Trainer:
             effective_loader.sampler.set_epoch(epoch)
 
         total_batches = safe_dataloader_len(effective_loader)
+        if total_batches is not None and self.is_distributed and is_dist_avail_and_initialized():
+            from sid_unet.utils.distributed import sync_scalar_min
+            total_batches = sync_scalar_min(total_batches)
+
         pbar = tqdm(
             effective_loader,
             desc=f"Epoch {epoch}/{self.epochs} [Train]",
@@ -791,89 +795,103 @@ class Trainer:
         has_pending_grads = False
 
         prev_batch_end_time = time.perf_counter()
+        join_context = (
+            self.model.join()
+            if (self.is_distributed and hasattr(self.model, "join"))
+            else nullcontext()
+        )
         try:
-            for batch_idx, batch in enumerate(pbar):
-                data_time = time.perf_counter() - prev_batch_end_time
-                compute_start_time = time.perf_counter()
+            with join_context:
+                for batch_idx, batch in enumerate(pbar):
+                    data_time = time.perf_counter() - prev_batch_end_time
+                    compute_start_time = time.perf_counter()
 
-                step_in_epoch += 1
-                batch_size = len(batch["image"])
-                loss_dict_batch = {}
-                loss_val = 0.0
+                    step_in_epoch += 1
+                    batch_size = len(batch["image"])
+                    loss_dict_batch = {}
+                    loss_val = 0.0
 
-                is_accum_boundary = (step_in_epoch % accum_steps == 0) or (
-                    total_batches is not None and step_in_epoch == total_batches
-                )
-
-                # Avoid gradient synchronization across ranks on intermediate accumulation steps
-                no_sync = (
-                    self.is_distributed
-                    and hasattr(self.model, "no_sync")
-                    and accum_steps > 1
-                    and not is_accum_boundary
-                )
-                sync_context = self.model.no_sync() if no_sync else nullcontext()
-                with sync_context:
-                    loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
-                loss_val = loss_t.item()
-                has_pending_grads = True
-
-                self.hard_miner.record_batch_loss(batch_idx, loss_val)
-
-                metric_logger.update_dict(loss_dict_batch, n=batch_size)
-                self.global_step += 1
-
-                # Step optimizer on gradient accumulation boundary
-                if is_accum_boundary and has_pending_grads:
-                    grad_finite = True
-                    if self.grad_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-                        if not torch.isfinite(total_norm):
-                            self.logger.warning(
-                                f"⚠️ Non-finite gradient norm ({total_norm.item() if hasattr(total_norm, 'item') else total_norm}) detected at step {self.global_step}. "
-                                "Skipping optimizer update to prevent weight corruption."
-                            )
-                            grad_finite = False
-
-                    if grad_finite:
-                        self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad()
-                    has_pending_grads = False
-
-                if self.is_main_process and self.ckpt_manager.should_save_periodic(step=self.global_step):
-                    p_paths = self.ckpt_manager.save_periodic(
-                        epoch=epoch,
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        metrics={"train_loss": float(loss_val), "step": self.global_step},
-                        config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-                        step=self.global_step,
-                        scaler=self.scaler,
-                        history=self.history,
-                        hard_mining=self.hard_miner.state_dict(),
+                    is_accum_boundary = (step_in_epoch % accum_steps == 0) or (
+                        total_batches is not None and step_in_epoch == total_batches
                     )
-                    self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Step {self.global_step}, Epoch {epoch})")
 
-                compute_time = time.perf_counter() - compute_start_time
-                prev_batch_end_time = time.perf_counter()
+                    # Avoid gradient synchronization across ranks on intermediate accumulation steps
+                    no_sync = (
+                        self.is_distributed
+                        and hasattr(self.model, "no_sync")
+                        and accum_steps > 1
+                        and not is_accum_boundary
+                    )
+                    sync_context = self.model.no_sync() if no_sync else nullcontext()
+                    with sync_context:
+                        loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
+                    loss_val = loss_t.item()
+                    has_pending_grads = True
 
-                if self.bottleneck_detector is not None:
-                    self.bottleneck_detector.record_step(data_time=data_time, compute_time=compute_time)
+                    self.hard_miner.record_batch_loss(batch_idx, loss_val)
 
-                net_str = self.network_monitor.get_speed_str() if self.network_monitor is not None else "0.0 MB/s"
-                postfix_dict = {
-                    "loss": f"{loss_val:.4f}",
-                    "net": net_str,
-                    "iou": f"{loss_dict_batch.get('iou', 0.0):.4f}",
-                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                }
-                pbar.set_postfix(postfix_dict)
+                    metric_logger.update_dict(loss_dict_batch, n=batch_size)
+                    self.global_step += 1
+
+                    # Step optimizer on gradient accumulation boundary
+                    if is_accum_boundary and has_pending_grads:
+                        grad_finite = True
+                        if self.grad_clip > 0:
+                            self.scaler.unscale_(self.optimizer)
+                            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                            if not torch.isfinite(total_norm):
+                                self.logger.warning(
+                                    f"⚠️ Non-finite gradient norm ({total_norm.item() if hasattr(total_norm, 'item') else total_norm}) detected at step {self.global_step}. "
+                                    "Skipping optimizer update to prevent weight corruption."
+                                )
+                                grad_finite = False
+
+                        if grad_finite:
+                            self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad()
+                        has_pending_grads = False
+
+                    if self.is_main_process and self.ckpt_manager.should_save_periodic(step=self.global_step):
+                        p_paths = self.ckpt_manager.save_periodic(
+                            epoch=epoch,
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            metrics={"train_loss": float(loss_val), "step": self.global_step},
+                            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                            step=self.global_step,
+                            scaler=self.scaler,
+                            history=self.history,
+                            hard_mining=self.hard_miner.state_dict(),
+                        )
+                        self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Step {self.global_step}, Epoch {epoch})")
+
+                    compute_time = time.perf_counter() - compute_start_time
+                    prev_batch_end_time = time.perf_counter()
+
+                    if self.bottleneck_detector is not None:
+                        self.bottleneck_detector.record_step(data_time=data_time, compute_time=compute_time)
+
+                    net_str = self.network_monitor.get_speed_str() if self.network_monitor is not None else "0.0 MB/s"
+                    postfix_dict = {
+                        "loss": f"{loss_val:.4f}",
+                        "net": net_str,
+                        "iou": f"{loss_dict_batch.get('iou', 0.0):.4f}",
+                        "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                    }
+                    pbar.set_postfix(postfix_dict)
+
 
             # Flush pending accumulated gradients if last step did not land on accumulation boundary
             if has_pending_grads:
+                if self.is_distributed and is_dist_avail_and_initialized():
+                    import torch.distributed as dist
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
+                            p.grad.data.div_(self.world_size)
+
                 grad_finite = True
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.optimizer)

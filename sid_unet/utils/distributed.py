@@ -156,3 +156,30 @@ def broadcast_scalar(val: float, src: int = 0) -> float:
     t = torch.tensor([val], dtype=torch.float64, device=device)
     dist.broadcast(t, src=src)
     return float(t.item())
+
+
+def sync_scalar_min(val: int | float) -> int | float:
+    """Synchronize a scalar across all ranks taking the minimum."""
+    if not is_dist_avail_and_initialized():
+        return val
+
+    device = torch.device(f"cuda:{get_local_rank()}" if torch.cuda.is_available() else "cpu")
+    is_int = isinstance(val, int)
+    dtype = torch.long if is_int else torch.float64
+    t = torch.tensor([val], dtype=dtype, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN)
+    return int(t.item()) if is_int else float(t.item())
+
+
+def sync_scalar_max(val: int | float) -> int | float:
+    """Synchronize a scalar across all ranks taking the maximum."""
+    if not is_dist_avail_and_initialized():
+        return val
+
+    device = torch.device(f"cuda:{get_local_rank()}" if torch.cuda.is_available() else "cpu")
+    is_int = isinstance(val, int)
+    dtype = torch.long if is_int else torch.float64
+    t = torch.tensor([val], dtype=dtype, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return int(t.item()) if is_int else float(t.item())
+

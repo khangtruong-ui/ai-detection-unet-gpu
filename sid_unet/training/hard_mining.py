@@ -33,9 +33,16 @@ class HardMiningBatchFilter:
         self.hard_batch_indices = set(hard_batch_indices)
 
     def __iter__(self) -> Iterator[Any]:
+        yielded = 0
+        target = len(self.hard_batch_indices)
+        if target == 0:
+            return
         for batch_idx, batch in enumerate(self.dataloader):
             if batch_idx in self.hard_batch_indices:
                 yield batch
+                yielded += 1
+                if yielded >= target:
+                    break
 
     def __len__(self) -> int:
         return len(self.hard_batch_indices)
@@ -164,11 +171,20 @@ class HardMiner:
         else:
             # Hard mining epoch
             if self.hard_batch_indices:
+                from sid_unet.utils.distributed import is_dist_avail_and_initialized, sync_scalar_min
+                if is_dist_avail_and_initialized():
+                    local_count = len(self.hard_batch_indices)
+                    synced_k = sync_scalar_min(local_count)
+                    if local_count > synced_k:
+                        sorted_idx = sorted(self.hard_batch_indices)
+                        self.hard_batch_indices = set(sorted_idx[:synced_k])
+
                 self.is_active_epoch = True
+                prev_med_val = float(self.previous_median) if self.previous_median is not None else 0.0
                 logger.info(
                     f"⛏️ [HARD MINING] Epoch {epoch}: Active ({cycle_step}/{self.reset_epochs} in cycle). "
                     f"Training on {len(self.hard_batch_indices)} hard batches (previous {self.metric}: "
-                    f"{self.previous_median:.4f} if self.previous_median is not None else 0.0)."
+                    f"{prev_med_val:.4f})."
                 )
             else:
                 # If no hard batches recorded yet (e.g. resumed directly at epoch > 1), run full epoch
@@ -241,7 +257,7 @@ class HardMiner:
                 # Default: median
                 threshold = float(np.median(losses_arr))
 
-            from sid_unet.utils.distributed import is_dist_avail_and_initialized, broadcast_scalar
+            from sid_unet.utils.distributed import is_dist_avail_and_initialized, broadcast_scalar, sync_scalar_min
             if is_dist_avail_and_initialized():
                 threshold = broadcast_scalar(threshold, src=0)
 
@@ -256,6 +272,14 @@ class HardMiner:
             if not hard_indices and self.total_batches_in_full_epoch > 0:
                 hard_indices = set(range(self.total_batches_in_full_epoch))
 
+            # In distributed mode, ensure all ranks agree on the exact same number of hard batches
+            if is_dist_avail_and_initialized():
+                local_k = len(hard_indices)
+                synced_k = sync_scalar_min(local_k)
+                if local_k > synced_k and synced_k > 0:
+                    sorted_h = sorted(hard_indices, key=lambda i: self._current_epoch_losses[i], reverse=True)
+                    hard_indices = set(sorted_h[:synced_k])
+
             self.hard_batch_indices = hard_indices
             summary["median_loss"] = threshold
             summary["hard_batch_count"] = len(hard_indices)
@@ -268,6 +292,8 @@ class HardMiner:
             )
 
         return summary
+
+
 
     def state_dict(self) -> Dict[str, Any]:
         """Serialize hard mining state for checkpointing."""

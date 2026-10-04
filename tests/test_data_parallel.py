@@ -243,3 +243,71 @@ def test_distributed_trainer_ddp_execution():
             join=True,
         )
 
+
+def _ddp_trainer_hard_mining_worker(rank, world_size, port, tmpdir):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from sid_unet.utils.distributed import cleanup_distributed
+    from torch.utils.data.distributed import DistributedSampler
+
+    dataset = DummyDataset(size=32)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    train_loader = DataLoader(dataset, batch_size=4, sampler=sampler)
+    val_loader = DataLoader(dataset, batch_size=4, shuffle=False)
+
+    cfg = load_config("configs/test_smoke.yaml")
+    cfg.project.output_dir = tmpdir
+    cfg.data.num_workers = 0
+    cfg.data.batch_size = 4
+    cfg.training.epochs = 2
+    cfg.training.data_parallel = True
+    cfg.training.use_hard_mining = True
+    cfg.hard_mining = {"enabled": True, "metric": "median", "reset_epochs": 5}
+    cfg.training.gradient_accumulation_steps = 2
+    cfg.training.save_best = False
+    cfg.training.save_latest = False
+
+    trainer = Trainer(
+        config=cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+    )
+
+    results = trainer.train()
+    if rank == 0:
+        assert len(results["history"]) == 2
+        assert trainer.hard_miner.is_active_epoch is True
+
+    cleanup_distributed()
+
+
+def test_distributed_trainer_ddp_hard_mining_2epochs():
+    """Verify Trainer with DDP and Hard Mining transitions across epochs 1 and 2 without desync or deadlock."""
+    num_gpus = torch.cuda.device_count()
+    if not torch.cuda.is_available() or num_gpus < 2:
+        pytest.skip("Test requires at least 2 CUDA GPUs")
+
+    from sid_unet.utils.distributed import find_free_port
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        port = find_free_port()
+        torch.multiprocessing.spawn(
+            _ddp_trainer_hard_mining_worker,
+            args=(num_gpus, port, tmpdir),
+            nprocs=num_gpus,
+            join=True,
+        )
+
+
