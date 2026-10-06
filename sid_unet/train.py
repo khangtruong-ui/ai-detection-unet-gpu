@@ -188,6 +188,22 @@ def parse_args():
         help="Explicit starting/base learning rate when resuming training.",
     )
     parser.add_argument(
+        "--resume-epoch",
+        "--resume_epoch",
+        "--start-epoch",
+        "--start_epoch",
+        type=int,
+        default=None,
+        help="Explicit epoch number to resume training from.",
+    )
+    parser.add_argument(
+        "--resume-epoch-offset",
+        "--resume_epoch_offset",
+        type=int,
+        default=None,
+        help="Offset to add to checkpoint epoch when resuming (default: 0 to resume at checkpoint epoch).",
+    )
+    parser.add_argument(
         "--val-samples-per-epoch",
         "--val_samples_per_epoch",
         "--val-samples",
@@ -600,6 +616,10 @@ def main():
         overrides.append("training.save_latest=true")
     elif args.save_latest is False:
         overrides.append("training.save_latest=false")
+    if getattr(args, "resume_epoch", None) is not None:
+        overrides.append(f"training.resume_epoch={args.resume_epoch}")
+    if getattr(args, "resume_epoch_offset", None) is not None:
+        overrides.append(f"training.resume_epoch_offset={args.resume_epoch_offset}")
     if getattr(args, "debug", False) or getattr(args, "debug_mode", None):
         dbg_mode = args.debug_mode or "light"
         overrides.append(f"training.debug_mode={dbg_mode}")

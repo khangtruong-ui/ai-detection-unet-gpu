@@ -381,7 +381,7 @@ def format_resume_notification(info: Dict[str, Any]) -> str:
         "🔄 [AUTO-RESUME] Found existing checkpoint in repository!",
         f"   📁 Source:           {source_label}",
         f"   💾 Checkpoint File:  {path}",
-        f"   📊 Resume Training:  Starting from Epoch {epoch + 1} (Completed Epoch {epoch})",
+        f"   📊 Resume Training:  Starting from Epoch {epoch} (Checkpoint Epoch {epoch})",
     ]
     if step is not None:
         lines.append(f"   ⏱️ Global Step:      {step}")

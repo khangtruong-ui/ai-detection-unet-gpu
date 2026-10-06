@@ -28,15 +28,18 @@ class HardMiningBatchFilter:
     marked as hard examples based on their batch index.
     """
 
-    def __init__(self, dataloader: Any, hard_batch_indices: Set[int]):
+    def __init__(self, dataloader: Any, hard_batch_indices: Set[int], anchor_seed: Optional[int] = None):
         self.dataloader = dataloader
         self.hard_batch_indices = set(hard_batch_indices)
+        self.anchor_seed = anchor_seed
 
     def __iter__(self) -> Iterator[Any]:
         yielded = 0
         target = len(self.hard_batch_indices)
         if target == 0:
             return
+        if self.anchor_seed is not None:
+            torch.manual_seed(self.anchor_seed)
         for batch_idx, batch in enumerate(self.dataloader):
             if batch_idx in self.hard_batch_indices:
                 yield batch
@@ -214,13 +217,42 @@ class HardMiner:
             self.start_epoch(epoch)
         return self.wrap_dataloader(dataloader)
 
+    def get_anchor_epoch(self, epoch: Optional[int] = None) -> int:
+        """
+        Return the cycle anchor epoch (the full-training epoch where hard batches were mined).
+        All epochs within the same cycle share the exact same anchor epoch.
+        """
+        if not self.enabled:
+            return epoch if epoch is not None else self.current_epoch
+        ep = epoch if epoch is not None else self.current_epoch
+        cycle_len = self.reset_epochs + 1
+        cycle_step = (ep - 1) % cycle_len
+        return max(1, ep - cycle_step)
+
+    def get_sampler_epoch(self, epoch: int) -> int:
+        """
+        Return the epoch seed for DistributedSampler.
+        During active hard mining epochs, returns the cycle's anchor epoch so the
+        shuffled batch permutation matches the full epoch where losses were evaluated.
+        When a new cycle begins, returns the new anchor epoch to shuffle anew.
+        """
+        if self.enabled and self.is_hard_mining_active(epoch):
+            return self.get_anchor_epoch(epoch)
+        return epoch
+
     def wrap_dataloader(self, dataloader: DataLoader) -> Union[DataLoader, HardMiningBatchFilter]:
         """
         If hard mining is active for the current epoch and hard batches are available,
         wrap the dataloader to only yield the hard batches. Otherwise, return the original dataloader.
         """
         if self.enabled and self.is_active_epoch and self.hard_batch_indices:
-            return HardMiningBatchFilter(dataloader, self.hard_batch_indices)
+            base_seed = 42
+            if hasattr(self.config, "project") and hasattr(self.config.project, "get"):
+                base_seed = int(self.config.project.get("seed", 42))
+            elif isinstance(self.config, dict) and "project" in self.config:
+                base_seed = int(self.config["project"].get("seed", 42))
+            anchor_seed = base_seed + self.get_anchor_epoch(self.current_epoch)
+            return HardMiningBatchFilter(dataloader, self.hard_batch_indices, anchor_seed=anchor_seed)
         return dataloader
 
     def record_batch_loss(self, batch_idx: int, loss_val: float) -> None:
@@ -308,6 +340,7 @@ class HardMiner:
             "threshold": self.previous_median,
             "hard_batch_indices": list(self.hard_batch_indices),
             "total_batches_in_full_epoch": self.total_batches_in_full_epoch,
+            "cycle_anchor_epoch": self.get_anchor_epoch(self.current_epoch),
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
@@ -334,3 +367,5 @@ class HardMiner:
             self.hard_batch_indices = set(int(x) for x in state["hard_batch_indices"])
         if "total_batches_in_full_epoch" in state:
             self.total_batches_in_full_epoch = int(state["total_batches_in_full_epoch"])
+        if "cycle_anchor_epoch" in state and state["cycle_anchor_epoch"] is not None:
+            self.cycle_anchor_epoch = int(state["cycle_anchor_epoch"])

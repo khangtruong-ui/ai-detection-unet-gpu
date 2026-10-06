@@ -64,9 +64,9 @@ def test_resume_lr_auto_reschedules_cosine():
         trainer.resume_from_checkpoint(ckpt_path)
 
         resumed_lr = trainer.optimizer.param_groups[0]["lr"]
-        # Resumed LR must NOT be 1e-6! It should be scaled according to cosine at epoch 11/40
+        # Resumed LR must NOT be 1e-6! It should be scaled according to cosine at epoch 10/40
         assert resumed_lr > 1e-5
-        expected_lr = 1e-6 + 0.5 * (0.0003 - 1e-6) * (1.0 + math.cos(math.pi * 11 / 40))
+        expected_lr = 1e-6 + 0.5 * (0.0003 - 1e-6) * (1.0 + math.cos(math.pi * 10 / 40))
         assert resumed_lr == pytest.approx(expected_lr, rel=1e-3)
         assert getattr(trainer.scheduler, "T_max", None) == 40
 
@@ -97,11 +97,11 @@ def test_resume_lr_restart_mode():
         trainer.resume_from_checkpoint(ckpt_path)
 
         resumed_lr = trainer.optimizer.param_groups[0]["lr"]
-        expected_restart_lr = 1e-6 + 0.5 * (0.0003 - 1e-6) * (1.0 + math.cos(math.pi * 1 / 30))
+        expected_restart_lr = 0.0003
         assert resumed_lr == pytest.approx(expected_restart_lr, rel=1e-3)
 
         # Stepping through remaining epochs reaches min_lr at epoch 40
-        for ep in range(11, 41):
+        for ep in range(10, 41):
             trainer.scheduler.step()
         assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(1e-6, rel=1e-3)
 
@@ -132,7 +132,7 @@ def test_resume_lr_custom_explicit_rate():
         trainer = Trainer(config=cfg)
         trainer.resume_from_checkpoint(ckpt_path)
 
-        expected_custom_lr = 1e-6 + 0.5 * (0.0005 - 1e-6) * (1.0 + math.cos(math.pi * 1 / 30))
+        expected_custom_lr = 0.0005
         assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(expected_custom_lr, rel=1e-3)
 
 

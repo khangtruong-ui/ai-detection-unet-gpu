@@ -340,7 +340,7 @@ class Trainer:
         )
 
         self.global_step = 0
-        self.start_epoch = 0
+        self.start_epoch = 1
         self.history: list = []
         self.log_interval = int(config.logging.get("log_interval", 20))
 
@@ -387,13 +387,19 @@ class Trainer:
             strict=strict,
             map_location=self.device,
         )
-        self.start_epoch = resumed_epoch
+        offset = int(self.config.training.get("resume_epoch_offset", 0))
+        custom_resume_epoch = self.config.training.get("resume_epoch", self.config.training.get("start_epoch", None))
+        if custom_resume_epoch is not None:
+            self.start_epoch = int(custom_resume_epoch)
+        else:
+            self.start_epoch = max(1, resumed_epoch + offset)
+
         if self.epochs <= self.start_epoch:
             orig_epochs = self.epochs
             self.epochs = self.start_epoch + orig_epochs
             self.logger.info(
-                f"Resumed checkpoint completed epoch {self.start_epoch}, while configured epochs is {orig_epochs}. "
-                f"Extending total epochs to {self.epochs} (will execute epochs {self.start_epoch + 1} to {self.epochs})."
+                f"Resumed checkpoint from epoch {self.start_epoch}, while configured epochs is {orig_epochs}. "
+                f"Extending total epochs to {self.epochs} (will execute epochs {self.start_epoch} to {self.epochs})."
             )
 
         # Smart Learning Rate & Scheduler Resumption Strategy
@@ -601,7 +607,7 @@ class Trainer:
 
     def _build_scheduler(
         self,
-        start_epoch: int = 0,
+        start_epoch: int = 1,
         total_epochs: Optional[int] = None,
         base_lr: Optional[float] = None,
         mode: str = "reschedule",
@@ -615,7 +621,7 @@ class Trainer:
                 g["initial_lr"] = b_lr
 
             if mode in ("restart", "cycle", "warm_restart"):
-                remaining_epochs = max(1, epochs - start_epoch)
+                remaining_epochs = max(1, epochs - start_epoch + 1)
 
                 def lr_lambda(step: int) -> float:
                     rel_step = max(0, step - start_epoch)
@@ -628,7 +634,7 @@ class Trainer:
                     target = min_lr + 0.5 * (b_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
                     return max(0.0, target / max(1e-12, b_lr))
 
-            last_epoch = start_epoch if start_epoch > 0 else -1
+            last_epoch = (start_epoch - 1) if start_epoch > 1 else -1
             scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer,
                 lr_lambda=lr_lambda,
@@ -643,7 +649,7 @@ class Trainer:
                 self.optimizer,
                 step_size=max(1, epochs // 3),
                 gamma=0.5,
-                last_epoch=start_epoch if start_epoch > 0 else -1,
+                last_epoch=(start_epoch - 1) if start_epoch > 1 else -1,
             )
         elif self.scheduler_name == "plateau":
             mode_p = "max" if self.config.training.get("early_stopping_mode", "max") == "max" else "min"
@@ -860,11 +866,19 @@ class Trainer:
         self.hard_miner.start_epoch(epoch)
         effective_loader = self.hard_miner.wrap_dataloader(self.train_loader)
 
-        # Sync DistributedSampler epoch if present
+        # Sync DistributedSampler epoch if present using cycle anchor epoch during hard mining
+        sampler_epoch = self.hard_miner.get_sampler_epoch(epoch)
         if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
-            self.train_loader.sampler.set_epoch(epoch)
+            self.train_loader.sampler.set_epoch(sampler_epoch)
         elif hasattr(effective_loader, "sampler") and hasattr(effective_loader.sampler, "set_epoch"):
-            effective_loader.sampler.set_epoch(epoch)
+            effective_loader.sampler.set_epoch(sampler_epoch)
+
+        # For single-GPU shuffle, ensure cycle anchor reproducibility
+        if not self.is_distributed and self.hard_miner.enabled:
+            proj_cfg = getattr(self.config, "project", {})
+            p_seed = int(proj_cfg.get("seed", 42)) if hasattr(proj_cfg, "get") else 42
+            anchor_seed = p_seed + self.hard_miner.get_anchor_epoch(epoch)
+            torch.manual_seed(anchor_seed)
 
         total_batches = safe_dataloader_len(effective_loader)
         if total_batches is not None and self.is_distributed and is_dist_avail_and_initialized():
@@ -1163,19 +1177,19 @@ class Trainer:
         # Auto-tune batch size if enabled and on GPU
         self._check_and_auto_scale_batch_size()
 
-        history = list(self.history)
+        history = [h for h in self.history if int(h.get("epoch", 0)) < self.start_epoch]
         best_val_score = self.ckpt_manager.best_score
         start_time = time.time()
         self._current_epoch = self.start_epoch
 
-        if self.start_epoch >= self.epochs:
+        if self.start_epoch > self.epochs:
             self.logger.info(
-                f"Training already completed up to epoch {self.start_epoch} (configured epochs: {self.epochs}). "
+                f"Training already completed up to epoch {self.start_epoch - 1} (configured epochs: {self.epochs}). "
                 "Skipping training loop and generating final evaluation report."
             )
         else:
             try:
-                for epoch in range(self.start_epoch + 1, self.epochs + 1):
+                for epoch in range(self.start_epoch, self.epochs + 1):
                     self._current_epoch = epoch
                     epoch_start = time.time()
                     train_metrics = self.train_epoch(epoch)

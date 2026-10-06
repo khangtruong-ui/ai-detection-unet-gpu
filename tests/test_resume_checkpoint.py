@@ -203,7 +203,7 @@ def test_resume_notifications_formatting():
     }
     banner = format_resume_notification(info)
     assert "[AUTO-RESUME]" in banner
-    assert "Epoch 6" in banner
+    assert "Epoch 5" in banner
     assert "1250" in banner
     assert "0.8840" in banner
 
@@ -597,5 +597,124 @@ def test_memory_attention_rope_theta_warning_filtered():
             rejected = True
             break
     assert rejected is True
+
+
+def test_resume_from_checkpoint_starts_at_checkpoint_epoch_x_not_x_plus_1():
+    """Verify that when resuming from a checkpoint from epoch x, trainer resumes AT epoch x, not assuming x+1."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, "ckpt_ep3.pt")
+        torch.save({
+            "epoch": 3,
+            "step": 150,
+            "best_score": 0.72,
+            "model_state_dict": {},
+            "history": [{"epoch": 1, "val_iou": 0.5}, {"epoch": 2, "val_iou": 0.6}],
+        }, ckpt_path)
+
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=5",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ])
+
+        trainer = Trainer(config=cfg)
+        res = trainer.resume_from_checkpoint(ckpt_path)
+
+        # Checkpoint is from epoch 3 -> resumed start_epoch must be 3, NOT 3+1=4
+        assert res["epoch"] == 3
+        assert trainer.start_epoch == 3
+
+        executed_epochs = []
+        original_train_epoch = trainer.train_epoch
+
+        def mock_train_epoch(ep):
+            executed_epochs.append(ep)
+            return {"total_loss": 0.1, "iou": 0.8}
+
+        trainer.train_epoch = mock_train_epoch
+        trainer.validate = lambda *args, **kwargs: ({"val_iou": 0.8, "val_total_loss": 0.1}, {}, {})
+
+        trainer.train()
+        # Should have executed epochs 3, 4, 5 (not skipping 3!)
+        assert executed_epochs == [3, 4, 5]
+
+
+def test_resume_from_interrupted_emergency_checkpoint_resumes_same_epoch():
+    """Verify that an interrupted emergency checkpoint resumes at the interrupted epoch."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = os.path.join(tmpdir, "checkpoint_latest.pt")
+        torch.save({
+            "epoch": 11,
+            "step": 5000,
+            "best_score": 0.65,
+            "model_state_dict": {},
+            "metrics": {"interrupted": True},
+            "history": [{"epoch": i, "val_iou": 0.5} for i in range(1, 11)],
+        }, ckpt_path)
+
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=15",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ])
+
+        trainer = Trainer(config=cfg)
+        res = trainer.resume_from_checkpoint(ckpt_path)
+
+        # Emergency checkpoint from epoch 11 must resume from epoch 11 (NOT skip to 12!)
+        assert res["epoch"] == 11
+        assert trainer.start_epoch == 11
+
+        executed_epochs = []
+        trainer.train_epoch = lambda ep: (executed_epochs.append(ep) or {"total_loss": 0.1, "iou": 0.8})
+        trainer.validate = lambda *args, **kwargs: ({"val_iou": 0.8, "val_total_loss": 0.1}, {}, {})
+
+        trainer.train()
+        assert executed_epochs == [11, 12, 13, 14, 15]
+
+
+def test_hard_mining_anchor_epoch_shuffle_reproducibility():
+    """Verify that get_anchor_epoch and get_sampler_epoch preserve shuffle across hard mining cycle."""
+    from sid_unet.training.hard_mining import HardMiner
+    from sid_unet.utils.config import ConfigDict
+
+    cfg = ConfigDict({
+        "hard_mining": {
+            "enabled": True,
+            "metric": "median",
+            "reset_epochs": 5,
+        }
+    })
+    miner = HardMiner(cfg)
+
+    # In cycle 1 (epochs 1..6):
+    # Epoch 1: full training (anchor epoch 1)
+    assert miner.get_anchor_epoch(1) == 1
+    assert miner.get_sampler_epoch(1) == 1
+    assert miner.is_hard_mining_active(1) is False
+
+    # Epochs 2..6: hard mining epochs (all anchored to epoch 1 for exact shuffle reproducibility)
+    for ep in range(2, 7):
+        assert miner.get_anchor_epoch(ep) == 1
+        assert miner.get_sampler_epoch(ep) == 1
+        assert miner.is_hard_mining_active(ep) is True
+
+    # Epoch 7: cycle reset to full training (anchor advances to epoch 7 for fresh new shuffle)
+    assert miner.get_anchor_epoch(7) == 7
+    assert miner.get_sampler_epoch(7) == 7
+    assert miner.is_hard_mining_active(7) is False
+
+    # Epochs 8..12: second cycle hard mining (all anchored to epoch 7)
+    for ep in range(8, 13):
+        assert miner.get_anchor_epoch(ep) == 7
+        assert miner.get_sampler_epoch(ep) == 7
+        assert miner.is_hard_mining_active(ep) is True
+
 
 
