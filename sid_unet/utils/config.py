@@ -162,6 +162,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fallback_to_16bit": True,    # Automatically fall back to GPU 16-bit mode (AMP FP16/BF16) if 8-bit mode is unsupported or fails
         "fallback_on_unsupported_8bit": True, # Alias for fallback_to_16bit
         "scheduler": "cosine",        # 'cosine', 'step', 'plateau', 'none'
+        "resume_lr_mode": "auto",     # 'auto', 'reschedule', 'restart', 'reset', 'keep'
+        "resume_lr": None,            # Explicit starting/base learning rate when resuming (None = auto)
         "warmup_epochs": 1,
         "min_lr": 1e-6,
         "grad_clip_norm": 1.0,

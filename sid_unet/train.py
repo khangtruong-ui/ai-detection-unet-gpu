@@ -172,6 +172,22 @@ def parse_args():
         help="Disable automatic checkpoint resumption.",
     )
     parser.add_argument(
+        "--resume-lr-mode",
+        "--resume_lr_mode",
+        "--lr-resume-mode",
+        type=str,
+        default=None,
+        choices=["auto", "reschedule", "restart", "cycle", "reset", "keep"],
+        help="Strategy for learning rate and scheduler when resuming training (default: 'auto').",
+    )
+    parser.add_argument(
+        "--resume-lr",
+        "--resume_lr",
+        type=float,
+        default=None,
+        help="Explicit starting/base learning rate when resuming training.",
+    )
+    parser.add_argument(
         "--val-samples-per-epoch",
         "--val_samples_per_epoch",
         "--val-samples",
@@ -621,6 +637,10 @@ def main():
         overrides.append("training.data_parallel=true")
     elif getattr(args, "data_parallel", None) is False:
         overrides.append("training.data_parallel=false")
+    if getattr(args, "resume_lr_mode", None) is not None:
+        overrides.append(f"training.resume_lr_mode={args.resume_lr_mode}")
+    if getattr(args, "resume_lr", None) is not None:
+        overrides.append(f"training.resume_lr={args.resume_lr}")
 
     # Check if we should auto-launch multi-process DDP via torchrun
     dp_disabled = (getattr(args, "data_parallel", None) is False) or any(

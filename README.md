@@ -909,7 +909,7 @@ Install in editable mode using `pip` or `uv`:
 # Clone and enter directory
 cd /workspace
 
-# Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu, sid-check-8bit)
+# Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu, sid-check-8bit, sid-push, sid-pull, sid-checkpoint)
 pip install -e .
 
 # Or with debug diagnostics dependencies (nn-toolbox):
@@ -1418,6 +1418,53 @@ sid-train --config configs/default.yaml --resume outputs/RUN/default/checkpoints
 
 # 4. Disable auto-resume to start a fresh training run from epoch 1
 sid-train --config configs/default.yaml --no-auto-resume
+```
+
+#### D. Hugging Face Checkpoint Synchronization (`sid-push` & `sid-pull`)
+Easily push and pull model checkpoints to and from Hugging Face repositories with version archiving, automated model card (`README.md`) generation, and multi-version tracking (`manifest.json`):
+
+```bash
+# 1. Pull checkpoints from Hugging Face Hub (pulls latest best and latest checkpoint into local directory)
+sid-pull --name KhangTruong/diffusion-diff-minimized
+
+# Pull a specific version
+sid-pull --name KhangTruong/diffusion-diff-minimized --version v1
+
+# List available versions and checkpoints in remote repository without downloading
+sid-pull --name KhangTruong/diffusion-diff-minimized --list
+
+# 2. Push checkpoints to Hugging Face Hub with versioning
+sid-push --name KhangTruong/diffusion-diff-minimized --version v2 --message "Release v2 after 40 epochs"
+
+# Reformat repository to clean multi-version structure, archiving into versions/ and removing legacy output paths
+sid-push --name KhangTruong/diffusion-diff-minimized --version v1 --reformat
+
+# 3. Unified CLI command (sid-checkpoint push / pull / list)
+sid-checkpoint list --name KhangTruong/diffusion-diff-minimized
+sid-checkpoint pull --name KhangTruong/diffusion-diff-minimized
+sid-checkpoint push --name KhangTruong/diffusion-diff-minimized --version v2
+```
+
+#### E. Resuming Training & Adaptive Learning Rate Scheduling (`--resume-lr-mode`, `--resume-lr`)
+When continuing to train a model after an initial cosine schedule has completed, standard PyTorch cosine schedulers can get trapped at the minimum learning rate (`1e-6`). `sid-train` automatically detects this state and intelligently reschedules or restarts the learning rate schedule over the new epoch horizon:
+
+```bash
+# 1. Automatic rescheduling (default: 'auto'):
+# If total epochs is extended (e.g. from 10 to 40), rescales the cosine curve across the entire 40 epochs
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --override training.epochs=40
+
+# 2. Explicit restart mode: starts a new cosine cycle from base_lr down to min_lr across remaining epochs
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --override training.epochs=40 --resume-lr-mode restart
+
+# 3. Custom resume learning rate:
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --override training.epochs=40 --resume-lr 0.0002
+
+# Available modes for --resume-lr-mode:
+#   'auto'        : Automatically detects if LR reached min_lr and reschedules over new total epochs (default)
+#   'reschedule'  : Rescales global cosine schedule over total epochs [0, total_epochs]
+#   'restart'     : Starts a fresh cosine decay cycle over remaining epochs [start_epoch, total_epochs]
+#   'reset'       : Resets learning rate to base training.learning_rate
+#   'keep'        : Preserves the exact checkpoint learning rate without modification
 ```
 
 #### D. Runtime Learnability Debugging (`--debug`, `--debug-mode`)

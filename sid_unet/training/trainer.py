@@ -7,6 +7,7 @@ and evaluation report generation.
 from __future__ import annotations
 
 import gc
+import math
 import os
 import time
 from contextlib import nullcontext
@@ -394,8 +395,55 @@ class Trainer:
                 f"Resumed checkpoint completed epoch {self.start_epoch}, while configured epochs is {orig_epochs}. "
                 f"Extending total epochs to {self.epochs} (will execute epochs {self.start_epoch + 1} to {self.epochs})."
             )
-            if self.scheduler is not None and hasattr(self.scheduler, "T_max"):
-                self.scheduler.T_max = self.epochs
+
+        # Smart Learning Rate & Scheduler Resumption Strategy
+        current_opt_lr = float(self.optimizer.param_groups[0].get("lr", 0.0))
+        min_lr = float(self.config.training.get("min_lr", 1e-6))
+        configured_base_lr = float(self.config.training.get("learning_rate", 1e-3))
+        custom_resume_lr = self.config.training.get("resume_lr", None)
+        resume_lr_mode = str(self.config.training.get("resume_lr_mode", "auto")).lower()
+
+        old_T_max = getattr(self.scheduler, "T_max", None)
+        is_decayed_to_min = (current_opt_lr <= (min_lr * 2.0))
+        has_completed_orig = (old_T_max is not None and self.start_epoch >= old_T_max)
+        is_extended_epochs = (self.epochs > (old_T_max or self.start_epoch))
+
+        should_adjust_lr = (
+            resume_lr_mode in ("reschedule", "restart", "cycle", "warm_restart", "reset")
+            or (resume_lr_mode == "auto" and (is_decayed_to_min or has_completed_orig or is_extended_epochs))
+        )
+
+        if should_adjust_lr and resume_lr_mode != "keep":
+            base_lr = float(custom_resume_lr) if custom_resume_lr is not None else configured_base_lr
+            if resume_lr_mode in ("restart", "cycle", "warm_restart"):
+                effective_mode = "restart"
+            elif resume_lr_mode == "reset":
+                effective_mode = "reset"
+            else:
+                effective_mode = "reschedule"
+
+            self.scheduler = self._build_scheduler(
+                start_epoch=self.start_epoch,
+                total_epochs=self.epochs,
+                base_lr=base_lr,
+                mode=effective_mode,
+            )
+
+            new_lr = float(self.optimizer.param_groups[0]["lr"])
+            self.logger.info(
+                f"🔄 [RESUME LR] Resumed learning rate was {current_opt_lr:.2e}. "
+                f"Adjusted to {new_lr:.4e} (mode='{effective_mode}', base_lr={base_lr:.4e}, "
+                f"min_lr={min_lr:.4e}, epoch {self.start_epoch}/{self.epochs}). "
+                f"Scheduler rebuilt over {self.epochs} epochs."
+            )
+            if self.is_main_process:
+                print(
+                    f"🔄 [RESUME LR] Resumed LR adjusted: {current_opt_lr:.2e} -> {new_lr:.4e} "
+                    f"(mode='{effective_mode}', epoch {self.start_epoch}/{self.epochs}, base_lr={base_lr:.4e})",
+                    flush=True,
+                )
+        elif self.scheduler is not None and hasattr(self.scheduler, "T_max"):
+            self.scheduler.T_max = self.epochs
 
         ckpt_meta = getattr(self.ckpt_manager, "last_loaded_checkpoint_info", {})
         if ckpt_meta.get("step") is not None:
@@ -551,15 +599,57 @@ class Trainer:
         else:
             return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
 
-    def _build_scheduler(self):
+    def _build_scheduler(
+        self,
+        start_epoch: int = 0,
+        total_epochs: Optional[int] = None,
+        base_lr: Optional[float] = None,
+        mode: str = "reschedule",
+    ):
+        epochs = total_epochs if total_epochs is not None else self.epochs
+        b_lr = base_lr if base_lr is not None else self.lr
+        min_lr = float(self.config.training.get("min_lr", 1e-6))
+
         if self.scheduler_name == "cosine":
-            min_lr = float(self.config.training.get("min_lr", 1e-6))
-            return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs, eta_min=min_lr)
+            for g in self.optimizer.param_groups:
+                g["initial_lr"] = b_lr
+
+            if mode in ("restart", "cycle", "warm_restart"):
+                remaining_epochs = max(1, epochs - start_epoch)
+
+                def lr_lambda(step: int) -> float:
+                    rel_step = max(0, step - start_epoch)
+                    progress = min(1.0, max(0.0, float(rel_step) / float(remaining_epochs)))
+                    target = min_lr + 0.5 * (b_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+                    return max(0.0, target / max(1e-12, b_lr))
+            else:
+                def lr_lambda(step: int) -> float:
+                    progress = min(1.0, max(0.0, float(step) / max(1, epochs)))
+                    target = min_lr + 0.5 * (b_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+                    return max(0.0, target / max(1e-12, b_lr))
+
+            last_epoch = start_epoch if start_epoch > 0 else -1
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=lr_lambda,
+                last_epoch=last_epoch,
+            )
+            scheduler.T_max = epochs
+            scheduler.eta_min = min_lr
+            scheduler.base_lrs = [b_lr] * len(self.optimizer.param_groups)
+            return scheduler
         elif self.scheduler_name == "step":
-            return torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=max(1, self.epochs // 3), gamma=0.5)
+            return torch.optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=max(1, epochs // 3),
+                gamma=0.5,
+                last_epoch=start_epoch if start_epoch > 0 else -1,
+            )
         elif self.scheduler_name == "plateau":
-            mode = "max" if self.config.training.get("early_stopping_mode", "max") == "max" else "min"
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode=mode, factor=0.5, patience=2)
+            mode_p = "max" if self.config.training.get("early_stopping_mode", "max") == "max" else "min"
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode=mode_p, factor=0.5, patience=2)
+        else:
+            return None
     def _run_debug_diagnostics(self) -> Optional[Any]:
         """Run automated diagnostic session using nn-toolbox."""
         mode_str = self.debug_mode if isinstance(self.debug_mode, str) else "light"

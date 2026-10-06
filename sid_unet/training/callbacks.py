@@ -426,7 +426,7 @@ class CheckpointManager:
             try:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             except Exception as sched_err:
-                logger.warning(f"Could not restore scheduler state ({sched_err}); continuing.")
+                logger.info(f"Checkpoint scheduler state format differs ({sched_err}); scheduler will be initialized or rescheduled.")
 
         if scaler is not None and isinstance(checkpoint, dict) and "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None:
             try:

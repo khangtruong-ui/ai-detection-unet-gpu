@@ -15,10 +15,16 @@ import torch
 
 HF_CHECKPOINT_CANDIDATES = [
     "checkpoint_latest.pt",
-    "checkpoint_periodic.pt",
+    "checkpoints/checkpoint_latest.pt",
     "checkpoint_best.pt",
+    "checkpoints/checkpoint_best.pt",
+    "checkpoint_periodic.pt",
+    "checkpoints/checkpoint_periodic.pt",
+    "outputs/RUN/default/checkpoints/checkpoint_latest.pt",
+    "outputs/RUN/default/checkpoints/checkpoint_best.pt",
     "pytorch_model.bin",
     "model.pt",
+    "checkpoints/model.pt",
     "efficientsam3_ft/efficientsam3_tinyvit.pt",
     "efficientsam3_efficientvit.pt",
     "efficientsam3_repvit.pt",
@@ -134,7 +140,35 @@ def download_hf_checkpoint(
     except ImportError as e:
         raise ImportError("huggingface_hub is required to resume from Hugging Face repository: " + str(e))
 
-    filenames_to_try = [target_filename] if target_filename else HF_CHECKPOINT_CANDIDATES
+    filenames_to_try = [target_filename] if target_filename else list(HF_CHECKPOINT_CANDIDATES)
+    if not target_filename:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=token)
+            repo_files = api.list_repo_files(repo_id=repo_id)
+            dynamic_cands = []
+            # Priority patterns
+            for pat in [
+                "checkpoints/checkpoint_latest.pt",
+                "checkpoint_latest.pt",
+                "outputs/RUN/default/checkpoints/checkpoint_latest.pt",
+                "checkpoints/checkpoint_best.pt",
+                "checkpoint_best.pt",
+                "outputs/RUN/default/checkpoints/checkpoint_best.pt",
+                "checkpoints/checkpoint_periodic.pt",
+                "checkpoint_periodic.pt",
+            ]:
+                if pat in repo_files and pat not in dynamic_cands:
+                    dynamic_cands.append(pat)
+            # Check for any *.pt under checkpoints/ or outputs/
+            for rf in repo_files:
+                if rf.endswith(".pt") and ("checkpoint" in rf.lower() or "model" in rf.lower()) and rf not in dynamic_cands:
+                    dynamic_cands.append(rf)
+            if dynamic_cands:
+                filenames_to_try = dynamic_cands + [f for f in filenames_to_try if f not in dynamic_cands]
+        except Exception:
+            pass
+
     effective_cache = cache_dir or os.environ.get("HF_HUB_CACHE") or (
         os.path.join(os.environ["HF_HOME"], "hub") if "HF_HOME" in os.environ else None
     )
