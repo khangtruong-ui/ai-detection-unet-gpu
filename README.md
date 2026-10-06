@@ -1420,7 +1420,25 @@ sid-train --config configs/default.yaml --resume outputs/RUN/default/checkpoints
 sid-train --config configs/default.yaml --no-auto-resume
 ```
 
-#### D. Hugging Face Checkpoint Synchronization (`sid-push` & `sid-pull`)
+#### D. Hugging Face Checkpointing During Training (`--hf-repo`, `--push-to-hub`)
+You can configure model training to automatically checkpoint directly to a Hugging Face model repository whenever regular checkpoints (best, latest, periodic) are saved:
+
+```bash
+# 1. Train and checkpoint directly to a Hugging Face model repository
+# (Verifies repository upfront, warns if flag is off, and synchronizes best/latest/periodic checkpoints)
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --hf-repo KhangTruong/Testing-model
+
+# 2. Specify explicit version tag
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --hf-repo KhangTruong/Testing-model --hf-version v2
+
+# 3. Disable Hugging Face checkpointing explicitly (saves only locally):
+sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --no-push-to-hub
+```
+
+**Upfront Repository Verification:**
+Before training begins (on the first hand), `sid-train` validates whether the Hugging Face repository exists, is accessible, and has write permissions with your credentials (`HF_TOKEN` / `huggingface-cli login`). If the repository does not exist, it creates it and validates write access. If the Hugging Face checkpointing flag is not active, a warning is emitted noting that checkpoints will only be saved locally.
+
+#### E. Hugging Face Checkpoint Synchronization (`sid-push` & `sid-pull`)
 Easily push and pull model checkpoints to and from Hugging Face repositories with version archiving, automated model card (`README.md`) generation, and multi-version tracking (`manifest.json`):
 
 ```bash
@@ -1445,7 +1463,7 @@ sid-checkpoint pull --name KhangTruong/diffusion-diff-minimized
 sid-checkpoint push --name KhangTruong/diffusion-diff-minimized --version v2
 ```
 
-#### E. Resuming Training & Adaptive Learning Rate Scheduling (`--resume-lr-mode`, `--resume-lr`)
+#### F. Resuming Training & Adaptive Learning Rate Scheduling (`--resume-lr-mode`, `--resume-lr`)
 When continuing to train a model after an initial cosine schedule has completed, standard PyTorch cosine schedulers can get trapped at the minimum learning rate (`1e-6`). `sid-train` automatically detects this state and intelligently reschedules or restarts the learning rate schedule over the new epoch horizon:
 
 ```bash

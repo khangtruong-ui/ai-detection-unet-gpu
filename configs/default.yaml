@@ -62,6 +62,9 @@ training:
   early_stopping_patience: 5
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"
+  push_to_hub: false           # Set to true (or pass --push-to-hub / --hf-repo) to checkpoint to Hugging Face Hub
+  hub_repo: null               # Hugging Face repository ID (e.g. 'KhangTruong/Testing-model')
+  hub_version: "v1"            # Hugging Face version tag (e.g. 'v1', 'v2')
 
 bootstrapping:
   enabled: false               # Default: no bootstrapping (set to true to enable Bootstrapping v1.0 kickstarting)

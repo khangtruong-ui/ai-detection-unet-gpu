@@ -106,6 +106,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "seed": 42,
         "device": "auto",  # 'auto', 'cuda', or 'cpu'
         "output_dir": "outputs",
+        "hub_repo": None,             # Optional Hugging Face repository ID for checkpoints
+        "resume_repo": None,          # Optional Hugging Face repository ID for resumption
     },
     "data": {
         "dataset_name": "KhangTruong/IMD2020",
@@ -180,6 +182,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "early_stopping_patience": 5,
         "early_stopping_metric": "val_iou",
         "early_stopping_mode": "max",
+        "push_to_hub": False,         # Checkpoint directly to Hugging Face Hub during training
+        "hub_repo": None,             # Hugging Face repository ID for checkpoints (e.g. 'KhangTruong/Testing-model')
+        "hub_version": "v1",          # Hugging Face version tag (default: 'v1')
     },
     "hard_mining": {
         "enabled": False,              # Default: use_hard_mining=false

@@ -35,7 +35,11 @@ from sid_unet.postprocessing import (
     get_postprocessor_from_config,
 )
 from sid_unet.models.unet import UNet, build_model
-from sid_unet.utils.checkpoint import download_hf_checkpoint, resolve_checkpoint_source
+from sid_unet.utils.checkpoint import (
+    download_hf_checkpoint,
+    resolve_checkpoint_source,
+    verify_hf_repo_checkpointable,
+)
 
 
 def from_pretrained(
@@ -62,4 +66,6 @@ __all__ = [
     "from_pretrained",
     "download_hf_checkpoint",
     "resolve_checkpoint_source",
+    "verify_hf_repo_checkpointable",
 ]
+

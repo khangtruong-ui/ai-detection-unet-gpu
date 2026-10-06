@@ -404,3 +404,22 @@ def format_no_resume_notification(output_dir: Optional[str] = None) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def verify_hf_repo_checkpointable(
+    repo_id_or_uri: str,
+    token: Optional[str] = None,
+    create_if_missing: bool = True,
+    private: bool = False,
+    raise_on_error: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    """Verify if a Hugging Face model repository is accessible, writable, and checkpointable."""
+    from sid_unet.checkpoint_sync import verify_hf_repo_checkpointable as _verify
+    return _verify(
+        repo_id_or_uri=repo_id_or_uri,
+        token=token,
+        create_if_missing=create_if_missing,
+        private=private,
+        raise_on_error=raise_on_error,
+    )
+

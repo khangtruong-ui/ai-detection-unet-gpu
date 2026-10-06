@@ -404,6 +404,39 @@ def test_cli_resume_repo_flag(monkeypatch, capsys):
         assert res["history"][2]["epoch"] == 3
 
 
+def test_cli_hf_repo_flag_and_push_to_hub(monkeypatch, capsys):
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(10))
+    mock_verify = MagicMock(return_value=(True, None))
+    monkeypatch.setattr("sid_unet.checkpoint_sync.verify_hf_repo_checkpointable", mock_verify)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_args = [
+            "sid-train",
+            "--config", "configs/test_smoke.yaml",
+            "--output_dir", os.path.join(tmpdir, "out"),
+            "--hf-repo", "KhangTruong/Testing-model",
+            "--no-skip-collision",
+            "--override",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "training.save_latest=true",
+            "data.num_workers=0",
+            "data.train_samples_per_epoch=2",
+            "data.val_samples=2",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ]
+        monkeypatch.setattr(sys, "argv", run_args)
+        with patch("sid_unet.training.callbacks.CheckpointManager.push_to_hf") as mock_push_hf:
+            res = train_main()
+            assert mock_verify.called
+            assert mock_push_hf.called
+            assert res["best_epoch"] == 1
+
+
+
 def test_load_checkpoint_shape_mismatch_tolerance():
     """Test that CheckpointManager.load_checkpoint safely skips shape-mismatched weights (e.g. 4-bit packed vs float)."""
     with tempfile.TemporaryDirectory() as tmpdir:

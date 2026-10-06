@@ -59,6 +59,103 @@ def _get_hf_username(api: HfApi, token: Optional[str] = None) -> Optional[str]:
         return None
 
 
+def verify_hf_repo_checkpointable(
+    repo_id_or_uri: str,
+    token: Optional[str] = None,
+    create_if_missing: bool = True,
+    private: bool = False,
+    raise_on_error: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    """Verify if a Hugging Face model repository is accessible, writable, and checkpointable.
+
+    Performs comprehensive upfront ('first hand') validation:
+      1. Validates repository format and parses repo ID.
+      2. Ensures `huggingface_hub` package is installed.
+      3. Verifies Hugging Face API token is present and valid (`whoami`).
+      4. Checks whether repository exists and is writable (`auth_check(write=True)`).
+      5. If repository does not exist and `create_if_missing=True`, creates repository
+         and validates write authorization.
+
+    Returns:
+        (True, None) if repo is verified checkpointable.
+        (False, error_message) or raises exception if not checkpointable.
+    """
+    if not _HF_AVAILABLE:
+        msg = "huggingface_hub is required for checkpointing to Hugging Face: pip install huggingface_hub"
+        if raise_on_error:
+            raise ImportError(msg)
+        return False, msg
+
+    hf_token = _get_hf_token(token)
+    if not hf_token:
+        msg = (
+            f"No Hugging Face authentication token found to checkpoint to repository '{repo_id_or_uri}'. "
+            "Please set HF_TOKEN environment variable or run `huggingface-cli login`."
+        )
+        if raise_on_error:
+            raise PermissionError(msg)
+        return False, msg
+
+    api = HfApi(token=hf_token)
+
+    try:
+        whoami = api.whoami(token=hf_token)
+        username = whoami.get("name")
+    except Exception as exc:
+        msg = f"Invalid or expired Hugging Face token when authenticating for '{repo_id_or_uri}': {exc}"
+        if raise_on_error:
+            raise PermissionError(msg) from exc
+        return False, msg
+
+    # Resolve repo ID
+    repo_id = repo_id_or_uri.strip()
+    if repo_id.startswith("hf://"):
+        repo_id = repo_id[5:]
+    elif repo_id.startswith("https://huggingface.co/"):
+        repo_id = repo_id[len("https://huggingface.co/"):]
+    if ":" in repo_id:
+        repo_id = repo_id.split(":", 1)[0]
+    repo_id = repo_id.strip("/")
+
+    if "/" not in repo_id and username:
+        repo_id = f"{username}/{repo_id}"
+
+    try:
+        exists = api.repo_exists(repo_id=repo_id, repo_type="model", token=hf_token)
+    except Exception as exc:
+        msg = f"Could not query Hugging Face repository '{repo_id}': {exc}"
+        if raise_on_error:
+            raise RuntimeError(msg) from exc
+        return False, msg
+
+    if exists:
+        try:
+            api.auth_check(repo_id=repo_id, repo_type="model", write=True, token=hf_token)
+        except Exception as exc:
+            msg = f"Hugging Face repository '{repo_id}' exists but write access was denied: {exc}"
+            if raise_on_error:
+                raise PermissionError(msg) from exc
+            return False, msg
+    else:
+        if create_if_missing:
+            try:
+                api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True, token=hf_token)
+                api.auth_check(repo_id=repo_id, repo_type="model", write=True, token=hf_token)
+            except Exception as exc:
+                msg = f"Failed to create or verify write access for Hugging Face repository '{repo_id}': {exc}"
+                if raise_on_error:
+                    raise PermissionError(msg) from exc
+                return False, msg
+        else:
+            msg = f"Hugging Face repository '{repo_id}' does not exist and create_if_missing is False."
+            if raise_on_error:
+                raise FileNotFoundError(msg)
+            return False, msg
+
+    return True, None
+
+
+
 def resolve_repo_and_version(
     name: Optional[str] = None,
     repo: Optional[str] = None,
@@ -373,12 +470,14 @@ def push_checkpoint(
         token=hf_token,
     )
 
-    # Ensure repository exists
-    try:
-        api.repo_info(repo_id=repo_id, repo_type="model")
-    except Exception:
-        print(f"Creating repository '{repo_id}' on Hugging Face Hub (private={private})...")
-        api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+    # Verify repository is checkpointable upfront ("on the first hand")
+    verify_hf_repo_checkpointable(
+        repo_id_or_uri=repo_id,
+        token=hf_token,
+        create_if_missing=True,
+        private=private,
+        raise_on_error=True,
+    )
 
     # 2. Find local artifacts
     artifacts = find_local_checkpoint_artifacts(

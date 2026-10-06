@@ -17,6 +17,7 @@ import argparse
 import os
 import random
 import sys
+import warnings
 from typing import Any, Dict, List, Optional
 import numpy as np
 from PIL import ImageFile
@@ -149,11 +150,46 @@ def parse_args():
     parser.add_argument(
         "--resume-repo",
         "--resume_repo",
-        "--hf-repo",
-        "--hf_repo",
         type=str,
         default=None,
-        help="Hugging Face model repository ID or URI (e.g. 'KhangTruong/sid-unet' or 'hf://KhangTruong/sid-unet:checkpoint_best.pt') to resume from.",
+        help="Explicit Hugging Face model repository ID or URI (e.g. 'hf://KhangTruong/sid-unet:checkpoint_best.pt') to resume from.",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        "--hf_repo",
+        "--hub-repo",
+        "--hub_repo",
+        type=str,
+        default=None,
+        help="Hugging Face model repository ID to checkpoint on (and auto-resume if existing checkpoint found), e.g. 'KhangTruong/Testing-model'.",
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        "--push_to_hub",
+        "--hf-checkpoint",
+        "--hf_checkpoint",
+        dest="push_to_hub",
+        action="store_true",
+        default=None,
+        help="Enable checkpointing directly to Hugging Face Hub during training (warning emitted if flag is not on).",
+    )
+    parser.add_argument(
+        "--no-push-to-hub",
+        "--no_push_to_hub",
+        "--no-hf-checkpoint",
+        "--no_hf_checkpoint",
+        dest="push_to_hub",
+        action="store_false",
+        help="Disable checkpointing to Hugging Face Hub even if repository is configured.",
+    )
+    parser.add_argument(
+        "--hf-version",
+        "--hf_version",
+        "--hub-version",
+        "--hub_version",
+        type=str,
+        default="v1",
+        help="Version identifier for Hugging Face Hub checkpoints (default: 'v1').",
     )
     parser.add_argument(
         "--auto-resume",
@@ -462,12 +498,52 @@ def train_single_run(
     logger.info(f"Effective configuration saved to '{config_save_path}'")
     logger.info(f"Dataset: {config.data.dataset_name} | Streaming: {config.data.streaming}")
 
+    # Hugging Face checkpointing configuration & upfront verification
+    hf_repo = (
+        config.training.get("hub_repo")
+        or config.training.get("hf_repo")
+        or config.project.get("hub_repo")
+        or config.project.get("hf_repo")
+    )
+    push_to_hub = bool(
+        config.training.get("push_to_hub", False)
+        or (hf_repo is not None and config.training.get("push_to_hub") is not False)
+    )
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+    if not push_to_hub:
+        warn_msg = (
+            "⚠️ [HF CHECKPOINT] Hugging Face model checkpointing is not enabled. "
+            "Checkpoints will only be saved locally. "
+            "To enable Hugging Face checkpointing, pass --hf-repo <repo_id> or --push-to-hub."
+        )
+        warnings.warn(warn_msg, UserWarning, stacklevel=2)
+        logger.warning(warn_msg)
+    else:
+        if not hf_repo:
+            warn_msg = (
+                "⚠️ [HF CHECKPOINT] Hugging Face checkpointing flag is enabled, but no Hugging Face repository was specified. "
+                "Checkpoints will only be saved locally. Please provide --hf-repo <repo_id>."
+            )
+            warnings.warn(warn_msg, UserWarning, stacklevel=2)
+            logger.warning(warn_msg)
+        else:
+            # Verify if the repo is checkpointable upfront ("on the first hand")
+            logger.info(f"Verifying if Hugging Face repository '{hf_repo}' is checkpointable...")
+            from sid_unet.checkpoint_sync import verify_hf_repo_checkpointable
+            verify_hf_repo_checkpointable(hf_repo, token=hf_token, create_if_missing=True)
+            logger.info(f"✅ Hugging Face repository '{hf_repo}' is verified checkpointable.")
+
     # Checkpoint resolution:
     # 1. Explicit Hugging Face repo or URI (--resume-repo or --resume hf://...)
     # 2. Explicit local path (--resume path/to/ckpt.pt)
     # 3. Config project.resume_repo or training.resume_repo
-    # 4. Automatic search in repo and output directories (if auto_resume=True)
+    # 4. Hub repository (--hf-repo) if existing checkpoint exists
+    # 5. Automatic search in repo and output directories (if auto_resume=True)
     resume_target = resume or resume_repo or config.project.get("resume_repo") or config.training.get("resume_repo")
+    if not resume_target and auto_resume and hf_repo:
+        resume_target = hf_repo
+
     resume_info = None
 
     if resume_target:
@@ -477,6 +553,17 @@ def train_single_run(
                 hf_data = download_hf_checkpoint(str(resume_target))
                 resume = hf_data["checkpoint_path"]
                 resume_info = {**inspect_checkpoint(resume), **hf_data}
+            except FileNotFoundError as fnf_err:
+                if (resume and is_hf_repo_id(str(resume))) or resume_repo:
+                    logger.error(f"Failed to download checkpoint from Hugging Face repo '{resume_target}': {fnf_err}")
+                    raise fnf_err
+                else:
+                    logger.info(
+                        f"ℹ️ [AUTO-RESUME] No existing checkpoint found in Hugging Face repository '{resume_target}'. "
+                        "Starting fresh training from epoch 1 and checkpointing to this repository."
+                    )
+                    resume = None
+                    resume_info = None
             except Exception as e:
                 logger.error(f"Failed to download checkpoint from Hugging Face repo '{resume_target}': {e}")
                 raise e
@@ -661,6 +748,17 @@ def main():
         overrides.append(f"training.resume_lr_mode={args.resume_lr_mode}")
     if getattr(args, "resume_lr", None) is not None:
         overrides.append(f"training.resume_lr={args.resume_lr}")
+    if getattr(args, "hf_repo", None) is not None:
+        overrides.append(f"training.hub_repo={args.hf_repo}")
+        overrides.append(f"training.hf_repo={args.hf_repo}")
+    if getattr(args, "push_to_hub", None) is True:
+        overrides.append("training.push_to_hub=true")
+    elif getattr(args, "push_to_hub", None) is False:
+        overrides.append("training.push_to_hub=false")
+    elif getattr(args, "hf_repo", None) is not None:
+        overrides.append("training.push_to_hub=true")
+    if getattr(args, "hf_version", None) is not None:
+        overrides.append(f"training.hub_version={args.hf_version}")
 
     # Check if we should auto-launch multi-process DDP via torchrun
     dp_disabled = (getattr(args, "data_parallel", None) is False) or any(

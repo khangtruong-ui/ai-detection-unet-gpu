@@ -325,6 +325,23 @@ class Trainer:
         checkpoint_steps = config.training.get("checkpoint_steps", config.training.get("checkpoint_interval_steps", None))
         if checkpoint_steps is not None:
             checkpoint_steps = int(checkpoint_steps)
+
+        training_cfg = getattr(config, "training", {}) if not hasattr(config, "get") else config.get("training", {})
+        project_cfg = getattr(config, "project", {}) if not hasattr(config, "get") else config.get("project", {})
+
+        hf_repo = (
+            training_cfg.get("hub_repo")
+            or training_cfg.get("hf_repo")
+            or project_cfg.get("hub_repo")
+            or project_cfg.get("hf_repo")
+        )
+        push_to_hub = bool(
+            training_cfg.get("push_to_hub", False)
+            or (hf_repo is not None and training_cfg.get("push_to_hub") is not False)
+        )
+        hf_version = str(training_cfg.get("hub_version", "v1"))
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
         self.ckpt_manager = CheckpointManager(
             checkpoint_dir=self.checkpoint_dir,
             metric_name=config.training.get("early_stopping_metric", "val_iou"),
@@ -333,6 +350,11 @@ class Trainer:
             save_latest=bool(config.training.get("save_latest", True)),
             checkpoint_period=checkpoint_period,
             checkpoint_steps=checkpoint_steps,
+            hf_repo=hf_repo,
+            push_to_hub=push_to_hub,
+            hf_version=hf_version,
+            hf_token=hf_token,
+            verify_repo=True,
         )
         self.early_stopping = EarlyStopping(
             patience=int(config.training.get("early_stopping_patience", 5)),
@@ -1380,12 +1402,23 @@ class Trainer:
 
         import gc
         gc.collect()
-        if self.is_distributed and is_dist_avail_and_initialized():
-            import torch.distributed as dist
+        if self.is_main_process and getattr(self.ckpt_manager, "push_to_hub", False) and getattr(self.ckpt_manager, "hf_repo", None):
             try:
-                dist.barrier()
-            except Exception:
-                pass
+                from sid_unet.checkpoint_sync import push_checkpoint
+                s_dir = os.path.dirname(self.checkpoint_dir) if os.path.basename(self.checkpoint_dir) == "checkpoints" else self.checkpoint_dir
+                self.logger.info(f"🚀 Performing final synchronization to Hugging Face Hub '{self.ckpt_manager.hf_repo}' with evaluation reports...")
+                push_checkpoint(
+                    repo=self.ckpt_manager.hf_repo,
+                    version=self.ckpt_manager.hf_version,
+                    source_dir=s_dir,
+                    message=f"feat(release): final training report and checkpoints for {self.ckpt_manager.hf_repo} ({self.ckpt_manager.hf_version})",
+                    token=self.ckpt_manager.hf_token,
+                    set_latest=True,
+                    include_reports=True,
+                )
+            except Exception as e:
+                self.logger.warning(f"⚠️ Final Hugging Face sync warning: {e}")
+
         self.close()
 
         return {

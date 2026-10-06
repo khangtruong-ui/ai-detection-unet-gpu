@@ -190,6 +190,11 @@ class CheckpointManager:
         save_latest: bool = True,
         checkpoint_period: Optional[float] = 3600.0,
         checkpoint_steps: Optional[int] = None,
+        hf_repo: Optional[str] = None,
+        push_to_hub: bool = False,
+        hf_version: Optional[str] = None,
+        hf_token: Optional[str] = None,
+        verify_repo: bool = True,
     ):
         self.checkpoint_dir = checkpoint_dir
         self.metric_name = metric_name
@@ -200,11 +205,37 @@ class CheckpointManager:
         self.checkpoint_steps = checkpoint_steps
         self.last_periodic_save_time = time.time()
         self.last_periodic_step = 0
+        self.hf_repo = hf_repo
+        self.push_to_hub = bool(push_to_hub)
+        self.hf_version = hf_version or "v1"
+        self.hf_token = hf_token
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.best_score = float("-inf") if mode == "max" else float("inf")
         self.best_epoch = -1
         self.last_loaded_checkpoint_info: Dict[str, Any] = {}
+
+        if not self.push_to_hub:
+            warning_msg = (
+                "⚠️ [HF CHECKPOINT] Hugging Face model checkpointing is not enabled. "
+                "Checkpoints will only be saved locally. "
+                "To enable Hugging Face checkpointing, pass --hf-repo <repo_id> or --push-to-hub."
+            )
+            warnings.warn(warning_msg, UserWarning, stacklevel=2)
+            logger.warning(warning_msg)
+        else:
+            if not self.hf_repo:
+                warning_msg = (
+                    "⚠️ [HF CHECKPOINT] Hugging Face checkpointing flag is enabled, but no Hugging Face repository was specified. "
+                    "Checkpoints will only be saved locally. Please provide --hf-repo <repo_id>."
+                )
+                warnings.warn(warning_msg, UserWarning, stacklevel=2)
+                logger.warning(warning_msg)
+                self.push_to_hub = False
+            elif verify_repo:
+                from sid_unet.checkpoint_sync import verify_hf_repo_checkpointable
+                verify_hf_repo_checkpointable(self.hf_repo, token=self.hf_token, create_if_missing=True)
+
 
     def is_better(self, score: float) -> bool:
         if self.mode == "max":
@@ -268,7 +299,56 @@ class CheckpointManager:
         latest_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml")
         save_config(cfg_dict, latest_cfg_path)
 
-        return {"periodic": periodic_path, "latest": latest_path}
+        saved = {"periodic": periodic_path, "latest": latest_path}
+
+        if self.push_to_hub and self.hf_repo:
+            self.push_to_hf(epoch=epoch, step=step, saved_paths=saved, is_periodic=True)
+
+        return saved
+
+    def push_to_hf(
+        self,
+        epoch: Optional[int] = None,
+        step: Optional[int] = None,
+        saved_paths: Optional[Dict[str, str]] = None,
+        is_best: bool = False,
+        is_periodic: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Push newly saved checkpoints to the Hugging Face model repository."""
+        if not self.push_to_hub or not self.hf_repo:
+            return None
+
+        # In distributed environment, only rank 0 (main process) pushes
+        try:
+            from sid_unet.utils.distributed import is_main_process
+            if not is_main_process():
+                return None
+        except Exception:
+            pass
+
+        try:
+            from sid_unet.checkpoint_sync import push_checkpoint
+            source_dir = (
+                os.path.dirname(self.checkpoint_dir)
+                if os.path.basename(self.checkpoint_dir) == "checkpoints"
+                else self.checkpoint_dir
+            )
+            tag_label = "best" if is_best else ("periodic" if is_periodic else f"epoch_{epoch}")
+            msg = f"checkpoint: update {self.hf_repo} ({tag_label} at epoch {epoch}, step {step})"
+            result = push_checkpoint(
+                repo=self.hf_repo,
+                version=self.hf_version,
+                source_dir=source_dir,
+                checkpoint_name=None,
+                message=msg,
+                token=self.hf_token,
+                set_latest=True,
+                include_reports=False,
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to push checkpoint to Hugging Face Hub '{self.hf_repo}': {e}")
+            return None
 
     def save(
         self,
@@ -323,6 +403,14 @@ class CheckpointManager:
                 best_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_best_config.yaml")
                 save_config(config, best_cfg_path)
                 saved_paths["best"] = best_path
+
+        if self.push_to_hub and self.hf_repo:
+            self.push_to_hf(
+                epoch=epoch,
+                step=step,
+                saved_paths=saved_paths,
+                is_best=(current_score is not None and current_score == self.best_score),
+            )
 
         return saved_paths
 
