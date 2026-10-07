@@ -12,6 +12,8 @@ from sid_unet.dataset.loader import (
     create_test_dataloader,
     get_split_candidates,
     load_hf_dataset_robust,
+    load_parquet_dataset,
+    load_parquet_or_hf_dataset,
     process_raw_sample,
     safe_dataloader_len,
     BackgroundPrefetcher,
@@ -33,7 +35,10 @@ __all__ = [
     "create_test_dataloader",
     "get_split_candidates",
     "load_hf_dataset_robust",
+    "load_parquet_dataset",
+    "load_parquet_or_hf_dataset",
     "process_raw_sample",
     "safe_dataloader_len",
     "BackgroundPrefetcher",
 ]
+

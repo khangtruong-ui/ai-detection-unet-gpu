@@ -19,6 +19,11 @@ data:
   val_samples_per_epoch: -1    # Set to -1 or negative to run until dataset is depleted
   val_samples: -1              # Alias for val_samples_per_epoch
   test_samples: -1             # Set to -1 or negative to run until dataset is depleted
+  use_parquet_loader: true     # Use parquet-dataset-loader for non-blocking index streaming
+  save_to_disk: false          # Progressively persist streamed row groups to disk
+  background_download: false   # Download parquet files/row groups in background thread
+  columns: null                # Optional column projection (e.g. ['image', 'mask'])
+  token: null                  # Hugging Face auth token (or True to use stored auth)
   augmentations:
     horizontal_flip: 0.5
     vertical_flip: 0.2

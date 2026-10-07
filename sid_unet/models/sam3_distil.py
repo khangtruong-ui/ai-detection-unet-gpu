@@ -286,9 +286,25 @@ class SAM3DistilLoRA(nn.Module):
             force_download=self.force_download,
         )
 
+        # Resolve bpe vocabulary path for student text encoder
+        bpe_path = None
+        try:
+            import sam3
+            sam3_pkg_dir = os.path.dirname(sam3.__file__)
+            for candidate in [
+                os.path.join(sam3_pkg_dir, "assets", "bpe_simple_vocab_16e6.txt.gz"),
+                os.path.join(sam3_pkg_dir, "..", "assets", "bpe_simple_vocab_16e6.txt.gz"),
+            ]:
+                if os.path.exists(candidate):
+                    bpe_path = os.path.abspath(candidate)
+                    break
+        except Exception:
+            pass
+
         # 2. Build base EfficientSAM3 image model
         base_model = build_efficientsam3_image_model(
             checkpoint_path=ckpt,
+            bpe_path=bpe_path,
             backbone_type=self.backbone_type,
             model_name=self.model_name,
             text_encoder_type=self.text_encoder_type,

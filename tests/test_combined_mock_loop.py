@@ -55,6 +55,7 @@ def mock_dataset_config_path(tmp_path):
     cfg["training"]["epochs"] = 2
     cfg["training"]["amp"] = False
     cfg["training"]["save_latest"] = True
+    cfg["training"]["early_stopping_patience"] = 10
     cfg["logging"]["save_sample_images"] = False
 
     cfg_file = tmp_path / "mock_dataset.yaml"

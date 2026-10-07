@@ -23,17 +23,22 @@ dependencies = [
     "matplotlib>=3.5.0",
     "diffusers>=0.25.0",
     "accelerate>=0.25.0",
+    "parquet-dataset-loader @ git+https://github.com/khangtruong-ui/parquet-dataset-loader.git",
 ]
 
 [project.optional-dependencies]
 debug = [
-    "nn-toolbox>=0.1.0",
+    "nn-toolbox @ git+https://github.com/khangtruong-ui/nn-toolbox.git",
 ]
 8bit = [
     "bitsandbytes>=0.41.0",
     "accelerate>=0.25.0",
 ]
 diffusion = [
+    "diffusers>=0.25.0",
+    "accelerate>=0.25.0",
+]
+diffusion-diff = [
     "diffusers>=0.25.0",
     "accelerate>=0.25.0",
 ]
@@ -50,7 +55,7 @@ sam3 = [
     "accelerate>=0.25.0",
 ]
 sam3-distil = [
-    "sam3-distil>=0.1.0",
+    "sam3-distil @ git+https://github.com/khangtruong-ui/sam3-distil.git",
     "timm>=1.0.17",
     "peft>=0.7.0",
     "bitsandbytes>=0.41.0",
@@ -74,8 +79,8 @@ all = [
     "bitsandbytes>=0.41.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "nn-toolbox>=0.1.0",
-    "sam3-distil>=0.1.0",
+    "nn-toolbox @ git+https://github.com/khangtruong-ui/nn-toolbox.git",
+    "sam3-distil @ git+https://github.com/khangtruong-ui/sam3-distil.git",
     "timm>=1.0.17",
     "omegaconf>=2.3.0",
     "ftfy>=6.1.1",
@@ -109,8 +114,12 @@ addopts = "-v --tb=short"
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
 torchvision = [{ index = "pytorch-cu128" }]
+nn-toolbox = { git = "https://github.com/khangtruong-ui/nn-toolbox.git" }
+sam3-distil = { git = "https://github.com/khangtruong-ui/sam3-distil.git" }
+parquet-dataset-loader = { git = "https://github.com/khangtruong-ui/parquet-dataset-loader.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+

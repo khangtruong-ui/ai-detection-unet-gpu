@@ -12,7 +12,8 @@ import os
 import queue
 import sys
 import threading
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+import logging
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from PIL import Image, ImageFile
 import torch
@@ -20,6 +21,20 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_in
 from datasets import load_dataset as hf_load_dataset
 
 from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_rank, get_world_size
+
+logger = logging.getLogger(__name__)
+
+_orig_hf_load_dataset = hf_load_dataset
+
+try:
+    import parquet_dataset_loader as pdl
+    from parquet_dataset_loader import IndexedParquetDataset, ParquetDatasetError
+    _HAS_PARQUET_LOADER = True
+except ImportError:
+    pdl = None  # type: ignore
+    IndexedParquetDataset = None  # type: ignore
+    ParquetDatasetError = Exception  # type: ignore
+    _HAS_PARQUET_LOADER = False
 
 # Ensure PIL loads truncated/partial images without raising OSError
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -532,6 +547,107 @@ def load_hf_dataset_robust(
         raise e
 
 
+def load_parquet_dataset(
+    dataset_name: str,
+    requested_split: str,
+    streaming: bool = True,
+    save_to_disk: Union[bool, str] = False,
+    background_download: bool = False,
+    columns: Optional[Sequence[str]] = None,
+    token: Optional[Union[bool, str]] = None,
+    cache_dir: Optional[str] = None,
+    max_cached_row_groups: int = 2,
+    **kwargs: Any,
+) -> Tuple[Any, str]:
+    """
+    Load a Parquet dataset via parquet-dataset-loader for instant, non-blocking access.
+    Tries requested split and fallback candidates.
+    Returns (IndexedParquetDataset, resolved_split_name).
+    """
+    if not _HAS_PARQUET_LOADER or pdl is None:
+        raise ImportError(
+            "parquet-dataset-loader is not installed or failed to import. "
+            "Install via pip install parquet-dataset-loader."
+        )
+
+    candidates = get_split_candidates(requested_split)
+    last_error: Optional[Exception] = None
+
+    for cand in candidates:
+        try:
+            ds = pdl.load_dataset(
+                path=dataset_name,
+                split=cand,
+                streaming=streaming,
+                save_to_disk=save_to_disk,
+                background_download=background_download,
+                columns=columns,
+                token=token,
+                cache_dir=cache_dir,
+                max_cached_row_groups=max_cached_row_groups,
+                **kwargs,
+            )
+            return ds, cand
+        except Exception as e:
+            last_error = e
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(
+        f"Could not load parquet dataset '{dataset_name}' with split '{requested_split}'"
+    )
+
+
+def load_parquet_or_hf_dataset(
+    dataset_name: str,
+    requested_split: str,
+    streaming: bool = True,
+    save_to_disk: Union[bool, str] = False,
+    background_download: bool = False,
+    columns: Optional[Sequence[str]] = None,
+    token: Optional[Union[bool, str]] = None,
+    use_parquet_loader: bool = True,
+    cache_dir: Optional[str] = None,
+    max_cached_row_groups: int = 2,
+    **kwargs: Any,
+) -> Tuple[Any, str]:
+    """
+    Universal dataset loader that prefers parquet-dataset-loader for non-blocking
+    O(log M) index streaming, automatically falling back to HuggingFace datasets if
+    the dataset is not a Parquet repository, if parquet loader is disabled, or on error.
+    """
+    if hf_load_dataset is not _orig_hf_load_dataset:
+        # Caller or test framework monkeypatched hf_load_dataset; respect the override
+        return load_hf_dataset_robust(
+            dataset_name, requested_split=requested_split, streaming=streaming
+        )
+
+    if use_parquet_loader and _HAS_PARQUET_LOADER and pdl is not None:
+        try:
+            return load_parquet_dataset(
+                dataset_name=dataset_name,
+                requested_split=requested_split,
+                streaming=streaming,
+                save_to_disk=save_to_disk,
+                background_download=background_download,
+                columns=columns,
+                token=token,
+                cache_dir=cache_dir,
+                max_cached_row_groups=max_cached_row_groups,
+                **kwargs,
+            )
+        except Exception as e:
+            logger.info(
+                f"parquet-dataset-loader could not load '{dataset_name}' ({type(e).__name__}: {e}); "
+                "falling back to Hugging Face dataset loader."
+            )
+
+    return load_hf_dataset_robust(
+        dataset_name, requested_split=requested_split, streaming=streaming
+    )
+
+
 def is_mock_dataset(dataset_name: Optional[str]) -> bool:
     """Check if the provided dataset name signifies a synthetic/mock dataset override."""
     if not dataset_name or not isinstance(dataset_name, str):
@@ -678,6 +794,13 @@ class SIDStreamingDataset(IterableDataset):
         max_samples: Optional[int] = None,
         seed: int = 42,
         target_image_size: Tuple[int, int] = (256, 256),
+        use_parquet_loader: bool = True,
+        save_to_disk: Union[bool, str] = False,
+        background_download: bool = False,
+        columns: Optional[Sequence[str]] = None,
+        token: Optional[Union[bool, str]] = None,
+        cache_dir: Optional[str] = None,
+        max_cached_row_groups: int = 2,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -689,12 +812,26 @@ class SIDStreamingDataset(IterableDataset):
         self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
         self.seed = seed
         self.target_image_size = target_image_size
+        self.use_parquet_loader = use_parquet_loader
+        self.save_to_disk = save_to_disk
+        self.background_download = background_download
+        self.columns = columns
+        self.token = token
+        self.cache_dir = cache_dir
+        self.max_cached_row_groups = max_cached_row_groups
+        self._current_dataset = None
 
     def __len__(self) -> int:
         if self.max_samples is not None and self.max_samples > 0:
             return self.max_samples
         if is_mock_dataset(self.dataset_name):
             return 100
+        cur = getattr(self, "_current_dataset", None)
+        if cur is not None and hasattr(cur, "__len__"):
+            try:
+                return len(cur)
+            except (TypeError, NotImplementedError):
+                pass
         raise TypeError(f"'{type(self).__name__}' object has no len() when max_samples is None")
 
     def _get_mock_stream(self) -> Iterator[Dict[str, Any]]:
@@ -725,8 +862,20 @@ class SIDStreamingDataset(IterableDataset):
             return self._get_mock_stream()
 
         # Load streamed dataset with robust fallback
-        hf_ds, resolved = load_hf_dataset_robust(self.dataset_name, requested_split=self.split, streaming=True)
+        raw_ds, resolved = load_parquet_or_hf_dataset(
+            self.dataset_name,
+            requested_split=self.split,
+            streaming=True,
+            save_to_disk=self.save_to_disk,
+            background_download=self.background_download,
+            columns=self.columns,
+            token=self.token,
+            use_parquet_loader=self.use_parquet_loader,
+            cache_dir=self.cache_dir,
+            max_cached_row_groups=self.max_cached_row_groups,
+        )
         self.resolved_split = resolved
+        self._current_dataset = raw_ds
 
         # Note: Do NOT call hf_ds.shuffle() on remote multi-shard IterableDataset streams,
         # as Hugging Face opens simultaneous HTTP readers across all shards (e.g. 62 parquet files),
@@ -739,37 +888,45 @@ class SIDStreamingDataset(IterableDataset):
 
         # Shard across distributed ranks if world_size > 1
         if world_size > 1:
-            if hasattr(hf_ds, "n_shards") and hf_ds.n_shards >= world_size:
-                hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
-            elif hasattr(hf_ds, "shard") and callable(hf_ds.shard):
+            if hasattr(raw_ds, "shard") and callable(raw_ds.shard):
                 try:
-                    hf_ds = hf_ds.shard(num_shards=world_size, index=rank)
+                    raw_ds = raw_ds.shard(num_shards=world_size, index=rank)
                 except Exception:
-                    hf_ds = itertools.islice(hf_ds, rank, None, world_size)
+                    raw_ds = itertools.islice(raw_ds, rank, None, world_size)
+            elif hasattr(raw_ds, "n_shards") and raw_ds.n_shards >= world_size:
+                raw_ds = raw_ds.shard(num_shards=world_size, index=rank)
             else:
-                hf_ds = itertools.islice(hf_ds, rank, None, world_size)
+                raw_ds = itertools.islice(raw_ds, rank, None, world_size)
 
         worker_info = get_worker_info()
         if worker_info is not None and worker_info.num_workers > 1:
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
-            if hasattr(hf_ds, "n_shards") and hf_ds.n_shards >= num_workers:
-                stream_iter = iter(hf_ds.shard(num_shards=num_workers, index=worker_id))
+            if hasattr(raw_ds, "shard") and callable(raw_ds.shard):
+                try:
+                    stream_iter = iter(raw_ds.shard(num_shards=num_workers, index=worker_id))
+                except Exception:
+                    stream_iter = itertools.islice(raw_ds, worker_id, None, num_workers)
+            elif hasattr(raw_ds, "n_shards") and raw_ds.n_shards >= num_workers:
+                stream_iter = iter(raw_ds.shard(num_shards=num_workers, index=worker_id))
             else:
-                stream_iter = itertools.islice(hf_ds, worker_id, None, num_workers)
+                stream_iter = itertools.islice(raw_ds, worker_id, None, num_workers)
 
             if self.max_samples is not None and self.max_samples > 0:
                 worker_max = (self.max_samples - 1 - worker_id) // num_workers + 1 if self.max_samples > worker_id else 0
                 stream_iter = itertools.islice(stream_iter, worker_max)
         else:
-            stream_iter = iter(hf_ds)
-            if self.max_samples is not None and self.max_samples > 0:
-                stream_iter = itertools.islice(stream_iter, self.max_samples)
+            if hasattr(raw_ds, "take") and callable(raw_ds.take) and self.max_samples is not None and self.max_samples > 0:
+                stream_iter = iter(raw_ds.take(self.max_samples))
+            else:
+                stream_iter = iter(raw_ds)
+                if self.max_samples is not None and self.max_samples > 0:
+                    stream_iter = itertools.islice(stream_iter, self.max_samples)
 
         return stream_iter
 
     def close(self) -> None:
-        """Explicitly close the current active stream and raw prefetch iterator if supported."""
+        """Explicitly close the current active stream, reader, and raw prefetch iterator if supported."""
         raw_iter = getattr(self, "_raw_prefetch_iter", None)
         if raw_iter is not None and hasattr(raw_iter, "close") and callable(raw_iter.close):
             try:
@@ -785,6 +942,14 @@ class SIDStreamingDataset(IterableDataset):
             except Exception:
                 pass
         self._current_stream = None
+
+        ds = getattr(self, "_current_dataset", None)
+        if ds is not None and hasattr(ds, "close") and callable(ds.close):
+            try:
+                ds.close()
+            except Exception:
+                pass
+        self._current_dataset = None
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         import random
@@ -853,6 +1018,10 @@ class SIDStreamingDataset(IterableDataset):
 class SIDMapDataset(Dataset):
     """
     Standard Indexable PyTorch Dataset when streaming = False.
+    When use_parquet_loader is True, leverages IndexedParquetDataset to provide
+    instant non-blocking index streaming with O(log M) random access, avoiding multi-gigabyte
+    download blocking at initialization.
+    Supports background downloading and progressive disk persistence.
     When max_samples is None or <= 0, uses the full dataset until depletion.
     """
 
@@ -863,6 +1032,13 @@ class SIDMapDataset(Dataset):
         transform: Optional[JointCompose] = None,
         max_samples: Optional[int] = None,
         target_image_size: Tuple[int, int] = (256, 256),
+        use_parquet_loader: bool = True,
+        save_to_disk: Union[bool, str] = False,
+        background_download: bool = False,
+        columns: Optional[Sequence[str]] = None,
+        token: Optional[Union[bool, str]] = None,
+        cache_dir: Optional[str] = None,
+        max_cached_row_groups: int = 2,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -870,6 +1046,13 @@ class SIDMapDataset(Dataset):
         self.transform = transform
         self.target_image_size = target_image_size
         self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
+        self.use_parquet_loader = use_parquet_loader
+        self.save_to_disk = save_to_disk
+        self.background_download = background_download
+        self.columns = columns
+        self.token = token
+        self.cache_dir = cache_dir
+        self.max_cached_row_groups = max_cached_row_groups
 
         if is_mock_dataset(dataset_name):
             self.resolved_split = split
@@ -880,13 +1063,37 @@ class SIDMapDataset(Dataset):
             return
 
         self._is_mock = False
-        hf_ds, resolved = load_hf_dataset_robust(dataset_name, requested_split=split, streaming=False)
+        ds, resolved = load_parquet_or_hf_dataset(
+            dataset_name=dataset_name,
+            requested_split=split,
+            streaming=True,  # For parquet-dataset-loader, streaming=True returns IndexedParquetDataset with instant O(log M) random access!
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            use_parquet_loader=use_parquet_loader,
+            cache_dir=cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
+        )
         self.resolved_split = resolved
         self.split = resolved
 
-        if self.max_samples is not None and 0 < self.max_samples < len(hf_ds):
-            hf_ds = hf_ds.select(range(self.max_samples))
-        self.data = hf_ds
+        # If fallback loaded an IterableDataset from HuggingFace (not indexable),
+        # reload using HF non-streaming so it becomes an indexable Dataset:
+        if not hasattr(ds, "__getitem__"):
+            ds, resolved = load_hf_dataset_robust(dataset_name, requested_split=split, streaming=False)
+            self.resolved_split = resolved
+            self.split = resolved
+
+        if self.max_samples is not None and 0 < self.max_samples < len(ds):
+            if hasattr(ds, "take") and callable(ds.take):
+                ds = ds.take(self.max_samples)
+            elif hasattr(ds, "select") and callable(ds.select):
+                ds = ds.select(range(self.max_samples))
+            else:
+                ds = ds[: self.max_samples]
+
+        self.data = ds
 
     def __len__(self) -> int:
         if getattr(self, "_is_mock", False):
@@ -917,6 +1124,15 @@ class SIDMapDataset(Dataset):
         )
         sample_dict["sample_idx"] = idx
         return sample_dict
+
+    def close(self) -> None:
+        """Close underlying dataset reader and stop any background download thread."""
+        data = getattr(self, "data", None)
+        if data is not None and hasattr(data, "close") and callable(data.close):
+            try:
+                data.close()
+            except Exception:
+                pass
 
 
 def resolve_num_workers(num_workers_cfg: Optional[Union[int, str]] = None) -> int:
@@ -1038,6 +1254,14 @@ def create_eval_dataloader(
     transform = get_transforms(image_size=image_size, is_train=False)
     mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
+    use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
+    save_to_disk = config.data.get("save_to_disk", False)
+    background_download = bool(config.data.get("background_download", False))
+    columns = config.data.get("columns", None)
+    token = config.data.get("token", None)
+    pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
+    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 2))
+
     if streaming:
         eval_dataset = SIDStreamingDataset(
             dataset_name=dataset_name,
@@ -1047,6 +1271,13 @@ def create_eval_dataloader(
             max_samples=eval_max_samples,
             seed=seed,
             target_image_size=image_size,
+            use_parquet_loader=use_parquet_loader,
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            cache_dir=pdl_cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
         )
         prefetch_batches = int(config.data.get("prefetch_batches", 24))
         raw_loader = DataLoader(
@@ -1064,6 +1295,13 @@ def create_eval_dataloader(
             transform=transform,
             max_samples=eval_max_samples,
             target_image_size=image_size,
+            use_parquet_loader=use_parquet_loader,
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            cache_dir=pdl_cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
         )
         eval_sampler = None
         if is_dist_avail_and_initialized():
@@ -1147,6 +1385,14 @@ def create_dataloaders(
 
     mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
+    use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
+    save_to_disk = config.data.get("save_to_disk", False)
+    background_download = bool(config.data.get("background_download", False))
+    columns = config.data.get("columns", None)
+    token = config.data.get("token", None)
+    pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
+    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 2))
+
     if streaming:
         train_dataset = SIDStreamingDataset(
             dataset_name=dataset_name,
@@ -1156,6 +1402,13 @@ def create_dataloaders(
             max_samples=train_max_samples,
             seed=seed,
             target_image_size=image_size,
+            use_parquet_loader=use_parquet_loader,
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            cache_dir=pdl_cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
         )
         val_dataset = SIDStreamingDataset(
             dataset_name=dataset_name,
@@ -1165,6 +1418,13 @@ def create_dataloaders(
             max_samples=val_max_samples,
             seed=seed,
             target_image_size=image_size,
+            use_parquet_loader=use_parquet_loader,
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            cache_dir=pdl_cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
         )
 
         train_prefetch = max(48, int(config.data.get("prefetch_batches", 48)))
@@ -1193,6 +1453,13 @@ def create_dataloaders(
             transform=train_transform,
             max_samples=train_max_samples,
             target_image_size=image_size,
+            use_parquet_loader=use_parquet_loader,
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            cache_dir=pdl_cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
         )
         val_dataset = SIDMapDataset(
             dataset_name=dataset_name,
@@ -1200,6 +1467,13 @@ def create_dataloaders(
             transform=val_transform,
             max_samples=val_max_samples,
             target_image_size=image_size,
+            use_parquet_loader=use_parquet_loader,
+            save_to_disk=save_to_disk,
+            background_download=background_download,
+            columns=columns,
+            token=token,
+            cache_dir=pdl_cache_dir,
+            max_cached_row_groups=max_cached_row_groups,
         )
 
         train_sampler = None
