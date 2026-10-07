@@ -28,7 +28,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
   - [3. Auxiliary Classifier & Multi-Task Semantic Regularization](#3-auxiliary-classifier--multi-task-semantic-regularization)
-  - [4. Streaming Dataset Engine & Dynamic Mask Synthesis](#4-streaming-dataset-engine--dynamic-mask-synthesis)
+  - [4. Non-Blocking Dataset Loading Engine & Dynamic Mask Synthesis (parquet-dataset-loader)](#4-non-blocking-dataset-loading-engine--dynamic-mask-synthesis-parquet-dataset-loader)
   - [5. Mask Post-Processing Pipeline (Noise Suppression, Hole Filling, Morphology)](#5-mask-post-processing-pipeline-noise-suppression-hole-filling-morphology)
   - [6. SAM3 Spatial Join & Boundary Contrast Refinement](#6-sam3-spatial-join--boundary-contrast-refinement)
   - [7. Simultaneous Multi-Stage Ablation Evaluation](#7-simultaneous-multi-stage-ablation-evaluation)
@@ -688,14 +688,54 @@ $$
 
 ---
 
-### 4. Streaming Dataset Engine & Dynamic Mask Synthesis
+### 4. Non-Blocking Dataset Loading Engine & Dynamic Mask Synthesis (parquet-dataset-loader)
 
-To train on massive multi-gigabyte or terabyte forensic datasets without saturating local storage:
-- **Streaming Pipeline (`streaming: true`)**: Samples are streamed on-the-fly via Hugging Face `IterableDataset` with shuffle buffers and non-blocking worker prefetching.
-- **Automatic Label & Mask Synthesis Logic**:
-  - **Label 0 (Real / Authentic)**: Pure zero mask $\mathbf{0}_{H \times W}$.
-  - **Label 1 (Fully Synthetic)**: Pure one mask $\mathbf{1}_{H \times W}$.
-  - **Label 2 (Tampered / Inpainted)**: Ground truth mask binarized to $\{0.0, 1.0\}$.
+Training on massive multi-gigabyte or terabyte image manipulation datasets (such as [`KhangTruong/COCO-inpainted`](https://huggingface.co/datasets/KhangTruong/COCO-inpainted) at 62.4 GB across 65 Parquet files, or [`KhangTruong/BeyondTheBrush`](https://huggingface.co/datasets/KhangTruong/BeyondTheBrush)) traditionally causes severe bottlenecks:
+- **Hugging Face `load_dataset("repo", streaming=False)`**: Blocks for 15–30 minutes downloading the entire dataset before training can start, consuming massive disk and RAM.
+- **Hugging Face `load_dataset("repo", streaming=True)`**: Returns an `IterableDataset` with **no length** (`len()` raises `TypeError`), **no random access**, and synchronous HTTP freezes on row group boundaries.
+
+To solve this, `sid_unet` natively integrates [**`parquet-dataset-loader`**](https://github.com/khangtruong-ui/parquet-dataset-loader) (`use_parquet_loader: true` by default):
+
+```
+                        Hugging Face Remote Parquet Files (62+ GB)
+                                            │
+                                            ▼  (HTTP Range: bytes=-65536)
+                        ┌──────────────────────────────────────┐
+                        │   Inspect Footer Metadata (~26 KB)   │  ──► ~0.4s setup time!
+                        │   Construct Global In-Memory Index   │
+                        └──────────────────┬───────────────────┘
+                                           │
+             ┌─────────────────────────────┴─────────────────────────────┐
+             ▼                                                           ▼
+┌───────────────────────────────┐                       ┌───────────────────────────────┐
+│     SIDMapDataset (Map-Style) │                       │  SIDStreamingDataset (Stream) │
+│ - len(ds) known immediately   │                       │ - Sharded across DDP ranks    │
+│ - O(log M) random access ds[i]│                       │ - Threaded background prefetch│
+│ - PyTorch multi-worker spawn  │                       │ - Reservoir shuffle buffer    │
+│ - Progressive save to disk    │                       │ - Bounded LRU cache (~150MB)  │
+└───────────────────────────────┘                       └───────────────────────────────┘
+```
+
+#### Key Capabilities:
+1. **Instant, Non-Blocking Initialization (~0.4s)**:
+   Uses HTTP Range requests to read Parquet footers and builds an index in ~0.4s without downloading full files. Training starts immediately.
+2. **True Map-Style Random Access with $O(\log M)$ Seek (`SIDMapDataset`)**:
+   Standard indexable PyTorch `Dataset` (`streaming: false`) wraps `IndexedParquetDataset`. Random access (`ds[idx]`) seeks directly to the target row group via binary search and downloads only that chunk, cached in an in-memory thread-safe LRU cache.
+3. **PyTorch Multi-Worker DataLoader Compatibility**:
+   Supports `num_workers > 0` with `multiprocessing_context="spawn"`. Dataset components are fully picklable with clean serialization guards (`__getstate__` / `__setstate__`), so worker processes instantiate their own connection handles without deadlocks or thread lock pickling errors.
+4. **Progressive Disk Persistence (`save_to_disk: true` or path)**:
+   Streams unblocked while saving fetched row groups to local disk in the background. Subsequent runs reload locally with zero network I/O.
+5. **Background Downloader (`background_download: true`)**:
+   Spawns an asynchronous background worker thread to pre-fetch remaining row groups to disk ahead of foreground iteration.
+6. **Column Projection (`columns: ["image", "mask"]`)**:
+   Transfers only the requested columns over HTTP, cutting network payload from ~98 MB down to ~250 KB per row group.
+7. **Transparent Fallback**:
+   If the target dataset is not a Parquet repository or if `use_parquet_loader: false`, the loader automatically falls back to standard Hugging Face `load_dataset` without raising errors.
+
+#### Dynamic Label & Mask Synthesis Logic
+- **Label 0 (Real / Authentic)**: Pure zero mask $\mathbf{0}_{H \times W}$.
+- **Label 1 (Fully Synthetic)**: Pure one mask $\mathbf{1}_{H \times W}$.
+- **Label 2 (Tampered / Inpainted)**: Ground truth mask binarized to $\{0.0, 1.0\}$.
 - **Dynamic 2-Column Inferencing**: In 2-column image/mask datasets where explicit labels are omitted:
 
 $$
@@ -903,36 +943,56 @@ sid-train --config configs/experiments/diffusion_diff_minimized/diffusion_diff_m
 
 ## Installation
 
-Install in editable mode using `pip` or `uv`:
+Install in editable mode using `uv` (recommended) or `pip`:
 
 ```bash
 # Clone and enter directory
 cd /workspace
 
-# Install package and all CLI commands (sid-train, sid-eval, sid-cross-eval, sid-predict, sid-illu, sid-check-8bit, sid-push, sid-pull, sid-checkpoint)
-pip install -e .
+# 1. Base installation (includes parquet-dataset-loader from GitHub automatically)
+uv pip install -e .
 
-# Or with debug diagnostics dependencies (nn-toolbox):
-pip install -e ".[debug]"
+# 2. Diffusion models & forensics extra (diffusers, accelerate):
+uv pip install -e ".[diffusion-diff]"
 
-# Or with 8-bit training dependencies (bitsandbytes):
-pip install -e ".[8bit]"
+# 3. SAM3 Distilled Student model extra (sam3-distil from GitHub, timm, peft, bitsandbytes):
+uv pip install -e ".[sam3-distil]"
 
-# Or with all optional features:
-pip install -e ".[all]"
+# 4. Debug & Learnability diagnostics extra (nn-toolbox from GitHub):
+uv pip install -e ".[debug]"
 
+# 5. 8-bit quantized training dependencies (bitsandbytes):
+uv pip install -e ".[8bit]"
+
+# 6. All optional dependencies combined:
+uv pip install -e ".[all]"
+
+# 7. Development and testing suite:
+uv pip install -e ".[dev]"
+```
+
+### Automatic Git Installation Links
+The package uses standard [PEP 508](https://peps.python.org/pep-0508/) direct URL specifications and `[tool.uv.sources]` in `pyproject.toml` to automatically fetch, build, and install companion repositories directly from GitHub:
+- [**`parquet-dataset-loader`**](https://github.com/khangtruong-ui/parquet-dataset-loader): Automatically installed with base `dependencies` (`git+https://github.com/khangtruong-ui/parquet-dataset-loader.git`).
+- [**`nn-toolbox`**](https://github.com/khangtruong-ui/nn-toolbox): Automatically installed when installing `.[debug]` or `.[all]` (`git+https://github.com/khangtruong-ui/nn-toolbox.git`).
+- [**`sam3-distil`**](https://github.com/khangtruong-ui/sam3-distil): Automatically installed when installing `.[sam3-distil]` or `.[all]` (`git+https://github.com/khangtruong-ui/sam3-distil.git`).
+
+### Installation Extras Reference
+| Extra Target | Install Command | Included Dependencies & Sources |
+|---|---|---|
+| **Base** | `uv pip install -e .` | PyTorch, torchvision, pyarrow, datasets, `parquet-dataset-loader @ git+https://github.com/khangtruong-ui/parquet-dataset-loader.git` |
+| **`diffusion-diff`** | `uv pip install -e ".[diffusion-diff]"` | `diffusers>=0.25.0`, `accelerate>=0.25.0` (for `diffusion_diff`, `diffusion_diff_v2`, `diffusion_diff_minimized`) |
+| **`sam3-distil`** | `uv pip install -e ".[sam3-distil]"` | `sam3-distil @ git+https://github.com/khangtruong-ui/sam3-distil.git`, `timm>=1.0.17`, `peft>=0.7.0`, `bitsandbytes>=0.41.0` |
+| **`debug`** | `uv pip install -e ".[debug]"` | `nn-toolbox @ git+https://github.com/khangtruong-ui/nn-toolbox.git` (runtime learnability diagnostics) |
+| **`8bit`** | `uv pip install -e ".[8bit]"` | `bitsandbytes>=0.41.0` (8-bit AdamW optimizer & NF4 quantization) |
+| **`all`** | `uv pip install -e ".[all]"` | All above packages and extras combined into a single environment |
+| **`dev`** | `uv pip install -e ".[dev]"` | `pytest>=7.0.0`, `pytest-cov>=4.0.0` for full offline test execution |
+
+```bash
 # Run automated 8-bit hardware and library compatibility check:
 sid-check-8bit
 # or via training CLI:
 python -m sid_unet.train --check-8bit
-
-# Or using uv (compatible with torch>=2.5.0, preserving your existing PyTorch installation):
-uv pip install -e .
-
-# With development and testing dependencies:
-pip install -e ".[dev]"
-# or:
-uv pip install -e ".[dev]"
 ```
 
 ---
@@ -1016,10 +1076,17 @@ The configuration file is divided into modular top-level sections:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `dataset_name` | `str` | `"KhangTruong/IMD2020"` | Hugging Face dataset identifier or local path. |
-| `streaming` | `bool` | `false` | When `true`, streams samples on-the-fly without downloading entire datasets to disk. |
+| `streaming` | `bool` | `false` | When `true`, streams samples on-the-fly; when `false`, runs in indexable map-style mode. |
+| `use_parquet_loader` | `bool` | `true` | When `true`, uses `parquet-dataset-loader` for instant (~0.4s) non-blocking index streaming via HTTP Range requests with $O(\log M)$ random access. Falls back to Hugging Face if unavailable. |
+| `save_to_disk` | `bool` / `str` | `false` | If `true` or a directory path, progressively saves streamed row groups to disk in the background while training runs unblocked. |
+| `background_download` | `bool` | `false` | If `true` with `save_to_disk`, downloads remaining row groups in an asynchronous background thread ahead of foreground training. |
+| `columns` | `list[str]` / `null` | `null` | Column projection list (e.g. `["image", "mask"]`). Only these columns are transferred over the network, dramatically saving bandwidth and memory. |
+| `token` | `str` / `bool` / `null` | `null` | Hugging Face authentication token, or `true` to use stored credentials for private/gated datasets. |
+| `cache_dir` | `str` / `null` | `null` | Local directory for caching metadata indices and row groups (defaults to `~/.cache/parquet_dataset_loader`). |
+| `max_cached_row_groups` | `int` | `2` | Number of decoded row groups kept in the thread-safe LRU memory cache (keeps RAM strictly bounded at ~100–200 MB). |
 | `image_size` | `[H, W]` | `[256, 256]` | Target input image resolution `[height, width]` passed to model. |
 | `batch_size` | `int` | `16` | Micro-batch size per forward/backward pass. |
-| `num_workers` | `int` | `2` | DataLoader worker processes for multi-process sample prefetching. |
+| `num_workers` | `int` | `2` | DataLoader worker processes for multi-process sample prefetching (`-1` for all CPU cores). |
 | `pin_memory` | `bool` | `true` | Pins CPU memory pages to accelerate host-to-GPU data transfers. |
 | `shuffle_buffer_size` | `int` | `1000` | Sample buffer size for pseudo-random shuffling when `streaming: true`. |
 | `train_split` | `str` | `"train"` | Dataset split name for training. |
@@ -1338,6 +1405,22 @@ model:
 training:
   learning_rate: 0.0003
   amp: true
+```
+
+#### 8. Non-Blocking Parquet Dataset Configuration Example
+```yaml
+data:
+  dataset_name: "KhangTruong/IMD2020"            # Hugging Face Parquet dataset repository or local directory
+  streaming: false                               # false: Indexable MapDataset; true: Streaming IterableDataset
+  use_parquet_loader: true                       # Non-blocking index streaming via parquet-dataset-loader (default: true)
+  save_to_disk: false                            # Save fetched row groups to disk in the background (default: false)
+  background_download: false                     # Pre-fetch remaining row groups in background thread (default: false)
+  columns: ["image", "mask"]                     # Column projection: downloads only image and mask (saves 90%+ bandwidth)
+  token: null                                    # HF access token or true to use stored auth
+  batch_size: 16
+  num_workers: 4                                 # Multi-process DataLoader (compatible with spawn multiprocessing)
+  pin_memory: true
+  image_size: [256, 256]
 ```
 
 ---
