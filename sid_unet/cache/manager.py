@@ -646,17 +646,39 @@ class DatasetCacheManager:
 
     def _save_metadata(self, all_shards: Dict[str, List[str]], status: str = "in_progress") -> None:
         """Write cache_info.json and README.md dataset card."""
+        meta_path = os.path.join(self.output_dir, "cache_info.json")
+        splits_dict: Dict[str, int] = {}
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    old_data = json.load(f)
+                    if isinstance(old_data, dict):
+                        splits_dict.update(old_data.get("splits", {}))
+            except Exception:
+                pass
+
+        # Update with newly provided shards
+        for s, files in all_shards.items():
+            if files:
+                splits_dict[s] = len(files)
+
+        # Retain counts for common splits if already present on remote repo or disk
+        for known_s in ["train", "validation"]:
+            if known_s not in splits_dict:
+                existing = self._detect_existing_shards(known_s)
+                if existing:
+                    splits_dict[known_s] = len(existing)
+
         info = {
             "source_dataset": self.source_dataset_name,
             "extractor": self.extractor.get_metadata(),
             "image_size": list(self.image_size),
             "latent_size": [self.image_size[0] // 8, self.image_size[1] // 8],
             "total_channels": self.extractor.total_channels,
-            "splits": {s: len(files) for s, files in all_shards.items()},
+            "splits": splits_dict,
             "status": status,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        meta_path = os.path.join(self.output_dir, "cache_info.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(info, f, indent=2)
 
