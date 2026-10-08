@@ -1721,6 +1721,15 @@ sid-train \
   --cached-hf-repo datasets/COCO-inpainted-cache
 ```
 
+#### C. Memory-Bounded Pipeline & Auto-Batch Probing Safeguards
+
+- **Memory-Bounded Streaming (`CachedStreamingDataset` & `BackgroundPrefetcher`)**:
+  When `data.streaming: true` (default for cached configs), shards are read sequentially and prefetched asynchronously via a lightweight single-threaded background queue (`BackgroundPrefetcher`). Only the active Parquet shard table (~330 MB) is retained in memory, preventing system RAM / cgroup OOM crashes while maintaining extreme GPU throughput (>500 samples/sec).
+- **Bounded LRU Table Cache (`CachedTensorDataset`)**:
+  For non-streaming/map-style workloads (`data.streaming: false`), `CachedTensorDataset` manages an `OrderedDict` LRU table cache (`max_cached_tables=2` by default) with worker multiprocessing capped to safe limits using `spawn` context to prevent PyArrow multithreaded fork deadlocks.
+- **Cross-Resolution Auto-Batch Probing**:
+  The memory probe (`find_optimal_batch_size`) supports multi-resolution models by reconciling input latent dimensions ($Z \in \mathbb{R}^{C \times H/8 \times W/8}$) with decoded ground-truth mask targets ($Y \in \mathbb{R}^{1 \times H \times W}$), preventing loss function shape mismatch warnings and enabling reliable automatic batch size scaling.
+
 ---
 
 ## Loss Functions & Metrics

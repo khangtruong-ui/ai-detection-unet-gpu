@@ -1136,7 +1136,10 @@ class SIDMapDataset(Dataset):
                 pass
 
 
-def resolve_num_workers(num_workers_cfg: Optional[Union[int, str]] = None) -> int:
+def resolve_num_workers(
+    num_workers_cfg: Optional[Union[int, str]] = None,
+    max_workers: Optional[int] = None,
+) -> int:
     """Resolve number of dataloader workers. -1 or negative defaults to number of CPU cores."""
     if num_workers_cfg is None:
         val = -1
@@ -1148,9 +1151,12 @@ def resolve_num_workers(num_workers_cfg: Optional[Union[int, str]] = None) -> in
 
     if val < 0:
         try:
-            return max(1, len(os.sched_getaffinity(0)))
+            cores = max(1, len(os.sched_getaffinity(0)))
         except (AttributeError, NotImplementedError, OSError):
-            return max(1, os.cpu_count() or 1)
+            cores = max(1, os.cpu_count() or 1)
+        if max_workers is not None and max_workers > 0:
+            return min(cores, max_workers)
+        return cores
     return val
 
 
@@ -1428,27 +1434,30 @@ def create_cached_dataloaders(
 ) -> Union[Tuple[DataLoader, DataLoader], Tuple[DataLoader, DataLoader, DataLoader]]:
     """
     Build DataLoaders from cached high-dimensional forensics representations.
+    Supports streaming mode (CachedStreamingDataset + BackgroundPrefetcher) and
+    map-style mode (CachedTensorDataset with bounded LRU caching).
     """
-    from sid_unet.cache.dataset import CachedTensorDataset, SpatialJointTransform
+    from sid_unet.cache.dataset import CachedTensorDataset, CachedStreamingDataset, SpatialJointTransform
 
     batch_size = resolve_batch_size(config)
-    num_workers = resolve_num_workers(config.data.get("num_workers", -1))
+    streaming = bool(config.data.get("streaming", False))
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
     token = config.data.get("token", None)
+    seed = int(config.project.get("seed", 42))
 
     train_split = config.data.get("train_split", "train")
     val_split = config.data.get("val_split", "validation")
     test_split = config.data.get("test_split", val_split)
 
-    train_samples_cfg = config.data.get("train_samples_per_epoch", 2000)
+    train_samples_cfg = config.data.get("train_samples_per_epoch", -1)
     train_max_samples = resolve_sample_limit(
-        samples_val=train_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=2000
+        samples_val=train_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=None
     )
 
-    val_samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", 400))
+    val_samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", -1))
     val_max_samples = resolve_sample_limit(
-        samples_val=val_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=400
+        samples_val=val_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=None
     )
 
     aug_cfg = config.data.get("augmentations", {})
@@ -1477,12 +1486,82 @@ def create_cached_dataloaders(
             split=val_split, image_size=image_size, channels=expected_channels, num_samples=8
         )
 
+    if streaming:
+        shuffle_buffer = int(config.data.get("shuffle_buffer_size", 32))
+        train_dataset = CachedStreamingDataset(
+            parquet_files=train_files,
+            transform=train_transform,
+            target_image_size=image_size,
+            expected_channels=expected_channels,
+            max_samples=train_max_samples,
+            shuffle=True,
+            shuffle_buffer_size=shuffle_buffer,
+            seed=seed,
+        )
+        val_dataset = CachedStreamingDataset(
+            parquet_files=val_files,
+            transform=None,
+            target_image_size=image_size,
+            expected_channels=expected_channels,
+            max_samples=val_max_samples,
+            shuffle=False,
+            seed=seed,
+        )
+
+        train_prefetch = max(48, int(config.data.get("prefetch_batches", 48)))
+        val_prefetch = max(16, train_prefetch // 2)
+
+        raw_train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
+        )
+        raw_val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
+        )
+        train_loader = BackgroundPrefetcher(raw_train_loader, maxsize=train_prefetch)
+        val_loader = BackgroundPrefetcher(raw_val_loader, maxsize=val_prefetch)
+
+        if include_test:
+            test_files = resolve_cached_parquet_files(cached_repo, split=test_split, token=token) or val_files
+            test_dataset = CachedStreamingDataset(
+                parquet_files=test_files,
+                transform=None,
+                target_image_size=image_size,
+                expected_channels=expected_channels,
+                shuffle=False,
+                seed=seed,
+            )
+            raw_test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                num_workers=0,
+                pin_memory=pin_memory,
+                worker_init_fn=worker_init_fn,
+            )
+            test_loader = BackgroundPrefetcher(raw_test_loader, maxsize=val_prefetch)
+            return train_loader, val_loader, test_loader
+        return train_loader, val_loader
+
+    # Map-style (non-streaming) loader with memory-bounded LRU cache and safe worker count
+    raw_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=4)
+    max_cached_workers = int(config.data.get("max_cached_workers", 4))
+    num_workers = min(max(0, raw_workers), max_cached_workers)
+    mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
+
     train_dataset = CachedTensorDataset(
         parquet_files=train_files,
         transform=train_transform,
         target_image_size=image_size,
         expected_channels=expected_channels,
         max_samples=train_max_samples,
+        max_cached_tables=int(config.data.get("max_cached_tables", 2)),
     )
     val_dataset = CachedTensorDataset(
         parquet_files=val_files,
@@ -1490,23 +1569,28 @@ def create_cached_dataloaders(
         target_image_size=image_size,
         expected_channels=expected_channels,
         max_samples=val_max_samples,
+        max_cached_tables=int(config.data.get("max_cached_tables", 2)),
     )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=max(0, num_workers),
+        num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        multiprocessing_context=mp_context,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=max(0, num_workers),
+        num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        multiprocessing_context=mp_context,
+        worker_init_fn=worker_init_fn,
     )
 
     if include_test:
@@ -1516,13 +1600,16 @@ def create_cached_dataloaders(
             transform=None,
             target_image_size=image_size,
             expected_channels=expected_channels,
+            max_cached_tables=int(config.data.get("max_cached_tables", 2)),
         )
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=max(0, num_workers),
+            num_workers=num_workers,
             pin_memory=pin_memory,
+            multiprocessing_context=mp_context,
+            worker_init_fn=worker_init_fn,
         )
         return train_loader, val_loader, test_loader
 

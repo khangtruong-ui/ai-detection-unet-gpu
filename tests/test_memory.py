@@ -149,6 +149,35 @@ def test_find_optimal_batch_size():
     assert optimal_bs >= 1
 
 
+def test_find_optimal_batch_size_latent_with_mask_shape():
+    """Verify that find_optimal_batch_size reconciles differing input and mask spatial resolutions."""
+    class MockLatentModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(84, 1, kernel_size=1)
+            self.aux_classifier = False
+
+        def forward(self, x):
+            # Input is (B, 84, 32, 32), output is upsampled to (B, 1, 256, 256)
+            feat = self.conv(x)
+            return nn.functional.interpolate(feat, size=(256, 256), mode="bilinear")
+
+    model = MockLatentModel()
+    from sid_unet.losses.combined import CombinedMaskLoss
+    loss_fn = CombinedMaskLoss()
+
+    optimal_bs = find_optimal_batch_size(
+        model=model,
+        loss_fn=loss_fn,
+        sample_shape=(84, 32, 32),
+        mask_shape=(256, 256),
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        min_batch_size=1,
+    )
+    assert optimal_bs >= 1
+
+
 def test_gradient_checkpointing_forward_backward():
     model = UNet(
         features=[16, 32],

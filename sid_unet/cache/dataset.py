@@ -138,10 +138,13 @@ def decode_mask_tensor(
     raise TypeError(f"Unsupported mask format: {type(raw_mask)}")
 
 
+from collections import OrderedDict
+
+
 class CachedTensorDataset(Dataset):
     """
     Map-style PyTorch Dataset for loading high-dimensional forensics cached tensors.
-    Reads from local Parquet files with fast in-memory indexing.
+    Reads from local Parquet files with fast in-memory indexing and bounded LRU caching.
     """
 
     def __init__(
@@ -151,12 +154,14 @@ class CachedTensorDataset(Dataset):
         target_image_size: Tuple[int, int] = (256, 256),
         expected_channels: int = 84,
         max_samples: Optional[int] = None,
+        max_cached_tables: int = 2,
     ):
         self.parquet_files = [str(f) for f in parquet_files if os.path.exists(str(f))]
         self.transform = transform
         self.target_image_size = target_image_size
         self.expected_channels = expected_channels
         self.max_samples = max_samples
+        self.max_cached_tables = max(1, int(max_cached_tables))
 
         if not self.parquet_files:
             raise FileNotFoundError(f"No valid Parquet files found in: {parquet_files}")
@@ -182,19 +187,23 @@ class CachedTensorDataset(Dataset):
             if self.max_samples is not None and total_rows >= self.max_samples:
                 break
 
-        # Fast table cache per file
-        self._cached_tables: Dict[str, pa.Table] = {}
+        # Bounded LRU table cache per worker process to prevent memory exhaustion
+        self._cached_tables: OrderedDict[str, pa.Table] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._index)
 
     def _get_row(self, idx: int) -> Dict[str, Any]:
         file_path, _, row_in_file = self._index[idx]
-        if file_path not in self._cached_tables:
-            # Cache table in memory for fast random access
-            self._cached_tables[file_path] = pq.read_table(file_path)
+        if file_path in self._cached_tables:
+            table = self._cached_tables[file_path]
+            self._cached_tables.move_to_end(file_path)
+        else:
+            table = pq.read_table(file_path)
+            self._cached_tables[file_path] = table
+            while len(self._cached_tables) > self.max_cached_tables:
+                self._cached_tables.popitem(last=False)
 
-        table = self._cached_tables[file_path]
         row_dict = {
             col: table[col][row_in_file].as_py()
             for col in table.column_names
@@ -233,6 +242,7 @@ class CachedStreamingDataset(IterableDataset):
     """
     Streaming IterableDataset for loading cached Parquet shards without loading
     the full dataset into memory.
+    Supports multi-worker DataLoaders, DDP sharding, shuffle buffers, and length reporting.
     """
 
     def __init__(
@@ -243,28 +253,68 @@ class CachedStreamingDataset(IterableDataset):
         expected_channels: int = 84,
         max_samples: Optional[int] = None,
         shuffle: bool = False,
+        shuffle_buffer_size: int = 0,
+        seed: int = 42,
     ):
-        self.parquet_files = list(parquet_files)
+        self.parquet_files = [str(f) for f in parquet_files if os.path.exists(str(f))]
         self.transform = transform
         self.target_image_size = target_image_size
         self.expected_channels = expected_channels
         self.max_samples = max_samples
         self.shuffle = shuffle
+        self.shuffle_buffer_size = max(0, int(shuffle_buffer_size))
+        self.seed = int(seed)
+
+        self._total_rows = 0
+        for f in self.parquet_files:
+            try:
+                meta = pq.read_metadata(f)
+                self._total_rows += meta.num_rows
+            except Exception:
+                pass
+
+    def __len__(self) -> int:
+        if self.max_samples is not None and self.max_samples > 0:
+            return min(self._total_rows, self.max_samples)
+        return self._total_rows
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
+        from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_rank, get_world_size
+
+        is_dist = is_dist_avail_and_initialized()
+        rank = get_rank() if is_dist else 0
+        world_size = get_world_size() if is_dist else 1
+
+        worker_info = torch.utils.data.get_worker_info()
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        global_worker_id = rank * num_workers + worker_id
+        total_global_workers = world_size * num_workers
+
         files = list(self.parquet_files)
         if self.shuffle:
-            random.shuffle(files)
+            rng = random.Random(self.seed + global_worker_id)
+            rng.shuffle(files)
+        else:
+            rng = random.Random(self.seed)
+
+        if total_global_workers > 1:
+            assigned_files = [f for idx, f in enumerate(files) if idx % total_global_workers == global_worker_id]
+        else:
+            assigned_files = files
 
         count = 0
-        for f in files:
+        buffer: List[Dict[str, Any]] = []
+
+        for f in assigned_files:
             if not os.path.exists(f):
                 continue
             table = pq.read_table(f)
             num_rows = table.num_rows
             row_indices = list(range(num_rows))
             if self.shuffle:
-                random.shuffle(row_indices)
+                rng.shuffle(row_indices)
 
             for row_idx in row_indices:
                 z_raw = table["z_high_dim"][row_idx].as_py()
@@ -281,7 +331,7 @@ class CachedStreamingDataset(IterableDataset):
                 if self.transform is not None:
                     z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
 
-                yield {
+                sample = {
                     "image": z_tensor,
                     "mask": mask_tensor,
                     "label": torch.tensor(label_val, dtype=torch.long),
@@ -289,6 +339,25 @@ class CachedStreamingDataset(IterableDataset):
                     "is_cached": True,
                 }
 
+                if self.shuffle_buffer_size > 1:
+                    buffer.append(sample)
+                    if len(buffer) >= self.shuffle_buffer_size:
+                        pop_idx = rng.randint(0, len(buffer) - 1)
+                        yield buffer.pop(pop_idx)
+                        count += 1
+                        if self.max_samples is not None and count >= self.max_samples:
+                            return
+                else:
+                    yield sample
+                    count += 1
+                    if self.max_samples is not None and count >= self.max_samples:
+                        return
+
+        if buffer:
+            if self.shuffle:
+                rng.shuffle(buffer)
+            for sample in buffer:
+                yield sample
                 count += 1
                 if self.max_samples is not None and count >= self.max_samples:
                     return

@@ -197,6 +197,7 @@ def find_optimal_batch_size(
     aux_classifier: bool = True,
     num_classes: int = 3,
     logger: Optional[Any] = None,
+    mask_shape: Optional[Tuple[int, int]] = None,
 ) -> int:
     """
     Automatically probe and determine the largest safe batch size that fits in memory
@@ -244,6 +245,7 @@ def find_optimal_batch_size(
 
     c, h, w = sample_shape
     safe_bs = min_batch_size
+    mask_h, mask_w = mask_shape if mask_shape is not None else (h, w)
 
     try:
         for bs in candidates:
@@ -251,13 +253,23 @@ def find_optimal_batch_size(
             try:
                 # Generate dummy batch
                 images = torch.randn(bs, c, h, w, device=device)
-                masks = torch.zeros(bs, 1, h, w, device=device)
+                masks = torch.zeros(bs, 1, mask_h, mask_w, device=device)
                 labels = torch.randint(0, num_classes, (bs,), device=device) if aux_classifier else None
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
                     outputs = model(images)
+                    # Dynamically reconcile mask spatial dimensions if model outputs a different size
+                    pred_tensor = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+                    if (
+                        pred_tensor is not None
+                        and hasattr(pred_tensor, "shape")
+                        and pred_tensor.dim() >= 4
+                        and pred_tensor.shape[-2:] != masks.shape[-2:]
+                    ):
+                        masks = torch.zeros(bs, 1, pred_tensor.shape[-2], pred_tensor.shape[-1], device=device)
+
                     if loss_fn is not None:
                         loss, _ = loss_fn(outputs, masks, labels)
                     else:

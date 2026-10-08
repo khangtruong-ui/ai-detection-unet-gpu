@@ -792,6 +792,7 @@ class Trainer:
                         aux_classifier=getattr(self.raw_model, "aux_classifier", True),
                         num_classes=int(self.config.model.get("num_classes", 3)),
                         logger=self.logger,
+                        mask_shape=img_size,
                     )
                 else:
                     safe_bs = current_bs
@@ -808,6 +809,7 @@ class Trainer:
                     aux_classifier=getattr(self.raw_model, "aux_classifier", True),
                     num_classes=int(self.config.model.get("num_classes", 3)),
                     logger=self.logger,
+                    mask_shape=img_size,
                 )
 
             if safe_bs < current_bs:

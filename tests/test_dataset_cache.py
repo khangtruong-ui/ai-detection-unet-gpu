@@ -295,3 +295,60 @@ def test_async_hub_uploader_and_progressive_caching(dummy_minimized_model, temp_
     assert uploaded_calls[0][0] == "train/train-00000.parquet"
     assert "Add shard 00000" in uploaded_calls[0][1]
 
+
+def test_cached_streaming_dataset_and_prefetcher(temp_cache_dir):
+    """Test CachedStreamingDataset length reporting, shuffle buffer, and iteration."""
+    shard1 = _generate_mock_cached_parquet_shard(split="train", num_samples=8)[0]
+    shard2 = os.path.join(temp_cache_dir, "mock_train_00001.parquet")
+    import shutil
+    shutil.copyfile(shard1, shard2)
+
+    ds = CachedStreamingDataset(
+        parquet_files=[shard1, shard2],
+        target_image_size=(256, 256),
+        expected_channels=84,
+        shuffle=True,
+        shuffle_buffer_size=4,
+        max_samples=12,
+    )
+    assert len(ds) == 12
+
+    items = list(ds)
+    assert len(items) == 12
+    assert items[0]["image"].shape == (84, 32, 32)
+    assert items[0]["mask"].shape == (1, 256, 256)
+    assert items[0]["is_cached"] is True
+
+
+def test_create_cached_dataloaders_streaming_mode(temp_cache_dir):
+    """Test create_cached_dataloaders with streaming=True using BackgroundPrefetcher."""
+    train_shards = _generate_mock_cached_parquet_shard(split="train", num_samples=16)
+    val_shards = _generate_mock_cached_parquet_shard(split="validation", num_samples=8)
+
+    cfg = ConfigDict({
+        "project": {"seed": 42},
+        "data": {
+            "cached_hf_repo": os.path.dirname(train_shards[0]),
+            "streaming": True,
+            "image_size": [256, 256],
+            "batch_size": 4,
+            "num_workers": -1,
+            "pin_memory": False,
+            "train_samples_per_epoch": 8,
+            "val_samples_per_epoch": 4,
+            "prefetch_batches": 8,
+            "shuffle_buffer_size": 4,
+            "augmentations": {"horizontal_flip": 0.5},
+        },
+        "model": {"total_z_channels": 84},
+    })
+
+    train_loader, val_loader = create_dataloaders(cfg, include_test=False)
+    assert len(train_loader) == 2
+    batch = next(iter(train_loader))
+    assert batch["image"].shape == (4, 84, 32, 32)
+    assert batch["mask"].shape == (4, 1, 256, 256)
+    assert batch["label"].shape == (4,)
+    assert batch["is_cached"].all()
+
+
