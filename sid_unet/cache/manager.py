@@ -367,6 +367,65 @@ class DatasetCacheManager:
 
         return sorted(list(existing_names))
 
+    def _count_existing_samples(self, split: str, existing_shards: List[str]) -> int:
+        """
+        Count the actual number of samples across existing shards accurately.
+        Avoids false shard-multiplication assumptions when shards are partial or variable sized.
+        """
+        if not existing_shards:
+            return 0
+
+        # 1. First check local parquet shards if present
+        local_total = 0
+        all_local_found = True
+        split_dir = os.path.join(self.output_dir, split)
+        for s in existing_shards:
+            local_path = os.path.join(split_dir, s)
+            if os.path.exists(local_path):
+                try:
+                    local_total += pq.read_metadata(local_path).num_rows
+                except Exception:
+                    all_local_found = False
+                    break
+            else:
+                all_local_found = False
+                break
+
+        if all_local_found and local_total > 0:
+            return local_total
+
+        # 2. If shards are remote on Hugging Face Hub, query remote count via parquet-dataset-loader
+        if self.hf_repo_id:
+            try:
+                import parquet_dataset_loader as pdl
+                remote_ds = pdl.load_dataset(
+                    path=self.hf_repo_id,
+                    split=split,
+                    token=self.hf_token,
+                )
+                remote_len = len(remote_ds)
+                if remote_len > 0:
+                    return remote_len
+            except Exception as e:
+                logger.debug(f"Could not read remote dataset row count via pdl for '{self.hf_repo_id}/{split}': {e}")
+
+        # 3. Fallback: inspect individual local shards that exist
+        partial_total = 0
+        has_at_least_one = False
+        for s in existing_shards:
+            local_path = os.path.join(split_dir, s)
+            if os.path.exists(local_path):
+                try:
+                    partial_total += pq.read_metadata(local_path).num_rows
+                    has_at_least_one = True
+                except Exception:
+                    pass
+        if has_at_least_one:
+            return partial_total
+
+        # 4. Fallback estimation only if no metadata can be inspected
+        return len(existing_shards) * self.samples_per_shard
+
     def cache_split(
         self,
         split: str = "train",
@@ -398,7 +457,7 @@ class DatasetCacheManager:
 
         existing_shards = self._detect_existing_shards(split) if should_resume else []
         already_cached_shards = len(existing_shards)
-        already_cached_samples = already_cached_shards * self.samples_per_shard
+        already_cached_samples = self._count_existing_samples(split, existing_shards) if should_resume else 0
 
         shard_files: List[str] = [
             os.path.join(self.output_dir, split, f) for f in existing_shards
@@ -407,11 +466,11 @@ class DatasetCacheManager:
         if should_resume and already_cached_shards > 0:
             logger.info(
                 f"⏩ [RESUME] Found {already_cached_shards} existing shards for split '{split}' "
-                f"(~{already_cached_samples} samples). Resuming from shard index {already_cached_shards:05d}."
+                f"({already_cached_samples} actual samples). Resuming from shard index {already_cached_shards:05d}."
             )
             # If dataset is already completely processed, return early
             if total_dataset_len is not None and already_cached_samples >= total_dataset_len:
-                logger.info(f"✨ Split '{split}' is already fully cached ({already_cached_shards} shards). Skipping.")
+                logger.info(f"✨ Split '{split}' is already fully cached ({already_cached_shards} shards, {already_cached_samples} samples). Skipping.")
                 if hasattr(ds, "close"):
                     ds.close()
                 return shard_files

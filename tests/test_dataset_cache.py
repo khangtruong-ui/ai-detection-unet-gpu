@@ -352,3 +352,120 @@ def test_create_cached_dataloaders_streaming_mode(temp_cache_dir):
     assert batch["is_cached"].all()
 
 
+def test_cached_indexed_dataset_and_sharding():
+    """Test CachedIndexedDataset random access, length reporting, and DDP sharding."""
+    from sid_unet.cache.dataset import CachedIndexedDataset, SpatialJointTransform
+
+    class DummyPdlDataset:
+        def __init__(self, n=16, indices=None):
+            self.n = n
+            self.indices = indices if indices is not None else list(range(n))
+
+        def __len__(self):
+            return len(self.indices)
+
+        def __getitem__(self, idx):
+            real_idx = self.indices[idx]
+            z_t = np.random.randn(84, 32, 32).astype(np.float16).tobytes()
+            mask_img = Image.new("L", (256, 256), color=255)
+            buf = io.BytesIO()
+            mask_img.save(buf, format="PNG")
+            return {
+                "img_id": f"dummy_{real_idx}",
+                "label": real_idx % 3,
+                "z_high_dim": z_t,
+                "mask": buf.getvalue(),
+                "channels": 84,
+                "latent_h": 32,
+                "latent_w": 32,
+            }
+
+        def shard(self, num_shards, index, contiguous=False):
+            sharded_indices = [idx for i, idx in enumerate(self.indices) if i % num_shards == index]
+            return DummyPdlDataset(n=self.n, indices=sharded_indices)
+
+    raw_pdl = DummyPdlDataset(n=16)
+    tf = SpatialJointTransform()
+    cached_ds = CachedIndexedDataset(pdl_dataset=raw_pdl, transform=tf, expected_channels=84)
+
+    assert len(cached_ds) == 16
+    sample = cached_ds[0]
+    assert sample["image"].shape == (84, 32, 32)
+    assert sample["mask"].shape == (1, 256, 256)
+    assert sample["is_cached"] is True
+
+    # Shard across 4 workers
+    sharded = cached_ds.shard(num_shards=4, index=1)
+    assert len(sharded) == 4
+    sample_shard = sharded[0]
+    assert sample_shard["img_id"] == "dummy_1"
+
+
+def test_count_existing_samples_avoids_overestimating(dummy_minimized_model, temp_cache_dir):
+    """Test that _count_existing_samples counts actual rows and does not assume len*samples_per_shard."""
+    split_dir = os.path.join(temp_cache_dir, "validation")
+    os.makedirs(split_dir, exist_ok=True)
+
+    # Write 3 small shards of 64, 36, and 50 rows = total 150 rows
+    row_counts = [64, 36, 50]
+    shard_names = []
+    for i, rc in enumerate(row_counts):
+        s_name = f"validation-{i:05d}.parquet"
+        s_path = os.path.join(split_dir, s_name)
+        shard_names.append(s_name)
+
+        t = pa.Table.from_pydict({
+            "img_id": [f"val_{i}_{j}" for j in range(rc)],
+            "label": [j % 3 for j in range(rc)],
+            "z_high_dim": [b"\x00" * 10] * rc,
+            "mask": [b"\x00" * 10] * rc,
+            "channels": [84] * rc,
+            "latent_h": [32] * rc,
+            "latent_w": [32] * rc,
+        })
+        pq.write_table(t, s_path, compression="zstd")
+
+    manager = DatasetCacheManager(
+        model=dummy_minimized_model,
+        output_dir=temp_cache_dir,
+        samples_per_shard=2000,
+        push_to_hub=False,
+    )
+
+    actual_count = manager._count_existing_samples("validation", shard_names)
+    assert actual_count == 150, f"Expected 150 actual rows, got {actual_count}"
+    assert actual_count != 3 * 2000, "Should not multiply shard count by samples_per_shard!"
+
+
+def test_checkpoint_manager_non_blocking_hub_push(temp_cache_dir):
+    """Test CheckpointManager background ThreadPoolExecutor handles pushes non-blockingly."""
+    from sid_unet.training.callbacks import CheckpointManager
+
+    push_executed = False
+
+    def mock_push(*args, **kwargs):
+        nonlocal push_executed
+        push_executed = True
+        return {"status": "success"}
+
+    ckpt_manager = CheckpointManager(
+        checkpoint_dir=os.path.join(temp_cache_dir, "ckpts"),
+        push_to_hub=True,
+        hf_repo="KhangTruong/test-model",
+        verify_repo=False,
+    )
+
+    import sid_unet.checkpoint_sync
+    orig_push = sid_unet.checkpoint_sync.push_checkpoint
+    sid_unet.checkpoint_sync.push_checkpoint = mock_push
+    try:
+        fut = ckpt_manager.push_to_hf(epoch=1, step=10, saved_paths={"latest": "dummy.pt"})
+        assert fut is not None
+        ckpt_manager.wait_pending_pushes(timeout=5)
+        assert push_executed is True
+    finally:
+        sid_unet.checkpoint_sync.push_checkpoint = orig_push
+        ckpt_manager.close()
+
+
+

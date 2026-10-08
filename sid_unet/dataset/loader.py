@@ -1434,10 +1434,16 @@ def create_cached_dataloaders(
 ) -> Union[Tuple[DataLoader, DataLoader], Tuple[DataLoader, DataLoader, DataLoader]]:
     """
     Build DataLoaders from cached high-dimensional forensics representations.
-    Supports streaming mode (CachedStreamingDataset + BackgroundPrefetcher) and
-    map-style mode (CachedTensorDataset with bounded LRU caching).
+    Prefers parquet-dataset-loader for instant, non-blocking HTTP streaming with
+    DDP sharding and fork-safe multi-worker DataLoaders.
+    Falls back to local shard resolution (CachedStreamingDataset / CachedTensorDataset).
     """
-    from sid_unet.cache.dataset import CachedTensorDataset, CachedStreamingDataset, SpatialJointTransform
+    from sid_unet.cache.dataset import (
+        CachedTensorDataset,
+        CachedStreamingDataset,
+        CachedIndexedDataset,
+        SpatialJointTransform,
+    )
 
     batch_size = resolve_batch_size(config)
     streaming = bool(config.data.get("streaming", False))
@@ -1467,10 +1473,133 @@ def create_cached_dataloaders(
         random_rotate90=aug_cfg.get("random_rotate90", 0.25),
     )
 
+    expected_channels = int(config.model.get("total_z_channels", 84))
+    use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
+    save_to_disk = config.data.get("save_to_disk", False)
+    background_download = bool(config.data.get("background_download", False))
+    pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
+    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 2))
+
+    # 1. High-performance non-blocking path via parquet-dataset-loader
+    if use_parquet_loader and _HAS_PARQUET_LOADER and pdl is not None:
+        try:
+            logger.info(
+                f"⚡ Loading cached dataset '{cached_repo}' via parquet-dataset-loader (streaming={streaming}, save_to_disk={save_to_disk})..."
+            )
+            train_pdl, resolved_train_split = load_parquet_dataset(
+                dataset_name=cached_repo,
+                requested_split=train_split,
+                streaming=streaming,
+                save_to_disk=save_to_disk,
+                background_download=background_download,
+                token=token,
+                cache_dir=pdl_cache_dir,
+                max_cached_row_groups=max_cached_row_groups,
+            )
+            val_pdl, resolved_val_split = load_parquet_dataset(
+                dataset_name=cached_repo,
+                requested_split=val_split,
+                streaming=streaming,
+                save_to_disk=save_to_disk,
+                background_download=background_download,
+                token=token,
+                cache_dir=pdl_cache_dir,
+                max_cached_row_groups=max_cached_row_groups,
+            )
+
+            train_dataset = CachedIndexedDataset(
+                pdl_dataset=train_pdl,
+                transform=train_transform,
+                target_image_size=image_size,
+                expected_channels=expected_channels,
+                max_samples=train_max_samples,
+            )
+            val_dataset = CachedIndexedDataset(
+                pdl_dataset=val_pdl,
+                transform=None,
+                target_image_size=image_size,
+                expected_channels=expected_channels,
+                max_samples=val_max_samples,
+            )
+
+            if is_dist_avail_and_initialized():
+                world_size = get_world_size()
+                rank = get_rank()
+                train_dataset = train_dataset.shard(num_shards=world_size, index=rank)
+                val_dataset = val_dataset.shard(num_shards=world_size, index=rank)
+                logger.info(
+                    f"⚡ Sharded cached dataset for DDP rank {rank}/{world_size}: "
+                    f"Train samples = {len(train_dataset)}, Val samples = {len(val_dataset)}"
+                )
+
+            raw_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=4)
+            max_cached_workers = int(config.data.get("max_cached_workers", 4))
+            num_workers = min(max(0, raw_workers), max_cached_workers)
+            mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
+
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                drop_last=False,
+                multiprocessing_context=mp_context,
+                worker_init_fn=worker_init_fn,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                drop_last=False,
+                multiprocessing_context=mp_context,
+                worker_init_fn=worker_init_fn,
+            )
+
+            if include_test:
+                test_pdl, _ = load_parquet_dataset(
+                    dataset_name=cached_repo,
+                    requested_split=test_split,
+                    streaming=streaming,
+                    save_to_disk=save_to_disk,
+                    background_download=background_download,
+                    token=token,
+                    cache_dir=pdl_cache_dir,
+                    max_cached_row_groups=max_cached_row_groups,
+                )
+                test_dataset = CachedIndexedDataset(
+                    pdl_dataset=test_pdl,
+                    transform=None,
+                    target_image_size=image_size,
+                    expected_channels=expected_channels,
+                )
+                if is_dist_avail_and_initialized():
+                    test_dataset = test_dataset.shard(num_shards=get_world_size(), index=get_rank())
+                test_loader = DataLoader(
+                    test_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    drop_last=False,
+                    multiprocessing_context=mp_context,
+                    worker_init_fn=worker_init_fn,
+                )
+                return train_loader, val_loader, test_loader
+
+            return train_loader, val_loader
+
+        except Exception as pdl_err:
+            logger.warning(
+                f"⚠️ parquet-dataset-loader direct cached access encountered warning ({type(pdl_err).__name__}: {pdl_err}). "
+                "Falling back to resolve_cached_parquet_files..."
+            )
+
+    # 2. Fallback path via resolve_cached_parquet_files
     train_files = resolve_cached_parquet_files(cached_repo, split=train_split, token=token)
     val_files = resolve_cached_parquet_files(cached_repo, split=val_split, token=token)
-
-    expected_channels = int(config.model.get("total_z_channels", 84))
 
     # Fallback to mock shard if repo has no parquet files
     if not train_files:
@@ -1572,10 +1701,31 @@ def create_cached_dataloaders(
         max_cached_tables=int(config.data.get("max_cached_tables", 2)),
     )
 
+    train_sampler = None
+    val_sampler = None
+    if is_dist_avail_and_initialized():
+        world_size = get_world_size()
+        rank = get_rank()
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+        )
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=seed,
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
@@ -1585,6 +1735,7 @@ def create_cached_dataloaders(
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
+        sampler=val_sampler,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -1602,9 +1753,19 @@ def create_cached_dataloaders(
             expected_channels=expected_channels,
             max_cached_tables=int(config.data.get("max_cached_tables", 2)),
         )
+        test_sampler = None
+        if is_dist_avail_and_initialized():
+            test_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_dataset,
+                num_replicas=get_world_size(),
+                rank=get_rank(),
+                shuffle=False,
+                seed=seed,
+            )
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
+            sampler=test_sampler,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,

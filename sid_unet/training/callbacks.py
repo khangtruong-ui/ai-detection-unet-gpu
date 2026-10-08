@@ -4,6 +4,7 @@ Callbacks for training: checkpoint management and early stopping.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import time
@@ -215,6 +216,14 @@ class CheckpointManager:
         self.best_epoch = -1
         self.last_loaded_checkpoint_info: Dict[str, Any] = {}
 
+        # Non-blocking asynchronous background executor for Hugging Face uploads
+        self._hub_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._pending_push_futures: List[concurrent.futures.Future] = []
+        if self.push_to_hub:
+            self._hub_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="hf-ckpt-uploader"
+            )
+
         if not self.push_to_hub:
             warning_msg = (
                 "⚠️ [HF CHECKPOINT] Hugging Face model checkpointing is not enabled. "
@@ -236,7 +245,6 @@ class CheckpointManager:
                 from sid_unet.checkpoint_sync import verify_hf_repo_checkpointable
                 verify_hf_repo_checkpointable(self.hf_repo, token=self.hf_token, create_if_missing=True)
 
-
     def is_better(self, score: float) -> bool:
         if self.mode == "max":
             return score > self.best_score
@@ -249,7 +257,8 @@ class CheckpointManager:
             if step > 0 and (step - self.last_periodic_step) >= self.checkpoint_steps:
                 return True
         if self.checkpoint_period is not None and self.checkpoint_period > 0:
-            if (now - self.last_periodic_save_time) >= self.checkpoint_period:
+            effective_period = max(60.0, float(self.checkpoint_period))
+            if (now - self.last_periodic_save_time) >= effective_period:
                 return True
         return False
 
@@ -266,7 +275,7 @@ class CheckpointManager:
         history: Optional[List[Dict[str, Any]]] = None,
         hard_mining: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
-        """Save a periodic checkpoint based on elapsed time or step count."""
+        """Save a periodic checkpoint to local disk based on elapsed time or step count (local only, non-blocking)."""
         self.last_periodic_save_time = time.time()
         if step is not None:
             self.last_periodic_step = step
@@ -299,12 +308,8 @@ class CheckpointManager:
         latest_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml")
         save_config(cfg_dict, latest_cfg_path)
 
-        saved = {"periodic": periodic_path, "latest": latest_path}
-
-        if self.push_to_hub and self.hf_repo:
-            self.push_to_hf(epoch=epoch, step=step, saved_paths=saved, is_periodic=True)
-
-        return saved
+        # Periodic saves are strictly local snapshots; never push to Hub during training steps
+        return {"periodic": periodic_path, "latest": latest_path}
 
     def push_to_hf(
         self,
@@ -314,7 +319,7 @@ class CheckpointManager:
         is_best: bool = False,
         is_periodic: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Push newly saved checkpoints to the Hugging Face model repository."""
+        """Push newly saved checkpoints to the Hugging Face model repository asynchronously without blocking training."""
         if not self.push_to_hub or not self.hf_repo:
             return None
 
@@ -326,29 +331,66 @@ class CheckpointManager:
         except Exception:
             pass
 
+        def _do_push():
+            try:
+                from sid_unet.checkpoint_sync import push_checkpoint
+                source_dir = (
+                    os.path.dirname(self.checkpoint_dir)
+                    if os.path.basename(self.checkpoint_dir) == "checkpoints"
+                    else self.checkpoint_dir
+                )
+                tag_label = "best" if is_best else ("periodic" if is_periodic else f"epoch_{epoch}")
+                msg = f"checkpoint: update {self.hf_repo} ({tag_label} at epoch {epoch}, step {step})"
+                logger.info(
+                    f"🚀 [Non-Blocking Hub Uploader] Pushing checkpoint ({tag_label}) to Hugging Face Hub '{self.hf_repo}' in background..."
+                )
+                result = push_checkpoint(
+                    repo=self.hf_repo,
+                    version=self.hf_version,
+                    source_dir=source_dir,
+                    checkpoint_name=None,
+                    message=msg,
+                    token=self.hf_token,
+                    set_latest=True,
+                    include_reports=False,
+                )
+                logger.info(
+                    f"✅ [Non-Blocking Hub Uploader] Checkpoint successfully uploaded to Hugging Face Hub '{self.hf_repo}'."
+                )
+                return result
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to push checkpoint to Hugging Face Hub '{self.hf_repo}': {e}")
+                return None
+
+        if self._hub_executor is None:
+            self._hub_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="hf-ckpt-uploader"
+            )
+
+        fut = self._hub_executor.submit(_do_push)
+        self._pending_push_futures.append(fut)
+        return {"status": "in_progress", "future": fut}
+
+    def wait_pending_pushes(self, timeout: Optional[float] = None) -> None:
+        """Wait for any in-flight non-blocking Hugging Face checkpoint uploads to complete."""
+        while self._pending_push_futures:
+            fut = self._pending_push_futures.pop(0)
+            try:
+                fut.result(timeout=timeout)
+            except Exception as e:
+                logger.warning(f"In-flight checkpoint upload encountered error: {e}")
+
+    def close(self) -> None:
+        """Drain in-flight uploads and clean up background worker thread."""
+        self.wait_pending_pushes(timeout=120)
+        if hasattr(self, "_hub_executor") and self._hub_executor is not None:
+            self._hub_executor.shutdown(wait=False)
+
+    def __del__(self) -> None:
         try:
-            from sid_unet.checkpoint_sync import push_checkpoint
-            source_dir = (
-                os.path.dirname(self.checkpoint_dir)
-                if os.path.basename(self.checkpoint_dir) == "checkpoints"
-                else self.checkpoint_dir
-            )
-            tag_label = "best" if is_best else ("periodic" if is_periodic else f"epoch_{epoch}")
-            msg = f"checkpoint: update {self.hf_repo} ({tag_label} at epoch {epoch}, step {step})"
-            result = push_checkpoint(
-                repo=self.hf_repo,
-                version=self.hf_version,
-                source_dir=source_dir,
-                checkpoint_name=None,
-                message=msg,
-                token=self.hf_token,
-                set_latest=True,
-                include_reports=False,
-            )
-            return result
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to push checkpoint to Hugging Face Hub '{self.hf_repo}': {e}")
-            return None
+            self.close()
+        except Exception:
+            pass
 
     def save(
         self,

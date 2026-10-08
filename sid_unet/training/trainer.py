@@ -516,17 +516,23 @@ class Trainer:
             latest_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
             if not os.path.exists(latest_path) or os.path.abspath(checkpoint_path) != os.path.abspath(latest_path):
                 try:
-                    self.ckpt_manager.save_periodic(
-                        epoch=self.start_epoch,
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        metrics={"resumed_from": str(checkpoint_path), "step": self.global_step},
-                        config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-                        step=self.global_step,
-                        scaler=self.scaler,
-                        history=self.history,
-                    )
+                    cfg_dict = self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config)
+                    model_to_save = getattr(self.model, "module", self.model)
+                    state = {
+                        "epoch": self.start_epoch,
+                        "step": self.global_step,
+                        "model_state_dict": model_to_save.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer is not None else None,
+                        "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
+                        "scaler_state_dict": self.scaler.state_dict() if (self.scaler is not None and hasattr(self.scaler, "state_dict")) else None,
+                        "metrics": {"resumed_from": str(checkpoint_path), "step": self.global_step},
+                        "best_score": self.ckpt_manager.best_score,
+                        "best_epoch": self.ckpt_manager.best_epoch,
+                        "history": self.history,
+                        "config": cfg_dict,
+                    }
+                    torch.save(state, latest_path)
+                    save_config(cfg_dict, os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml"))
                 except Exception as sync_err:
                     self.logger.warning(f"Could not write initial synced latest checkpoint: {sync_err}")
 
@@ -986,7 +992,7 @@ class Trainer:
                         self.optimizer.zero_grad()
                         has_pending_grads = False
 
-                    if self.is_main_process and self.ckpt_manager.should_save_periodic(step=self.global_step):
+                    if self.is_main_process and step_in_epoch > 1 and self.ckpt_manager.should_save_periodic(step=self.global_step):
                         p_paths = self.ckpt_manager.save_periodic(
                             epoch=epoch,
                             model=self.model,
@@ -1295,22 +1301,6 @@ class Trainer:
                     if "best" in saved_paths:
                         self.logger.info(f"⭐ New best model saved to {saved_paths['best']} (score: {self.ckpt_manager.best_score:.4f})")
 
-                    # Check periodic checkpointing
-                    if self.is_main_process and self.ckpt_manager.should_save_periodic(step=self.global_step):
-                        p_paths = self.ckpt_manager.save_periodic(
-                            epoch=epoch,
-                            model=self.model,
-                            optimizer=self.optimizer,
-                            scheduler=self.scheduler,
-                            metrics=val_summary,
-                            config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
-                            step=self.global_step,
-                            scaler=self.scaler,
-                            history=history,
-                            hard_mining=self.hard_miner.state_dict(),
-                        )
-                        self.logger.info(f"⏱️ Periodic checkpoint saved to {p_paths['periodic']} (Epoch {epoch})")
-
                     # Check early stopping
                     monitored_score = val_summary.get(self.ckpt_manager.metric_name, 0.0)
                     if self.early_stopping(monitored_score):
@@ -1410,6 +1400,8 @@ class Trainer:
 
         import gc
         gc.collect()
+        if hasattr(self.ckpt_manager, "wait_pending_pushes"):
+            self.ckpt_manager.wait_pending_pushes(timeout=120)
         if self.is_main_process and getattr(self.ckpt_manager, "push_to_hub", False) and getattr(self.ckpt_manager, "hf_repo", None):
             try:
                 from sid_unet.checkpoint_sync import push_checkpoint

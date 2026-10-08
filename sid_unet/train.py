@@ -690,6 +690,13 @@ def train_single_run(
 
 
 def main():
+    import signal
+    if hasattr(signal, "SIGHUP"):
+        try:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        except Exception:
+            pass
+
     args = parse_args()
 
     if getattr(args, "check_8bit", False):
@@ -811,7 +818,8 @@ def main():
         ] + sys.argv[1:]
         print(f"🚀 Auto-launching High-Performance Multi-GPU DistributedDataParallel (DDP) across {num_gpus} GPUs on port {port}...")
         sys.stdout.flush()
-        ret = subprocess.run(cmd)
+        sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
+        ret = subprocess.run(cmd, **sub_kwargs)
         sys.exit(ret.returncode)
 
     # Initialize distributed mode if running under torchrun / distributed launcher

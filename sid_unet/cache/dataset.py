@@ -274,9 +274,12 @@ class CachedStreamingDataset(IterableDataset):
                 pass
 
     def __len__(self) -> int:
+        from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_world_size
+        world_size = get_world_size() if is_dist_avail_and_initialized() else 1
+        total = self._total_rows
         if self.max_samples is not None and self.max_samples > 0:
-            return min(self._total_rows, self.max_samples)
-        return self._total_rows
+            total = min(total, self.max_samples)
+        return max(1, total // world_size)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_rank, get_world_size
@@ -361,3 +364,80 @@ class CachedStreamingDataset(IterableDataset):
                 count += 1
                 if self.max_samples is not None and count >= self.max_samples:
                     return
+
+
+class CachedIndexedDataset(Dataset):
+    """
+    High-performance PyTorch Dataset wrapping parquet-dataset-loader's IndexedParquetDataset
+    for instant non-blocking random access to pre-computed latent representations.
+    Supports DDP sharding via .shard(), multi-worker DataLoaders, and SpatialJointTransform.
+    """
+
+    def __init__(
+        self,
+        pdl_dataset: Any,
+        transform: Optional[SpatialJointTransform] = None,
+        target_image_size: Tuple[int, int] = (256, 256),
+        expected_channels: int = 84,
+        max_samples: Optional[int] = None,
+    ):
+        self.pdl_dataset = pdl_dataset
+        self.transform = transform
+        self.target_image_size = target_image_size
+        self.expected_channels = expected_channels
+        self.max_samples = max_samples
+        self._len = len(pdl_dataset)
+        if max_samples is not None and max_samples > 0:
+            self._len = min(self._len, max_samples)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx < 0 or idx >= self._len:
+            raise IndexError(f"Index {idx} out of bounds for dataset of length {self._len}")
+        row = self.pdl_dataset[idx]
+
+        z_raw = row["z_high_dim"]
+        ch = int(row.get("channels", self.expected_channels))
+        latent_h = int(row.get("latent_h", self.target_image_size[0] // 8))
+        latent_w = int(row.get("latent_w", self.target_image_size[1] // 8))
+
+        z_tensor = decode_cached_tensor(z_raw, channels=ch, h=latent_h, w=latent_w)
+        mask_tensor = decode_mask_tensor(row["mask"], target_size=self.target_image_size)
+
+        if self.transform is not None:
+            z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
+
+        raw_label = row.get("label", 2)
+        label = int(raw_label) if raw_label is not None else 2
+        img_id = str(row.get("img_id", f"cached_{idx}"))
+
+        return {
+            "image": z_tensor,
+            "mask": mask_tensor,
+            "label": torch.tensor(label, dtype=torch.long),
+            "img_id": img_id,
+            "is_cached": True,
+        }
+
+    def shard(self, num_shards: int, index: int, contiguous: bool = False) -> "CachedIndexedDataset":
+        sharded_pdl = self.pdl_dataset.shard(num_shards=num_shards, index=index, contiguous=contiguous)
+        sharded_max = None
+        if self.max_samples is not None and self.max_samples > 0:
+            sharded_max = max(1, self.max_samples // num_shards)
+        return CachedIndexedDataset(
+            pdl_dataset=sharded_pdl,
+            transform=self.transform,
+            target_image_size=self.target_image_size,
+            expected_channels=self.expected_channels,
+            max_samples=sharded_max,
+        )
+
+    def close(self) -> None:
+        if hasattr(self.pdl_dataset, "close") and callable(self.pdl_dataset.close):
+            try:
+                self.pdl_dataset.close()
+            except Exception:
+                pass
+

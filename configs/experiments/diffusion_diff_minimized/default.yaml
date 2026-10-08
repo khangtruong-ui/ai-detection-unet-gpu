@@ -85,7 +85,7 @@ training:
   gradient_accumulation_steps: 4
   save_best: true
   save_latest: true
-  checkpoint_period: 1
+  checkpoint_period: 3600
   early_stopping_patience: 4
   early_stopping_metric: "val_iou"
   early_stopping_mode: "max"
