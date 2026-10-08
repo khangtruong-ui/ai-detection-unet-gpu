@@ -1,6 +1,6 @@
 """
 CLI entrypoint for dataset tensor caching (sid-cache / sid-dataset-cache).
-Extracts frozen model latents and syncs to local disk and Hugging Face Hub.
+Extracts frozen model latents and progressively syncs to local disk and Hugging Face Hub.
 """
 
 from __future__ import annotations
@@ -77,8 +77,8 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         "--samples-per-shard",
         "--samples_per_shard",
         type=int,
-        default=5000,
-        help="Number of samples to pack into each Parquet shard file (default: 5000)",
+        default=2000,
+        help="Number of samples to pack into each Parquet shard file (default: 2000)",
     )
     parser.add_argument(
         "--push-to-hub",
@@ -86,7 +86,7 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         dest="push_to_hub",
         action="store_true",
         default=None,
-        help="Upload cached shards to Hugging Face Hub dataset repo upon completion (default: true if --hf-repo is specified)",
+        help="Progressively upload cached shards to Hugging Face Hub dataset repo (default: true if --hf-repo is specified)",
     )
     parser.add_argument(
         "--no-push-to-hub",
@@ -94,6 +94,24 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         dest="push_to_hub",
         action="store_false",
         help="Do not upload to Hugging Face Hub even if --hf-repo is provided",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume caching from existing remote/local shards, skipping already processed samples (default: True)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Do not resume; restart caching from shard index 0",
+    )
+    parser.add_argument(
+        "--delete-local-on-upload",
+        action="store_true",
+        default=False,
+        help="Remove local Parquet files once uploaded to Hugging Face Hub to save disk space",
     )
     parser.add_argument(
         "--fp16",
@@ -155,17 +173,22 @@ def cli_main(args: Optional[list] = None) -> None:
         device=device,
         fp16=parsed_args.fp16,
         hf_token=parsed_args.token,
+        resume=parsed_args.resume,
+        delete_local_on_upload=parsed_args.delete_local_on_upload,
+        push_to_hub=push_hub,
     )
 
     logger.info(
-        f"🚀 Running cache extraction: source='{source_dataset}', splits={parsed_args.splits}, "
-        f"max_samples={parsed_args.max_samples}, output_dir='{parsed_args.output_dir}'"
+        f"🚀 Running progressive cache extraction: source='{source_dataset}', splits={parsed_args.splits}, "
+        f"max_samples={parsed_args.max_samples}, output_dir='{parsed_args.output_dir}', "
+        f"push_to_hub={push_hub}, resume={parsed_args.resume}"
     )
 
     all_shards = manager.cache_all_splits(
         splits=parsed_args.splits,
         max_samples_per_split=parsed_args.max_samples,
         push_to_hub=push_hub,
+        resume=parsed_args.resume,
     )
 
     logger.info(f"🎉 Dataset caching finished! Total shards generated: {sum(len(v) for v in all_shards.values())}")

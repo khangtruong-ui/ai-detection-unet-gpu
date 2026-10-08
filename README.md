@@ -1666,23 +1666,37 @@ The `sid-cache` (or `sid-dataset-cache`) CLI extracts representations $Z$ once a
 #### A. Pre-computing Dataset Cache (`sid-cache`)
 
 ```bash
-# 1. Extract representation Z and push shards directly to Hugging Face Hub:
+# 1. Progressively extract representation Z and upload shards asynchronously to Hugging Face Hub:
+# (GPU computes next shard while background worker uploads previous shard concurrently)
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
   --hf-repo KhangTruong/COCO-inpainted-cache \
   --splits train validation \
   --batch-size 32 \
-  --shard-size 5000 \
+  --samples-per-shard 2000 \
   --fp16
 
-# 2. Extract and save locally only (without pushing to HF Hub):
+# 2. Resuming an existing or interrupted run:
+# Automatically detects completed remote/local shards and skips already-processed samples:
+sid-cache \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --resume
+
+# 3. Low-disk mode: delete local parquet files once uploaded to Hugging Face Hub:
+sid-cache \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --delete-local-on-upload
+
+# 4. Extract and save locally only (without pushing to HF Hub):
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
   --output-dir datasets/COCO-inpainted-cache \
   --splits train validation \
   --no-push-to-hub
 
-# 3. Test caching pipeline with a small sample limit:
+# 5. Fast verification run with a small sample limit:
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
   --output-dir datasets/test-cache \

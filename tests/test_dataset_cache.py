@@ -257,3 +257,41 @@ def test_sid_train_with_cached_hf_repo_integration(temp_cache_dir):
     assert results is not None
     assert "best_score" in results
     assert os.path.exists(output_run_dir)
+
+
+def test_async_hub_uploader_and_progressive_caching(dummy_minimized_model, temp_cache_dir, monkeypatch):
+    """Test AsyncHubUploader non-blocking background queue and progressive upload orchestration."""
+    from sid_unet.cache.manager import AsyncHubUploader
+
+    uploaded_calls = []
+
+    class MockHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, repo_id, repo_type="dataset", exist_ok=True):
+            pass
+
+        def upload_file(self, path_or_fileobj, path_in_repo, repo_id, repo_type="dataset", commit_message=None):
+            uploaded_calls.append((path_in_repo, commit_message))
+
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "HfApi", MockHfApi)
+
+    uploader = AsyncHubUploader(repo_id="KhangTruong/test-cache", max_pending=2)
+    test_file = os.path.join(temp_cache_dir, "test.parquet")
+    with open(test_file, "wb") as f:
+        f.write(b"mock_parquet_data")
+
+    uploader.submit_upload(
+        local_path=test_file,
+        rel_repo_path="train/train-00000.parquet",
+        commit_message="Add shard 00000",
+    )
+    uploader.wait_all()
+    uploader.close()
+
+    assert len(uploaded_calls) == 1
+    assert uploaded_calls[0][0] == "train/train-00000.parquet"
+    assert "Add shard 00000" in uploaded_calls[0][1]
+
