@@ -644,7 +644,8 @@ class DiffusionDiffModel(nn.Module):
                 self.vae.encoder.train(mode)
             if getattr(self.vae, "quant_conv", None) is not None:
                 self.vae.quant_conv.train(mode)
-        self.diffuser.eval()
+        if getattr(self, "diffuser", None) is not None:
+            self.diffuser.eval()
         return self
 
     def to(self, *args: Any, **kwargs: Any) -> "DiffusionDiffModel":
@@ -733,6 +734,10 @@ class DiffusionDiffModel(nn.Module):
         Runs frozen VAE encoder, multi-step noise perturbation, frozen diffuser prediction,
         sinusoidal embeddings, concatenation to Z, and trainable decoder.
         """
+        # Automatically route pre-computed cached tensor Z through fast forward_cached path
+        if x.dim() == 4 and x.shape[1] == self.total_z_channels:
+            return self.forward_cached(x)
+
         device = x.device
         dtype = x.dtype
         b_sz = x.shape[0]
@@ -861,6 +866,137 @@ class DiffusionDiffModel(nn.Module):
         if self.aux_classifier:
             return mask_logits, class_logits
         return mask_logits
+
+    def forward_cached(
+        self,
+        z_high_dim: torch.Tensor,
+        target_h: Optional[int] = None,
+        target_w: Optional[int] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Fast forward pass directly from pre-computed high-dimensional representation Z.
+        Bypasses VAE encoder and Diffuser UNet, running trainable decoder and auxiliary classifier.
+        """
+        device = z_high_dim.device
+        dtype = z_high_dim.dtype
+        b_sz, c_z, h_z, w_z = z_high_dim.shape
+        orig_h = target_h or (h_z * 8)
+        orig_w = target_w or (w_z * 8)
+
+        norm_device, norm_dtype = get_submodule_device_dtype(self.z_norm, device, dtype)
+        z_normed = self.z_norm(z_high_dim.to(device=norm_device, dtype=norm_dtype)).to(device=device, dtype=dtype)
+
+        class_logits = None
+        if self.aux_classifier and self.classifier_head is not None:
+            cls_device, cls_dtype = get_submodule_device_dtype(self.classifier_head, device, dtype)
+            class_logits = self.classifier_head(z_normed.to(device=cls_device, dtype=cls_dtype)).to(device=device, dtype=dtype)
+
+        dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
+        mask_logits = self.decoder(
+            z_normed.to(device=dec_device, dtype=dec_dtype),
+            skips=None,
+        ).to(device=device, dtype=dtype)
+
+        if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
+            mask_logits = mask_logits[:, :, :orig_h, :orig_w].contiguous()
+        else:
+            mask_logits = mask_logits.contiguous()
+
+        if mask_logits.device != device or mask_logits.dtype != dtype:
+            mask_logits = mask_logits.to(device=device, dtype=dtype)
+        if class_logits is not None and (
+            class_logits.device != device or class_logits.dtype != dtype
+        ):
+            class_logits = class_logits.to(device=device, dtype=dtype)
+
+        if self.aux_classifier:
+            return mask_logits, class_logits
+        return mask_logits
+
+    @torch.no_grad()
+    def extract_cache_tensors(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract high-dimensional representation Z from input image x for offline caching.
+        Returns tensor Z of shape [B, total_z_channels, H/8, W/8].
+        """
+        self.eval()
+        device = x.device
+        dtype = x.dtype
+        b_sz = x.shape[0]
+
+        x_proc, orig_h, orig_w = self._preprocess_input(x)
+        vae_device, vae_dtype = get_submodule_device_dtype(self.vae, device, dtype)
+        x_vae = x_proc.to(device=vae_device, dtype=vae_dtype)
+
+        posterior = self.vae.encode(x_vae).latent_dist
+        z0 = posterior.mode() * self.scaling_factor
+        z0 = torch.clamp(z0, min=-15.0, max=15.0)
+
+        z0_out = z0.to(device=device, dtype=dtype)
+        _, _, h_z, w_z = z0_out.shape
+
+        z_components: List[torch.Tensor] = []
+        if self.include_z0:
+            z_components.append(z0_out.detach())
+
+        diff_device, diff_dtype = get_submodule_device_dtype(self.diffuser, device, dtype)
+        cross_dim = getattr(self.diffuser.config, "cross_attention_dim", None)
+        uncond_emb = torch.zeros((b_sz, 1, cross_dim), device=diff_device, dtype=diff_dtype) if cross_dim is not None else None
+
+        for t_val in self.timesteps:
+            t_clamped = max(0, min(t_val, len(self.alphas_cumprod) - 1))
+            alpha_bar = self.alphas_cumprod[t_clamped].to(device=device, dtype=dtype)
+            sigma_val = torch.sqrt(torch.clamp(1.0 - alpha_bar, min=1e-8))
+            sqrt_alpha_bar = torch.sqrt(alpha_bar)
+
+            eps_k = torch.randn_like(z0_out)
+            z_tk = sqrt_alpha_bar * z0_out + sigma_val * eps_k
+
+            t_tensor = torch.full((b_sz,), t_clamped, device=diff_device, dtype=torch.long)
+            diffuser_kwargs: Dict[str, Any] = {}
+            if uncond_emb is not None:
+                diffuser_kwargs["encoder_hidden_states"] = uncond_emb.to(diff_dtype)
+            z_tk_input = z_tk.to(device=diff_device, dtype=diff_dtype)
+            pred_eps = (
+                self.diffuser(z_tk_input, t_tensor, **diffuser_kwargs)
+                .sample.detach()
+                .to(device=device, dtype=dtype)
+            )
+
+            t_tensor_dev = torch.full((b_sz,), t_clamped, device=device, dtype=torch.long)
+            t_emb = sinusoidal_embedding(t_tensor_dev.float(), dim=self.timestep_embed_dim)
+            t_spatial = expand_to_spatial(t_emb, h_z, w_z).to(dtype=dtype)
+
+            sigma_tensor = torch.full((b_sz,), sigma_val.item(), device=device, dtype=torch.float32)
+            sigma_emb = sinusoidal_embedding(sigma_tensor, dim=self.sigma_embed_dim)
+            sigma_spatial = expand_to_spatial(sigma_emb, h_z, w_z).to(dtype=dtype)
+
+            if self.include_noisy_latents:
+                z_components.append(z_tk.detach())
+            if self.include_added_noise:
+                z_components.append(eps_k.detach())
+            if self.include_predicted_noise:
+                z_components.append(pred_eps)
+            if self.include_noise_diff:
+                z_components.append((pred_eps - eps_k).detach())
+            if self.timestep_embed_dim > 0:
+                z_components.append(t_spatial)
+            if self.sigma_embed_dim > 0:
+                z_components.append(sigma_spatial)
+
+        z_high_dim = torch.cat(z_components, dim=1)
+        return z_high_dim
+
+    def bypass_diffuser_for_cached_training(self) -> None:
+        """
+        Unload or remove diffuser UNet when running in cached mode to reclaim GPU VRAM.
+        """
+        if hasattr(self, "diffuser") and self.diffuser is not None:
+            logger.info("⚡ Bypassing and unloading frozen Diffuser UNet to save VRAM during cached training.")
+            del self.diffuser
+            self.diffuser = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @torch.no_grad()
     def predict_mask(

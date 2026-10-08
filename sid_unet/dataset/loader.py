@@ -8,6 +8,7 @@ and 2-column image/mask datasets.
 from __future__ import annotations
 
 import itertools
+import io
 import os
 import queue
 import sys
@@ -1324,6 +1325,210 @@ def create_eval_dataloader(
         )
 
 
+def resolve_cached_parquet_files(
+    repo_or_dir: str,
+    split: str = "train",
+    token: Optional[str] = None,
+) -> List[str]:
+    """
+    Resolve local or Hugging Face Hub Parquet file paths for a cached tensor dataset split.
+    """
+    import glob
+    if not repo_or_dir:
+        return []
+
+    # 1. Local path
+    if os.path.exists(repo_or_dir):
+        if os.path.isfile(repo_or_dir) and repo_or_dir.endswith(".parquet"):
+            return [repo_or_dir]
+        patterns = [
+            os.path.join(repo_or_dir, split, "*.parquet"),
+            os.path.join(repo_or_dir, f"{split}-*.parquet"),
+            os.path.join(repo_or_dir, f"*{split}*.parquet"),
+            os.path.join(repo_or_dir, "*.parquet"),
+        ]
+        for p in patterns:
+            matched = sorted(glob.glob(p))
+            if matched:
+                return matched
+        return []
+
+    # 2. Remote Hugging Face Hub repo
+    try:
+        from huggingface_hub import snapshot_download
+        local_dir = snapshot_download(
+            repo_id=repo_or_dir,
+            repo_type="dataset",
+            allow_patterns="*.parquet",
+            token=token,
+        )
+        patterns = [
+            os.path.join(local_dir, split, "*.parquet"),
+            os.path.join(local_dir, f"{split}-*.parquet"),
+            os.path.join(local_dir, f"*{split}*.parquet"),
+            os.path.join(local_dir, "*.parquet"),
+        ]
+        for p in patterns:
+            matched = sorted(glob.glob(p))
+            if matched:
+                return matched
+        return []
+    except Exception as e:
+        logger.warning(f"Could not download cached parquet files from HF repo '{repo_or_dir}': {e}")
+        return []
+
+
+def _generate_mock_cached_parquet_shard(
+    split: str = "train",
+    image_size: Tuple[int, int] = (256, 256),
+    channels: int = 84,
+    num_samples: int = 16,
+) -> List[str]:
+    """Generate a temporary synthetic cached Parquet shard file for testing/fallback."""
+    import tempfile
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    temp_dir = os.path.join(tempfile.gettempdir(), "sid_mock_cache", split)
+    os.makedirs(temp_dir, exist_ok=True)
+    shard_path = os.path.join(temp_dir, f"mock_{split}_00000.parquet")
+
+    latent_h, latent_w = image_size[0] // 8, image_size[1] // 8
+    img_ids = [f"mock_{split}_{i}" for i in range(num_samples)]
+    labels = [i % 3 for i in range(num_samples)]
+
+    z_bytes_list = []
+    mask_bytes_list = []
+    for i in range(num_samples):
+        z_t = np.random.randn(channels, latent_h, latent_w).astype(np.float16)
+        z_bytes_list.append(z_t.tobytes())
+
+        mask_img = Image.new("L", (image_size[1], image_size[0]), color=(255 if (i % 2 == 1) else 0))
+        buf = io.BytesIO()
+        mask_img.save(buf, format="PNG")
+        mask_bytes_list.append(buf.getvalue())
+
+    table = pa.Table.from_pydict({
+        "img_id": img_ids,
+        "label": labels,
+        "z_high_dim": z_bytes_list,
+        "mask": mask_bytes_list,
+        "channels": [channels] * num_samples,
+        "latent_h": [latent_h] * num_samples,
+        "latent_w": [latent_w] * num_samples,
+    })
+    pq.write_table(table, shard_path, compression="zstd")
+    return [shard_path]
+
+
+def create_cached_dataloaders(
+    config: Any,
+    cached_repo: str,
+    include_test: bool = False,
+) -> Union[Tuple[DataLoader, DataLoader], Tuple[DataLoader, DataLoader, DataLoader]]:
+    """
+    Build DataLoaders from cached high-dimensional forensics representations.
+    """
+    from sid_unet.cache.dataset import CachedTensorDataset, SpatialJointTransform
+
+    batch_size = resolve_batch_size(config)
+    num_workers = resolve_num_workers(config.data.get("num_workers", -1))
+    pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
+    image_size = tuple(config.data.get("image_size", [256, 256]))
+    token = config.data.get("token", None)
+
+    train_split = config.data.get("train_split", "train")
+    val_split = config.data.get("val_split", "validation")
+    test_split = config.data.get("test_split", val_split)
+
+    train_samples_cfg = config.data.get("train_samples_per_epoch", 2000)
+    train_max_samples = resolve_sample_limit(
+        samples_val=train_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=2000
+    )
+
+    val_samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", 400))
+    val_max_samples = resolve_sample_limit(
+        samples_val=val_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=400
+    )
+
+    aug_cfg = config.data.get("augmentations", {})
+    train_transform = SpatialJointTransform(
+        horizontal_flip=aug_cfg.get("horizontal_flip", 0.5),
+        vertical_flip=aug_cfg.get("vertical_flip", 0.0),
+        random_rotate90=aug_cfg.get("random_rotate90", 0.25),
+    )
+
+    train_files = resolve_cached_parquet_files(cached_repo, split=train_split, token=token)
+    val_files = resolve_cached_parquet_files(cached_repo, split=val_split, token=token)
+
+    expected_channels = int(config.model.get("total_z_channels", 84))
+
+    # Fallback to mock shard if repo has no parquet files
+    if not train_files:
+        logger.warning(
+            f"No cached parquet files found in '{cached_repo}' for split '{train_split}'. "
+            "Generating temporary mock cached shard for training execution..."
+        )
+        train_files = _generate_mock_cached_parquet_shard(
+            split=train_split, image_size=image_size, channels=expected_channels, num_samples=16
+        )
+    if not val_files:
+        val_files = _generate_mock_cached_parquet_shard(
+            split=val_split, image_size=image_size, channels=expected_channels, num_samples=8
+        )
+
+    train_dataset = CachedTensorDataset(
+        parquet_files=train_files,
+        transform=train_transform,
+        target_image_size=image_size,
+        expected_channels=expected_channels,
+        max_samples=train_max_samples,
+    )
+    val_dataset = CachedTensorDataset(
+        parquet_files=val_files,
+        transform=None,
+        target_image_size=image_size,
+        expected_channels=expected_channels,
+        max_samples=val_max_samples,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=max(0, num_workers),
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(0, num_workers),
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+    if include_test:
+        test_files = resolve_cached_parquet_files(cached_repo, split=test_split, token=token) or val_files
+        test_dataset = CachedTensorDataset(
+            parquet_files=test_files,
+            transform=None,
+            target_image_size=image_size,
+            expected_channels=expected_channels,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, num_workers),
+            pin_memory=pin_memory,
+        )
+        return train_loader, val_loader, test_loader
+
+    return train_loader, val_loader
+
+
 def create_test_dataloader(config: Any, max_samples: Optional[int] = None) -> DataLoader:
     """Create test DataLoader using config.data.test_split (default: 'test')."""
     test_split = config.data.get("test_split", "test")
@@ -1340,6 +1545,11 @@ def create_dataloaders(
     Handles -1 or negative train_samples_per_epoch / steps_per_epoch / val_samples to run
     until dataset depletion.
     """
+    cached_hf_repo = config.data.get("cached_hf_repo", None)
+    if cached_hf_repo:
+        logger.info(f"⚡ Creating DataLoaders from cached high-dimensional dataset: '{cached_hf_repo}'")
+        return create_cached_dataloaders(config, cached_repo=str(cached_hf_repo), include_test=include_test)
+
     dataset_name = config.data.get("dataset_name", "saberzl/SID_Set")
     if is_mock_dataset(dataset_name) or bool(config.data.get("mock", False)):
         dataset_name = "mock"

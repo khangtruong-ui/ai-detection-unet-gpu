@@ -164,6 +164,15 @@ def parse_args():
         help="Hugging Face model repository ID to checkpoint on (and auto-resume if existing checkpoint found), e.g. 'KhangTruong/Testing-model'.",
     )
     parser.add_argument(
+        "--cached-hf-repo",
+        "--cached_hf_repo",
+        "--cached-repo",
+        type=str,
+        default=None,
+        dest="cached_hf_repo",
+        help="Hugging Face dataset repository ID or local path containing pre-computed cached forensic latents (e.g. 'KhangTruong/COCO-inpainted-cache').",
+    )
+    parser.add_argument(
         "--push-to-hub",
         "--push_to_hub",
         "--hf-checkpoint",
@@ -444,9 +453,12 @@ def train_single_run(
     total_runs: int = 1,
     base_output_dir: Optional[str] = None,
     skip_collision: bool = True,
+    cached_hf_repo: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a single training experiment with its given config."""
     config = load_config(config_path, overrides=overrides or [])
+    if cached_hf_repo:
+        config.data.cached_hf_repo = cached_hf_repo
 
     # Set random seed
     seed = int(config.project.get("seed", 42))
@@ -649,6 +661,17 @@ def train_single_run(
         custom_logger=logger,
     )
 
+    # If training with cached representations, bypass heavy diffuser UNet to save VRAM and latency
+    if getattr(config.data, "cached_hf_repo", None):
+        raw_m = getattr(trainer, "raw_model", getattr(trainer, "model", None))
+        if hasattr(raw_m, "bypass_diffuser_for_cached_training"):
+            raw_m.bypass_diffuser_for_cached_training()
+            if is_main_process():
+                logger.info(
+                    f"⚡ [DATASET CACHE] High-dimensional latent training active with repository '{config.data.cached_hf_repo}'. "
+                    "Diffuser UNet bypassed for extreme throughput!"
+                )
+
     # Resume training state if checkpoint found
     if resume:
         trainer.resume_from_checkpoint(resume)
@@ -808,6 +831,7 @@ def main():
                 total_runs=1,
                 base_output_dir=args.output_dir,
                 skip_collision=args.skip_collision,
+                cached_hf_repo=getattr(args, "cached_hf_repo", None),
             )
             return results
 
@@ -848,6 +872,7 @@ def main():
                 total_runs=len(config_paths),
                 base_output_dir=suite_run_dir,
                 skip_collision=args.skip_collision,
+                cached_hf_repo=getattr(args, "cached_hf_repo", None),
             )
             all_results.append(res)
 

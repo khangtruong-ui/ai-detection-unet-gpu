@@ -772,13 +772,19 @@ class Trainer:
         current_bs = int(self.config.data.get("batch_size", 16))
         img_size = tuple(self.config.data.get("image_size", [256, 256]))
 
+        if bool(self.config.data.get("cached_hf_repo", False)):
+            z_ch = int(self.config.model.get("total_z_channels", getattr(self.raw_model, "total_z_channels", 84)))
+            sample_shape = (z_ch, img_size[0] // 8, img_size[1] // 8)
+        else:
+            sample_shape = (3, img_size[0], img_size[1])
+
         try:
             if self.is_distributed:
                 if self.is_main_process:
                     safe_bs = find_optimal_batch_size(
                         model=self.raw_model,
                         loss_fn=self.loss_fn,
-                        sample_shape=(3, img_size[0], img_size[1]),
+                        sample_shape=sample_shape,
                         device=self.device,
                         max_batch_size=current_bs,
                         min_batch_size=1,
@@ -794,7 +800,7 @@ class Trainer:
                 safe_bs = find_optimal_batch_size(
                     model=self.raw_model,
                     loss_fn=self.loss_fn,
-                    sample_shape=(3, img_size[0], img_size[1]),
+                    sample_shape=sample_shape,
                     device=self.device,
                     max_batch_size=current_bs,
                     min_batch_size=1,

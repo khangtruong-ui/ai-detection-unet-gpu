@@ -48,6 +48,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [2. Evaluation & Benchmarking](#2-evaluation--benchmarking)
   - [3. Random Sample Visual Illustration (`sid-illu`)](#3-random-sample-visual-illustration-sid-illu)
   - [4. Inference & Mask Prediction](#4-inference--mask-prediction)
+  - [5. Dataset Feature Caching & High-Speed Training (`sid-cache`)](#5-dataset-feature-caching--high-speed-training-sid-cache)
 - [Loss Functions & Metrics](#loss-functions--metrics)
 - [Running Tests](#running-tests)
 - [License](#license)
@@ -77,6 +78,11 @@ Supports large-scale streaming and local datasets including standard 2-column im
     - **Label `0` (Real/Authentic)**: Pure zero mask ($\mathbf{0}$).
     - **Label `1` (Fully Synthetic)**: Pure one mask ($\mathbf{1}$).
     - **Label `2` (Partially Synthetic / Tampered)**: Ground truth mask binarized to $\{0.0, 1.0\}$.
+- **End-to-End Dataset Representation Caching (`sid-cache` & `--cached-hf-repo`)**:
+  - **Pre-computed High-Dimensional Latent Caching**: Pre-computes frozen generative representations $Z$ (84 channels in fp16 for `diffusion-diff-minimized`, 244 channels for `diffusion-diff-v2`) and bundles them directly into zstd-compressed Parquet shards synced to Hugging Face Hub (e.g. `KhangTruong/COCO-inpainted-cache`).
+  - **~5x Footprint Compression**: Slashes raw RGB dataset footprint from ~67 GB down to ~10–14 GB compressed Parquet files with fast zero-copy columnar streaming.
+  - **10x–20x Training Acceleration & VRAM Reduction**: During training with `--cached-hf-repo`, the heavy frozen Diffuser UNet is completely bypassed and purged from GPU memory (`bypass_diffuser_for_cached_training()`), slashing per-batch compute from ~500 ms to <25 ms.
+  - **Extensible Architecture**: Uniform extractor registry supporting `DiffusionDiffMinimizedModel`, `DiffusionDiffV2Model`, and `DiffusionDiffModel`.
 - **Ablation & Refinement Pipelines**:
   - Built-in multi-stage ablation: Raw model, Post-Processing (component filtering, hole filling, morphology), and SAM3 zero-shot boundary refinement.
 
@@ -1643,6 +1649,62 @@ sid-predict \
   --image /path/to/test_image.jpg \
   --output_dir predictions \
   --save_overlay
+```
+
+---
+
+### 5. Dataset Feature Caching & High-Speed Training (`sid-cache`)
+
+For generative diffusion forensic models (such as `diffusion-diff-minimized`, `diffusion-diff-v2`, and `diffusion-diff`), repeated feature extraction through frozen diffusion UNets is the dominant training bottleneck (~500 ms per batch).
+
+The `sid-cache` (or `sid-dataset-cache`) CLI extracts representations $Z$ once and packages them into compressed Parquet shards synced directly to Hugging Face Hub (e.g., `KhangTruong/COCO-inpainted-cache`) or saved locally. During subsequent training via `sid-train --cached-hf-repo <repo_or_dir>`, the heavy frozen Diffuser UNet is completely bypassed and purged from GPU memory (`bypass_diffuser_for_cached_training()`), cutting batch time from ~500 ms down to <25 ms (~20x faster) and freeing ~1.5 GB VRAM.
+
+#### Disk Size Comparison:
+- **Original Dataset (`KhangTruong/COCO-inpainted`)**: ~67 GB total (~529 KB / example across 126k images).
+- **Cached Dataset (`KhangTruong/COCO-inpainted-cache`)**: ~10–14 GB total (~80–110 KB / example Parquet zstd compressed), achieving a **~5x reduction in storage footprint**.
+
+#### A. Pre-computing Dataset Cache (`sid-cache`)
+
+```bash
+# 1. Extract representation Z and push shards directly to Hugging Face Hub:
+sid-cache \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --splits train validation \
+  --batch-size 32 \
+  --shard-size 5000 \
+  --fp16
+
+# 2. Extract and save locally only (without pushing to HF Hub):
+sid-cache \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --output-dir datasets/COCO-inpainted-cache \
+  --splits train validation \
+  --no-push-to-hub
+
+# 3. Test caching pipeline with a small sample limit:
+sid-cache \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --output-dir datasets/test-cache \
+  --max-samples 100 \
+  --no-push-to-hub
+```
+
+#### B. High-Speed Training with Cached Representations (`--cached-hf-repo`)
+
+Supply `--cached-hf-repo` to `sid-train`. It works transparently with Hugging Face Hub repositories or local directories:
+
+```bash
+# Train with cached tensors from Hugging Face Hub repository:
+sid-train \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --cached-hf-repo KhangTruong/COCO-inpainted-cache \
+  --hf-repo KhangTruong/Testing-model
+
+# Train with locally cached Parquet shards:
+sid-train \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --cached-hf-repo datasets/COCO-inpainted-cache
 ```
 
 ---

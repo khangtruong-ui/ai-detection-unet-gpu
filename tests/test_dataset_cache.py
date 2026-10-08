@@ -1,0 +1,259 @@
+"""
+Unit and integration tests for the dataset caching pipeline,
+high-dimensional forensics latents extraction, cached DataLoader loading,
+and cached training with Diffusion-Diff-Minimized.
+"""
+
+import io
+import os
+import shutil
+import tempfile
+import numpy as np
+from PIL import Image
+import pytest
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from sid_unet.models.diffusion_diff_minimized import DiffusionDiffMinimizedModel
+from sid_unet.models.diffusion_diff import DiffusionDiffModel
+from sid_unet.models.diffusion_diff_v2 import DiffusionDiffV2Model
+from sid_unet.cache.extractor import (
+    DiffusionDiffMinimizedExtractor,
+    get_extractor_for_model,
+)
+from sid_unet.cache.dataset import (
+    CachedTensorDataset,
+    CachedStreamingDataset,
+    SpatialJointTransform,
+    decode_cached_tensor,
+    decode_mask_tensor,
+)
+from sid_unet.cache.manager import DatasetCacheManager
+from sid_unet.cache.cli import parse_args
+from sid_unet.dataset.loader import (
+    create_dataloaders,
+    create_cached_dataloaders,
+    resolve_cached_parquet_files,
+    _generate_mock_cached_parquet_shard,
+)
+from sid_unet.utils.config import ConfigDict
+
+
+@pytest.fixture
+def dummy_minimized_model():
+    return DiffusionDiffMinimizedModel(use_dummy=True)
+
+
+@pytest.fixture
+def temp_cache_dir():
+    d = tempfile.mkdtemp(prefix="test_sid_cache_")
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_extractor_diffusion_diff_minimized(dummy_minimized_model):
+    """Test extractor produces correct 84-channel float16 tensor from RGB input."""
+    extractor = get_extractor_for_model(dummy_minimized_model, fp16=True)
+    assert extractor.model_name == "diffusion_diff_minimized"
+    assert extractor.total_channels == 84
+
+    x = torch.randn(2, 3, 256, 256)
+    z = extractor.extract_batch(x)
+    assert z.shape[:2] == (2, 84)
+    assert z.dtype == torch.float16
+
+
+def test_forward_cached_and_routing(dummy_minimized_model):
+    """Test fast forward_cached path and automatic routing in forward()."""
+    dummy_minimized_model.eval()
+    x = torch.randn(2, 3, 256, 256)
+    z = dummy_minimized_model.extract_cache_tensors(x)
+    assert z.shape[:2] == (2, 84)
+
+    # 1. Direct forward_cached call with target spatial dimensions
+    mask_logits_cached, class_logits_cached = dummy_minimized_model.forward_cached(z, target_h=256, target_w=256)
+    assert mask_logits_cached.shape == (2, 1, 256, 256)
+    assert class_logits_cached.shape == (2, 3)
+
+    # 2. Forward auto-routing when passing 84-channel tensor of latent size 32x32
+    z_standard = torch.randn(2, 84, 32, 32)
+    mask_logits_routed, class_logits_routed = dummy_minimized_model(z_standard)
+    assert mask_logits_routed.shape == (2, 1, 256, 256)
+    assert class_logits_routed.shape == (2, 3)
+
+
+def test_bypass_diffuser_for_cached_training(dummy_minimized_model):
+    """Test that Diffuser UNet can be completely unloaded while cached forward continues to work."""
+    z = torch.randn(2, 84, 32, 32)
+    assert dummy_minimized_model.diffuser is not None
+
+    dummy_minimized_model.bypass_diffuser_for_cached_training()
+    assert dummy_minimized_model.diffuser is None
+
+    # Cached forward works without diffuser
+    mask_logits, class_logits = dummy_minimized_model(z)
+    assert mask_logits.shape == (2, 1, 256, 256)
+    assert class_logits.shape == (2, 3)
+
+
+def test_diffusion_diff_and_v2_cache_methods():
+    """Verify caching methods exist and work across the entire diffusion family."""
+    m_v1 = DiffusionDiffModel(use_dummy=True)
+    m_v2 = DiffusionDiffV2Model(use_dummy=True)
+
+    x = torch.randn(1, 3, 256, 256)
+    z1 = m_v1.extract_cache_tensors(x)
+    z2 = m_v2.extract_cache_tensors(x)
+
+    assert z1.shape[1] == m_v1.total_z_channels
+    assert z2.shape[1] == m_v2.total_z_channels
+
+    out1 = m_v1.forward_cached(z1, target_h=256, target_w=256)
+    out2 = m_v2.forward_cached(z2, target_h=256, target_w=256)
+    assert out1[0].shape == (1, 1, 256, 256)
+    assert out2[0].shape == (1, 1, 256, 256)
+
+
+def test_spatial_joint_transform():
+    """Test synchronous spatial flips and rotations on (Z, mask)."""
+    transform = SpatialJointTransform(horizontal_flip=1.0, vertical_flip=1.0, random_rotate90=1.0)
+    z = torch.arange(84 * 32 * 32, dtype=torch.float32).reshape(84, 32, 32)
+    mask = torch.ones(1, 256, 256, dtype=torch.float32)
+
+    z_aug, mask_aug = transform(z, mask)
+    assert z_aug.shape == (84, 32, 32)
+    assert mask_aug.shape == (1, 256, 256)
+
+
+def test_cached_parquet_dataset_load(temp_cache_dir):
+    """Test creating and reading cached Parquet shards with CachedTensorDataset."""
+    shards = _generate_mock_cached_parquet_shard(
+        split="train",
+        image_size=(256, 256),
+        channels=84,
+        num_samples=10,
+    )
+
+    dataset = CachedTensorDataset(
+        parquet_files=shards,
+        target_image_size=(256, 256),
+        expected_channels=84,
+    )
+    assert len(dataset) == 10
+
+    sample = dataset[0]
+    assert sample["image"].shape == (84, 32, 32)
+    assert sample["mask"].shape == (1, 256, 256)
+    assert sample["label"].dim() == 0
+    assert sample["is_cached"] is True
+
+
+def test_create_cached_dataloaders(temp_cache_dir):
+    """Test loader integration via create_dataloaders with cached_hf_repo."""
+    # Create train and val shards in temp dir
+    train_shards = _generate_mock_cached_parquet_shard(split="train", num_samples=16)
+    val_shards = _generate_mock_cached_parquet_shard(split="validation", num_samples=8)
+
+    cfg = ConfigDict({
+        "project": {"seed": 42},
+        "data": {
+            "cached_hf_repo": os.path.dirname(train_shards[0]),
+            "image_size": [256, 256],
+            "batch_size": 4,
+            "num_workers": 0,
+            "pin_memory": False,
+            "train_samples_per_epoch": -1,
+            "val_samples_per_epoch": -1,
+            "augmentations": {"horizontal_flip": 0.5},
+        },
+        "model": {"total_z_channels": 84},
+    })
+
+    train_loader, val_loader = create_dataloaders(cfg, include_test=False)
+    batch = next(iter(train_loader))
+    assert batch["image"].shape == (4, 84, 32, 32)
+    assert batch["mask"].shape == (4, 1, 256, 256)
+    assert batch["label"].shape == (4,)
+    assert batch["is_cached"].all()
+
+
+def test_training_step_with_cache(dummy_minimized_model, temp_cache_dir):
+    """Test full forward and backward pass on cached data with trainable decoder optimization."""
+    from sid_unet.losses.auxiliary import SIDTotalLoss
+    from sid_unet.losses.combined import CombinedMaskLoss
+
+    dummy_minimized_model.train()
+    dummy_minimized_model.bypass_diffuser_for_cached_training()
+
+    loss_fn = SIDTotalLoss(mask_loss_type="combined", aux_classifier=True)
+    optimizer = torch.optim.AdamW(dummy_minimized_model.parameters(), lr=1e-3)
+
+    z_batch = torch.randn(2, 84, 32, 32, requires_grad=False)
+    mask_batch = torch.randint(0, 2, (2, 1, 256, 256)).float()
+    label_batch = torch.tensor([1, 2], dtype=torch.long)
+
+    optimizer.zero_grad()
+    outputs = dummy_minimized_model(z_batch)
+    loss, loss_dict = loss_fn(outputs, mask_batch, label_batch)
+    assert torch.isfinite(loss)
+
+    loss.backward()
+    optimizer.step()
+    assert dummy_minimized_model.decoder.stages[0].res_blocks[0].conv1.weight.grad is not None
+
+
+def test_cache_cli_parser():
+    """Test CLI argument parsing for sid-cache."""
+    args = parse_args([
+        "--config", "configs/experiments/diffusion_diff_minimized/default.yaml",
+        "--dataset", "KhangTruong/COCO-inpainted",
+        "--hf-repo", "KhangTruong/COCO-inpainted-cache",
+        "--batch-size", "16",
+        "--max-samples", "100",
+        "--push-to-hub",
+    ])
+    assert args.config == "configs/experiments/diffusion_diff_minimized/default.yaml"
+    assert args.dataset_name == "KhangTruong/COCO-inpainted"
+    assert args.hf_repo == "KhangTruong/COCO-inpainted-cache"
+    assert args.batch_size == 16
+    assert args.max_samples == 100
+    assert args.push_to_hub is True
+
+
+def test_sid_train_with_cached_hf_repo_integration(temp_cache_dir):
+    """Test full sid-train execution using --cached-hf-repo flag and dummy diffusion model."""
+    from sid_unet.train import train_single_run
+
+    # Generate mock cached shards for train and validation
+    _generate_mock_cached_parquet_shard(split="train", num_samples=8)
+    _generate_mock_cached_parquet_shard(split="validation", num_samples=4)
+
+    mock_cache_dir = os.path.dirname(_generate_mock_cached_parquet_shard(split="train", num_samples=2)[0])
+    output_run_dir = os.path.join(temp_cache_dir, "cached_run")
+
+    overrides = [
+        "model.use_dummy=true",
+        "training.epochs=1",
+        "data.batch_size=2",
+        "data.train_samples_per_epoch=4",
+        "data.val_samples_per_epoch=2",
+        "training.amp=false",
+        "training.use_8bit_optimizer=false",
+        "bootstrapping.enabled=false",
+        "hard_mining.enabled=false",
+        f"project.output_dir={output_run_dir}",
+    ]
+
+    results = train_single_run(
+        config_path="configs/experiments/diffusion_diff_minimized/default.yaml",
+        overrides=overrides,
+        cached_hf_repo=mock_cache_dir,
+        auto_resume=False,
+    )
+
+    assert results is not None
+    assert "best_score" in results
+    assert os.path.exists(output_run_dir)

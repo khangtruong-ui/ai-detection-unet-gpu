@@ -100,6 +100,8 @@ sid-check-8bit = "sid_unet.utils.compatibility:cli_check_8bit"
 sid-push = "sid_unet.checkpoint_sync:cli_push"
 sid-pull = "sid_unet.checkpoint_sync:cli_pull"
 sid-checkpoint = "sid_unet.checkpoint_sync:cli_main"
+sid-cache = "sid_unet.cache.cli:cli_main"
+sid-dataset-cache = "sid_unet.cache.cli:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
