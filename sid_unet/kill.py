@@ -321,22 +321,35 @@ def kill_all_background_tasks(
 
     pids_to_kill = [p["pid"] for p in procs]
 
-    # Step 1: Send initial signal (SIGKILL if force, else SIGTERM)
-    initial_sig = signal.SIGKILL if force else signal.SIGTERM
-    if not quiet:
-        sig_name = "SIGKILL" if force else "SIGTERM"
-        print(f"🛑 Sending {sig_name} to {len(pids_to_kill)} process(es)...")
+    # Step 1: Send initial signal (SIGKILL if force, else graceful SIGINT + SIGTERM)
+    if force:
+        if not quiet:
+            print(f"🛑 Sending SIGKILL to {len(pids_to_kill)} process(es)...")
+        for pid in pids_to_kill:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as e:
+                if not quiet:
+                    print(f"   ⚠️ Permission denied killing PID {pid}: {e}")
+    else:
+        if not quiet:
+            print(f"🛑 Sending graceful termination signal (SIGINT/SIGTERM) to {len(pids_to_kill)} process(es)...")
+        for pid in pids_to_kill:
+            # Send SIGINT first: tasks shielded against SSH disconnect (like sid-train) ignore SIGTERM
+            # but gracefully terminate on SIGINT. Also send SIGTERM for processes listening only to SIGTERM.
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    break
+                except PermissionError as e:
+                    if not quiet:
+                        print(f"   ⚠️ Permission denied killing PID {pid}: {e}")
+                    break
 
-    for pid in pids_to_kill:
-        try:
-            os.kill(pid, initial_sig)
-        except ProcessLookupError:
-            pass
-        except PermissionError as e:
-            if not quiet:
-                print(f"   ⚠️ Permission denied killing PID {pid}: {e}")
-
-    # Step 2: Wait for processes to exit if SIGTERM was sent
+    # Step 2: Wait for processes to exit if graceful signals were sent
     if not force:
         start_t = time.time()
         while time.time() - start_t < timeout:

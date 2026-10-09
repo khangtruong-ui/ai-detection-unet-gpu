@@ -71,3 +71,57 @@ def test_kill_dummy_background_unet_process():
 def test_cli_main_dry_run():
     ret = cli_main(["--dry-run", "--quiet"])
     assert ret == 0
+
+
+def test_shield_process_signals():
+    import signal
+    from sid_unet.utils.signals import shield_process_signals, SSH_DISCONNECT_SIGNALS
+
+    ignored = shield_process_signals()
+    assert signal.SIGTERM in ignored
+    if hasattr(signal, "SIGHUP"):
+        assert signal.SIGHUP in ignored
+
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    if hasattr(signal, "SIGHUP"):
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+
+
+def test_kill_shielded_background_process_gracefully():
+    """Verify that a background task that shields itself from SIGTERM (signal 15)
+    is still gracefully terminated by sid-kill without force=True."""
+    # Process ignores SIGTERM and SIGHUP, but responds to SIGINT
+    code = (
+        "import time, signal\n"
+        "from sid_unet.utils.signals import shield_process_signals\n"
+        "shield_process_signals()\n"
+        "# sid_unet dummy background task\n"
+        "time.sleep(60)\n"
+    )
+    dummy_proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.3)
+    try:
+        assert dummy_proc.poll() is None
+
+        # Verify it was found
+        procs = find_unet_processes(include_children=True)
+        assert dummy_proc.pid in [p["pid"] for p in procs]
+
+        # Graceful kill (force=False) must terminate the shielded process promptly via SIGINT
+        t0 = time.time()
+        killed = kill_all_background_tasks(force=False, timeout=3.0, quiet=True)
+        elapsed = time.time() - t0
+
+        assert killed >= 1
+        dummy_proc.wait(timeout=2.0)
+        assert dummy_proc.poll() is not None
+        # Should have terminated quickly without stalling on the timeout
+        assert elapsed < 2.5
+    finally:
+        if dummy_proc.poll() is None:
+            dummy_proc.kill()
+

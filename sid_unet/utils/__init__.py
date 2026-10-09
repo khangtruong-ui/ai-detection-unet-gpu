@@ -28,6 +28,12 @@ from sid_unet.utils.compatibility import (
     cli_check_8bit,
 )
 
+from sid_unet.utils.signals import (
+    shield_process_signals,
+    SSH_DISCONNECT_SIGNALS,
+    SSH_DISCONNECT_SIGNAL_NAMES,
+)
+
 __all__ = [
     "ConfigDict",
     "load_config",
@@ -57,6 +63,9 @@ __all__ = [
     "validate_8bit_environment",
     "installation_check_8bit",
     "cli_check_8bit",
+    "shield_process_signals",
+    "SSH_DISCONNECT_SIGNALS",
+    "SSH_DISCONNECT_SIGNAL_NAMES",
 ]
 
 

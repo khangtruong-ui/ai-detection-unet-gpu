@@ -751,6 +751,9 @@ def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
 
 
 def main():
+    from sid_unet.utils.signals import shield_process_signals
+    shield_process_signals()
+
     args = parse_args()
     raw_patterns = args.checkpoint if isinstance(args.checkpoint, list) else [args.checkpoint]
     checkpoint_paths = expand_checkpoint_patterns(raw_patterns)

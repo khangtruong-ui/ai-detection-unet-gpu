@@ -939,6 +939,9 @@ def run_cross_evaluation(
 
 
 def main():
+    from sid_unet.utils.signals import shield_process_signals
+    shield_process_signals()
+
     args = parse_args()
     raw_configs = args.cross_configs if isinstance(args.cross_configs, list) else [args.cross_configs]
     config_paths = expand_config_patterns(raw_configs)

@@ -150,6 +150,9 @@ def _predict_chunk(model, chunk_tensors, device):
 
 
 def main():
+    from sid_unet.utils.signals import shield_process_signals
+    shield_process_signals()
+
     args = parse_args()
 
     if not args.image and not args.input_dir:

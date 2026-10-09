@@ -690,12 +690,9 @@ def train_single_run(
 
 
 def main():
-    import signal
-    if hasattr(signal, "SIGHUP"):
-        try:
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        except Exception:
-            pass
+    from sid_unet.utils.signals import shield_process_signals
+    # Shield process from SSH disconnection, terminal hangup, and session teardown signals (SIGHUP, SIGTERM, etc.)
+    shield_process_signals()
 
     args = parse_args()
 
@@ -823,6 +820,12 @@ def main():
     ):
         import signal
         import subprocess
+        import time
+        from sid_unet.utils.signals import shield_process_signals
+
+        # Ensure launcher process itself is shielded from SSH disconnection and session signals
+        shield_process_signals()
+
         num_gpus = torch.cuda.device_count()
         port = find_free_port()
         cmd = [
@@ -834,15 +837,26 @@ def main():
         ] + sys.argv[1:]
         print(f"🚀 Auto-launching High-Performance Multi-GPU DistributedDataParallel (DDP) across {num_gpus} GPUs on port {port}...")
         sys.stdout.flush()
+
+        # Shield Torch Elastic agent from SSH disconnection / session teardown signals (SIGHUP, SIGTERM, SIGQUIT)
+        # by configuring it to only trap SIGINT for intentional termination (e.g. sid-kill or Ctrl+C)
+        env = os.environ.copy()
+        env["TORCHELASTIC_SIGNALS_TO_HANDLE"] = "SIGINT"
+        env["PYTHONUNBUFFERED"] = "1"
+
         sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
-        proc = subprocess.Popen(cmd, **sub_kwargs)
+        proc = subprocess.Popen(cmd, env=env, **sub_kwargs)
 
         def _forward_kill(signum=None, frame=None):
             if proc.poll() is None:
                 try:
                     if os.name != "nt":
-                        os.killpg(proc.pid, signal.SIGTERM)
+                        # Send SIGINT first to trigger graceful worker shutdown in Torch Elastic
+                        os.killpg(proc.pid, signal.SIGINT)
                         time.sleep(0.5)
+                        if proc.poll() is None:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                            time.sleep(0.5)
                         if proc.poll() is None:
                             os.killpg(proc.pid, signal.SIGKILL)
                     else:
@@ -852,17 +866,18 @@ def main():
             if signum is not None:
                 sys.exit(128 + signum)
 
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            try:
-                signal.signal(sig, _forward_kill)
-            except (ValueError, OSError):
-                pass
+        # Hook SIGINT for interactive terminal interruptions (Ctrl+C) and graceful sid-kill requests
+        try:
+            signal.signal(signal.SIGINT, _forward_kill)
+        except (ValueError, OSError):
+            pass
 
         try:
             ret = proc.wait()
             sys.exit(ret)
         finally:
-            _forward_kill()
+            if proc.poll() is None:
+                _forward_kill()
 
     # Initialize distributed mode if running under torchrun / distributed launcher
     init_distributed_mode()

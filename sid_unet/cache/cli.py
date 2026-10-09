@@ -135,12 +135,8 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
 
 
 def cli_main(args: Optional[list] = None) -> None:
-    import signal
-    if hasattr(signal, "SIGHUP"):
-        try:
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        except Exception:
-            pass
+    from sid_unet.utils.signals import shield_process_signals
+    shield_process_signals()
 
     parsed_args = parse_args(args)
     logger = setup_logger(name="sid_cache")
