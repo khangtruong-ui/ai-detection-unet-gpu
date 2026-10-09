@@ -218,7 +218,7 @@ def test_trainer_periodic_checkpointing_in_loop():
             "project.device=cpu",
             "training.epochs=1",
             "training.batch_size=2",
-            "training.checkpoint_period=0.0001",  # Trigger immediately
+            "training.checkpoint_period=0.0001s",  # Trigger immediately
             "model.features=[16, 32]",
             "data.image_size=[64, 64]",
             "logging.log_interval=1",

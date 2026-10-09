@@ -257,8 +257,7 @@ class CheckpointManager:
             if step > 0 and (step - self.last_periodic_step) >= self.checkpoint_steps:
                 return True
         if self.checkpoint_period is not None and self.checkpoint_period > 0:
-            effective_period = max(60.0, float(self.checkpoint_period))
-            if (now - self.last_periodic_save_time) >= effective_period:
+            if (now - self.last_periodic_save_time) >= float(self.checkpoint_period):
                 return True
         return False
 

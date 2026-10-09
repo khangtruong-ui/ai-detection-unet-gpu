@@ -10,6 +10,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+pytest.importorskip("sam3", reason="SAM3-Distil requires sam3-distil")
+pytest.importorskip("peft", reason="SAM3-Distil requires peft")
+
 from sid_unet.models.sam3_distil import SAM3DistilLoRA, SAM3Distil
 from sid_unet.models.unet import build_model, UNet
 from sid_unet.utils.config import ConfigDict

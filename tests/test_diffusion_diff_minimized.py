@@ -436,11 +436,14 @@ def test_diffusion_diff_minimized_real_tiny_sd_cuda():
     """
     from diffusers import DiffusionPipeline
 
-    pipe = DiffusionPipeline.from_pretrained(
-        DEFAULT_DIFFUSION_CHECKPOINT,
-        dtype=torch.float16,
-        device_map="cuda",
-    )
+    try:
+        pipe = DiffusionPipeline.from_pretrained(
+            DEFAULT_DIFFUSION_CHECKPOINT,
+            dtype=torch.float16,
+            device_map="cuda",
+        )
+    except torch.OutOfMemoryError:
+        pytest.skip("Insufficient free VRAM on shared GPU to load full segmind/tiny-sd pipeline")
     model = DiffusionDiffMinimizedModel(
         pipeline=pipe,
         timesteps=[250],
