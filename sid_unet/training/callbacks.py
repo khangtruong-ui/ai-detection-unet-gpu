@@ -308,8 +308,17 @@ class CheckpointManager:
         latest_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml")
         save_config(cfg_dict, latest_cfg_path)
 
-        # Periodic saves are strictly local snapshots; never push to Hub during training steps
-        return {"periodic": periodic_path, "latest": latest_path}
+        saved = {"periodic": periodic_path, "latest": latest_path}
+
+        if self.push_to_hub and self.hf_repo:
+            self.push_to_hf(
+                epoch=epoch,
+                step=step,
+                saved_paths=saved,
+                is_periodic=True,
+            )
+
+        return saved
 
     def push_to_hf(
         self,

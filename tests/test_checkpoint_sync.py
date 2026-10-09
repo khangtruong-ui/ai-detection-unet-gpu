@@ -268,6 +268,7 @@ def test_checkpoint_manager_tied_hf_checkpointing(mock_push, mock_verify):
         )
         assert "latest" in saved
         assert "best" in saved
+        mgr.wait_pending_pushes(timeout=5)
         assert mock_push.called
         assert mock_push.call_args[1]["repo"] == "KhangTruong/Testing-model"
 
@@ -280,6 +281,7 @@ def test_checkpoint_manager_tied_hf_checkpointing(mock_push, mock_verify):
             step=20,
         )
         assert "periodic" in p_saved
+        mgr.wait_pending_pushes(timeout=5)
         assert mock_push.called
         assert mock_push.call_args[1]["repo"] == "KhangTruong/Testing-model"
 

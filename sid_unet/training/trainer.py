@@ -48,6 +48,7 @@ from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
 from sid_unet.utils.network import NetworkSpeedMonitor, BottleneckDetector
 from sid_unet.utils.compatibility import check_8bit_compatibility
+from sid_unet.utils.config import save_config
 
 def parse_checkpoint_period(training_cfg: Any) -> float:
     """Parse checkpoint period from config, defaulting to 3600 seconds (1 hour)."""

@@ -1181,9 +1181,9 @@ def resolve_batch_size(config: Any) -> int:
         return int(config.data.batch_size)
 
     dev_cfg = str(config.project.get("device", "auto")).lower() if hasattr(config, "project") else "auto"
-    data_parallel = True
+    data_parallel = False
     if hasattr(config, "training"):
-        data_parallel = bool(config.training.get("data_parallel", True))
+        data_parallel = bool(config.training.get("data_parallel", False))
 
     # DistributedDataParallel (DDP) multi-process mode
     if is_dist_avail_and_initialized():
@@ -1476,9 +1476,9 @@ def create_cached_dataloaders(
     expected_channels = int(config.model.get("total_z_channels", 84))
     use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
     save_to_disk = config.data.get("save_to_disk", False)
-    background_download = bool(config.data.get("background_download", False))
+    background_download = bool(config.data.get("background_download", bool(save_to_disk)))
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
-    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 2))
+    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 4))
 
     # 1. High-performance non-blocking path via parquet-dataset-loader
     if use_parquet_loader and _HAS_PARQUET_LOADER and pdl is not None:
@@ -1525,8 +1525,8 @@ def create_cached_dataloaders(
             if is_dist_avail_and_initialized():
                 world_size = get_world_size()
                 rank = get_rank()
-                train_dataset = train_dataset.shard(num_shards=world_size, index=rank)
-                val_dataset = val_dataset.shard(num_shards=world_size, index=rank)
+                train_dataset = train_dataset.shard(num_shards=world_size, index=rank, contiguous=True)
+                val_dataset = val_dataset.shard(num_shards=world_size, index=rank, contiguous=True)
                 logger.info(
                     f"⚡ Sharded cached dataset for DDP rank {rank}/{world_size}: "
                     f"Train samples = {len(train_dataset)}, Val samples = {len(val_dataset)}"
@@ -1537,16 +1537,43 @@ def create_cached_dataloaders(
             num_workers = min(max(0, raw_workers), max_cached_workers)
             mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                drop_last=False,
-                multiprocessing_context=mp_context,
-                worker_init_fn=worker_init_fn,
-            )
+            # Zero-thrashing sampler preserving row-group cache locality
+            try:
+                from parquet_dataset_loader import BlockShuffledSampler
+            except ImportError:
+                BlockShuffledSampler = None
+
+            if BlockShuffledSampler is not None:
+                window_blocks = int(config.data.get("window_blocks", 1))
+                rank_seed = seed + (get_rank() if is_dist_avail_and_initialized() else 0)
+                train_sampler = BlockShuffledSampler(
+                    train_dataset,
+                    window_blocks=window_blocks,
+                    seed=rank_seed,
+                    shuffle=True,
+                )
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=batch_size,
+                    sampler=train_sampler,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    drop_last=False,
+                    multiprocessing_context=mp_context,
+                    worker_init_fn=worker_init_fn,
+                )
+            else:
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    drop_last=False,
+                    multiprocessing_context=mp_context,
+                    worker_init_fn=worker_init_fn,
+                )
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=batch_size,
@@ -1576,7 +1603,7 @@ def create_cached_dataloaders(
                     expected_channels=expected_channels,
                 )
                 if is_dist_avail_and_initialized():
-                    test_dataset = test_dataset.shard(num_shards=get_world_size(), index=get_rank())
+                    test_dataset = test_dataset.shard(num_shards=get_world_size(), index=get_rank(), contiguous=True)
                 test_loader = DataLoader(
                     test_dataset,
                     batch_size=batch_size,

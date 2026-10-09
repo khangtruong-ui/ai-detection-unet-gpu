@@ -80,5 +80,13 @@ def setup_logger(
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
+    if name != "sid_unet":
+        pkg_logger = logging.getLogger("sid_unet")
+        pkg_logger.setLevel(level)
+        pkg_logger.handlers.clear()
+        pkg_logger.addHandler(console_handler)
+        if log_file:
+            pkg_logger.addHandler(file_handler)
+
     return logger
 

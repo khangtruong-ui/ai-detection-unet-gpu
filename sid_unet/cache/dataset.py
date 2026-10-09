@@ -421,7 +421,7 @@ class CachedIndexedDataset(Dataset):
             "is_cached": True,
         }
 
-    def shard(self, num_shards: int, index: int, contiguous: bool = False) -> "CachedIndexedDataset":
+    def shard(self, num_shards: int, index: int, contiguous: bool = True) -> "CachedIndexedDataset":
         sharded_pdl = self.pdl_dataset.shard(num_shards=num_shards, index=index, contiguous=contiguous)
         sharded_max = None
         if self.max_samples is not None and self.max_samples > 0:
@@ -433,6 +433,20 @@ class CachedIndexedDataset(Dataset):
             expected_channels=self.expected_channels,
             max_samples=sharded_max,
         )
+
+    def get_row_group_indices(self) -> List[List[int]]:
+        """Return dataset row indices grouped by underlying Parquet row group."""
+        if hasattr(self.pdl_dataset, "get_row_group_indices"):
+            raw_groups = self.pdl_dataset.get_row_group_indices()
+            if self.max_samples is not None and self.max_samples > 0:
+                filtered_groups = []
+                for g in raw_groups:
+                    valid_g = [i for i in g if i < self._len]
+                    if valid_g:
+                        filtered_groups.append(valid_g)
+                return filtered_groups
+            return raw_groups
+        return [list(range(self._len))]
 
     def close(self) -> None:
         if hasattr(self.pdl_dataset, "close") and callable(self.pdl_dataset.close):
