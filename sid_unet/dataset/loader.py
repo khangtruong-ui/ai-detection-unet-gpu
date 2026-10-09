@@ -1247,7 +1247,8 @@ def create_eval_dataloader(
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", False))
     batch_size = int(config.data.get("batch_size", 16))
-    num_workers = resolve_num_workers(config.data.get("num_workers", -1))
+    max_eval_workers = int(config.data.get("max_eval_workers", config.data.get("max_workers", 4)))
+    num_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_eval_workers)
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
     seed = int(config.project.get("seed", 42))
@@ -1841,7 +1842,8 @@ def create_dataloaders(
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", True))
     batch_size = resolve_batch_size(config)
-    num_workers = resolve_num_workers(config.data.get("num_workers", -1))
+    max_data_workers = int(config.data.get("max_workers", 4))
+    num_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_data_workers)
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
     shuffle_buffer = int(config.data.get("shuffle_buffer_size", 1000))

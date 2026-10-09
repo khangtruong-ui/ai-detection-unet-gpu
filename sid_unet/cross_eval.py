@@ -85,6 +85,15 @@ def parse_args():
         help="Batch size for evaluation (overrides config data.batch_size).",
     )
     parser.add_argument(
+        "--num_workers",
+        "--num-workers",
+        "--workers",
+        type=int,
+        default=None,
+        dest="num_workers",
+        help="Number of DataLoader workers for evaluation (overrides config data.num_workers).",
+    )
+    parser.add_argument(
         "--override",
         nargs="*",
         default=[],
@@ -954,13 +963,17 @@ def main():
     if not checkpoint_paths:
         raise FileNotFoundError(f"No valid checkpoints found matching: {raw_ckpts}")
 
+    overrides = list(args.override or [])
+    if getattr(args, "num_workers", None) is not None:
+        overrides.append(f"data.num_workers={args.num_workers}")
+
     results = run_cross_evaluation(
         checkpoint_paths=checkpoint_paths,
         config_paths=config_paths,
         split=args.split,
         samples=args.samples,
         batch_size=args.batch_size,
-        overrides=args.override,
+        overrides=overrides,
         output_dir=args.output_dir,
         threshold=args.threshold,
         segment=args.segment,

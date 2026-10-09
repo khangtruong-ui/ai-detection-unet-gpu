@@ -34,6 +34,10 @@ def test_resolve_num_workers():
     assert resolve_num_workers(-1) == expected_cpu
     assert resolve_num_workers(-2) == expected_cpu
 
+    # When max_workers is supplied, -1 or negative values should be capped
+    assert resolve_num_workers(-1, max_workers=4) == min(expected_cpu, 4)
+    assert resolve_num_workers(-2, max_workers=2) == min(expected_cpu, 2)
+
     # Non-negative explicit values should be respected
     assert resolve_num_workers(0) == 0
     assert resolve_num_workers(2) == 2

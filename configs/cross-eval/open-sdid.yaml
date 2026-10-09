@@ -8,7 +8,7 @@ data:
   streaming: false
   image_size: [256, 256]
   batch_size: 16
-  num_workers: -1
+  num_workers: 4
   pin_memory: true
   eval_split: "cross_test"
   test_split: "cross_test"

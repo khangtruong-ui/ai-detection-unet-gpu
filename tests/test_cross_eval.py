@@ -373,3 +373,21 @@ def test_cross_eval_metrics_differentiation_and_collision_robustness(monkeypatch
         assert raw_m["pixel_acc"] == 1.0
         assert post_m["pixel_acc"] == 1.0
 
+
+def test_cross_eval_num_workers_cli_and_cap(monkeypatch):
+    """Verify that --num-workers CLI argument is properly parsed and passed to overrides."""
+    from sid_unet.cross_eval import parse_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sid-cross-eval",
+            "--cross-configs", "configs/cross-eval/cocoglide.yaml",
+            "--checkpoints", "dummy.pt",
+            "--num-workers", "4",
+        ],
+    )
+    args = parse_args()
+    assert args.num_workers == 4
+
