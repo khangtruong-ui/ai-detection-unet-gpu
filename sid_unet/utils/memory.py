@@ -273,8 +273,9 @@ def find_optimal_batch_size(
                     if loss_fn is not None:
                         loss, _ = loss_fn(outputs, masks, labels)
                     else:
-                        if isinstance(outputs, tuple):
-                            mask_out, cls_out = outputs
+                        if isinstance(outputs, (tuple, list)):
+                            mask_out = outputs[0]
+                            cls_out = outputs[1] if len(outputs) > 1 else None
                             loss = mask_out.mean() + (cls_out.mean() if cls_out is not None else 0.0)
                         else:
                             loss = outputs.mean()

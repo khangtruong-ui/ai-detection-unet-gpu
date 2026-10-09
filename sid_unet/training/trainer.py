@@ -1095,8 +1095,9 @@ class Trainer:
 
         metric_logger.update_dict(loss_dict, n=images.size(0))
 
-        if isinstance(outputs, tuple):
-            mask_logits, class_logits = outputs
+        if isinstance(outputs, (tuple, list)):
+            mask_logits = outputs[0]
+            class_logits = outputs[1] if len(outputs) > 1 else None
         else:
             mask_logits, class_logits = outputs, None
 

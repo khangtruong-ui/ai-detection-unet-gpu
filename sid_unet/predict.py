@@ -142,8 +142,9 @@ def _predict_chunk(model, chunk_tensors, device):
     """Run model prediction on a batch of tensors with OOM handling."""
     chunk_inp = torch.cat(chunk_tensors, dim=0).to(device)
     outputs = model(chunk_inp)
-    if isinstance(outputs, tuple):
-        mask_logits, class_logits = outputs
+    if isinstance(outputs, (tuple, list)):
+        mask_logits = outputs[0]
+        class_logits = outputs[1] if len(outputs) > 1 else None
     else:
         mask_logits, class_logits = outputs, None
     return mask_logits, class_logits

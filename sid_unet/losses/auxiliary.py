@@ -30,6 +30,7 @@ class SIDTotalLoss(nn.Module):
         aux_classifier: bool = True,
         aux_loss_type: str = "cross_entropy",
         aux_weight: float = 0.2,
+        artifact_weight: float = 1.0,
     ):
         super().__init__()
         self.mask_loss_fn = CombinedMaskLoss(
@@ -44,20 +45,28 @@ class SIDTotalLoss(nn.Module):
         self.aux_classifier = aux_classifier
         self.aux_loss_type = aux_loss_type
         self.aux_weight = aux_weight
+        self.artifact_weight = artifact_weight
 
     def forward(
         self,
-        model_output: Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]],
+        model_output: Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]],
         target_masks: torch.Tensor,
         target_labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        model_output: mask_logits or (mask_logits, class_logits)
+        model_output: mask_logits or (mask_logits, class_logits) or (mask_logits, class_logits, artifact_loss)
         target_masks: (B, 1, H, W)
         target_labels: (B,)
         """
-        if isinstance(model_output, tuple):
-            mask_logits, class_logits = model_output
+        art_loss = None
+        if isinstance(model_output, (tuple, list)):
+            mask_logits = model_output[0]
+            class_logits = model_output[1] if len(model_output) > 1 else None
+            art_loss = model_output[2] if len(model_output) > 2 else None
+        elif isinstance(model_output, dict):
+            mask_logits = model_output.get("mask_logits")
+            class_logits = model_output.get("class_logits")
+            art_loss = model_output.get("artifact_loss")
         else:
             mask_logits = model_output
             class_logits = None
@@ -74,10 +83,12 @@ class SIDTotalLoss(nn.Module):
             aux_loss = F.cross_entropy(class_logits, target_labels)
             total_loss = total_loss + self.aux_weight * aux_loss
             loss_metrics["aux_loss"] = aux_loss.item()
-            loss_metrics["total_loss"] = total_loss.item()
-        else:
-            loss_metrics["total_loss"] = total_loss.item()
 
+        if art_loss is not None and self.artifact_weight > 0:
+            total_loss = total_loss + self.artifact_weight * art_loss
+            loss_metrics["artifact_loss"] = art_loss.item() if hasattr(art_loss, "item") else float(art_loss)
+
+        loss_metrics["total_loss"] = total_loss.item()
         return total_loss, loss_metrics
 
 
@@ -96,4 +107,5 @@ def build_loss(config: Any) -> SIDTotalLoss:
         aux_classifier=bool(model_cfg.get("aux_classifier", True)),
         aux_loss_type=loss_cfg.get("aux_loss_type", "cross_entropy"),
         aux_weight=float(loss_cfg.get("aux_weight", 0.2)),
+        artifact_weight=float(loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", 1.0))),
     )

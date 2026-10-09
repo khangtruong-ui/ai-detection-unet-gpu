@@ -24,6 +24,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [6. Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)](#6-diffusion-multi-noise-feature-decoder-diffusion-diff)
   - [7. Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)](#7-diffusion-multi-noise-latent-feature-decoder-v2-diffusion-diff-v2)
   - [8. Diffusion-Diff Minimized (Diffusion-Diff-Minimized)](#8-diffusion-diff-minimized-diffusion-diff-minimized)
+  - [9. GAP-SAM: Global Artifact Prior with Distilled SAM3](#9-gap-sam-global-artifact-prior-with-distilled-sam3)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -65,6 +66,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)**: Advanced latent perturbation forensics extracting $z_0$, adding noise across multiple diffusion timesteps, computing frozen diffuser predicted noise and sinusoidal schedule embeddings ($t, \sigma$), concatenated into high-dimensional $Z$ decoded by a fully configurable trainable decoder.
   - **Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)**: State-of-the-art dual-decoder generative perturbation architecture with **frozen VAE encoder by default**, **eliminated encoder-to-decoder skips by default**, and a **parallel pretrained, frozen VAE decoder** providing rich generative decoding priors through **perpendicular skip connections** directly into the trainable decoder.
   - **Diffusion-Diff Minimized (Diffusion-Diff-Minimized)**: Ultra-fast generative forensic architecture designed to dramatically reduce diffusion-diff compute time. Replaces the heavy SD 1.5 backbone with **Segmind Tiny-SD (`segmind/tiny-sd`)** loaded via `DiffusionPipeline.from_pretrained("segmind/tiny-sd", dtype=torch.float16, device_map="cuda")`, and slashes computation down to strictly **2 lines of computation** (1 real latent, 1 chosen noisy latent from the diffusion model vs 4 in v2), reducing representation $Z$ from 244 channels to 84 channels, cutting UNet forward passes from 3 to 1, and cutting UNet parameters from ~860M to ~400M while preserving perpendicular skip connections.
+  - **GAP-SAM (Global Artifact Prior SAM with `sam-distil`)**: Implementation of *GAP-SAM* (Yan et al., arXiv:2608.20929) adapted with lightweight **`sam-distil`** foundation backbones (`tinyvit`, `efficientvit`, `repvit`). Combines a frozen VAE reconstruction branch ($x_r$), dual-branch feature encoding with shared base weights and PEFT LoRA, Global Average Pooling (GAP) artifact interaction MLP ($\mathbf{t}_{\text{art}}$), zero-gated FiLM feature modulation ($\alpha_f = 0$ initialization), and an auxiliary real-vs-synthetic artifact classification loss ($\mathcal{L}_{\text{art}}$) to achieve generalizable AI image manipulation localization.
 - **Continuous Master Reports & Automatic Checkpoint Continuation**:
   - **Automatic Repository Checkpoint Discovery**: Automatically scans repository and output directories (`outputs/RUN/...`, `checkpoints/`, etc.) for existing checkpoints (`checkpoint_latest.pt`, `checkpoint_periodic.pt`, `checkpoint_best.pt`) and displays a highlighted on-screen notification with detailed resume metadata (epoch, global step, metric score).
   - **Hugging Face Model Repository Resumption**: Download and resume training or evaluation directly from Hugging Face Hub repositories (`--resume-repo <owner/repo>` or `--resume hf://<owner/repo>`).
@@ -631,6 +633,103 @@ $$
 1. **3x Fewer Diffuser Evaluations**: By collapsing the multi-step perturbation schedule to a single well-calibrated noisy latent ($t=250$), only one UNet evaluation is executed per forward pass.
 2. **Compact Backbone Memory**: Tiny-SD's 3-stage UNet dramatically cuts parameter memory and intermediate activation caching, allowing larger batch sizes and higher throughput on consumer GPUs (e.g. RTX 3060, RTX 4070).
 3. **Slimmer Decoder Complexity**: The trainable decoder projects from 84 input channels instead of 244 channels, reducing decoder parameters and FLOPs while retaining high fidelity through perpendicular skip connection fusions from the parallel frozen decoder.
+
+---
+
+### 9. GAP-SAM: Global Artifact Prior with Distilled SAM3
+
+Based on the research paper [*"GAP-SAM: A Global Artifact Prior for Generalizable AI-Generated Image Manipulation Localization"* (Yan et al., arXiv:2608.20929)](https://arxiv.org/abs/2608.20929), this architecture addresses the fundamental generalization bottleneck in AI manipulation localization. Standard foundation segmentation models (like SAM) are conditioned on high-level semantic tokens, which often leads to overfitting on known generative domains and failure under diverse unseen generators or severe perturbations.
+
+`GAP-SAM` resolves this by decoupling manipulation localization into **semantic perception** and **global artifact extraction**. In this repository, we adapt GAP-SAM with lightweight foundation models from the **`sam-distil`** module (`EfficientSAM3` backbones: `tinyvit`, `efficientvit`, `repvit`), replacing the massive, slow SAM3 architecture with fast, highly efficient distilled vision transformers while preserving full forensic fidelity.
+
+```
+                  Input Image x_o (B, 3, H, W)
+                               │
+            ┌──────────────────┴──────────────────┐
+            ▼                                     ▼
+     Trainable Branch                      Reconstruction Branch
+ (Vision Transformer + LoRA)            (Frozen SD AutoencoderKL)
+            │                                     │
+            ▼                                     ▼
+   Adaptive Feature Maps F_o^l             Reconstructed Image x_r
+  [F_o^0, F_o^1, F_o^2] (256-d)                   │
+            │                                     ▼
+            │                              Frozen Base SAM3 Pass
+            │                            (Base Weights, No LoRA)
+            │                                     │
+            │                                     ▼
+            │                           Reference Feature Maps F_r^l
+            │                          [F_r^0, F_r^1, F_r^2] (256-d)
+            │                                     │
+            ├─────────────────────────────────────┤
+            │                                     │
+            ▼                                     ▼
+  Global Average Pool:                  Global Average Pool:
+    h_o = GAP(F_o^L)                      h_r = GAP(F_r^L)
+            │                                     │
+            └──────────────────┬──────────────────┘
+                               │
+                               ▼
+                   Paired Artifact Encoder
+             LayerNorm_o(h_o) ║ LayerNorm_r(h_r)
+                               ▼
+               Interaction MLP: [512 -> 512 -> 256]
+                               │
+                               ▼
+                 Artifact Token t_art (B, 256)
+                               │
+            ┌──────────────────┴──────────────────┐
+            │                                     │
+            ▼                                     ▼
+    Zero-Gated FiLM                      Artifact Classifier
+  Modulation on F_o^l:                   c(h) = MLP(h) -> 2-class
+  ~F_o^l = F_o^l + alpha_f *             Anchors latent space to
+  (gamma^l * F_o^l + beta^l)             real-vs-synthetic axis
+  (alpha_f = 0 at init)                           │
+            │                                     ▼
+            ▼                              L_art Cross-Entropy
+  Modulated FPN Features                          │
+            │                                     │
+            ▼                                     │
+   EfficientSAM3 Decoder                          │
+            │                                     │
+            ▼                                     ▼
+  Mask Logits (B, 1, H, W)                Total Loss L_total =
+    + L_loc (BCE + Dice)            L_loc + lambda_art * L_art
+```
+
+#### Mathematical & Architectural Principles
+
+- **1. Paired Artifact Feature Extraction & Reconstruction Branch**:
+  Given an input image $\mathbf{x}_o \in \mathbb{R}^{B \times 3 \times H \times W}$, a frozen Variational Autoencoder ($\mathrm{VAE}_{\mathrm{enc}}, \mathrm{VAE}_{\mathrm{dec}}$ from Stable Diffusion) reconstructs the image:
+  $$\mathbf{x}_r = \mathrm{VAE}_{\mathrm{dec}}\left(\mathrm{VAE}_{\mathrm{enc}}(\mathbf{x}_o)\right)$$
+  The generative reconstruction suppresses localized manipulation traces while retaining overall scene structure. The original image $\mathbf{x}_o$ is processed by the trainable LoRA-adapted backbone, and $\mathbf{x}_r$ is processed by the frozen base backbone (`peft_model.disable_adapter()`, eliminating parameter memory duplication) to extract paired feature representations $\mathbf{F}_o^l, \mathbf{F}_r^l \in \mathbb{R}^{B \times 256 \times H_l \times W_l}$ across FPN pyramid levels $l \in \{0, 1, 2\}$.
+
+- **2. Global Average Pooling (GAP) & Artifact Interaction MLP**:
+  Global spatial average pooling collapses the final layer feature maps ($l=L$):
+  $$\mathbf{h}_o = \mathrm{GAP}(\mathbf{F}_o^L), \qquad \mathbf{h}_r = \mathrm{GAP}(\mathbf{F}_r^L) \quad \in \mathbb{R}^{B \times 256}$$
+  Branch-specific LayerNorms stabilize distribution differences:
+  $$\hat{\mathbf{h}}_o = \mathrm{LN}_o(\mathbf{h}_o), \qquad \hat{\mathbf{h}}_r = \mathrm{LN}_r(\mathbf{h}_r)$$
+  A 2-layer interaction Multi-Layer Perceptron ($512 \to 512 \to 256$) with GELU and output LayerNorm computes the global artifact token $\mathbf{t}_{\text{art}}$:
+  $$\mathbf{t}_{\text{art}} = \mathrm{LN}\left(\mathbf{W}_2 \, \mathrm{GELU}\left(\mathbf{W}_1 \, [\hat{\mathbf{h}}_o \,\|\, \hat{\mathbf{h}}_r] + \mathbf{b}_1\right) + \mathbf{b}_2\right) \quad \in \mathbb{R}^{B \times 256}$$
+
+- **3. Zero-Gated FiLM Conditioning on FPN Feature Pyramid**:
+  Rather than standard cross-attention which can perturb fine spatial details, Feature-wise Linear Modulation (FiLM) modulates each feature pyramid level $l$ using affine parameters $\boldsymbol{\gamma}^l, \boldsymbol{\beta}^l \in \mathbb{R}^{256}$ projected from $\mathbf{t}_{\text{art}}$. To ensure training stability and preserve pretrained SAM3 representations at initialization, a scalar gate $\alpha_f$ is initialized strictly to zero ($\alpha_f = 0$):
+  $$\tilde{\mathbf{F}}_o^l = \mathbf{F}_o^l + \alpha_f \cdot \left(\boldsymbol{\gamma}^l \odot \mathbf{F}_o^l + \boldsymbol{\beta}^l\right)$$
+  At the beginning of training, $\tilde{\mathbf{F}}_o^l \equiv \mathbf{F}_o^l$, creating an exact identity mapping and preventing optimization shocks.
+
+- **4. Forensic Latent Anchoring via Artifact Classifier Loss**:
+  To anchor the pooled representations $\mathbf{h}_o, \mathbf{h}_r$ to the forensic real-versus-synthetic axis, a lightweight linear classifier $c(\mathbf{h}) \in \mathbb{R}^2$ predicts whether an embedding originates from authentic natural content or synthetic manipulation:
+  $$\mathcal{L}_{\text{art}} = \mathcal{L}_{\text{CE}}(c(\mathbf{h}_o), y_{\text{binary}}) + \mathcal{L}_{\text{CE}}(c(\mathbf{h}_r), 0)$$
+  where ground-truth label $y_{\text{binary}} = 1$ if the image contains synthetic content (labels 1 or 2) and $0$ for pristine authentic images. The total loss combines dense mask localization with artifact supervision ($\lambda_{\text{art}} = 1.0$):
+  $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{loc}}(\hat{\mathbf{M}}, \mathbf{M}_{\text{gt}}) + \lambda_{\text{art}} \, \mathcal{L}_{\text{art}}$$
+
+- **5. Lightweight Foundation Backbones via `sam-distil`**:
+  Instead of Meta's heavy SAM3 ViT backbones, `GAP-SAM` integrates distilled models from the `sam-distil` module:
+  - **`tinyvit`**: Ultra-fast hierarchical ViT balancing extreme throughput and forensic accuracy.
+  - **`efficientvit`**: High-resolution linear-attention backbone optimal for edge boundaries.
+  - **`repvit`**: Structural re-parameterization CNN-ViT hybrid offering minimal mobile latency.
+  Trainable parameters are kept minimal via PEFT LoRA on projection matrices (`q_proj`, `v_proj` or `qkv`), allowing full fine-tuning on consumer 12GB GPUs (e.g. RTX 3060).
 
 ---
 
@@ -1413,7 +1512,40 @@ training:
   amp: true
 ```
 
-#### 8. Non-Blocking Parquet Dataset Configuration Example
+#### 8. GAP-SAM Distilled SAM3 Configuration Example (`configs/experiments/gap_sam/default.yaml`)
+```yaml
+model:
+  name: "gap_sam"
+  backbone: "tinyvit"                            # "tinyvit", "efficientvit", or "repvit"
+  model_name: "11m"
+  checkpoint_path: "/workspace/sam3-distil/checkpoints/efficientsam3_ft/efficientsam3_tinyvit.pt"
+  text_encoder_type: "MobileCLIP-S0"
+  prompt_text: "tampered region"                 # Prompt text conditioning
+  vae_pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"  # Frozen SD VAE
+  freeze_vae: true
+  lora_r: 16                                     # PEFT LoRA rank dimension
+  lora_alpha: 32                                 # LoRA scaling factor
+  lora_target_modules: ["qkv", "qkv_proj", "out_proj", "proj", "linear1", "linear2"]
+  target_size: [1008, 1008]
+  artifact_weight: 1.0                           # Auxiliary artifact classifier loss weight (lambda_art)
+  enable_artifact_classifier: true
+  aux_classifier: true
+  num_classes: 3
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  focal_weight: 0.5
+  artifact_weight: 1.0                           # lambda_art * L_art
+
+training:
+  learning_rate: 0.0002
+  amp: true
+  gradient_accumulation_steps: 4
+```
+
+#### 9. Non-Blocking Parquet Dataset Configuration Example
 ```yaml
 data:
   dataset_name: "KhangTruong/IMD2020"            # Hugging Face Parquet dataset repository or local directory
@@ -1460,6 +1592,13 @@ sid-train --config configs/experiments/diffusion_diff_v2/default.yaml
 
 # Train Diffusion-Diff-Minimized (Ultra-Fast 2-Line Tiny-SD)
 sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml
+
+# Train GAP-SAM with TinyViT backbone and PEFT LoRA
+sid-train --config configs/experiments/gap_sam/default.yaml
+
+# Train GAP-SAM with EfficientViT or RepViT backbones
+sid-train --config configs/experiments/gap_sam/gap_sam_efficientvit_lora.yaml
+sid-train --config configs/experiments/gap_sam/gap_sam_repvit_lora.yaml
 ```
 
 #### B. Multi-Experiment Suite (Continuous Reporting & Collision Skipping)
@@ -1801,6 +1940,9 @@ pytest
 
 # Run tests with detailed verbose output
 pytest -v
+
+# Run GAP-SAM specific tests
+pytest tests/test_gap_sam.py -v
 
 # Run tests with code coverage report
 pytest --cov=sid_unet

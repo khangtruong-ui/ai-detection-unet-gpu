@@ -69,8 +69,12 @@ def test_all_experiment_configs_validity():
         assert cfg.data.train_samples_per_epoch == -1
         assert cfg.data.val_samples == -1
 
-        # Use fast tiny model for sam3 config loop testing
-        if "sam3_distil" in str(cfg.model.name).lower():
+        # Use fast tiny model for sam3 / gap-sam config loop testing
+        if "gap_sam" in str(cfg.model.name).lower() or "gap-sam" in str(cfg.model.name).lower():
+            cfg.model.checkpoint_path = None
+            cfg.model.load_in_4bit = False
+            cfg.model.use_dummy_vae = True
+        elif "sam3_distil" in str(cfg.model.name).lower():
             cfg.model.checkpoint_path = None
             cfg.model.load_in_4bit = False
         elif "sam3" in str(cfg.model.name).lower():
@@ -83,22 +87,29 @@ def test_all_experiment_configs_validity():
         try:
             model = build_model(cfg)
         except ImportError as e:
-            if "sam" in str(cfg.model.name).lower():
+            if "sam" in str(cfg.model.name).lower() or "gap" in str(cfg.model.name).lower():
                 continue
             raise e
         loss_fn = build_loss(cfg)
 
         # Test forward pass with small batch
+        model.eval()
         h, w = cfg.data.image_size
         dev = next(model.parameters()).device
-        x = torch.randn(2, 3, h, w, device=dev)
+        x = torch.randn(1, 3, h, w, device=dev)
         out = model(x)
         if cfg.model.aux_classifier:
             assert isinstance(out, tuple)
-            mask_out, cls_out = out
-            assert mask_out.shape == (2, 1, h, w)
-            assert cls_out.shape == (2, cfg.model.num_classes)
+            mask_out = out[0]
+            cls_out = out[1]
+            assert mask_out.shape == (1, 1, h, w)
+            assert cls_out.shape == (1, cfg.model.num_classes)
         else:
-            assert out.shape == (2, 1, h, w)
+            mask_out = out[0] if isinstance(out, tuple) else out
+            assert mask_out.shape == (1, 1, h, w)
+
+        del model, loss_fn, out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 

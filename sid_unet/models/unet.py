@@ -292,6 +292,8 @@ class UNet(nn.Module):
             elif any(k.startswith(("stage1.", "linear.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "efficientnet"
                 merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
+            elif any(k.startswith(("paired_artifact_encoder.", "zero_gated_film.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "gap_sam"
             elif any(k.startswith(("base_model.backbone.vision_backbone", "peft_model.base_model", "model.backbone.vision_backbone")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_distil"
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
@@ -348,6 +350,57 @@ def build_model(config: Any) -> nn.Module:
 
     model_name = str(model_cfg.get("name", "unet")).lower()
     backbone = str(model_cfg.get("backbone", "")).lower()
+
+    if any(k in model_name for k in ["gap_sam", "gap-sam", "gapsam"]) or (
+        ("gap" in model_name or "gap" in backbone) and any(b in backbone for b in ["tinyvit", "efficientvit", "repvit", "sam"])
+    ):
+        from sid_unet.models.gap_sam import GAPSAM
+        ckpt_name = model_cfg.get(
+            "checkpoint_path",
+            model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", None))
+        )
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        bb_type = model_cfg.get("backbone", model_cfg.get("backbone_type", "tinyvit"))
+        if str(bb_type).lower() in ["gap_sam", "gap-sam", "gapsam", "sam3"]:
+            bb_type = model_cfg.get("sam_backbone", model_cfg.get("sam_backbone_type", "tinyvit"))
+
+        # Sensible variant default based on backbone type
+        default_variant = "11m" if "tinyvit" in str(bb_type).lower() else ("b0" if "efficientvit" in str(bb_type).lower() else "m1.1")
+        variant_name = str(model_cfg.get("variant", model_cfg.get("model_variant", model_cfg.get("model_name", default_variant))))
+        if variant_name in ["gap_sam", "gap-sam", "gapsam"]:
+            variant_name = default_variant
+
+        return GAPSAM(
+            checkpoint_path=str(ckpt_name) if ckpt_name else None,
+            backbone_type=str(bb_type),
+            model_name=variant_name,
+            text_encoder_type=model_cfg.get("text_encoder_type", "MobileCLIP-S0"),
+            text_encoder_context_length=int(model_cfg.get("text_encoder_context_length", 16)),
+            load_in_4bit=bool(model_cfg.get("load_in_4bit", False)),
+            load_in_8bit=bool(model_cfg.get("load_in_8bit", False)),
+            lora_r=int(model_cfg.get("lora_r", 16)),
+            lora_alpha=int(model_cfg.get("lora_alpha", 32)),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
+            lora_target_modules=model_cfg.get("lora_target_modules", None),
+            prompt_text=str(model_cfg.get("prompt_text", "tampered region")),
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            target_size=tuple(model_cfg.get("target_size", [1008, 1008])),
+            input_rescale=bool(model_cfg.get("input_rescale", True)),
+            vae_pretrained_model_name_or_path=model_cfg.get("vae_pretrained_model_name_or_path", model_cfg.get("vae_checkpoint", "stabilityai/sd-vae-ft-mse")),
+            vae_subfolder=model_cfg.get("vae_subfolder", None),
+            freeze_vae=bool(model_cfg.get("freeze_vae", True)),
+            use_dummy_vae=bool(model_cfg.get("use_dummy_vae", False)),
+            dummy_vae_channels=tuple(model_cfg.get("dummy_vae_channels", [32, 64])),
+            artifact_weight=float(model_cfg.get("artifact_weight", 1.0)),
+            enable_artifact_classifier=bool(model_cfg.get("enable_artifact_classifier", True)),
+            device=dev_cfg,
+            cache_dir=model_cfg.get("cache_dir", None),
+            token=model_cfg.get("token", None),
+            force_download=bool(model_cfg.get("force_download", False)),
+        )
 
     if any(k in model_name for k in ["sam3_distil", "sam3-distil", "efficientsam3", "sam3distil"]) or (
         ("sam3" in model_name or "sam3" in backbone) and any(b in backbone for b in ["tinyvit", "efficientvit", "repvit"])

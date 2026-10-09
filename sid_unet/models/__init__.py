@@ -22,12 +22,27 @@ from sid_unet.models.diffusion_diff_minimized import (
     DiffusionDiffMinimized,
 )
 
+from sid_unet.models.gap_sam import (
+    GAPSAM,
+    GAPSAMDistil,
+    GAP_SAM,
+    PairedArtifactEncoder,
+    ZeroGatedFiLM,
+    ArtifactClassifier,
+)
+
 __all__ = [
     "UNet",
     "EfficientNetSegmentation",
     "SAM3QLoRA",
     "SAM3DistilLoRA",
     "SAM3Distil",
+    "GAPSAM",
+    "GAPSAMDistil",
+    "GAP_SAM",
+    "PairedArtifactEncoder",
+    "ZeroGatedFiLM",
+    "ArtifactClassifier",
     "build_model",
     "DoubleConv",
     "Down",
