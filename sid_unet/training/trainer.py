@@ -482,11 +482,18 @@ class Trainer:
 
         # Restore hard mining state if present
         if "hard_mining" in ckpt_meta and ckpt_meta["hard_mining"] and hasattr(self, "hard_miner"):
-            self.hard_miner.load_state_dict(ckpt_meta["hard_mining"])
-            self.logger.info(
-                f"⛏️ [HARD MINING] State restored from checkpoint: Epoch {self.hard_miner.current_epoch}, "
-                f"Active: {self.hard_miner.is_active_epoch}, Hard Batches: {len(self.hard_miner.hard_batch_indices)}"
-            )
+            cur_iters = len(self.train_loader) if hasattr(self.train_loader, "__len__") else None
+            self.hard_miner.load_state_dict(ckpt_meta["hard_mining"], current_iterations=cur_iters)
+            if self.hard_miner.is_active_epoch:
+                self.logger.info(
+                    f"⛏️ [HARD MINING] State restored from checkpoint: Epoch {self.hard_miner.current_epoch}, "
+                    f"Active: {self.hard_miner.is_active_epoch}, Hard Batches: {len(self.hard_miner.hard_batch_indices)}"
+                )
+            else:
+                self.logger.info(
+                    f"⛏️ [HARD MINING] Hard mining state initialized for Epoch {self.hard_miner.current_epoch}: "
+                    f"Full training epoch scheduled (Active={self.hard_miner.is_active_epoch})."
+                )
 
         # Restore best score in early stopping
         if self.ckpt_manager.best_score not in [float("-inf"), float("inf")]:

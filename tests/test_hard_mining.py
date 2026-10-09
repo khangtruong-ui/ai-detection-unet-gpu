@@ -310,3 +310,142 @@ def test_resume_preserves_hard_mining_state():
         assert trainer_resume.hard_miner.threshold == pytest.approx(orig_threshold)
         assert trainer_resume.hard_miner.is_hard_mining_active(epoch=3) is True
 
+
+def test_legacy_checkpoint_hard_mining_mismatched_iterations_ignored():
+    """Verify that an old legacy checkpoint with mismatched iterations ignores stale hard mining."""
+    cfg = {"hard_mining": {"enabled": True, "metric": "median", "reset_epochs": 5}}
+    miner = HardMiner(cfg)
+
+    # Legacy checkpoint: no 'version' key, recorded 1910 batches on previous machine
+    legacy_state = {
+        "enabled": True,
+        "metric": "median",
+        "reset_epochs": 5,
+        "current_epoch": 16,
+        "cycle_epoch": 4,
+        "is_active_epoch": True,
+        "previous_median": 0.543,
+        "threshold": 0.543,
+        "hard_batch_indices": list(range(1, 1910, 2)),  # 955 batches from 1910-batch machine
+        "total_batches_in_full_epoch": 1910,
+        "cycle_anchor_epoch": 13,
+    }
+
+    # Current machine has 955 batches (e.g. different GPU count or batch size)
+    current_iterations = 955
+    miner.load_state_dict(legacy_state, current_iterations=current_iterations)
+
+    # Must detect mismatch, ignore hardmining, and schedule full epoch
+    assert miner.is_active_epoch is False
+    assert len(miner.hard_batch_indices) == 0
+    assert miner.total_batches_in_full_epoch == 955
+
+
+def test_legacy_checkpoint_hard_mining_matching_iterations_preserved():
+    """Verify that an old legacy checkpoint with matching iterations preserves hard mining state."""
+    cfg = {"hard_mining": {"enabled": True, "metric": "median", "reset_epochs": 5}}
+    miner = HardMiner(cfg)
+
+    legacy_state = {
+        "enabled": True,
+        "metric": "median",
+        "reset_epochs": 5,
+        "current_epoch": 16,
+        "cycle_epoch": 4,
+        "is_active_epoch": True,
+        "previous_median": 0.543,
+        "threshold": 0.543,
+        "hard_batch_indices": [10, 20, 30, 40],
+        "total_batches_in_full_epoch": 955,
+        "cycle_anchor_epoch": 13,
+    }
+
+    # Current machine matches 955 iterations
+    current_iterations = 955
+    miner.load_state_dict(legacy_state, current_iterations=current_iterations)
+
+    # Must preserve hard mining state
+    assert miner.is_active_epoch is True
+    assert miner.hard_batch_indices == {10, 20, 30, 40}
+    assert miner.total_batches_in_full_epoch == 955
+
+
+def test_future_v2_checkpoint_with_topology_change_recalibrates():
+    """Verify that future v2 checkpoints with changed world_size/iterations recalibrate cleanly."""
+    cfg = {"hard_mining": {"enabled": True, "metric": "median", "reset_epochs": 5}}
+    miner = HardMiner(cfg)
+
+    # Future v2 checkpoint saved on 2-GPU machine (world_size=2, 478 iterations/rank)
+    v2_state = {
+        "version": 2,
+        "enabled": True,
+        "metric": "median",
+        "reset_epochs": 5,
+        "current_epoch": 16,
+        "cycle_epoch": 4,
+        "is_active_epoch": True,
+        "previous_median": 0.543,
+        "threshold": 0.543,
+        "hard_batch_indices": [5, 15, 25],
+        "total_batches_in_full_epoch": 478,
+        "world_size": 2,
+        "num_gpus": 2,
+        "iterations_per_epoch": 478,
+        "cycle_anchor_epoch": 13,
+    }
+
+    # Resumed on 1-GPU machine (world_size=1, 955 iterations)
+    miner.load_state_dict(v2_state, current_iterations=955)
+
+    # Topology changed: should clear stale indices and schedule full epoch for new machine
+    assert miner.is_active_epoch is False
+    assert len(miner.hard_batch_indices) == 0
+    assert miner.total_batches_in_full_epoch == 955
+
+
+def test_future_v2_checkpoint_matching_topology_resumes_seamlessly():
+    """Verify that future v2 checkpoints with matching world_size/iterations resume seamlessly."""
+    cfg = {"hard_mining": {"enabled": True, "metric": "median", "reset_epochs": 5}}
+    miner = HardMiner(cfg)
+
+    v2_state = {
+        "version": 2,
+        "enabled": True,
+        "metric": "median",
+        "reset_epochs": 5,
+        "current_epoch": 16,
+        "cycle_epoch": 4,
+        "is_active_epoch": True,
+        "previous_median": 0.543,
+        "threshold": 0.543,
+        "hard_batch_indices": [5, 15, 25],
+        "total_batches_in_full_epoch": 955,
+        "world_size": 1,
+        "num_gpus": 1,
+        "iterations_per_epoch": 955,
+        "cycle_anchor_epoch": 13,
+    }
+
+    miner.load_state_dict(v2_state, current_iterations=955)
+
+    assert miner.is_active_epoch is True
+    assert miner.hard_batch_indices == {5, 15, 25}
+    assert miner.total_batches_in_full_epoch == 955
+
+
+def test_hard_mining_batch_filter_bounded_len():
+    """Verify that HardMiningBatchFilter bounds reported length by dataloader capacity."""
+    dummy_loader = list(range(10))  # 10 batches (indices 0..9)
+    # Hard indices contain indices beyond loader capacity (e.g. 15, 25 from another GPU setup)
+    hard_indices = {2, 5, 8, 15, 25}
+    filtered = HardMiningBatchFilter(dummy_loader, hard_indices)
+
+    # Only 3 indices (2, 5, 8) fall within range(10)
+    assert len(filtered) == 3
+
+    # Yields exactly 3 batches
+    yielded = list(filtered)
+    assert len(yielded) == 3
+    assert yielded == [2, 5, 8]
+
+

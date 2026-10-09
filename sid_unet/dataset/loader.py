@@ -1117,7 +1117,18 @@ class SIDMapDataset(Dataset):
             )
             sample_dict["sample_idx"] = idx
             return sample_dict
-        raw_sample = self.data[idx]
+        raw_sample = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                raw_sample = self.data[idx]
+                break
+            except Exception as exc:
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.5 * (2 ** attempt))
+                else:
+                    raise
         sample_dict = process_raw_sample(
             raw_sample,
             transform=self.transform,

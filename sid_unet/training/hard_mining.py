@@ -26,6 +26,8 @@ class HardMiningBatchFilter:
     """
     Lightweight wrapper around an existing DataLoader or iterator that yields only batches
     marked as hard examples based on their batch index.
+    Bounded by the underlying dataloader length to prevent yielding or claiming iterations
+    that do not exist when running on machines with different numbers of GPUs.
     """
 
     def __init__(self, dataloader: Any, hard_batch_indices: Set[int], anchor_seed: Optional[int] = None):
@@ -34,12 +36,21 @@ class HardMiningBatchFilter:
         self.anchor_seed = anchor_seed
 
     def __iter__(self) -> Iterator[Any]:
-        yielded = 0
-        target = len(self.hard_batch_indices)
-        if target == 0:
+        if not self.hard_batch_indices:
             return
         if self.anchor_seed is not None:
             torch.manual_seed(self.anchor_seed)
+
+        loader_len = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
+        if loader_len is not None:
+            target = sum(1 for idx in self.hard_batch_indices if idx < loader_len)
+        else:
+            target = len(self.hard_batch_indices)
+
+        if target == 0:
+            return
+
+        yielded = 0
         for batch_idx, batch in enumerate(self.dataloader):
             if batch_idx in self.hard_batch_indices:
                 yield batch
@@ -48,6 +59,12 @@ class HardMiningBatchFilter:
                     break
 
     def __len__(self) -> int:
+        if hasattr(self.dataloader, "__len__"):
+            try:
+                loader_len = len(self.dataloader)
+                return sum(1 for idx in self.hard_batch_indices if idx < loader_len)
+            except Exception:
+                pass
         return len(self.hard_batch_indices)
 
     @property
@@ -244,8 +261,34 @@ class HardMiner:
         """
         If hard mining is active for the current epoch and hard batches are available,
         wrap the dataloader to only yield the hard batches. Otherwise, return the original dataloader.
+        Validates dataloader length against recorded full-epoch batches to guard against
+        multi-GPU topology mismatches.
         """
         if self.enabled and self.is_active_epoch and self.hard_batch_indices:
+            if hasattr(dataloader, "__len__"):
+                actual_loader_len = len(dataloader)
+                # If dataloader length does not match total batches recorded during full epoch
+                if self.total_batches_in_full_epoch > 0 and actual_loader_len != self.total_batches_in_full_epoch:
+                    logger.warning(
+                        f"⚠️ [HARD MINING] Dataloader iteration count ({actual_loader_len}) does not match "
+                        f"full epoch batches ({self.total_batches_in_full_epoch}). Disabling hard mining filter for "
+                        f"epoch {self.current_epoch} to ensure complete training across all GPUs."
+                    )
+                    self.is_active_epoch = False
+                    self.hard_batch_indices.clear()
+                    return dataloader
+
+                # Verify valid indices
+                valid_count = sum(1 for idx in self.hard_batch_indices if idx < actual_loader_len)
+                if valid_count == 0 and actual_loader_len > 0:
+                    logger.warning(
+                        f"⚠️ [HARD MINING] None of the {len(self.hard_batch_indices)} hard batch indices fall within "
+                        f"current dataloader bounds (0..{actual_loader_len - 1}). Disabling hard mining filter for epoch {self.current_epoch}."
+                    )
+                    self.is_active_epoch = False
+                    self.hard_batch_indices.clear()
+                    return dataloader
+
             base_seed = 42
             if hasattr(self.config, "project") and hasattr(self.config.project, "get"):
                 base_seed = int(self.config.project.get("seed", 42))
@@ -325,11 +368,20 @@ class HardMiner:
 
         return summary
 
-
-
     def state_dict(self) -> Dict[str, Any]:
-        """Serialize hard mining state for checkpointing."""
+        """Serialize hard mining state for checkpointing with version 2 enhanced topology metadata."""
+        from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_world_size
+        world_size = get_world_size() if is_dist_avail_and_initialized() else 1
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+        batch_size = None
+        if hasattr(self.config, "data"):
+            batch_size = getattr(self.config.data, "batch_size", None)
+        elif isinstance(self.config, dict) and "data" in self.config:
+            batch_size = self.config["data"].get("batch_size")
+
         return {
+            "version": 2,  # Schema version 2 for forward-compatible multi-GPU checkpointing
             "enabled": self.enabled,
             "metric": self.metric,
             "reset_epochs": self.reset_epochs,
@@ -338,15 +390,34 @@ class HardMiner:
             "is_active_epoch": self.is_active_epoch,
             "previous_median": self.previous_median,
             "threshold": self.previous_median,
-            "hard_batch_indices": list(self.hard_batch_indices),
+            "hard_batch_indices": sorted(list(self.hard_batch_indices)),
             "total_batches_in_full_epoch": self.total_batches_in_full_epoch,
             "cycle_anchor_epoch": self.get_anchor_epoch(self.current_epoch),
+            "world_size": world_size,
+            "num_gpus": num_gpus,
+            "per_device_batch_size": batch_size,
+            "iterations_per_epoch": self.total_batches_in_full_epoch,
         }
 
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-        """Restore hard mining state from checkpoint."""
+    def load_state_dict(self, state: Dict[str, Any], current_iterations: Optional[int] = None) -> None:
+        """
+        Restore hard mining state from checkpoint.
+
+        Handles both legacy (v1, untagged) checkpoints and enhanced (v2+) checkpoints:
+        - For legacy checkpoints: inspects if the saved iterations (total_batches_in_full_epoch)
+          matches the current machine's dataloader iterations.
+          * If matches: preserves the hard mining state.
+          * If differs (e.g. run on machine with different number of GPUs): ignores the legacy
+            hard mining state, resets active status, and runs a full epoch to recalibrate.
+        - For v2+ checkpoints: stores and verifies topology metadata (world_size, num_gpus, batch_size,
+          iterations_per_epoch). If topology differs, recalibrates with a full epoch cleanly.
+        """
         if not state:
             return
+
+        is_legacy = "version" not in state or int(state.get("version", 1)) < 2
+        checkpoint_version = int(state.get("version", 1))
+
         if "enabled" in state:
             self.enabled = bool(state["enabled"])
         if "metric" in state:
@@ -357,15 +428,73 @@ class HardMiner:
             self.current_epoch = int(state["current_epoch"])
         if "cycle_epoch" in state:
             self.cycle_epoch = int(state["cycle_epoch"])
-        if "is_active_epoch" in state:
-            self.is_active_epoch = bool(state["is_active_epoch"])
-        if "previous_median" in state:
-            self.previous_median = float(state["previous_median"]) if state["previous_median"] is not None else None
-        elif "threshold" in state:
-            self.previous_median = float(state["threshold"]) if state["threshold"] is not None else None
-        if "hard_batch_indices" in state:
-            self.hard_batch_indices = set(int(x) for x in state["hard_batch_indices"])
-        if "total_batches_in_full_epoch" in state:
-            self.total_batches_in_full_epoch = int(state["total_batches_in_full_epoch"])
         if "cycle_anchor_epoch" in state and state["cycle_anchor_epoch"] is not None:
             self.cycle_anchor_epoch = int(state["cycle_anchor_epoch"])
+
+        saved_median = state.get("previous_median", state.get("threshold"))
+        self.previous_median = float(saved_median) if saved_median is not None else None
+
+        saved_total_batches = int(state.get("total_batches_in_full_epoch", 0))
+        raw_hard_indices = set(int(x) for x in state.get("hard_batch_indices", []))
+        was_active = bool(state.get("is_active_epoch", False))
+
+        from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_world_size
+        cur_world_size = get_world_size() if is_dist_avail_and_initialized() else 1
+
+        if is_legacy:
+            # Legacy checkpoint logic:
+            # Check if the number of iterations matches the current machine.
+            if current_iterations is not None and saved_total_batches > 0:
+                if current_iterations == saved_total_batches:
+                    # Matches machine! Keep restored hard mining state
+                    self.total_batches_in_full_epoch = saved_total_batches
+                    self.hard_batch_indices = raw_hard_indices
+                    self.is_active_epoch = was_active
+                    logger.info(
+                        f"⛏️ [HARD MINING] Legacy checkpoint iteration count ({saved_total_batches}) "
+                        f"matches current machine dataloader ({current_iterations}). "
+                        f"Preserving hard mining state ({len(self.hard_batch_indices)} hard batches, active={self.is_active_epoch})."
+                    )
+                else:
+                    # Mismatched iterations (e.g. different GPU count or batch size) -> Ignore existing hardmining
+                    self.total_batches_in_full_epoch = current_iterations
+                    self.hard_batch_indices.clear()
+                    self.is_active_epoch = False
+                    logger.warning(
+                        f"⚠️ [HARD MINING] Legacy checkpoint detected with mismatched iterations: "
+                        f"checkpoint recorded {saved_total_batches} iterations, but current machine yields "
+                        f"{current_iterations} iterations per epoch (e.g. different number of GPUs). "
+                        f"Ignoring legacy hard mining state to prevent GPU/iteration mismatch. "
+                        f"Epoch {self.current_epoch} will execute a full training epoch to recalibrate hard batches for this machine."
+                    )
+            else:
+                self.total_batches_in_full_epoch = saved_total_batches
+                self.hard_batch_indices = raw_hard_indices
+                self.is_active_epoch = was_active
+        else:
+            # Future checkpoint (version >= 2):
+            saved_world_size = int(state.get("world_size", 1))
+            saved_iters = int(state.get("iterations_per_epoch", saved_total_batches))
+
+            topology_matches = (cur_world_size == saved_world_size)
+            iters_match = (current_iterations is None or current_iterations == saved_iters)
+
+            if topology_matches and iters_match:
+                self.total_batches_in_full_epoch = saved_iters
+                self.hard_batch_indices = raw_hard_indices
+                self.is_active_epoch = was_active
+                logger.info(
+                    f"⛏️ [HARD MINING] Resumed v{checkpoint_version} checkpoint with matching environment "
+                    f"(world_size={cur_world_size}, iters={saved_iters}). "
+                    f"Restored {len(self.hard_batch_indices)} hard batches (active={self.is_active_epoch})."
+                )
+            else:
+                self.total_batches_in_full_epoch = current_iterations if current_iterations is not None else saved_iters
+                self.hard_batch_indices.clear()
+                self.is_active_epoch = False
+                logger.warning(
+                    f"⚠️ [HARD MINING] Checkpoint topology changed since save (saved world_size={saved_world_size}, "
+                    f"iters={saved_iters}; current world_size={cur_world_size}, iters={current_iterations}). "
+                    f"Ignoring stale batch indices and running full epoch {self.current_epoch} to recalibrate "
+                    f"hard mining specifically for the current GPU count."
+                )
