@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
@@ -370,7 +371,7 @@ class DiffusionDiffMinimizedModel(nn.Module):
             if self.diffuser_fp16 and torch.cuda.is_available():
                 load_kwargs["dtype"] = torch.float16
                 if device_map:
-                    load_kwargs["device_map"] = device_map
+                    load_kwargs["device_map"] = "cuda" if device_map.startswith("cuda") else device_map
             elif self.diffuser_fp16:
                 load_kwargs["dtype"] = torch.float32
 
@@ -386,9 +387,24 @@ class DiffusionDiffMinimizedModel(nn.Module):
                     pretrained_model_name_or_path, **load_kwargs
                 )
 
+            # Move to specific local rank GPU if specified in distributed mode
+            target_device = None
+            if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
+                target_device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+            elif isinstance(device_map, str) and device_map.startswith("cuda:"):
+                target_device = device_map
+
+            if target_device is not None:
+                pipe = pipe.to(target_device)
+
             self.vae = pipe.vae
             self.diffuser = pipe.unet
             loaded_via_pipe = True
+            del pipe
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             logger.info(
                 f"Successfully loaded {pretrained_model_name_or_path} via DiffusionPipeline"
             )
@@ -403,6 +419,8 @@ class DiffusionDiffMinimizedModel(nn.Module):
                 vae_kwargs: Dict[str, Any] = {}
                 if subfolder_vae:
                     vae_kwargs["subfolder"] = subfolder_vae
+                if self.diffuser_fp16 and torch.cuda.is_available():
+                    vae_kwargs["torch_dtype"] = torch.float16
                 self.vae = AutoencoderKL.from_pretrained(
                     pretrained_model_name_or_path, **vae_kwargs
                 )
@@ -539,6 +557,17 @@ class DiffusionDiffMinimizedModel(nn.Module):
 
     def to(self, *args: Any, **kwargs: Any) -> "DiffusionDiffMinimizedModel":
         """Move model to device and cast frozen diffuser to half precision if on CUDA."""
+        if getattr(self, "diffuser_fp16", False):
+            if hasattr(self, "diffuser") and self.diffuser is not None:
+                try:
+                    self.diffuser = self.diffuser.to(dtype=torch.float16)
+                except Exception:
+                    pass
+            if hasattr(self, "vae") and self.vae is not None:
+                try:
+                    self.vae = self.vae.to(dtype=torch.float16)
+                except Exception:
+                    pass
         res = super().to(*args, **kwargs)
         if getattr(self, "diffuser_fp16", False):
             try:
@@ -549,6 +578,12 @@ class DiffusionDiffMinimizedModel(nn.Module):
                     and self.diffuser is not None
                 ):
                     self.diffuser = self.diffuser.to(device=device, dtype=torch.float16)
+                if (
+                    device.type == "cuda"
+                    and hasattr(self, "vae")
+                    and self.vae is not None
+                ):
+                    self.vae = self.vae.to(device=device, dtype=torch.float16)
             except Exception:
                 pass
         return res

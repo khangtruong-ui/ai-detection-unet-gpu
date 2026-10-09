@@ -798,6 +798,21 @@ def main():
     in_pytest = ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
     no_autospawn = bool(os.environ.get("SID_UNET_NO_AUTOSPAWN", False))
 
+    # Pre-flight check: warn if other sid_unet processes are currently running
+    if torch.cuda.is_available() and not in_dist and not in_pytest:
+        try:
+            from sid_unet.kill import find_unet_processes
+            other_tasks = [p for p in find_unet_processes(include_children=False) if p["pid"] != os.getpid()]
+            if other_tasks:
+                pids_str = ", ".join(str(p["pid"]) for p in other_tasks[:3])
+                print(
+                    f"⚠️ WARNING: Found {len(other_tasks)} other active/background sid_unet process(es) "
+                    f"(PID {pids_str}). If you encounter CUDA Out of Memory, run 'sid-kill' to terminate background tasks."
+                )
+                sys.stdout.flush()
+        except Exception:
+            pass
+
     if (
         torch.cuda.is_available()
         and torch.cuda.device_count() > 1
@@ -806,6 +821,7 @@ def main():
         and not in_pytest
         and not no_autospawn
     ):
+        import signal
         import subprocess
         num_gpus = torch.cuda.device_count()
         port = find_free_port()
@@ -819,8 +835,34 @@ def main():
         print(f"🚀 Auto-launching High-Performance Multi-GPU DistributedDataParallel (DDP) across {num_gpus} GPUs on port {port}...")
         sys.stdout.flush()
         sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
-        ret = subprocess.run(cmd, **sub_kwargs)
-        sys.exit(ret.returncode)
+        proc = subprocess.Popen(cmd, **sub_kwargs)
+
+        def _forward_kill(signum=None, frame=None):
+            if proc.poll() is None:
+                try:
+                    if os.name != "nt":
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        time.sleep(0.5)
+                        if proc.poll() is None:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.terminate()
+                except OSError:
+                    pass
+            if signum is not None:
+                sys.exit(128 + signum)
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(sig, _forward_kill)
+            except (ValueError, OSError):
+                pass
+
+        try:
+            ret = proc.wait()
+            sys.exit(ret)
+        finally:
+            _forward_kill()
 
     # Initialize distributed mode if running under torchrun / distributed launcher
     init_distributed_mode()

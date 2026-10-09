@@ -650,6 +650,12 @@ class DiffusionDiffModel(nn.Module):
 
     def to(self, *args: Any, **kwargs: Any) -> "DiffusionDiffModel":
         """Move model to device and cast frozen diffuser to half precision if on CUDA."""
+        if getattr(self, "diffuser_fp16", False):
+            if hasattr(self, "diffuser") and self.diffuser is not None:
+                try:
+                    self.diffuser = self.diffuser.to(dtype=torch.float16)
+                except Exception:
+                    pass
         res = super().to(*args, **kwargs)
         if getattr(self, "diffuser_fp16", False):
             try:

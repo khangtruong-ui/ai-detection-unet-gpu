@@ -102,6 +102,7 @@ sid-pull = "sid_unet.checkpoint_sync:cli_pull"
 sid-checkpoint = "sid_unet.checkpoint_sync:cli_main"
 sid-cache = "sid_unet.cache.cli:cli_main"
 sid-dataset-cache = "sid_unet.cache.cli:cli_main"
+sid-kill = "sid_unet.kill:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["."]

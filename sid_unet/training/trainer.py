@@ -162,6 +162,8 @@ class Trainer:
         loaded_model = model or build_model(config)
         is_quantized = getattr(loaded_model, "load_in_4bit", False) or getattr(loaded_model, "load_in_8bit", False)
         if not is_quantized:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             self.model = loaded_model.to(self.device)
             if self.is_distributed:
                 find_unused = bool(config.training.get("find_unused_parameters", False))

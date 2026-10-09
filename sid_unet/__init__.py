@@ -54,6 +54,8 @@ def from_pretrained(
     return UNet.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
 
+from sid_unet.kill import kill_all_background_tasks
+
 __all__ = [
     "__version__",
     "MaskPostProcessor",
@@ -67,5 +69,6 @@ __all__ = [
     "download_hf_checkpoint",
     "resolve_checkpoint_source",
     "verify_hf_repo_checkpointable",
+    "kill_all_background_tasks",
 ]
 
