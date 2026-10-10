@@ -61,8 +61,20 @@ class SIDTotalLoss(nn.Module):
         art_loss = None
         if isinstance(model_output, (tuple, list)):
             mask_logits = model_output[0]
-            class_logits = model_output[1] if len(model_output) > 1 else None
-            art_loss = model_output[2] if len(model_output) > 2 else None
+            if len(model_output) >= 3:
+                class_logits = model_output[1]
+                art_loss = model_output[2]
+            elif len(model_output) == 2:
+                second_item = model_output[1]
+                if not self.aux_classifier or (second_item is not None and getattr(second_item, "ndim", 2) == 0):
+                    class_logits = None
+                    art_loss = second_item
+                else:
+                    class_logits = second_item
+                    art_loss = None
+            else:
+                class_logits = None
+                art_loss = None
         elif isinstance(model_output, dict):
             mask_logits = model_output.get("mask_logits")
             class_logits = model_output.get("class_logits")

@@ -364,6 +364,18 @@ def test_gap_sam_yaml_configs():
         assert cfg.model.name == "gap_sam"
         assert cfg.model.backbone in ("tinyvit", "efficientvit", "repvit")
         assert cfg.loss.artifact_weight == 1.0
+        assert cfg.model.lora_r == 8, f"{fname} should have lora_r=8"
+        assert cfg.model.lora_alpha == 16, f"{fname} should have lora_alpha=16"
+        assert cfg.model.lora_dropout == 0.0, f"{fname} should have lora_dropout=0.0"
+        assert cfg.training.epochs == 3, f"{fname} should have epochs=3"
+        assert cfg.training.learning_rate == 0.0002
+        assert cfg.training.weight_decay == 0.05
+        assert cfg.training.val_check_interval == 0.1
+        assert cfg.training.early_stopping_patience == 5
+        assert cfg.training.early_stopping_metric == "val_loss"
+        assert cfg.training.early_stopping_mode == "min"
+        assert cfg.model.aux_classifier is False
+        assert cfg.loss.aux_classifier is False
 
 
 def test_gap_sam_text_cache_and_preload(device):
@@ -500,7 +512,8 @@ def test_gap_sam_bypass_vae_for_cached_training(device):
 
         # Cached forward works without VAE present
         out = model.forward_cached(x, f_r=f_r)
-        assert out[0].shape == (1, 1, 256, 256)
+        mask_out = out[0] if isinstance(out, (tuple, list)) else out
+        assert mask_out.shape == (1, 1, 256, 256)
 
         # Uncached forward without f_r correctly raises informative RuntimeError
         with pytest.raises(RuntimeError, match="bypass_vae_for_cached_training"):
@@ -543,4 +556,142 @@ def test_gap_sam_cache_extractor_registration(device):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def test_gap_sam_training_forward_shapes_without_aux_classifier(device):
+    """Verify GAP-SAM in pure configuration (aux_classifier=False) produces 2-tuple (mask, art) in train mode."""
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        use_dummy_vae=True,
+        aux_classifier=False,
+        device=device,
+    )
+    model.train()
+
+    x = torch.randn(2, 3, 256, 256, device=device)
+    target_masks = torch.zeros(2, 1, 256, 256, device=device)
+    outputs = model(x)
+
+    assert isinstance(outputs, tuple), "Expected tuple output"
+    assert len(outputs) == 2, f"Expected 2-tuple (mask_logits, art_loss), got length {len(outputs)}"
+
+    mask_logits, art_loss = outputs
+    assert mask_logits.shape == (2, 1, 256, 256)
+    assert art_loss is not None
+    assert art_loss.ndim == 0
+    assert art_loss.item() > 0.0
+
+    # Verify SIDTotalLoss correctly processes 2-tuple (mask_logits, art_loss) when aux_classifier=False
+    loss_fn = SIDTotalLoss(
+        mask_loss_type="combined",
+        bce_weight=0.5,
+        dice_weight=0.5,
+        aux_classifier=False,
+        artifact_weight=1.0,
+    )
+    total_loss, loss_metrics = loss_fn(outputs, target_masks)
+    assert "artifact_loss" in loss_metrics, "artifact_loss must be logged in metrics"
+    assert "mask_loss" in loss_metrics
+    assert "aux_loss" not in loss_metrics
+    assert total_loss.ndim == 0
+    assert torch.isclose(total_loss, torch.tensor(loss_metrics["mask_loss"] + loss_metrics["artifact_loss"], device=total_loss.device), atol=1e-5)
+
+
+def test_artifact_classifier_loss_halving_formula(device):
+    """Verify ArtifactClassifier loss exactly implements 0.5 * (loss_o + loss_r) matching paper Eq. 7."""
+    classifier = ArtifactClassifier(in_features=256).to(device)
+
+    h_o = torch.randn(4, 256, device=device)
+    h_r = torch.randn(4, 256, device=device)
+
+    # Compute expected loss manually: 0.5 * (BCE(h_o, 0) + BCE(h_r, 1))
+    logits_o = classifier(h_o)
+    logits_r = classifier(h_r)
+    expected_o = torch.nn.functional.binary_cross_entropy_with_logits(logits_o, torch.zeros_like(logits_o))
+    expected_r = torch.nn.functional.binary_cross_entropy_with_logits(logits_r, torch.ones_like(logits_r))
+    expected_total = 0.5 * (expected_o + expected_r)
+
+    actual_loss = classifier.compute_loss(h_o, h_r)
+    assert torch.isclose(actual_loss, expected_total, atol=1e-6), (
+        f"Loss {actual_loss.item()} does not match expected {expected_total.item()}"
+    )
+
+
+def test_trainer_intra_epoch_val_check_interval():
+    """Verify Trainer correctly schedules and executes intra-epoch validation checks."""
+    from sid_unet.training.trainer import Trainer
+    from torch.utils.data import DataLoader, TensorDataset
+
+    # Tiny synthetic dataset
+    imgs = torch.randn(8, 3, 32, 32)
+    msks = torch.zeros(8, 1, 32, 32)
+    lbls = torch.zeros(8, dtype=torch.long)
+
+    class DictDataset(torch.utils.data.Dataset):
+        def __init__(self, imgs, msks, lbls):
+            self.imgs, self.msks, self.lbls = imgs, msks, lbls
+        def __len__(self):
+            return len(self.imgs)
+        def __getitem__(self, idx):
+            return {"image": self.imgs[idx], "mask": self.msks[idx], "label": self.lbls[idx]}
+
+    train_ds = DictDataset(imgs, msks, lbls)
+    val_ds = DictDataset(imgs[:4], msks[:4], lbls[:4])
+
+    train_loader = DataLoader(train_ds, batch_size=2, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=2, shuffle=False)
+
+    model = nn.Sequential(
+        nn.Conv2d(3, 16, 3, padding=1),
+        nn.ReLU(),
+        nn.Conv2d(16, 1, 1),
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_intra_val", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
+            "data": {"image_size": [32, 32], "batch_size": 2, "train_samples_per_epoch": -1, "val_samples": -1},
+            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+            "training": {
+                "epochs": 1,
+                "learning_rate": 0.001,
+                "optimizer": "adamw",
+                "val_check_interval": 0.5,  # Validate twice in an epoch (at step 2 of 4 and step 4)
+                "early_stopping_patience": 5,
+                "early_stopping_metric": "val_loss",
+                "early_stopping_mode": "min",
+                "save_best": False,
+                "save_latest": False,
+            },
+            "logging": {"log_interval": 1, "measure_network": False},
+        })
+
+        trainer = Trainer(
+            config=cfg,
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        assert trainer.val_check_interval == 0.5
+        val_calls = 0
+        orig_val = trainer.validate
+        def mock_val(*args, **kwargs):
+            nonlocal val_calls
+            val_calls += 1
+            return orig_val(*args, **kwargs)
+        trainer.validate = mock_val
+
+        trainer.train()
+        # With 4 batches total and val_check_interval=0.5:
+        # step 2 triggers intra-epoch validate (1st call),
+        # epoch end triggers regular validate (2nd call).
+        assert val_calls >= 2, f"Expected at least 2 validation evaluations, got {val_calls}"
+
 

@@ -278,20 +278,20 @@ class ArtifactClassifier(nn.Module):
             is_real = None
 
         if is_real is not None and is_real.any():
-            # Real-only formulation from paper Eq. 6
+            # Real-only formulation from paper Eq. 6/7
             real_logit_o = logit_o[is_real]
             real_logit_r = logit_r[is_real]
             real_target_o = torch.zeros_like(real_logit_o)
             real_target_r = target_r[is_real]
             loss_o = F.binary_cross_entropy_with_logits(real_logit_o, real_target_o)
             loss_r = F.binary_cross_entropy_with_logits(real_logit_r, real_target_r)
-            return loss_o + loss_r
+            return 0.5 * (loss_o + loss_r)
         else:
             # Fallback across all batch items: original image vs synthetic reconstruction
             target_o = torch.zeros_like(logit_o)
             loss_o = F.binary_cross_entropy_with_logits(logit_o, target_o)
             loss_r = F.binary_cross_entropy_with_logits(logit_r, target_r)
-            return loss_o + loss_r
+            return 0.5 * (loss_o + loss_r)
 
 
 class GAPSAM(SAM3DistilLoRA):
@@ -312,12 +312,12 @@ class GAPSAM(SAM3DistilLoRA):
         text_encoder_context_length: Context token length (default: 16).
         load_in_4bit: Whether to enable 4-bit NF4 quantization for base model (default: False).
         load_in_8bit: Whether to enable 8-bit quantization for base model (default: False).
-        lora_r: LoRA rank (default: 16).
-        lora_alpha: LoRA scaling factor (default: 32).
-        lora_dropout: Dropout probability for LoRA layers (default: 0.05).
+        lora_r: LoRA rank (default: 8, matching paper).
+        lora_alpha: LoRA scaling factor (default: 16, matching paper).
+        lora_dropout: Dropout probability for LoRA layers (default: 0.0, matching paper).
         lora_target_modules: Names of module layers to attach LoRA adapters to.
         prompt_text: Text conditioning prompt (default: 'tampered region').
-        aux_classifier: Whether to enable auxiliary classification head (default: True).
+        aux_classifier: Whether to enable auxiliary classification head (default: False, matching paper).
         num_classes: Number of target classes for auxiliary head (default: 3).
         in_channels: Input image channels (default: 3).
         out_channels: Output mask channels (default: 1).
@@ -345,12 +345,12 @@ class GAPSAM(SAM3DistilLoRA):
         text_encoder_context_length: int = 16,
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
-        lora_r: int = 16,
-        lora_alpha: int = 32,
-        lora_dropout: float = 0.05,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.0,
         lora_target_modules: Optional[List[str]] = None,
         prompt_text: str = "tampered region",
-        aux_classifier: bool = True,
+        aux_classifier: bool = False,
         num_classes: int = 3,
         in_channels: int = 3,
         out_channels: int = 1,

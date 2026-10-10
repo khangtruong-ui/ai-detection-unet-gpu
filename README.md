@@ -1523,26 +1523,33 @@ model:
   prompt_text: "tampered region"                 # Prompt text conditioning
   vae_pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"  # Frozen SD VAE
   freeze_vae: true
-  lora_r: 16                                     # PEFT LoRA rank dimension
-  lora_alpha: 32                                 # LoRA scaling factor
+  lora_r: 8                                      # PEFT LoRA rank dimension (matching paper)
+  lora_alpha: 16                                 # LoRA scaling factor (matching paper)
+  lora_dropout: 0.0                              # Zero dropout (matching paper)
   lora_target_modules: ["qkv", "qkv_proj", "out_proj", "proj", "linear1", "linear2"]
   target_size: [1008, 1008]
   artifact_weight: 1.0                           # Auxiliary artifact classifier loss weight (lambda_art)
   enable_artifact_classifier: true
-  aux_classifier: true
-  num_classes: 3
+  aux_classifier: false
 
 loss:
   mask_loss_type: "combined"
   bce_weight: 0.5
   dice_weight: 0.5
   focal_weight: 0.5
+  aux_classifier: false
   artifact_weight: 1.0                           # lambda_art * L_art
 
 training:
+  epochs: 3                                      # 3 epochs (matching paper)
   learning_rate: 0.0002
+  weight_decay: 0.05
+  val_check_interval: 0.1                        # Evaluate val loss every 0.1 epoch (matching paper)
+  early_stopping_patience: 5                     # Patience of 5 evaluations (matching paper)
+  early_stopping_metric: "val_loss"
+  early_stopping_mode: "min"
   amp: true
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 4                 # Effective batch size 32 (8 * 4)
 ```
 
 #### 9. Non-Blocking Parquet Dataset Configuration Example

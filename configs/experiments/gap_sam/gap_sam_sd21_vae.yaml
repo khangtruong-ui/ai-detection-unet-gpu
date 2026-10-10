@@ -54,7 +54,7 @@ model:
     - "proj"
     - "linear1"
     - "linear2"
-  aux_classifier: true
+  aux_classifier: false
   num_classes: 3
   in_channels: 3
   out_channels: 1
@@ -74,13 +74,13 @@ loss:
   focal_weight: 0.5
   focal_gamma: 2.0
   focal_alpha: 0.25
-  aux_classifier: true
+  aux_classifier: false
   aux_loss_type: "cross_entropy"
-  aux_weight: 0.2
+  aux_weight: 0.0
   artifact_weight: 1.0
 
 training:
-  epochs: 10
+  epochs: 3
   learning_rate: 0.0002
   weight_decay: 0.05
   optimizer: "adamw"
@@ -88,12 +88,13 @@ training:
   amp: true
   grad_clip_norm: 1.0
   gradient_accumulation_steps: 4
+  val_check_interval: 0.1
   save_best: true
   save_latest: true
   checkpoint_period: 1
   early_stopping_patience: 5
-  early_stopping_metric: "val_iou"
-  early_stopping_mode: "max"
+  early_stopping_metric: "val_loss"
+  early_stopping_mode: "min"
 
 logging:
   log_interval: 20

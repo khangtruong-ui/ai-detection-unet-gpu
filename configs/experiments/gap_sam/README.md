@@ -33,13 +33,19 @@ Existing AI image manipulation localizers fine-tune semantic segmentation founda
 
 ## 2. Configuration Files
 
-| Config File | Backbone | Variant | VAE | LoRA $(r, \alpha)$ | Target Size | Use Case |
-|---|---|---|---|---|---|---|
-| [`default.yaml`](default.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(16, 32)$ | $1008 \times 1008$ | General-purpose GAP-SAM baseline on COCO-inpainted |
-| [`gap_sam_tinyvit_lora.yaml`](gap_sam_tinyvit_lora.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(16, 32)$ | $1008 \times 1008$ | Optimized TinyViT configuration |
-| [`gap_sam_efficientvit_lora.yaml`](gap_sam_efficientvit_lora.yaml) | `efficientvit` | `b0` | `sd-vae-ft-mse` | $(16, 32)$ | $1008 \times 1008$ | Real-time / mobile inference latency profile |
-| [`gap_sam_repvit_lora.yaml`](gap_sam_repvit_lora.yaml) | `repvit` | `m1.1` | `sd-vae-ft-mse` | $(16, 32)$ | $1008 \times 1008$ | Structural re-parameterization vision backbone |
-| [`gap_sam_sd21_vae.yaml`](gap_sam_sd21_vae.yaml) | `tinyvit` | `11m` | `SD 2.1 (vae)` | $(8, 16)$ | $1008 \times 1008$ | Direct reproduction of paper setup |
+All configurations strictly align with the hyperparameters reported in the paper (arXiv:2608.20929):
+- **LoRA Hyperparameters:** Rank $r=8$, scaling factor $\alpha=16$, dropout $0.0$.
+- **Training Epochs:** 3 epochs with AdamW optimizer, learning rate $2\times 10^{-4}$, weight decay $0.05$, effective batch size $32$ ($8 \times 4$).
+- **Intra-Epoch Evaluation & Early Stopping:** Validation loss evaluated every $0.1$ epoch (`val_check_interval: 0.1`) with early stopping patience of 5 evaluations (`early_stopping_metric: val_loss`, `early_stopping_mode: min`).
+- **Learning Objective:** $\mathcal{L} = \mathcal{L}_{\mathrm{SAM3}} + \lambda_{\mathrm{art}} \mathcal{L}_{\mathrm{art}}$ ($\lambda_{\mathrm{art}}=1.0$). Pure GAP-SAM without semantic/tamper-type auxiliary classifier head (`aux_classifier: false`), eliminating unnecessary parameters and compute overhead.
+
+| Config File | Backbone | Variant | VAE | LoRA $(r, \alpha, \text{dropout})$ | Epochs | Eval Interval | Use Case |
+|---|---|---|---|---|---|---|---|
+| [`default.yaml`](default.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | $0.1$ epoch | Paper-aligned GAP-SAM baseline on COCO-inpainted |
+| [`gap_sam_tinyvit_lora.yaml`](gap_sam_tinyvit_lora.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | $0.1$ epoch | Optimized TinyViT configuration |
+| [`gap_sam_efficientvit_lora.yaml`](gap_sam_efficientvit_lora.yaml) | `efficientvit` | `b0` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | $0.1$ epoch | Real-time / mobile inference latency profile |
+| [`gap_sam_repvit_lora.yaml`](gap_sam_repvit_lora.yaml) | `repvit` | `m1.1` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | $0.1$ epoch | Structural re-parameterization vision backbone |
+| [`gap_sam_sd21_vae.yaml`](gap_sam_sd21_vae.yaml) | `tinyvit` | `11m` | `SD 2.1 (vae)` | $(8, 16, 0.0)$ | 3 | $0.1$ epoch | Stable Diffusion 2.1 VAE configuration matching paper |
 
 ---
 
