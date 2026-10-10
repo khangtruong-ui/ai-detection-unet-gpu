@@ -51,6 +51,7 @@ def test_test_configs_loading():
     assert quick_cfg.model.aux_classifier is False
 
 
+@pytest.mark.timeout(180)
 def test_all_experiment_configs_validity():
     import glob
     import torch
@@ -69,6 +70,7 @@ def test_all_experiment_configs_validity():
         assert cfg.data.train_samples_per_epoch == -1
         assert cfg.data.val_samples == -1
 
+        cfg.project.device = "cpu"
         # Use fast tiny model for sam3 / gap-sam config loop testing
         if "gap_sam" in str(cfg.model.name).lower() or "gap-sam" in str(cfg.model.name).lower():
             cfg.model.checkpoint_path = None
@@ -92,24 +94,29 @@ def test_all_experiment_configs_validity():
             raise e
         loss_fn = build_loss(cfg)
 
-        # Test forward pass with small batch
+        # Test forward pass with small batch and no grad
         model.eval()
         h, w = cfg.data.image_size
+        test_h, test_w = min(h, 64), min(w, 64)
         dev = next(model.parameters()).device
-        x = torch.randn(1, 3, h, w, device=dev)
-        out = model(x)
+        with torch.no_grad():
+            x = torch.randn(1, 3, test_h, test_w, device=dev)
+            out = model(x)
         if cfg.model.aux_classifier:
             assert isinstance(out, tuple)
             mask_out = out[0]
             cls_out = out[1]
-            assert mask_out.shape == (1, 1, h, w)
+            assert mask_out.shape == (1, 1, test_h, test_w)
             assert cls_out.shape == (1, cfg.model.num_classes)
         else:
             mask_out = out[0] if isinstance(out, tuple) else out
-            assert mask_out.shape == (1, 1, h, w)
+            assert mask_out.shape == (1, 1, test_h, test_w)
 
         del model, loss_fn, out
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 

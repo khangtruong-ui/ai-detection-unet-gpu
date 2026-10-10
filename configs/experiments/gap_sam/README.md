@@ -184,4 +184,39 @@ Thorough CUDA kernel and timeline profiling identified the root cause:
 | **GPU Utilization (`nvidia-smi`)** | 49.6% (avg) | **90.3%** (peaks at 100%) | **+40.7% Utilization** |
 | **Average GPU Power Draw** | 183 W | **254 W** | **Full GPU Saturation** |
 
+---
+
+## 6. SSH Disconnection Fault Resilience & Signal Immunity
+
+### Problem Diagnosis & Root Cause Analysis
+When training remotely over SSH (even inside `tmux` or `nohup`), sudden SSH client disconnections or network drops historically resulted in abrupt training termination and C++ runtime aborts logged as:
+```text
+torch.AcceleratorError: CUDA error: unspecified launch failure
+...
+File "sid_unet/models/gap_sam.py", line 931, in forward
+    torch.cuda.empty_cache()
+...
+torch.AcceleratorError: CUDA error: unspecified launch failure
+terminate called after throwing an instance of 'c10::AcceleratorError'
+```
+
+In-depth kernel and runtime investigation revealed three interdependent root causes:
+1. **Multiprocessing Worker Signal Vulnerability**: In Python multiprocessing (`spawn` / `fork`), spawned worker processes reset signal handlers back to system defaults (`SIG_DFL`). While the main training process ignored `SIGHUP`, DataLoader worker processes belonged to the same controlling terminal process group and were killed instantly upon SSH disconnection.
+2. **Severed Shared Memory & CUDA Kernel Faults**: Abruptly terminating DataLoader workers during active pinned memory / UVM IPC transfers severed the queue while CUDA kernels were executing, generating an asynchronous `cudaErrorLaunchFailure` (`torch.AcceleratorError`).
+3. **Double Exception & std::terminate**: In `GAPSAM.forward()` and `SAM3DistilModel.forward()`, the batched grounding fallback caught `Exception` and unconditionally called `torch.cuda.empty_cache()` without catching exceptions. Invoking `empty_cache()` on a GPU context with an unrecoverable CUDA fault triggered a secondary `torch.AcceleratorError` inside the `except` block, causing the C++ runtime to abort with `terminate called after throwing c10::AcceleratorError`.
+4. **Terminal Stream Broken Pipes**: When pseudo-terminals (`/dev/pts/*`) close, stdout/stderr flushes raise `BrokenPipeError` or `OSError(errno.EIO)`.
+
+### Implemented Solutions
+
+1. **DataLoader Worker Signal Immunity**:
+   - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_process_signals(detach_terminal=False)`, ensuring every DataLoader worker ignores `SIGHUP`, `SIGTERM`, `SIGPIPE`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `SIGWINCH`, and `SIGIO`.
+2. **Controlling Terminal Detachment & Stream Protection**:
+   - `sid_unet/utils/signals.py` detaches the process group via `detach_controlling_terminal()` (`os.setsid()` / `os.setpgrp()`) and wraps `sys.stdout` and `sys.stderr` with `SafeStreamWrapper` to safely absorb broken pipe and `EIO` errors when terminals detach.
+3. **Fatal CUDA Fault Isolation & Guarded Memory Cleanup**:
+   - In `GAPSAM.forward()` and `SAM3DistilModel.forward()`, fatal CUDA accelerator faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) are detected immediately and re-raised without attempting fallback GPU operations.
+   - All `torch.cuda.empty_cache()` calls are safely wrapped in `try...except Exception: pass` to prevent secondary exceptions from crashing the runtime.
+4. **Automated Test Timeout Safeguards**:
+   - Configured `pytest-timeout>=2.2.0` with `--timeout=60` in `pyproject.toml` to guarantee no unit or integration tests can block indefinitely.
+
+
 

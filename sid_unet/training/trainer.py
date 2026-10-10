@@ -139,7 +139,10 @@ class Trainer:
                 self.num_gpus = 1
             self.is_data_parallel = (self.num_gpus > 1)
 
-        if self.device.type == "cuda" and torch.cuda.is_available():
+        cudnn_benchmark = bool(
+            config.training.get("cudnn_benchmark", config.training.get("benchmark", True))
+        )
+        if self.device.type == "cuda" and torch.cuda.is_available() and cudnn_benchmark:
             torch.backends.cudnn.benchmark = True
 
         # 2. Output and logging setup
@@ -166,8 +169,7 @@ class Trainer:
         loaded_model = model or build_model(config)
         is_quantized = getattr(loaded_model, "load_in_4bit", False) or getattr(loaded_model, "load_in_8bit", False)
         if not is_quantized:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            clear_memory_cache(self.device)
             self.model = loaded_model.to(self.device)
             if self.is_distributed:
                 find_unused = bool(config.training.get("find_unused_parameters", False))
@@ -213,6 +215,8 @@ class Trainer:
             )
 
         self.loss_fn = (loss_fn or build_loss(config)).to(self.device)
+        if hasattr(self.loss_fn, "aux_classifier") and getattr(loaded_model, "aux_classifier", False):
+            self.loss_fn.aux_classifier = True
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
@@ -918,8 +922,12 @@ class Trainer:
         with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             try:
                 outputs = self.model(images, **model_kwargs) if model_kwargs else self.model(images)
-            except RuntimeError as exc:
-                if "FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc):
+            except Exception as exc:
+                is_cuda_fault = (
+                    isinstance(exc, getattr(torch, "AcceleratorError", ()))
+                    or "cudaErrorLaunchFailure" in str(exc)
+                )
+                if not is_cuda_fault and ("FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc)):
                     with torch.backends.cudnn.flags(enabled=False):
                         outputs = self.model(images, **model_kwargs) if model_kwargs else self.model(images)
                 else:

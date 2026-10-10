@@ -38,6 +38,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [10. Memory Management & OOM Dynamic Auto-Recovery](#10-memory-management--oom-dynamic-auto-recovery)
   - [11. Runtime Learnability Diagnostics & Debug Mode (nn-toolbox)](#11-runtime-learnability-diagnostics--debug-mode-nn-toolbox)
   - [12. Model Kickstarting via Bootstrapping v1.0 (with nn-toolbox verification)](#12-model-kickstarting-via-bootstrapping-v10-with-nn-toolbox-verification)
+  - [13. SSH Disconnection Fault Resilience & Multiprocessing Signal Immunity](#13-ssh-disconnection-fault-resilience--multiprocessing-signal-immunity)
 - [Installation](#installation)
 - [Project Structure](#project-structure)
 - [Configuration System](#configuration-system)
@@ -1055,6 +1056,43 @@ sid-train --config configs/experiments/diffusion_diff_minimized/diffusion_diff_m
 
 ---
 
+### 13. SSH Disconnection Fault Resilience & Multiprocessing Signal Immunity
+
+Training large models on remote GPU clusters or cloud instances often runs over long-lived SSH sessions. When an SSH connection drops, client terminals unexpectedly close, or network hiccups disconnect the session, standard processes typically receive terminal hangup and broken pipe signals (`SIGHUP`, `SIGPIPE`, `SIGTERM`), leading to process abortion or asynchronous CUDA launch failures.
+
+Crucially, running inside `tmux` or `nohup` was historically insufficient when PyTorch `DataLoader` worker processes were active:
+
+#### Root Cause Analysis
+1. **Multiprocessing Worker Signal Reset**: In Python multiprocessing (`fork` or `spawn`), worker child processes reset signal masks to system defaults (`SIG_DFL`). Even if the main training process ignored `SIGHUP`, DataLoader worker processes belonged to the same terminal session process group and were killed instantly upon SSH disconnection.
+2. **Severed Shared Memory & CUDA Hardware Faults**: Abruptly terminating DataLoader workers while memory buffers (pinned memory or UVM shared memory) were actively queued for CUDA streaming severed IPC transfers, triggering asynchronous GPU kernel aborts:
+   ```text
+   torch.AcceleratorError: CUDA error: unspecified launch failure
+   ```
+3. **Double Exception in Fallback Handlers**: Catching `Exception` in model forward passes and unconditionally calling `torch.cuda.empty_cache()` on an errored CUDA device raised secondary unhandled `AcceleratorError` exceptions inside the `except` block, triggering immediate C++ `std::terminate`.
+4. **Terminal Stream Broken Pipes**: When the pseudo-terminal device (`/dev/pts/*`) vanished upon SSH drop, writing progress bars (`tqdm`) or logging to `sys.stdout` and `sys.stderr` raised unhandled `BrokenPipeError` or `OSError(errno.EIO)`.
+
+#### Implemented Hardening & Architecture
+1. **Worker-Level Signal Shields**:
+   - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_process_signals(detach_terminal=False)`, ensuring all background DataLoader worker processes ignore:
+     - `SIGHUP` (1: Terminal hangup)
+     - `SIGTERM` (15: Termination signal)
+     - `SIGPIPE` (13: Broken pipe)
+     - `SIGQUIT` (3: Terminal quit)
+     - `SIGTSTP`, `SIGTTIN`, `SIGTTOU` (Job control signals)
+     - `SIGWINCH` (Window resize on SSH attach/detach)
+     - `SIGIO` (Asynchronous I/O)
+2. **Controlling Terminal Detachment**:
+   - `sid_unet/utils/signals.py` executes `detach_controlling_terminal()` via `os.setsid()` / `os.setpgrp()` so that closing terminal windows does not cascade kernel hangups to the training process tree.
+3. **Safe Text Stream Wrappers**:
+   - Wraps `sys.stdout` and `sys.stderr` with `SafeStreamWrapper`, silently absorbing `BrokenPipeError` and `OSError` with `EIO`/`EPIPE`/`EBADF` errnos.
+4. **Fatal CUDA Fault Detection & Guarded Caches**:
+   - `GAPSAM.forward()` and `SAM3DistilModel.forward()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and immediately re-raise without attempting further CUDA operations.
+   - All `torch.cuda.empty_cache()` calls across models and trainers are wrapped in exception handlers, preventing C++ `std::terminate` aborts.
+5. **Test Timeout Protection**:
+   - Integrated `pytest-timeout>=2.2.0` with `--timeout=60` in `pyproject.toml` so runaway test processes are terminated before causing indefinite hangs.
+
+---
+
 ## Installation
 
 Install in editable mode using `uv` (recommended) or `pip`:
@@ -1955,7 +1993,7 @@ $$
 Run the complete test suite with `pytest`:
 
 ```bash
-# Run all unit and integration tests
+# Run all unit and integration tests (default 60s timeout enforced via pytest-timeout)
 pytest
 
 # Run tests with detailed verbose output
@@ -1964,11 +2002,14 @@ pytest -v
 # Run GAP-SAM specific tests
 pytest tests/test_gap_sam.py -v
 
+# Override timeout for specific test runs
+pytest --timeout=30
+
 # Run tests with code coverage report
 pytest --cov=sid_unet
 ```
 
-All tests run cleanly in offline environments without network access.
+All tests run cleanly in offline environments without network access. Automatic 60-second timeouts are configured in `pyproject.toml` via `pytest-timeout` to prevent hanging processes.
 
 ---
 

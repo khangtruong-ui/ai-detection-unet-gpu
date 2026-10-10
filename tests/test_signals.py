@@ -60,3 +60,71 @@ def test_subprocess_ignores_ssh_signals():
     proc.send_signal(signal.SIGINT)
     proc.wait(timeout=2.0)
     assert proc.poll() is not None, "Process did not exit on SIGINT"
+
+
+def test_safe_stream_wrapper_broken_pipe_and_eio():
+    """Verify that SafeStreamWrapper suppresses BrokenPipeError and EIO on write/flush."""
+    import errno
+    from sid_unet.utils.signals import SafeStreamWrapper
+
+    class BrokenStream:
+        def __init__(self):
+            self.broken = False
+
+        def write(self, s):
+            if self.broken:
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+            return len(s)
+
+        def flush(self):
+            if self.broken:
+                raise OSError(errno.EIO, "Input/output error")
+
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            return 1
+
+    raw = BrokenStream()
+    wrapped = SafeStreamWrapper(raw)
+    assert wrapped.write("hello") == 5
+    wrapped.flush()
+
+    raw.broken = True
+    # Should not raise BrokenPipeError or OSError(EIO)
+    written = wrapped.write("data after ssh drop")
+    assert written == len("data after ssh drop")
+    wrapped.flush()
+
+
+def test_worker_init_fn_shields_dataloader_worker():
+    """Verify that worker_init_fn applies signal shielding in child worker processes."""
+    from sid_unet.dataset.loader import worker_init_fn
+
+    worker_init_fn(0)
+    for sig in (signal.SIGTERM, signal.SIGPIPE):
+        assert signal.getsignal(sig) == signal.SIG_IGN
+
+
+def test_fatal_cuda_fault_detection():
+    """Verify that fatal CUDA accelerator and launch errors are correctly identified."""
+    class FakeAcceleratorError(Exception):
+        pass
+
+    exc1 = FakeAcceleratorError("CUDA error: unspecified launch failure")
+    is_cuda_fault1 = (
+        "CUDA error" in str(exc1)
+        or "AcceleratorError" in str(type(exc1))
+        or "cudaError" in str(exc1)
+    )
+    assert is_cuda_fault1 is True
+
+    exc2 = ValueError("Shape mismatch in tensor")
+    is_cuda_fault2 = (
+        "CUDA error" in str(exc2)
+        or "AcceleratorError" in str(type(exc2))
+        or "cudaError" in str(exc2)
+    )
+    assert is_cuda_fault2 is False
+

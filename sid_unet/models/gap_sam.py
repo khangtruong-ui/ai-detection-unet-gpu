@@ -679,7 +679,10 @@ class GAPSAM(SAM3DistilLoRA):
             del self.vae
             self.vae = None
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
     def forward_cached(
         self,
@@ -922,13 +925,26 @@ class GAPSAM(SAM3DistilLoRA):
             if batch_pres.ndim == 1:
                 batch_pres = batch_pres.unsqueeze(-1)
 
-        except Exception:
+        except Exception as exc:
+            # Fatal CUDA accelerator errors indicate corrupted device state or severed worker IPC.
+            # Attempting empty_cache or additional CUDA operations will abort runtime with std::terminate.
+            is_cuda_fault = (
+                isinstance(exc, getattr(torch, "AcceleratorError", ()))
+                or "CUDA error" in str(exc)
+                or "AcceleratorError" in str(type(exc))
+                or "cudaError" in str(exc)
+            )
+            if is_cuda_fault:
+                raise exc
             try:
                 del grounding_backbone, batched_find_stage, batched_prompt
             except Exception:
                 pass
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
             # Fallback to per-sample decoding if batched grounding encounters issues
             find_stage = FindStage(

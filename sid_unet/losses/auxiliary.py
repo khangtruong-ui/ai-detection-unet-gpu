@@ -66,11 +66,23 @@ class SIDTotalLoss(nn.Module):
                 art_loss = model_output[2]
             elif len(model_output) == 2:
                 second_item = model_output[1]
-                if not self.aux_classifier or (second_item is not None and getattr(second_item, "ndim", 2) == 0):
+                # Determine if second_item is scalar artifact_loss or multi-element classification logits
+                is_scalar = (
+                    second_item is not None
+                    and (
+                        (torch.is_tensor(second_item) and (second_item.ndim == 0 or second_item.numel() == 1))
+                        or isinstance(second_item, (int, float))
+                    )
+                )
+                if is_scalar:
                     class_logits = None
                     art_loss = second_item
-                else:
+                elif self.aux_classifier and second_item is not None:
                     class_logits = second_item
+                    art_loss = None
+                else:
+                    # Model returned classification logits but loss aux_classifier is disabled
+                    class_logits = None
                     art_loss = None
             else:
                 class_logits = None
@@ -97,8 +109,10 @@ class SIDTotalLoss(nn.Module):
             loss_metrics["aux_loss"] = aux_loss.item()
 
         if art_loss is not None and self.artifact_weight > 0:
+            if torch.is_tensor(art_loss) and art_loss.numel() > 1:
+                art_loss = art_loss.mean()
             total_loss = total_loss + self.artifact_weight * art_loss
-            loss_metrics["artifact_loss"] = art_loss.item() if hasattr(art_loss, "item") else float(art_loss)
+            loss_metrics["artifact_loss"] = float(art_loss.item() if hasattr(art_loss, "item") else art_loss)
 
         loss_metrics["total_loss"] = total_loss.item()
         return total_loss, loss_metrics

@@ -71,6 +71,7 @@ sam3-distil = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-timeout>=2.2.0",
 ]
 all = [
     "diffusers>=0.25.0",
@@ -80,6 +81,7 @@ all = [
     "bitsandbytes>=0.41.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-timeout>=2.2.0",
     "nn-toolbox @ git+https://github.com/khangtruong-ui/nn-toolbox.git",
     "sam3-distil @ git+https://github.com/khangtruong-ui/sam3-distil.git",
     "timm>=1.0.17",
@@ -113,7 +115,7 @@ include = ["sid_unet*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short --timeout=60"
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
