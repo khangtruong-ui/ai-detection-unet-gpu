@@ -1570,6 +1570,11 @@ def create_cached_dataloaders(
             except ImportError:
                 BlockShuffledSampler = None
 
+            extra_loader_kwargs: Dict[str, Any] = {}
+            if num_workers > 0:
+                extra_loader_kwargs["persistent_workers"] = bool(config.data.get("persistent_workers", True))
+                extra_loader_kwargs["prefetch_factor"] = max(2, int(config.data.get("prefetch_factor", 2)))
+
             if BlockShuffledSampler is not None:
                 window_blocks = int(config.data.get("window_blocks", 1))
                 rank_seed = seed + (get_rank() if is_dist_avail_and_initialized() else 0)
@@ -1589,6 +1594,7 @@ def create_cached_dataloaders(
                     drop_last=False,
                     multiprocessing_context=mp_context,
                     worker_init_fn=worker_init_fn,
+                    **extra_loader_kwargs,
                 )
             else:
                 train_loader = DataLoader(
@@ -1600,6 +1606,7 @@ def create_cached_dataloaders(
                     drop_last=False,
                     multiprocessing_context=mp_context,
                     worker_init_fn=worker_init_fn,
+                    **extra_loader_kwargs,
                 )
             val_loader = DataLoader(
                 val_dataset,
@@ -1610,6 +1617,7 @@ def create_cached_dataloaders(
                 drop_last=False,
                 multiprocessing_context=mp_context,
                 worker_init_fn=worker_init_fn,
+                **extra_loader_kwargs,
             )
 
             if include_test:
@@ -1775,6 +1783,11 @@ def create_cached_dataloaders(
             seed=seed,
         )
 
+    extra_cached_kwargs: Dict[str, Any] = {}
+    if num_workers > 0:
+        extra_cached_kwargs["persistent_workers"] = bool(config.data.get("persistent_workers", True))
+        extra_cached_kwargs["prefetch_factor"] = max(2, int(config.data.get("prefetch_factor", 2)))
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -1785,6 +1798,7 @@ def create_cached_dataloaders(
         drop_last=False,
         multiprocessing_context=mp_context,
         worker_init_fn=worker_init_fn,
+        **extra_cached_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1796,6 +1810,7 @@ def create_cached_dataloaders(
         drop_last=False,
         multiprocessing_context=mp_context,
         worker_init_fn=worker_init_fn,
+        **extra_cached_kwargs,
     )
 
     if include_test:
@@ -2009,6 +2024,11 @@ def create_dataloaders(
                 seed=seed,
             )
 
+        extra_map_kwargs: Dict[str, Any] = {}
+        if num_workers > 0:
+            extra_map_kwargs["persistent_workers"] = bool(config.data.get("persistent_workers", True))
+            extra_map_kwargs["prefetch_factor"] = max(2, int(config.data.get("prefetch_factor", 2)))
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -2018,6 +2038,7 @@ def create_dataloaders(
             pin_memory=pin_memory,
             multiprocessing_context=mp_context,
             worker_init_fn=worker_init_fn,
+            **extra_map_kwargs,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -2028,6 +2049,7 @@ def create_dataloaders(
             pin_memory=pin_memory,
             multiprocessing_context=mp_context,
             worker_init_fn=worker_init_fn,
+            **extra_map_kwargs,
         )
 
     if include_test:

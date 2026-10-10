@@ -398,6 +398,7 @@ class SAM3DistilLoRA(nn.Module):
                 class_logits is [B, num_classes].
         """
         from sam3.model.data_misc import FindStage
+        from sam3.model.sam3_image import Prompt
 
         b_sz, _, orig_h, orig_w = x.shape
         model_device, param_dtype = get_submodule_device_dtype(
@@ -442,80 +443,130 @@ class SAM3DistilLoRA(nn.Module):
                 self._text_cache[cache_key] = {k: v.clone() for k, v in out_t.items()}
         text_outputs = {k: v.clone() for k, v in self._text_cache[cache_key].items()}
 
-        # 6. Reusable find_stage
-        find_stage = FindStage(
-            img_ids=torch.tensor([0], device=model_device, dtype=torch.long),
-            text_ids=torch.tensor([0], device=model_device, dtype=torch.long),
-            input_boxes=None,
-            input_boxes_mask=None,
-            input_boxes_label=None,
-            input_points=None,
-            input_points_mask=None,
-        )
-
-        semantic_segs = []
-        presence_logits = []
-
-        # 7. Grounding decoder per batch item
-        for i in range(b_sz):
-            item_backbone = {
-                "vision_features": backbone_out["vision_features"][i:i+1],
-                "vision_pos_enc": [p[i:i+1] for p in backbone_out["vision_pos_enc"]],
-                "backbone_fpn": [f[i:i+1] for f in backbone_out["backbone_fpn"]],
-            }
-            if "sam2_backbone_out" in backbone_out and backbone_out["sam2_backbone_out"] is not None:
-                s2 = backbone_out["sam2_backbone_out"]
-                if isinstance(s2, dict):
-                    item_s2 = {}
-                    for k_s2, v_s2 in s2.items():
-                        if isinstance(v_s2, torch.Tensor):
-                            item_s2[k_s2] = v_s2[i:i+1]
-                        elif isinstance(v_s2, (list, tuple)):
-                            item_s2[k_s2] = [t[i:i+1] if isinstance(t, torch.Tensor) else t for t in v_s2]
-                        else:
-                            item_s2[k_s2] = v_s2
-                    item_backbone["sam2_backbone_out"] = item_s2
-                else:
-                    item_backbone["sam2_backbone_out"] = s2
-
-            item_backbone.update(text_outputs)
+        # 6. Batched grounding decoder (vectorized across all batch items to maximize GPU utilization)
+        try:
+            batched_prompt = Prompt(
+                box_embeddings=torch.zeros(0, b_sz, 4, device=model_device),
+                box_mask=torch.zeros(b_sz, 0, device=model_device, dtype=torch.bool),
+            )
+            batched_find_stage = FindStage(
+                img_ids=torch.arange(b_sz, device=model_device, dtype=torch.long),
+                text_ids=torch.zeros(b_sz, device=model_device, dtype=torch.long),
+                input_boxes=None,
+                input_boxes_mask=None,
+                input_boxes_label=None,
+                input_points=None,
+                input_points_mask=None,
+            )
+            grounding_backbone = dict(backbone_out)
+            grounding_backbone.update(text_outputs)
 
             out = self.base_model.forward_grounding(
-                backbone_out=item_backbone,
-                find_input=find_stage,
-                geometric_prompt=self.dummy_prompt,
+                backbone_out=grounding_backbone,
+                find_input=batched_find_stage,
+                geometric_prompt=batched_prompt,
                 find_target=None,
             )
 
             # Retrieve mask logits
             if "semantic_seg" in out and out["semantic_seg"] is not None:
-                seg = out["semantic_seg"]
+                batch_masks = out["semantic_seg"]
             elif "pred_masks" in out and out["pred_masks"] is not None:
                 if "pred_logits" in out and out["pred_logits"] is not None:
                     q_weights = torch.sigmoid(out["pred_logits"])
-                    seg = (torch.sigmoid(out["pred_masks"]) * q_weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
+                    batch_masks = (torch.sigmoid(out["pred_masks"]) * q_weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
                 else:
-                    seg = out["pred_masks"].mean(dim=1, keepdim=True)
+                    batch_masks = out["pred_masks"].mean(dim=1, keepdim=True)
             else:
                 raise RuntimeError("EfficientSAM3 output contains neither semantic_seg nor pred_masks.")
 
             # Retrieve presence / confidence score
             if "presence_logit_dec" in out and out["presence_logit_dec"] is not None:
-                pres = out["presence_logit_dec"]
+                batch_pres = out["presence_logit_dec"]
             elif "presence_logit" in out and out["presence_logit"] is not None:
-                pres = out["presence_logit"]
+                batch_pres = out["presence_logit"]
             else:
-                pres = seg.mean(dim=[-2, -1])
+                batch_pres = batch_masks.mean(dim=[-2, -1])
 
-            if pres.ndim == 1:
-                pres = pres.unsqueeze(-1)
+            if batch_pres.ndim == 1:
+                batch_pres = batch_pres.unsqueeze(-1)
 
-            semantic_segs.append(seg)
-            presence_logits.append(pres)
+        except Exception:
+            try:
+                del grounding_backbone, batched_find_stage, batched_prompt
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        # 8. Concatenate batch results
-        batch_masks = torch.cat(semantic_segs, dim=0)
-        batch_pres = torch.cat(presence_logits, dim=0)
+            # Fallback to per-item loop if batched grounding encounters issues
+            find_stage = FindStage(
+                img_ids=torch.tensor([0], device=model_device, dtype=torch.long),
+                text_ids=torch.tensor([0], device=model_device, dtype=torch.long),
+                input_boxes=None,
+                input_boxes_mask=None,
+                input_boxes_label=None,
+                input_points=None,
+                input_points_mask=None,
+            )
+            semantic_segs = []
+            presence_logits = []
+            for i in range(b_sz):
+                item_backbone = {
+                    "vision_features": backbone_out["vision_features"][i:i+1],
+                    "vision_pos_enc": [p[i:i+1] for p in backbone_out["vision_pos_enc"]],
+                    "backbone_fpn": [f[i:i+1] for f in backbone_out["backbone_fpn"]],
+                }
+                if "sam2_backbone_out" in backbone_out and backbone_out["sam2_backbone_out"] is not None:
+                    s2 = backbone_out["sam2_backbone_out"]
+                    if isinstance(s2, dict):
+                        item_s2 = {}
+                        for k_s2, v_s2 in s2.items():
+                            if isinstance(v_s2, torch.Tensor):
+                                item_s2[k_s2] = v_s2[i:i+1]
+                            elif isinstance(v_s2, (list, tuple)):
+                                item_s2[k_s2] = [t[i:i+1] if isinstance(t, torch.Tensor) else t for t in v_s2]
+                            else:
+                                item_s2[k_s2] = v_s2
+                        item_backbone["sam2_backbone_out"] = item_s2
+                    else:
+                        item_backbone["sam2_backbone_out"] = s2
+
+                item_backbone.update(text_outputs)
+
+                out = self.base_model.forward_grounding(
+                    backbone_out=item_backbone,
+                    find_input=find_stage,
+                    geometric_prompt=self.dummy_prompt,
+                    find_target=None,
+                )
+
+                if "semantic_seg" in out and out["semantic_seg"] is not None:
+                    seg = out["semantic_seg"]
+                elif "pred_masks" in out and out["pred_masks"] is not None:
+                    if "pred_logits" in out and out["pred_logits"] is not None:
+                        q_weights = torch.sigmoid(out["pred_logits"])
+                        seg = (torch.sigmoid(out["pred_masks"]) * q_weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
+                    else:
+                        seg = out["pred_masks"].mean(dim=1, keepdim=True)
+                else:
+                    raise RuntimeError("EfficientSAM3 output contains neither semantic_seg nor pred_masks.")
+
+                if "presence_logit_dec" in out and out["presence_logit_dec"] is not None:
+                    pres = out["presence_logit_dec"]
+                elif "presence_logit" in out and out["presence_logit"] is not None:
+                    pres = out["presence_logit"]
+                else:
+                    pres = seg.mean(dim=[-2, -1])
+
+                if pres.ndim == 1:
+                    pres = pres.unsqueeze(-1)
+
+                semantic_segs.append(seg)
+                presence_logits.append(pres)
+
+            batch_masks = torch.cat(semantic_segs, dim=0)
+            batch_pres = torch.cat(presence_logits, dim=0)
 
         # 9. Resize mask logits back to input resolution [B, 1, orig_h, orig_w]
         mask_logits = F.interpolate(

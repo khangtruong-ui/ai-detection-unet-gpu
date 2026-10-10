@@ -139,6 +139,9 @@ class Trainer:
                 self.num_gpus = 1
             self.is_data_parallel = (self.num_gpus > 1)
 
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
         # 2. Output and logging setup
         self.output_dir = config.project.get("output_dir", "outputs")
         self.checkpoint_dir = os.path.join(self.output_dir, "checkpoints")

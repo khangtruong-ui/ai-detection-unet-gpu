@@ -695,3 +695,98 @@ def test_trainer_intra_epoch_val_check_interval():
         assert val_calls >= 2, f"Expected at least 2 validation evaluations, got {val_calls}"
 
 
+def test_gap_sam_batched_grounding_forward_and_fallback(device):
+    """Verify batched grounding produces valid outputs and gracefully falls back on error."""
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        use_dummy_vae=True,
+        aux_classifier=False,
+        device=device,
+    )
+    model.train()
+
+    # Test batch size 2 (vectorized batched grounding)
+    x = torch.randn(2, 3, 256, 256, device=device)
+    f_r = torch.randn(2, 256, device=device)
+    out = model(x, f_r=f_r)
+
+    assert isinstance(out, tuple)
+    mask_logits, art_loss = out
+    assert mask_logits.shape == (2, 1, 256, 256)
+    assert art_loss is not None
+    assert art_loss.ndim == 0
+
+    del out, mask_logits, art_loss
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Test fallback mechanism by temporarily breaking batched call
+    orig_forward_grounding = model.base_model.forward_grounding
+    calls = []
+
+    def failing_first_grounding(*args, **kwargs):
+        find_input = kwargs.get("find_input")
+        if find_input is not None and hasattr(find_input, "img_ids") and len(find_input.img_ids) > 1:
+            calls.append("batched_failed")
+            raise RuntimeError("Simulated batched grounding failure for fallback testing")
+        calls.append("fallback_success")
+        return orig_forward_grounding(*args, **kwargs)
+
+    model.base_model.forward_grounding = failing_first_grounding
+    try:
+        out_fallback = model(x, f_r=f_r)
+        mask_fallback, art_fallback = out_fallback
+        assert mask_fallback.shape == (2, 1, 256, 256)
+        assert "batched_failed" in calls
+        assert "fallback_success" in calls
+        del out_fallback, mask_fallback, art_fallback
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    finally:
+        model.base_model.forward_grounding = orig_forward_grounding
+
+
+def test_dataloader_persistent_workers_and_prefetch_factor():
+    """Verify create_cached_dataloaders configures persistent_workers and prefetch_factor when num_workers > 0."""
+    from sid_unet.dataset.loader import create_cached_dataloaders
+    cfg = ConfigDict({
+        "project": {"name": "test_persistent", "seed": 42},
+        "data": {
+            "cached_hf_repo": "dummy/repo",
+            "batch_size": 2,
+            "num_workers": 2,
+            "max_cached_workers": 2,
+            "use_parquet_loader": False,
+            "streaming": False,
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+        },
+        "model": {"name": "gap_sam"},
+    })
+    train_loader, val_loader = create_cached_dataloaders(cfg, cached_repo="dummy/repo")
+    assert train_loader.persistent_workers is True
+    assert train_loader.prefetch_factor == 2
+    assert val_loader.persistent_workers is True
+    assert val_loader.prefetch_factor == 2
+
+
+def test_trainer_cudnn_benchmark_enabled():
+    """Verify Trainer enables cuDNN benchmark on CUDA devices."""
+    from sid_unet.training.trainer import Trainer
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_cudnn", "output_dir": tmpdir, "seed": 42, "device": "cuda" if torch.cuda.is_available() else "cpu"},
+            "data": {"image_size": [32, 32], "batch_size": 2},
+            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+            "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
+            "logging": {"log_interval": 1, "measure_network": False},
+        })
+        trainer = Trainer(config=cfg)
+        if torch.cuda.is_available() and trainer.device.type == "cuda":
+            assert torch.backends.cudnn.benchmark is True
+
+
+
