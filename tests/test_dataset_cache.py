@@ -27,8 +27,10 @@ from sid_unet.cache.extractor import (
 from sid_unet.cache.dataset import (
     CachedTensorDataset,
     CachedStreamingDataset,
+    CachedIndexedDataset,
     SpatialJointTransform,
     decode_cached_tensor,
+    decode_cached_image,
     decode_mask_tensor,
 )
 from sid_unet.cache.manager import DatasetCacheManager
@@ -466,6 +468,259 @@ def test_checkpoint_manager_non_blocking_hub_push(temp_cache_dir):
     finally:
         sid_unet.checkpoint_sync.push_checkpoint = orig_push
         ckpt_manager.close()
+
+
+def test_decode_cached_tensor_safe_reshape_gap_sam_mismatch():
+    """
+    Test reproducing the exact bug in .logs.txt:
+    'ValueError: cannot reshape array of size 256 into shape (256,32,32)'
+    When dataset shard metadata incorrectly stored latent_h=32, latent_w=32 for
+    a 256-element 1D pooled descriptor, decode_cached_tensor must safely return (256,).
+    """
+    raw_vec = np.random.randn(256).astype(np.float16)
+    raw_bytes = raw_vec.tobytes()
+
+    # Metadata incorrectly specified 32x32 spatial dimensions
+    decoded = decode_cached_tensor(
+        raw_bytes,
+        channels=256,
+        latent_h=32,
+        latent_w=32,
+        target_image_size=(256, 256),
+    )
+    assert decoded.shape == (256,)
+    assert decoded.dtype == torch.float32
+    assert torch.allclose(decoded, torch.from_numpy(raw_vec.astype(np.float32)), atol=1e-3)
+
+
+def test_decode_cached_tensor_safe_shapes():
+    """Verify decode_cached_tensor handles standard 3D latents, 1D descriptors, and edge cases."""
+    # 1. Standard 84-channel 32x32 latent
+    std_arr = np.random.randn(84, 32, 32).astype(np.float16)
+    decoded_std = decode_cached_tensor(std_arr.tobytes(), channels=84, latent_h=32, latent_w=32)
+    assert decoded_std.shape == (84, 32, 32)
+
+    # 2. 1D descriptor with correct 1x1 metadata
+    desc_1d = np.random.randn(256).astype(np.float16)
+    decoded_1d = decode_cached_tensor(desc_1d.tobytes(), channels=256, latent_h=1, latent_w=1)
+    assert decoded_1d.shape == (256,)
+
+    # 3. Empty buffer fallback
+    decoded_empty = decode_cached_tensor(b"", channels=84, latent_h=32, latent_w=32)
+    assert decoded_empty.shape == (84, 32, 32)
+    assert torch.all(decoded_empty == 0)
+
+
+def test_spatial_joint_transform_1d_descriptor():
+    """Verify SpatialJointTransform handles 1D descriptors without IndexError or spatial distortion."""
+    tf = SpatialJointTransform(horizontal_flip=1.0, vertical_flip=1.0, random_rotate90=1.0)
+    z_1d = torch.randn(256)
+    mask = torch.ones(1, 64, 64)
+    mask[0, :32, :32] = 0.0
+
+    z_out, mask_out = tf(z_1d, mask)
+    # 1D descriptor must be unchanged
+    assert torch.equal(z_out, z_1d)
+    assert z_out.shape == (256,)
+    # Mask must have been transformed
+    assert mask_out.shape == (1, 64, 64)
+
+
+def test_cached_datasets_gap_sam_descriptor_with_and_without_image(temp_cache_dir):
+    """
+    Test CachedTensorDataset and CachedIndexedDataset with GAP-SAM 1D descriptor shards:
+    1. Modern shard with 'image' column containing JPEG bytes.
+    2. Legacy shard (like KhangTruong/gap-sam-coco-cache) without 'image' column.
+    """
+    split_dir = os.path.join(temp_cache_dir, "test_split")
+    os.makedirs(split_dir, exist_ok=True)
+
+    # Prepare dummy JPEG image
+    pil_img = Image.new("RGB", (256, 256), color=(128, 64, 32))
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG")
+    jpeg_bytes = buf.getvalue()
+
+    mask_bytes = np.zeros((1, 256, 256), dtype=np.uint8).tobytes()
+    desc_bytes = np.random.randn(256).astype(np.float16).tobytes()
+
+    # Case 1: Shard WITH image column
+    shard_with_img = os.path.join(split_dir, "with_img.parquet")
+    t1 = pa.Table.from_pydict({
+        "img_id": ["sample_0", "sample_1"],
+        "label": [0, 1],
+        "z_high_dim": [desc_bytes, desc_bytes],
+        "mask": [mask_bytes, mask_bytes],
+        "channels": [256, 256],
+        "latent_h": [1, 1],
+        "latent_w": [1, 1],
+        "image": [jpeg_bytes, jpeg_bytes],
+    })
+    pq.write_table(t1, shard_with_img, compression="zstd")
+
+    # Case 2: Shard WITHOUT image column (legacy metadata with 32x32 mismatch!)
+    shard_legacy = os.path.join(split_dir, "legacy_no_img.parquet")
+    t2 = pa.Table.from_pydict({
+        "img_id": ["legacy_0", "legacy_1"],
+        "label": [0, 1],
+        "z_high_dim": [desc_bytes, desc_bytes],
+        "mask": [mask_bytes, mask_bytes],
+        "channels": [256, 256],
+        "latent_h": [32, 32],  # The buggy 32x32 metadata
+        "latent_w": [32, 32],
+    })
+    pq.write_table(t2, shard_legacy, compression="zstd")
+
+    # Test CachedTensorDataset with both shards
+    ds_with_img = CachedTensorDataset([shard_with_img], expected_channels=256)
+    sample_img = ds_with_img[0]
+    assert sample_img["image"].shape == (3, 256, 256)
+    assert sample_img["f_r"].shape == (256,)
+    assert sample_img["gap_r"].shape == (256,)
+    assert sample_img["mask"].shape == (1, 256, 256)
+
+    ds_legacy = CachedTensorDataset([shard_legacy], expected_channels=256)
+    sample_leg = ds_legacy[0]
+    # Fallback image should be generated without error
+    assert sample_leg["image"].shape == (3, 256, 256)
+    assert sample_leg["f_r"].shape == (256,)
+    assert sample_leg["mask"].shape == (1, 256, 256)
+
+    # Test with custom image_provider
+    provider_called = False
+
+    def custom_provider(img_id, target_size):
+        nonlocal provider_called
+        provider_called = True
+        return torch.ones(3, *target_size)
+
+    ds_legacy_provider = CachedTensorDataset([shard_legacy], expected_channels=256, image_provider=custom_provider)
+    sample_leg_p = ds_legacy_provider[0]
+    assert provider_called is True
+    assert sample_leg_p["image"].shape == (3, 256, 256)
+    assert torch.all(sample_leg_p["image"] == 1.0)
+
+
+def test_cached_indexed_dataset_gap_sam_1d():
+    """Verify CachedIndexedDataset handles 1D descriptors and buggy 32x32 metadata."""
+    desc_bytes = np.random.randn(256).astype(np.float16).tobytes()
+    mask_bytes = np.zeros((1, 256, 256), dtype=np.uint8).tobytes()
+
+    class DummyPdlGapDataset:
+        def __init__(self, n=4):
+            self.n = n
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, idx):
+            return {
+                "img_id": f"dummy_{idx}",
+                "label": 0,
+                "z_high_dim": desc_bytes,
+                "mask": mask_bytes,
+                "channels": 256,
+                "latent_h": 32,  # Buggy metadata
+                "latent_w": 32,
+            }
+
+    raw_pdl = DummyPdlGapDataset(n=4)
+    cached_ds = CachedIndexedDataset(pdl_dataset=raw_pdl, expected_channels=256)
+    sample = cached_ds[0]
+    assert sample["image"].shape == (3, 256, 256)
+    assert sample["f_r"].shape == (256,)
+    assert sample["gap_r"].shape == (256,)
+
+
+def test_gap_sam_memory_probing_with_bypassed_vae():
+    """Verify find_optimal_batch_size probes GAP-SAM models with vae_bypassed=True without crash."""
+    from sid_unet.utils.memory import find_optimal_batch_size
+
+    class DummyGAPSAM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vae_bypassed = True
+            self.linear = nn.Linear(256, 1)
+
+        def forward(self, image, f_r=None, **kwargs):
+            bs = image.shape[0]
+            if f_r is None:
+                raise ValueError("Expected f_r when VAE is bypassed!")
+            mask_logits = self.linear(f_r).view(bs, 1, 1, 1).expand(bs, 1, 256, 256)
+            class_logits = torch.zeros(bs, 3, device=image.device)
+            return mask_logits, class_logits
+
+    model = DummyGAPSAM()
+    device = torch.device("cpu")
+    opt_bs = find_optimal_batch_size(
+        model=model,
+        device=device,
+        image_size=(256, 256),
+        in_channels=3,
+        min_batch_size=2,
+        max_batch_size=4,
+        force_probe=True,
+    )
+    assert opt_bs in (2, 4)
+
+
+def test_dataset_cache_manager_gap_sam_shards_with_images(temp_cache_dir):
+    """Verify DatasetCacheManager produces Parquet shards with 1x1 latent dimensions and 'image' column for GAP-SAM."""
+    from torch.utils.data import Dataset
+
+    class DummyImageMaskDataset(Dataset):
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, idx):
+            if idx >= 4:
+                raise IndexError(f"Index {idx} out of bounds")
+            return {
+                "image": torch.randn(3, 256, 256),
+                "mask": torch.zeros(1, 256, 256),
+                "label": 1,
+                "img_id": f"img_{idx}",
+            }
+
+    class DummyGAPSAMExtractorModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model_name = "gap_sam"
+            self.total_channels = 256
+
+        def extract_cache_tensors(self, x):
+            # Returns 1D pooled descriptor of shape (B, 256)
+            return torch.randn(x.shape[0], 256)
+
+    model = DummyGAPSAMExtractorModel()
+    manager = DatasetCacheManager(
+        model=model,
+        output_dir=temp_cache_dir,
+        batch_size=2,
+        samples_per_shard=2,
+        push_to_hub=False,
+    )
+    assert manager.store_images is True
+
+    ds = DummyImageMaskDataset()
+    shards = manager.cache_split("train", max_samples=4, dataset=ds)
+    assert len(shards) == 2
+
+    # Check Parquet table schema and content
+    for shard in shards:
+        tbl = pq.read_table(shard)
+        assert "image" in tbl.column_names
+        assert "z_high_dim" in tbl.column_names
+        assert tbl["channels"][0].as_py() == 256
+        assert tbl["latent_h"][0].as_py() == 1
+        assert tbl["latent_w"][0].as_py() == 1
+        # Image bytes can be decoded into PIL image
+        img_bytes = tbl["image"][0].as_py()
+        assert len(img_bytes) > 0
+        img = Image.open(io.BytesIO(img_bytes))
+        assert img.size == (256, 256)
+
+
 
 
 

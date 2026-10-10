@@ -1870,6 +1870,8 @@ sid-train \
   For non-streaming/map-style workloads (`data.streaming: false`), `CachedTensorDataset` manages an `OrderedDict` LRU table cache (`max_cached_tables=2` by default) with worker multiprocessing capped to safe limits using `spawn` context to prevent PyArrow multithreaded fork deadlocks.
 - **Cross-Resolution Auto-Batch Probing**:
   The memory probe (`find_optimal_batch_size`) supports multi-resolution models by reconciling input latent dimensions ($Z \in \mathbb{R}^{C \times H/8 \times W/8}$) with decoded ground-truth mask targets ($Y \in \mathbb{R}^{1 \times H \times W}$), preventing loss function shape mismatch warnings and enabling reliable automatic batch size scaling.
+- **GAP-SAM 1D Descriptor Caching & Image Serialization (`--store-images`)**:
+  Supports caching models that output 1D global descriptors (e.g. GAP-SAM's 256-dimensional $\mathbf{gap}_r$ vector). Parquet shards dynamically record $1 \times 1$ latent dimensions instead of forcing spatial dimensions, and store compressed RGB image bytes via the `image` column to supply the trainable LoRA segmentation backbone. Zero-copy `decode_cached_tensor()` safeguards automatically reconcile 1D descriptors without shape mismatch crashes, even when loading legacy shards with legacy spatial metadata.
 
 ---
 

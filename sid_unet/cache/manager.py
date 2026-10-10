@@ -212,6 +212,7 @@ class DatasetCacheManager:
         resume: bool = True,
         delete_local_on_upload: bool = False,
         push_to_hub: bool = False,
+        store_images: Optional[bool] = None,
     ):
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -230,6 +231,14 @@ class DatasetCacheManager:
         self.delete_local_on_upload = bool(delete_local_on_upload)
         self.push_to_hub_flag = bool(push_to_hub)
 
+        if store_images is None:
+            self.store_images = bool(
+                self.extractor.total_channels == 256
+                or getattr(self.extractor, "model_name", "") in ("gap_sam", "gap-sam")
+            )
+        else:
+            self.store_images = bool(store_images)
+
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.uploader: Optional[AsyncHubUploader] = None
@@ -247,8 +256,8 @@ class DatasetCacheManager:
             self._save_metadata(all_shards={}, status="in_progress")
             self._upload_metadata_sync()
 
-    def _process_sample_to_tensors(self, sample: Dict[str, Any]) -> Tuple[torch.Tensor, bytes, int, str]:
-        """Convert a raw dataset sample dict into an RGB tensor and mask PNG bytes."""
+    def _process_sample_to_tensors(self, sample: Dict[str, Any]) -> Tuple[torch.Tensor, bytes, int, str, Optional[bytes]]:
+        """Convert a raw dataset sample dict into an RGB tensor, mask PNG bytes, and optional JPEG bytes."""
         raw_img = sample.get("image")
         raw_mask = sample.get("mask")
         raw_label = sample.get("label")
@@ -257,6 +266,12 @@ class DatasetCacheManager:
         pil_img = ensure_rgb_image(raw_img)
         if pil_img.size != (self.image_size[1], self.image_size[0]):
             pil_img = pil_img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
+
+        img_bytes = None
+        if self.store_images:
+            img_buf = io.BytesIO()
+            pil_img.save(img_buf, format="JPEG", quality=95)
+            img_bytes = img_buf.getvalue()
 
         img_arr = np.array(pil_img, dtype=np.float32) / 255.0
         # (3, H, W) in range [0, 1]
@@ -303,7 +318,7 @@ class DatasetCacheManager:
             else:
                 label = 2
 
-        return img_tensor, mask_bytes, label, img_id
+        return img_tensor, mask_bytes, label, img_id, img_bytes
 
     def _write_shard_columnar(
         self,
@@ -315,6 +330,7 @@ class DatasetCacheManager:
         shard_idx: int,
         latent_h: int,
         latent_w: int,
+        image_bytes: Optional[List[bytes]] = None,
     ) -> str:
         """Write collected columnar shard records to a compressed Parquet file."""
         split_dir = os.path.join(self.output_dir, split)
@@ -323,19 +339,21 @@ class DatasetCacheManager:
         shard_path = os.path.join(split_dir, shard_filename)
 
         num_records = len(img_ids)
-        table = pa.Table.from_arrays(
-            [
-                pa.array(img_ids, type=pa.string()),
-                pa.array(labels, type=pa.int64()),
-                pa.array(z_bytes, type=pa.binary()),
-                pa.array(mask_bytes, type=pa.binary()),
-                pa.array([self.extractor.total_channels] * num_records, type=pa.int64()),
-                pa.array([latent_h] * num_records, type=pa.int64()),
-                pa.array([latent_w] * num_records, type=pa.int64()),
-            ],
-            names=["img_id", "label", "z_high_dim", "mask", "channels", "latent_h", "latent_w"],
-        )
+        arrays = [
+            pa.array(img_ids, type=pa.string()),
+            pa.array(labels, type=pa.int64()),
+            pa.array(z_bytes, type=pa.binary()),
+            pa.array(mask_bytes, type=pa.binary()),
+            pa.array([self.extractor.total_channels] * num_records, type=pa.int64()),
+            pa.array([latent_h] * num_records, type=pa.int64()),
+            pa.array([latent_w] * num_records, type=pa.int64()),
+        ]
+        names = ["img_id", "label", "z_high_dim", "mask", "channels", "latent_h", "latent_w"]
+        if image_bytes is not None and len(image_bytes) == num_records:
+            arrays.append(pa.array(image_bytes, type=pa.binary()))
+            names.append("image")
 
+        table = pa.Table.from_arrays(arrays, names=names)
         pq.write_table(table, shard_path, compression="zstd")
         del table
         shard_size_mb = os.path.getsize(shard_path) / (1024 * 1024)
@@ -431,6 +449,7 @@ class DatasetCacheManager:
         split: str = "train",
         max_samples: Optional[int] = None,
         resume: Optional[bool] = None,
+        dataset: Optional[Any] = None,
     ) -> List[str]:
         """
         Extract and save cached representations for a single split.
@@ -440,6 +459,7 @@ class DatasetCacheManager:
             split: Dataset split name (e.g. 'train' or 'validation').
             max_samples: Optional limit on the number of samples to process.
             resume: Whether to resume from existing remote/local shards.
+            dataset: Optional pre-loaded PyTorch or HF Dataset instance.
 
         Returns:
             List of generated Parquet file paths.
@@ -447,11 +467,15 @@ class DatasetCacheManager:
         should_resume = self.resume if resume is None else bool(resume)
         logger.info(f"🔄 Initializing cache extraction for split '{split}' from '{self.source_dataset_name}'...")
 
-        ds, resolved_split = load_parquet_or_hf_dataset(
-            self.source_dataset_name,
-            requested_split=split,
-            streaming=True,
-        )
+        if dataset is not None:
+            ds = dataset
+            resolved_split = split
+        else:
+            ds, resolved_split = load_parquet_or_hf_dataset(
+                self.source_dataset_name,
+                requested_split=split,
+                streaming=True,
+            )
 
         total_dataset_len = len(ds) if hasattr(ds, "__len__") else None
 
@@ -495,22 +519,32 @@ class DatasetCacheManager:
         shard_labels: List[int] = []
         shard_z_bytes: List[bytes] = []
         shard_mask_bytes: List[bytes] = []
+        shard_image_bytes: List[bytes] = []
 
         batch_images: List[torch.Tensor] = []
         batch_masks: List[bytes] = []
         batch_labels: List[int] = []
         batch_ids: List[str] = []
+        batch_raw_images: List[Optional[bytes]] = []
 
         pbar = tqdm(desc=f"Caching [{split}]", total=target_total, initial=total_processed, unit="samples")
 
         def flush_batch() -> None:
-            nonlocal batch_images, batch_masks, batch_labels, batch_ids
+            nonlocal batch_images, batch_masks, batch_labels, batch_ids, batch_raw_images, latent_h, latent_w
             if not batch_images:
                 return
 
             imgs = torch.stack(batch_images, dim=0).to(self.device)
             with torch.no_grad():
                 z_batch = self.extractor.extract_batch(imgs)
+
+            # Dynamically resolve latent spatial dimensions based on extractor output
+            if z_batch.dim() == 4:
+                latent_h = z_batch.shape[2]
+                latent_w = z_batch.shape[3]
+            elif z_batch.dim() <= 2:
+                latent_h = 1
+                latent_w = 1
 
             z_batch_cpu = z_batch.cpu()
             if self.fp16 and z_batch_cpu.dtype != torch.float16:
@@ -523,12 +557,15 @@ class DatasetCacheManager:
                 shard_labels.append(batch_labels[i])
                 shard_z_bytes.append(z_np[i].tobytes())
                 shard_mask_bytes.append(batch_masks[i])
+                if self.store_images and i < len(batch_raw_images) and batch_raw_images[i] is not None:
+                    shard_image_bytes.append(batch_raw_images[i])
 
             del imgs, z_batch, z_batch_cpu, z_np
             batch_images.clear()
             batch_masks.clear()
             batch_labels.clear()
             batch_ids.clear()
+            batch_raw_images.clear()
 
         def commit_shard() -> None:
             nonlocal shard_idx
@@ -544,6 +581,7 @@ class DatasetCacheManager:
                 shard_idx=shard_idx,
                 latent_h=latent_h,
                 latent_w=latent_w,
+                image_bytes=shard_image_bytes if self.store_images else None,
             )
             shard_files.append(path)
             num_written = len(shard_img_ids)
@@ -552,6 +590,7 @@ class DatasetCacheManager:
             shard_labels.clear()
             shard_z_bytes.clear()
             shard_mask_bytes.clear()
+            shard_image_bytes.clear()
 
             gc.collect()
             if torch.cuda.is_available():
@@ -568,15 +607,21 @@ class DatasetCacheManager:
 
             shard_idx += 1
 
+        consecutive_failures = 0
+        max_consecutive_failures = 50
+
         try:
             for raw_sample in ds:
                 try:
-                    img_t, mask_b, lbl, i_id = self._process_sample_to_tensors(raw_sample)
+                    img_t, mask_b, lbl, i_id, img_b = self._process_sample_to_tensors(raw_sample)
                     batch_images.append(img_t)
                     batch_masks.append(mask_b)
                     batch_labels.append(lbl)
                     batch_ids.append(i_id)
+                    if self.store_images:
+                        batch_raw_images.append(img_b)
                     total_processed += 1
+                    consecutive_failures = 0
                     pbar.update(1)
 
                     if len(batch_images) >= self.batch_size:
@@ -587,8 +632,14 @@ class DatasetCacheManager:
 
                     if max_samples is not None and total_processed >= max_samples:
                         break
+                except (IndexError, StopIteration):
+                    break
                 except Exception as sample_err:
+                    consecutive_failures += 1
                     logger.warning(f"Skipping corrupt sample: {sample_err}")
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples.")
+                        break
                     continue
 
             flush_batch()

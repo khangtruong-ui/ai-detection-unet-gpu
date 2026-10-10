@@ -256,6 +256,23 @@ def ensure_rgb_image(
     elif isinstance(image, io.BytesIO):
         image = Image.open(image)
 
+    if isinstance(image, torch.Tensor):
+        t = image.detach().cpu().float()
+        if t.ndim == 3:
+            if t.shape[0] in (1, 3, 4):
+                t = t.permute(1, 2, 0)
+        arr = t.numpy()
+        if arr.max() <= 1.0 and arr.min() >= 0.0:
+            arr = (arr * 255).astype(np.uint8)
+        else:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 2:
+            return Image.fromarray(arr).convert("RGB")
+        if arr.shape[-1] == 1:
+            arr = arr.squeeze(-1)
+            return Image.fromarray(arr).convert("RGB")
+        return Image.fromarray(arr).convert("RGB")
+
     if isinstance(image, np.ndarray):
         if image.ndim == 2:
             return Image.fromarray(image).convert("RGB")

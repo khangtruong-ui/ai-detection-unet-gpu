@@ -131,6 +131,19 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         default=None,
         help="Hugging Face API token for repository write access (optional if logged in via huggingface-cli)",
     )
+    parser.add_argument(
+        "--store-images",
+        dest="store_images",
+        action="store_true",
+        default=None,
+        help="Store RGB images in Parquet shards alongside features (default: True for descriptor models like gap_sam)",
+    )
+    parser.add_argument(
+        "--no-store-images",
+        dest="store_images",
+        action="store_false",
+        help="Do not store RGB images in Parquet shards",
+    )
     return parser.parse_args(args)
 
 
@@ -179,6 +192,7 @@ def cli_main(args: Optional[list] = None) -> None:
         resume=parsed_args.resume,
         delete_local_on_upload=parsed_args.delete_local_on_upload,
         push_to_hub=push_hub,
+        store_images=parsed_args.store_images,
     )
 
     logger.info(

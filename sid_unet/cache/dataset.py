@@ -42,6 +42,17 @@ class SpatialJointTransform:
     def __call__(
         self, z: torch.Tensor, mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if z.dim() < 2:
+            # 1D descriptor has no spatial dimensions; transform mask only
+            if self.hflip > 0 and random.random() < self.hflip:
+                mask = torch.flip(mask, dims=[-1])
+            if self.vflip > 0 and random.random() < self.vflip:
+                mask = torch.flip(mask, dims=[-2])
+            if self.rot90 > 0 and random.random() < self.rot90:
+                k = random.choice([1, 2, 3])
+                mask = torch.rot90(mask, k=k, dims=[-2, -1])
+            return z.contiguous(), mask.contiguous()
+
         if self.hflip > 0 and random.random() < self.hflip:
             z = torch.flip(z, dims=[-1])
             mask = torch.flip(mask, dims=[-1])
@@ -64,36 +75,108 @@ def decode_cached_tensor(
     h: Optional[int] = None,
     w: Optional[int] = None,
     dtype: torch.dtype = torch.float32,
+    latent_h: Optional[int] = None,
+    latent_w: Optional[int] = None,
+    **kwargs: Any,
 ) -> torch.Tensor:
     """
     Zero-copy decode of cached tensor from bytes or array into PyTorch tensor.
+    Safely reconciles both 3D/4D spatial feature maps [C, H, W] and 1D descriptors [C],
+    preventing shape mismatch crashes when metadata defines (C, H, W) for flat vectors.
     """
+    if h is None and latent_h is not None:
+        h = latent_h
+    if w is None and latent_w is not None:
+        w = latent_w
+
     if isinstance(raw_z, torch.Tensor):
         return raw_z.to(dtype=dtype)
 
+    def _safe_reshape_np(arr: np.ndarray) -> np.ndarray:
+        if channels is not None:
+            if arr.size == channels:
+                return arr.reshape((channels,))
+            if h is not None and w is not None and h > 0 and w > 0 and arr.size == channels * h * w:
+                if h == 1 and w == 1:
+                    return arr.reshape((channels,))
+                return arr.reshape((channels, h, w))
+            if h is not None and w is not None and h > 0 and w > 0 and arr.size % (h * w) == 0:
+                return arr.reshape((-1, h, w))
+            if arr.size == 1:
+                return arr.reshape((1,))
+        return arr
+
     if isinstance(raw_z, (bytes, bytearray)):
+        if len(raw_z) == 0:
+            c = channels or 1
+            sh = (c, h, w) if (h and w) else (c,)
+            return torch.zeros(sh, dtype=dtype)
         # Stored as float16 byte buffer
         np_arr = np.frombuffer(raw_z, dtype=np.float16).copy()
-        if channels is not None and h is not None and w is not None:
-            np_arr = np_arr.reshape((channels, h, w))
-        t = torch.from_numpy(np_arr).to(dtype=dtype)
-        return t
+        np_arr = _safe_reshape_np(np_arr)
+        return torch.from_numpy(np_arr).to(dtype=dtype)
 
     if isinstance(raw_z, np.ndarray):
         if raw_z.dtype == np.uint8:
             np_arr = np.frombuffer(raw_z.tobytes(), dtype=np.float16).copy()
-            if channels is not None and h is not None and w is not None:
-                np_arr = np_arr.reshape((channels, h, w))
+            np_arr = _safe_reshape_np(np_arr)
             return torch.from_numpy(np_arr).to(dtype=dtype)
+        raw_z = _safe_reshape_np(raw_z)
         return torch.from_numpy(raw_z).to(dtype=dtype)
 
     if isinstance(raw_z, (list, tuple)):
         t = torch.tensor(raw_z, dtype=torch.float16)
-        if channels is not None and h is not None and w is not None:
-            t = t.view(channels, h, w)
+        if channels is not None:
+            if h is not None and w is not None and h > 0 and w > 0 and t.numel() == channels * h * w:
+                t = t.view(channels, h, w)
+            elif t.numel() == channels:
+                t = t.view(channels)
+            elif h is not None and w is not None and h > 0 and w > 0 and t.numel() % (h * w) == 0:
+                t = t.view(-1, h, w)
         return t.to(dtype=dtype)
 
     raise TypeError(f"Unsupported cached tensor type: {type(raw_z)}")
+
+
+def decode_cached_image(
+    raw_img: Any,
+    target_size: Optional[Tuple[int, int]] = (256, 256),
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Decode image into float tensor of shape (3, H, W) normalized to [0.0, 1.0].
+    """
+    if isinstance(raw_img, torch.Tensor):
+        if raw_img.dim() == 4 and raw_img.shape[0] == 1:
+            raw_img = raw_img.squeeze(0)
+        return raw_img.to(dtype=dtype)
+
+    if isinstance(raw_img, (bytes, bytearray)):
+        try:
+            pil_img = Image.open(io.BytesIO(raw_img)).convert("RGB")
+            if target_size and pil_img.size != (target_size[1], target_size[0]):
+                pil_img = pil_img.resize((target_size[1], target_size[0]), Image.BILINEAR)
+            arr = np.array(pil_img, dtype=np.float32) / 255.0
+            return torch.from_numpy(arr.transpose(2, 0, 1)).to(dtype=dtype)
+        except Exception:
+            pass
+
+    if isinstance(raw_img, Image.Image):
+        pil_img = raw_img.convert("RGB")
+        if target_size and pil_img.size != (target_size[1], target_size[0]):
+            pil_img = pil_img.resize((target_size[1], target_size[0]), Image.BILINEAR)
+        arr = np.array(pil_img, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr.transpose(2, 0, 1)).to(dtype=dtype)
+
+    if isinstance(raw_img, np.ndarray):
+        arr = raw_img.astype(np.float32)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        if arr.ndim == 3 and arr.shape[-1] == 3:
+            arr = arr.transpose(2, 0, 1)
+        return torch.from_numpy(arr).to(dtype=dtype)
+
+    raise TypeError(f"Unsupported image format: {type(raw_img)}")
 
 
 def decode_mask_tensor(
@@ -116,8 +199,22 @@ def decode_mask_tensor(
             arr = np.array(pil_img, dtype=np.float32) / 255.0
             return torch.from_numpy(arr).unsqueeze(0).float()
         except Exception:
-            # Fallback if raw bytes
-            pass
+            # Fallback if raw byte buffer (e.g. numpy tobytes)
+            try:
+                h, w = target_size if target_size else (256, 256)
+                if len(raw_mask) == h * w:
+                    arr = np.frombuffer(raw_mask, dtype=np.uint8).reshape((1, h, w)).astype(np.float32) / 255.0
+                    return torch.from_numpy(arr).float()
+                elif len(raw_mask) == h * w * 4:
+                    arr = np.frombuffer(raw_mask, dtype=np.float32).reshape((1, h, w))
+                    return torch.from_numpy(arr).float()
+                else:
+                    arr = np.frombuffer(raw_mask, dtype=np.uint8).astype(np.float32) / 255.0
+                    if arr.size == h * w:
+                        return torch.from_numpy(arr.reshape((1, h, w))).float()
+                    return torch.from_numpy(arr).unsqueeze(0).float()
+            except Exception:
+                pass
 
     if isinstance(raw_mask, Image.Image):
         pil_img = raw_mask.convert("L")
@@ -155,6 +252,7 @@ class CachedTensorDataset(Dataset):
         expected_channels: int = 84,
         max_samples: Optional[int] = None,
         max_cached_tables: int = 2,
+        image_provider: Optional[Callable[[int, str], torch.Tensor]] = None,
     ):
         self.parquet_files = [str(f) for f in parquet_files if os.path.exists(str(f))]
         self.transform = transform
@@ -162,6 +260,7 @@ class CachedTensorDataset(Dataset):
         self.expected_channels = expected_channels
         self.max_samples = max_samples
         self.max_cached_tables = max(1, int(max_cached_tables))
+        self.image_provider = image_provider
 
         if not self.parquet_files:
             raise FileNotFoundError(f"No valid Parquet files found in: {parquet_files}")
@@ -221,21 +320,52 @@ class CachedTensorDataset(Dataset):
         z_tensor = decode_cached_tensor(z_raw, channels=ch, h=latent_h, w=latent_w)
         mask_tensor = decode_mask_tensor(row["mask"], target_size=self.target_image_size)
 
-        # Apply spatial augmentations synchronously
-        if self.transform is not None:
-            z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
-
         raw_label = row.get("label", 2)
         label = int(raw_label) if raw_label is not None else 2
         img_id = str(row.get("img_id", f"cached_{idx}"))
 
-        return {
-            "image": z_tensor,
-            "mask": mask_tensor,
-            "label": torch.tensor(label, dtype=torch.long),
-            "img_id": img_id,
-            "is_cached": True,
-        }
+        if z_tensor.dim() > 1 and (z_tensor.numel() == ch or z_tensor.shape[-2:] == (1, 1)):
+            z_tensor = z_tensor.view(-1)
+
+        if z_tensor.dim() == 1:
+            # 1D descriptor (e.g. GAP-SAM artifact descriptor gap_r of shape [256])
+            if "image" in row and row["image"] is not None:
+                img_tensor = decode_cached_image(row["image"], target_size=self.target_image_size)
+            elif self.image_provider is not None:
+                try:
+                    img_tensor = self.image_provider(idx, img_id)
+                except TypeError:
+                    try:
+                        img_tensor = self.image_provider(img_id, self.target_image_size)
+                    except TypeError:
+                        img_tensor = self.image_provider(img_id)
+            else:
+                img_tensor = torch.zeros(3, self.target_image_size[0], self.target_image_size[1], dtype=torch.float32)
+
+            if self.transform is not None:
+                img_tensor, mask_tensor = self.transform(img_tensor, mask_tensor)
+
+            return {
+                "image": img_tensor,
+                "mask": mask_tensor,
+                "f_r": z_tensor,
+                "gap_r": z_tensor,
+                "label": torch.tensor(label, dtype=torch.long),
+                "img_id": img_id,
+                "is_cached": True,
+            }
+        else:
+            # Spatial latent tensor (e.g. Diffusion-Diff [C, H, W])
+            if self.transform is not None:
+                z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
+
+            return {
+                "image": z_tensor,
+                "mask": mask_tensor,
+                "label": torch.tensor(label, dtype=torch.long),
+                "img_id": img_id,
+                "is_cached": True,
+            }
 
 
 class CachedStreamingDataset(IterableDataset):
@@ -255,6 +385,7 @@ class CachedStreamingDataset(IterableDataset):
         shuffle: bool = False,
         shuffle_buffer_size: int = 0,
         seed: int = 42,
+        image_provider: Optional[Callable[[int, str], torch.Tensor]] = None,
     ):
         self.parquet_files = [str(f) for f in parquet_files if os.path.exists(str(f))]
         self.transform = transform
@@ -264,6 +395,7 @@ class CachedStreamingDataset(IterableDataset):
         self.shuffle = shuffle
         self.shuffle_buffer_size = max(0, int(shuffle_buffer_size))
         self.seed = int(seed)
+        self.image_provider = image_provider
 
         self._total_rows = 0
         for f in self.parquet_files:
@@ -331,16 +463,47 @@ class CachedStreamingDataset(IterableDataset):
                 z_tensor = decode_cached_tensor(z_raw, channels=ch, h=latent_h, w=latent_w)
                 mask_tensor = decode_mask_tensor(mask_raw, target_size=self.target_image_size)
 
-                if self.transform is not None:
-                    z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
+                if z_tensor.dim() > 1 and (z_tensor.numel() == ch or z_tensor.shape[-2:] == (1, 1)):
+                    z_tensor = z_tensor.view(-1)
 
-                sample = {
-                    "image": z_tensor,
-                    "mask": mask_tensor,
-                    "label": torch.tensor(label_val, dtype=torch.long),
-                    "img_id": img_id_val,
-                    "is_cached": True,
-                }
+                if z_tensor.dim() == 1:
+                    raw_img_val = table["image"][row_idx].as_py() if "image" in table.column_names else None
+                    if raw_img_val is not None:
+                        img_tensor = decode_cached_image(raw_img_val, target_size=self.target_image_size)
+                    elif self.image_provider is not None:
+                        try:
+                            img_tensor = self.image_provider(count, img_id_val)
+                        except TypeError:
+                            try:
+                                img_tensor = self.image_provider(img_id_val, self.target_image_size)
+                            except TypeError:
+                                img_tensor = self.image_provider(img_id_val)
+                    else:
+                        img_tensor = torch.zeros(3, self.target_image_size[0], self.target_image_size[1], dtype=torch.float32)
+
+                    if self.transform is not None:
+                        img_tensor, mask_tensor = self.transform(img_tensor, mask_tensor)
+
+                    sample = {
+                        "image": img_tensor,
+                        "mask": mask_tensor,
+                        "f_r": z_tensor,
+                        "gap_r": z_tensor,
+                        "label": torch.tensor(label_val, dtype=torch.long),
+                        "img_id": img_id_val,
+                        "is_cached": True,
+                    }
+                else:
+                    if self.transform is not None:
+                        z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
+
+                    sample = {
+                        "image": z_tensor,
+                        "mask": mask_tensor,
+                        "label": torch.tensor(label_val, dtype=torch.long),
+                        "img_id": img_id_val,
+                        "is_cached": True,
+                    }
 
                 if self.shuffle_buffer_size > 1:
                     buffer.append(sample)
@@ -380,12 +543,14 @@ class CachedIndexedDataset(Dataset):
         target_image_size: Tuple[int, int] = (256, 256),
         expected_channels: int = 84,
         max_samples: Optional[int] = None,
+        image_provider: Optional[Callable[[int, str], torch.Tensor]] = None,
     ):
         self.pdl_dataset = pdl_dataset
         self.transform = transform
         self.target_image_size = target_image_size
         self.expected_channels = expected_channels
         self.max_samples = max_samples
+        self.image_provider = image_provider
         self._len = len(pdl_dataset)
         if max_samples is not None and max_samples > 0:
             self._len = min(self._len, max_samples)
@@ -406,20 +571,50 @@ class CachedIndexedDataset(Dataset):
         z_tensor = decode_cached_tensor(z_raw, channels=ch, h=latent_h, w=latent_w)
         mask_tensor = decode_mask_tensor(row["mask"], target_size=self.target_image_size)
 
-        if self.transform is not None:
-            z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
-
         raw_label = row.get("label", 2)
         label = int(raw_label) if raw_label is not None else 2
         img_id = str(row.get("img_id", f"cached_{idx}"))
 
-        return {
-            "image": z_tensor,
-            "mask": mask_tensor,
-            "label": torch.tensor(label, dtype=torch.long),
-            "img_id": img_id,
-            "is_cached": True,
-        }
+        if z_tensor.dim() > 1 and (z_tensor.numel() == ch or z_tensor.shape[-2:] == (1, 1)):
+            z_tensor = z_tensor.view(-1)
+
+        if z_tensor.dim() == 1:
+            if "image" in row and row["image"] is not None:
+                img_tensor = decode_cached_image(row["image"], target_size=self.target_image_size)
+            elif self.image_provider is not None:
+                try:
+                    img_tensor = self.image_provider(idx, img_id)
+                except TypeError:
+                    try:
+                        img_tensor = self.image_provider(img_id, self.target_image_size)
+                    except TypeError:
+                        img_tensor = self.image_provider(img_id)
+            else:
+                img_tensor = torch.zeros(3, self.target_image_size[0], self.target_image_size[1], dtype=torch.float32)
+
+            if self.transform is not None:
+                img_tensor, mask_tensor = self.transform(img_tensor, mask_tensor)
+
+            return {
+                "image": img_tensor,
+                "mask": mask_tensor,
+                "f_r": z_tensor,
+                "gap_r": z_tensor,
+                "label": torch.tensor(label, dtype=torch.long),
+                "img_id": img_id,
+                "is_cached": True,
+            }
+        else:
+            if self.transform is not None:
+                z_tensor, mask_tensor = self.transform(z_tensor, mask_tensor)
+
+            return {
+                "image": z_tensor,
+                "mask": mask_tensor,
+                "label": torch.tensor(label, dtype=torch.long),
+                "img_id": img_id,
+                "is_cached": True,
+            }
 
     def shard(self, num_shards: int, index: int, contiguous: bool = True) -> "CachedIndexedDataset":
         sharded_pdl = self.pdl_dataset.shard(num_shards=num_shards, index=index, contiguous=contiguous)
@@ -432,6 +627,7 @@ class CachedIndexedDataset(Dataset):
             target_image_size=self.target_image_size,
             expected_channels=self.expected_channels,
             max_samples=sharded_max,
+            image_provider=self.image_provider,
         )
 
     def get_row_group_indices(self) -> List[List[int]]:

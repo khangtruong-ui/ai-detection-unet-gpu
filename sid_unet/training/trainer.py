@@ -801,11 +801,16 @@ class Trainer:
         current_bs = int(self.config.data.get("batch_size", 16))
         img_size = tuple(self.config.data.get("image_size", [256, 256]))
 
-        if bool(self.config.data.get("cached_hf_repo", False)):
+        is_gap_sam = (
+            getattr(self.raw_model, "__class__", type(self.raw_model)).__name__.lower() in ("gapsam", "gap_sam")
+            or str(self.config.model.get("name", "")).lower() in ("gap_sam", "gap-sam", "gapsam")
+        )
+        if bool(self.config.data.get("cached_hf_repo", False)) and not is_gap_sam:
             z_ch = int(self.config.model.get("total_z_channels", getattr(self.raw_model, "total_z_channels", 84)))
             sample_shape = (z_ch, img_size[0] // 8, img_size[1] // 8)
         else:
-            sample_shape = (3, img_size[0], img_size[1])
+            in_ch = int(getattr(self.raw_model, "in_channels", self.config.model.get("in_channels", 3)))
+            sample_shape = (in_ch, img_size[0], img_size[1])
 
         try:
             if self.is_distributed:

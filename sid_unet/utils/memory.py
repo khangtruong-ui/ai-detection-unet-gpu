@@ -198,19 +198,27 @@ def find_optimal_batch_size(
     num_classes: int = 3,
     logger: Optional[Any] = None,
     mask_shape: Optional[Tuple[int, int]] = None,
+    image_size: Optional[Tuple[int, int]] = None,
+    in_channels: Optional[int] = None,
+    force_probe: bool = False,
+    **kwargs: Any,
 ) -> int:
     """
     Automatically probe and determine the largest safe batch size that fits in memory
     for the given model, image dimensions, and device without triggering an Out-of-Memory (OOM) error.
     Performs test forward, loss calculation, backward pass, and optimizer zeroing on dummy tensors.
     """
+    if image_size is not None:
+        c = in_channels if in_channels is not None else sample_shape[0]
+        sample_shape = (c, image_size[0], image_size[1])
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     elif isinstance(device, str):
         device = torch.device(device)
 
-    # If running on CPU without strict memory pressure, default to requested max_batch_size
-    if device.type == "cpu":
+    # If running on CPU without strict memory pressure, default to requested max_batch_size unless force_probe
+    if device.type == "cpu" and not force_probe:
         return max(min_batch_size, max_batch_size)
 
     # Candidate batch sizes to test in descending order (powers of 2, plus target max)
@@ -258,8 +266,18 @@ def find_optimal_batch_size(
 
                 optimizer.zero_grad(set_to_none=True)
 
+                probe_kwargs: Dict[str, Any] = {}
+                is_gap_sam = (
+                    getattr(model, "model_name", "") in ("gap_sam", "gap-sam", "gapsam")
+                    or getattr(model, "is_gap_sam", False)
+                    or hasattr(model, "bypass_vae_for_cached_training")
+                    or getattr(model, "vae_bypassed", False)
+                )
+                if is_gap_sam or hasattr(model, "forward_cached"):
+                    probe_kwargs["f_r"] = torch.zeros(bs, 256, device=device)
+
                 with torch.amp.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
-                    outputs = model(images)
+                    outputs = model(images, **probe_kwargs) if probe_kwargs else model(images)
                     # Dynamically reconcile mask spatial dimensions if model outputs a different size
                     pred_tensor = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
                     if (

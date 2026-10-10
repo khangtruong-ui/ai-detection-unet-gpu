@@ -109,7 +109,7 @@ model:
 #### 2. Offline Precomputed Dataset Cache (`sid-cache`)
 For maximum throughput and massive multi-epoch runs, precompute descriptors offline:
 ```bash
-# 1. Precompute gap_r descriptors into Hugging Face Parquet dataset shards
+# 1. Precompute gap_r descriptors into Hugging Face Parquet dataset shards (stores images automatically)
 sid-cache --model gap_sam \
           --config configs/experiments/gap_sam/default.yaml \
           --hf-repo KhangTruong/gap-sam-coco-cache \
@@ -120,6 +120,20 @@ sid-cache --model gap_sam \
 sid-train --config configs/experiments/gap_sam/default.yaml \
           --cached-hf-repo KhangTruong/gap-sam-coco-cache
 ```
+
+##### Parquet Shard Schema & Architecture Differences
+Unlike `diffusion_diff` (which replaces input images with high-dimensional 84/244-channel spatial latent feature maps), GAP-SAM operates with a hybrid representation:
+- **`z_high_dim`**: Stores the 256-dimensional pooled descriptor $\mathbf{gap}_r$ extracted from the frozen VAE reconstruction branch as a 1D float16 array.
+- **`latent_h` & `latent_w`**: Correctly serialized as $1 \times 1$ for 1D vectors (avoiding shape mismatches).
+- **`image`**: Compressed JPEG bytes preserving the original RGB image, which is required by the trainable LoRA vision backbone (EfficientSAM3) for mask segmentation.
+- **`mask`**: Compressed PNG bytes of the ground-truth binary tampering mask.
+
+##### Backward Compatibility with Legacy Shards
+If training on legacy remote repositories (such as older shards where `image` was omitted and spatial dimensions were hardcoded to $32 \times 32$):
+- **Robust Tensor Decoding**: `decode_cached_tensor` automatically detects 1D vectors ($256$ elements) and prevents `ValueError: cannot reshape array of size 256 into shape (256, 32, 32)`.
+- **Image Fallback / Pairing**: Datasets seamlessly fall back to an active image provider or synthesized image tensor without crashing.
+- **Bypassed VAE Probing**: Automatic batch size memory probing cleanly injects pre-allocated $\mathbf{f}_r$ dummy vectors, allowing safe batch size auto-scaling even when the VAE is purged from GPU VRAM.
+
 When `--cached-hf-repo` is passed:
 - `bypass_vae_for_cached_training()` deletes `AutoencoderKL` from GPU memory.
 - `f_r` / `gap_r` tensors are streamed directly from disk/network alongside image and mask tensors.

@@ -1417,8 +1417,12 @@ def _generate_mock_cached_parquet_shard(
 
     z_bytes_list = []
     mask_bytes_list = []
+    img_bytes_list = []
     for i in range(num_samples):
-        z_t = np.random.randn(channels, latent_h, latent_w).astype(np.float16)
+        if channels == 256:
+            z_t = np.random.randn(channels).astype(np.float16)
+        else:
+            z_t = np.random.randn(channels, latent_h, latent_w).astype(np.float16)
         z_bytes_list.append(z_t.tobytes())
 
         mask_img = Image.new("L", (image_size[1], image_size[0]), color=(255 if (i % 2 == 1) else 0))
@@ -1426,15 +1430,24 @@ def _generate_mock_cached_parquet_shard(
         mask_img.save(buf, format="PNG")
         mask_bytes_list.append(buf.getvalue())
 
-    table = pa.Table.from_pydict({
+        rgb_img = Image.new("RGB", (image_size[1], image_size[0]), color=((i * 20) % 255, (i * 40) % 255, (i * 60) % 255))
+        ibuf = io.BytesIO()
+        rgb_img.save(ibuf, format="JPEG")
+        img_bytes_list.append(ibuf.getvalue())
+
+    pydict = {
         "img_id": img_ids,
         "label": labels,
         "z_high_dim": z_bytes_list,
         "mask": mask_bytes_list,
         "channels": [channels] * num_samples,
-        "latent_h": [latent_h] * num_samples,
-        "latent_w": [latent_w] * num_samples,
-    })
+        "latent_h": [(1 if channels == 256 else latent_h)] * num_samples,
+        "latent_w": [(1 if channels == 256 else latent_w)] * num_samples,
+    }
+    if channels == 256:
+        pydict["image"] = img_bytes_list
+
+    table = pa.Table.from_pydict(pydict)
     pq.write_table(table, shard_path, compression="zstd")
     return [shard_path]
 
@@ -1485,7 +1498,9 @@ def create_cached_dataloaders(
         random_rotate90=aug_cfg.get("random_rotate90", 0.25),
     )
 
-    expected_channels = int(config.model.get("total_z_channels", 84))
+    model_name = str(config.model.get("name", "")).lower() if hasattr(config, "model") and hasattr(config.model, "get") else ""
+    default_channels = 256 if model_name in ("gap_sam", "gap-sam", "gapsam") else 84
+    expected_channels = int(config.model.get("total_z_channels", default_channels))
     use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
     save_to_disk = config.data.get("save_to_disk", False)
     background_download = bool(config.data.get("background_download", bool(save_to_disk)))
