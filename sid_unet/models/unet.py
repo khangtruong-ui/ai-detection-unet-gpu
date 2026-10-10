@@ -396,6 +396,8 @@ def build_model(config: Any) -> nn.Module:
             dummy_vae_channels=tuple(model_cfg.get("dummy_vae_channels", [32, 64])),
             artifact_weight=float(model_cfg.get("artifact_weight", 1.0)),
             enable_artifact_classifier=bool(model_cfg.get("enable_artifact_classifier", True)),
+            enable_artifact_cache=bool(model_cfg.get("enable_artifact_cache", True)),
+            artifact_cache_size=int(model_cfg.get("artifact_cache_size", 50000)),
             device=dev_cfg,
             cache_dir=model_cfg.get("cache_dir", None),
             token=model_cfg.get("token", None),

@@ -61,6 +61,15 @@ logger = logging.getLogger("sid_unet.models.gap_sam")
 DEFAULT_GAP_SAM_VAE_CHECKPOINT = "stabilityai/sd-vae-ft-mse"
 
 
+def _normalize_device_str(dev: Union[str, torch.device]) -> str:
+    """Normalize device representation to ensure consistent cache keys across device forms."""
+    d = torch.device(dev)
+    if d.type == "cuda":
+        idx = d.index if d.index is not None else 0
+        return f"cuda:{idx}"
+    return str(d)
+
+
 class PairedArtifactEncoder(nn.Module):
     """
     Paired Artifact Encoder from GAP-SAM (Section 4.1).
@@ -354,6 +363,8 @@ class GAPSAM(SAM3DistilLoRA):
         dummy_vae_channels: Tuple[int, ...] = (32, 64),
         artifact_weight: float = 1.0,
         enable_artifact_classifier: bool = True,
+        enable_artifact_cache: bool = True,
+        artifact_cache_size: int = 50000,
         device: Optional[Union[str, torch.device]] = "auto",
         cache_dir: Optional[str] = None,
         token: Optional[str] = None,
@@ -403,7 +414,16 @@ class GAPSAM(SAM3DistilLoRA):
         self.dummy_vae_channels = dummy_vae_channels
         self.artifact_weight = float(artifact_weight)
         self.enable_artifact_classifier = enable_artifact_classifier
+        self.enable_artifact_cache = bool(enable_artifact_cache)
+        self.artifact_cache_size = int(artifact_cache_size)
         self.last_artifact_loss: Optional[torch.Tensor] = None
+
+        # Cache registries and performance monitoring
+        self._artifact_cache: Dict[Any, torch.Tensor] = {}
+        self._artifact_cache_hits: int = 0
+        self._artifact_cache_misses: int = 0
+        self._text_cache_hits: int = 0
+        self._text_cache_misses: int = 0
 
         # 1. Initialize frozen VAE
         self._init_vae()
@@ -431,7 +451,8 @@ class GAPSAM(SAM3DistilLoRA):
         logger.info(
             f"Initialized GAP-SAM ({self.backbone_type}-{self.model_name}) | "
             f"Artifact Weight: {self.artifact_weight} | "
-            f"Frozen VAE: {self.vae_pretrained_model_name_or_path} (dummy={self.use_dummy_vae})"
+            f"Frozen VAE: {self.vae_pretrained_model_name_or_path} (dummy={self.use_dummy_vae}) | "
+            f"Artifact Cache: {self.enable_artifact_cache} (max_size={self.artifact_cache_size})"
         )
 
     def _init_vae(self) -> None:
@@ -530,6 +551,157 @@ class GAPSAM(SAM3DistilLoRA):
 
         return x_rec.to(dtype=x.dtype, device=x.device)
 
+    def _store_in_artifact_cache(self, key: Any, value: torch.Tensor) -> None:
+        """Store pooled artifact descriptor in LRU-style cache with size bound."""
+        if len(self._artifact_cache) >= self.artifact_cache_size:
+            oldest_key = next(iter(self._artifact_cache))
+            del self._artifact_cache[oldest_key]
+        self._artifact_cache[key] = value
+
+    def _compute_content_hashes(self, x: torch.Tensor) -> List[str]:
+        """Compute fast deterministic content hashes for batch of images to index dynamic cache."""
+        import hashlib
+        keys: List[str] = []
+        b_sz = x.shape[0]
+        # Downsample spatially by factor 16 to get tiny thumbnail bytes for sub-millisecond hashing
+        sub = x[:, :, ::16, ::16].contiguous().cpu().numpy()
+        for i in range(b_sz):
+            h = hashlib.md5(sub[i].tobytes()).hexdigest()
+            keys.append(h)
+        return keys
+
+    def clear_artifact_cache(self) -> None:
+        """Clear cached frozen artifact representations."""
+        self._artifact_cache.clear()
+
+    def clear_text_cache(self) -> None:
+        """Clear cached text prompt embeddings."""
+        self._text_cache.clear()
+        if hasattr(self.base_model.backbone, "clear_text_cache"):
+            self.base_model.backbone.clear_text_cache()
+
+    def preload_text_prompt(
+        self,
+        prompt_text: Optional[str] = None,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        """Pre-compute and cache text prompt embeddings to eliminate latency on first batch."""
+        text = prompt_text or self.prompt_text
+        target_dev = device or self._target_device
+        cache_key = (text, _normalize_device_str(target_dev))
+        with torch.no_grad():
+            try:
+                out_t = self.base_model.backbone.forward_text([text], device=target_dev)
+            except RuntimeError as exc:
+                if "FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc):
+                    with torch.backends.cudnn.flags(enabled=False):
+                        out_t = self.base_model.backbone.forward_text([text], device=target_dev)
+                else:
+                    raise exc
+            self._text_cache[cache_key] = {k: v.clone() for k, v in out_t.items()}
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Return diagnostic metrics for text and artifact caches."""
+        art_total = self._artifact_cache_hits + self._artifact_cache_misses
+        text_total = self._text_cache_hits + self._text_cache_misses
+        return {
+            "artifact_cache_size": len(self._artifact_cache),
+            "artifact_cache_max_size": self.artifact_cache_size,
+            "artifact_cache_hits": self._artifact_cache_hits,
+            "artifact_cache_misses": self._artifact_cache_misses,
+            "artifact_hit_rate": (self._artifact_cache_hits / max(1, art_total)),
+            "text_cache_entries": len(self._text_cache),
+            "text_cache_hits": self._text_cache_hits,
+            "text_cache_misses": self._text_cache_misses,
+            "text_hit_rate": (self._text_cache_hits / max(1, text_total)),
+        }
+
+    def compute_artifact_feature(
+        self,
+        x: torch.Tensor,
+        x_rec: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute frozen artifact representation (gap_r of shape [B, 256]) from input images.
+        Uses deterministic frozen VAE reconstruction and frozen SAM vision backbone (LoRA disabled).
+        """
+        if self.vae is None and x_rec is None:
+            raise RuntimeError(
+                "Frozen VAE was unloaded via bypass_vae_for_cached_training(), but un-cached sample "
+                "was encountered. Ensure all samples are pre-cached before bypassing VAE."
+            )
+
+        b_sz, _, orig_h, orig_w = x.shape
+        model_device, param_dtype = get_submodule_device_dtype(
+            self.peft_model, x.device, torch.float32
+        )
+
+        if x_rec is None:
+            x_rec = self.reconstruct_image(x)
+
+        if (orig_h, orig_w) != self.target_size:
+            x_rec_proc = F.interpolate(x_rec, size=self.target_size, mode="bilinear", align_corners=False)
+        else:
+            x_rec_proc = x_rec
+
+        if self.input_rescale:
+            x_rec_proc = (x_rec_proc - 0.5) / 0.5
+
+        if param_dtype in (torch.float16, torch.bfloat16):
+            x_rec_proc = x_rec_proc.to(device=model_device, dtype=param_dtype)
+        else:
+            x_rec_proc = x_rec_proc.to(device=model_device)
+
+        with torch.no_grad():
+            with self.peft_model.disable_adapter():
+                backbone_out_r = self.base_model.backbone.forward_image(x_rec_proc)
+
+        F_r_L = backbone_out_r["backbone_fpn"][-1]
+        gap_r = F_r_L.mean(dim=[-2, -1])  # [B, 256]
+        return gap_r
+
+    @torch.no_grad()
+    def extract_cache_tensors(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract high-dimensional frozen artifact descriptor gap_r for offline dataset caching.
+        Returns tensor of shape [B, 256].
+        """
+        self.eval()
+        gap_r = self.compute_artifact_feature(x)
+        return gap_r.to(device=x.device)
+
+    def bypass_vae_for_cached_training(self) -> None:
+        """
+        Unload frozen AutoencoderKL from GPU memory when running in cached mode to reclaim VRAM.
+        """
+        if hasattr(self, "vae") and self.vae is not None:
+            logger.info("⚡ Bypassing and unloading frozen VAE (AutoencoderKL) to save VRAM during cached training.")
+            del self.vae
+            self.vae = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def forward_cached(
+        self,
+        x: torch.Tensor,
+        f_r: torch.Tensor,
+        target_masks: Optional[torch.Tensor] = None,
+        target_labels: Optional[torch.Tensor] = None,
+        return_artifact_loss: Optional[bool] = None,
+        return_dict: bool = False,
+    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
+        """
+        Fast forward execution bypassing frozen VAE and frozen vision backbone using pre-computed f_r.
+        """
+        return self.forward(
+            x=x,
+            f_r=f_r,
+            target_masks=target_masks,
+            target_labels=target_labels,
+            return_artifact_loss=return_artifact_loss,
+            return_dict=return_dict,
+        )
+
     def compute_artifact_loss(
         self,
         h_o: torch.Tensor,
@@ -546,6 +718,10 @@ class GAPSAM(SAM3DistilLoRA):
         self,
         x: torch.Tensor,
         x_rec: Optional[torch.Tensor] = None,
+        f_r: Optional[torch.Tensor] = None,
+        gap_r: Optional[torch.Tensor] = None,
+        cache_keys: Optional[Union[Sequence[Any], str]] = None,
+        img_ids: Optional[Union[Sequence[Any], str]] = None,
         target_masks: Optional[torch.Tensor] = None,
         target_labels: Optional[torch.Tensor] = None,
         return_artifact_loss: Optional[bool] = None,
@@ -555,9 +731,9 @@ class GAPSAM(SAM3DistilLoRA):
         Forward pass of GAP-SAM model.
 
         Pipeline:
-            1. Preprocess observed image x and reconstructed image x_rec (auto-computed if None).
+            1. Preprocess observed image x.
             2. Extract multiscale FPN features F_o via adaptive branch (with trainable LoRA).
-            3. Extract multiscale FPN features F_r via frozen branch (with LoRA disabled).
+            3. Resolve frozen artifact prior F_r (via f_r argument, in-memory cache, or frozen VAE+backbone).
             4. Encode final-layer features into Global Artifact Prior Token t_art via PairedArtifactEncoder.
             5. Modulate all FPN levels channel-wise using zero-gated FiLM layer.
             6. Decode modulated FPN through EfficientSAM3 mask decoder to produce mask_logits.
@@ -566,6 +742,10 @@ class GAPSAM(SAM3DistilLoRA):
         Args:
             x: Input images [B, 3, H, W] in [0, 1].
             x_rec: Optional pre-computed VAE reconstructions [B, 3, H, W].
+            f_r: Optional pre-computed frozen artifact descriptor [B, 256] or feature map [B, 256, H, W].
+            gap_r: Alias for f_r.
+            cache_keys: Optional sample keys/identifiers to index dynamic artifact cache.
+            img_ids: Alias for cache_keys (e.g. from dataset loader).
             target_masks: Optional ground-truth masks for authentic sample masking in artifact loss.
             target_labels: Optional ground-truth labels for authentic sample masking.
             return_artifact_loss: If True, includes artifact loss in output. Defaults to self.training.
@@ -589,53 +769,92 @@ class GAPSAM(SAM3DistilLoRA):
             self.peft_model, x.device, torch.float32
         )
 
-        # 1. Generate or prepare VAE reconstruction
-        if x_rec is None:
-            x_rec = self.reconstruct_image(x)
-
-        # 2. Resize to native EfficientSAM3 target resolution (1008, 1008)
+        # 1. Resize observed image to native EfficientSAM3 target resolution (1008, 1008)
         if (orig_h, orig_w) != self.target_size:
             x_proc = F.interpolate(x, size=self.target_size, mode="bilinear", align_corners=False)
-            x_rec_proc = F.interpolate(x_rec, size=self.target_size, mode="bilinear", align_corners=False)
         else:
             x_proc = x
-            x_rec_proc = x_rec
 
-        # 3. Rescale from [0, 1] to [-1, 1] if enabled
+        # 2. Rescale observed image from [0, 1] to [-1, 1] if enabled
         if self.input_rescale:
             x_proc = (x_proc - 0.5) / 0.5
-            x_rec_proc = (x_rec_proc - 0.5) / 0.5
 
-        # 4. Cast to target device and precision
+        # 3. Cast to target device and precision
         if param_dtype in (torch.float16, torch.bfloat16):
             x_proc = x_proc.to(device=model_device, dtype=param_dtype)
-            x_rec_proc = x_rec_proc.to(device=model_device, dtype=param_dtype)
         else:
             x_proc = x_proc.to(device=model_device)
-            x_rec_proc = x_rec_proc.to(device=model_device)
 
-        # 5. Adaptive Branch: visual features for observed image x (trainable via LoRA)
+        # 4. Adaptive Branch: visual features for observed image x (trainable via LoRA)
         backbone_out_o = self.base_model.backbone.forward_image(x_proc)
 
-        # 6. Frozen Branch: visual features for reconstructed image x_rec (adapters disabled, no grad)
-        with torch.no_grad():
-            with self.peft_model.disable_adapter():
-                backbone_out_r = self.base_model.backbone.forward_image(x_rec_proc)
+        # 5. Frozen Branch: resolve frozen artifact prior representation F_r_resolved (gap_r)
+        # Directly uses cached representations when available to bypass heavy VAE and frozen vision backbone.
+        F_r_resolved: Optional[torch.Tensor] = None
+        f_r_input = f_r if f_r is not None else gap_r
 
-        # 7. Paired Artifact Encoder: extract t_art from final-layer feature maps F_o^L and F_r^L
+        if f_r_input is not None:
+            # Pre-computed cached artifact tensor [B, 256] or [B, 256, H, W]
+            F_r_resolved = f_r_input.to(device=model_device, dtype=param_dtype)
+        elif self.enable_artifact_cache:
+            # Check dynamic in-memory artifact cache
+            keys = cache_keys if cache_keys is not None else img_ids
+            if keys is None:
+                keys = self._compute_content_hashes(x)
+            elif isinstance(keys, (str, int)):
+                keys = [keys]
+
+            missing_indices: List[int] = []
+            cached_vectors: List[Optional[torch.Tensor]] = [None] * b_sz
+            for idx, k in enumerate(keys):
+                if k in self._artifact_cache:
+                    cached_vectors[idx] = self._artifact_cache[k]
+                else:
+                    missing_indices.append(idx)
+
+            if len(missing_indices) == 0:
+                # 100% cache hit!
+                self._artifact_cache_hits += b_sz
+                F_r_resolved = torch.stack(cached_vectors, dim=0).to(device=model_device, dtype=param_dtype)
+            else:
+                self._artifact_cache_hits += (b_sz - len(missing_indices))
+                self._artifact_cache_misses += len(missing_indices)
+
+                if len(missing_indices) == b_sz:
+                    # All items missed cache
+                    computed_gap_r = self.compute_artifact_feature(x, x_rec=x_rec)
+                    gap_r_cpu = computed_gap_r.detach().to(device="cpu", dtype=torch.float32)
+                    for idx, k in enumerate(keys):
+                        self._store_in_artifact_cache(k, gap_r_cpu[idx])
+                    F_r_resolved = computed_gap_r
+                else:
+                    # Partial cache hit: only compute for missing samples
+                    x_missing = x[missing_indices]
+                    x_rec_missing = x_rec[missing_indices] if x_rec is not None else None
+                    missing_gap_r = self.compute_artifact_feature(x_missing, x_rec=x_rec_missing)
+                    missing_gap_r_cpu = missing_gap_r.detach().to(device="cpu", dtype=torch.float32)
+                    for m_idx, orig_idx in enumerate(missing_indices):
+                        k = keys[orig_idx]
+                        self._store_in_artifact_cache(k, missing_gap_r_cpu[m_idx])
+                        cached_vectors[orig_idx] = missing_gap_r_cpu[m_idx]
+                    F_r_resolved = torch.stack(cached_vectors, dim=0).to(device=model_device, dtype=param_dtype)
+        else:
+            # Cache disabled: compute standard artifact representation
+            F_r_resolved = self.compute_artifact_feature(x, x_rec=x_rec)
+
+        # 6. Paired Artifact Encoder: extract t_art from final-layer feature maps F_o^L and F_r_resolved
         F_o_L = backbone_out_o["backbone_fpn"][-1]
-        F_r_L = backbone_out_r["backbone_fpn"][-1]
+        t_art, h_o, h_r = self.paired_artifact_encoder(F_o_L, F_r_resolved)
 
-        t_art, h_o, h_r = self.paired_artifact_encoder(F_o_L, F_r_L)
-
-        # 8. Zero-Gated FiLM: modulate observed multiscale FPN pyramid before mask decoding
+        # 7. Zero-Gated FiLM: modulate observed multiscale FPN pyramid before mask decoding
         modulated_fpn = self.zero_gated_film(backbone_out_o["backbone_fpn"], t_art)
         backbone_out_o["backbone_fpn"] = modulated_fpn
         backbone_out_o["vision_features"] = modulated_fpn[-1]
 
-        # 9. Extract text prompt embeddings (cached)
-        cache_key = (self.prompt_text, str(model_device))
+        # 8. Extract text prompt embeddings (cached with hit tracking)
+        cache_key = (self.prompt_text, _normalize_device_str(model_device))
         if cache_key not in self._text_cache:
+            self._text_cache_misses += 1
             with torch.no_grad():
                 try:
                     out_t = self.base_model.backbone.forward_text(
@@ -650,6 +869,8 @@ class GAPSAM(SAM3DistilLoRA):
                     else:
                         raise exc
                 self._text_cache[cache_key] = {k: v.clone() for k, v in out_t.items()}
+        else:
+            self._text_cache_hits += 1
         text_outputs = {k: v.clone() for k, v in self._text_cache[cache_key].items()}
 
         # 10. Reusable find_stage

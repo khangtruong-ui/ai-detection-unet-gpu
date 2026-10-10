@@ -7,6 +7,7 @@ and evaluation report generation.
 from __future__ import annotations
 
 import gc
+import inspect
 import math
 import os
 import time
@@ -186,6 +187,18 @@ class Trainer:
                 )
         else:
             self.model = loaded_model
+
+        # Check forward signature of underlying model for kwargs compatibility
+        try:
+            raw_target = getattr(loaded_model, "module", loaded_model)
+            sig = inspect.signature(raw_target.forward)
+            self._model_accepts_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            self._model_forward_params = set(sig.parameters.keys())
+        except Exception:
+            self._model_accepts_var_kwargs = True
+            self._model_forward_params = set()
 
         # 3.0 Hard Example Mining Setup
         self.hard_miner = HardMiner(config)
@@ -856,6 +869,17 @@ class Trainer:
             clear_memory_cache(self.device)
             gc.collect()
 
+    def _filter_model_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Filter forward kwargs to only those accepted by the underlying model."""
+        if not kwargs:
+            return {}
+        if getattr(self, "_model_accepts_var_kwargs", False):
+            return kwargs
+        forward_params = getattr(self, "_model_forward_params", None)
+        if forward_params is None:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in forward_params}
+
     def _step_batch_train(self, batch: Dict[str, Any], loss_divisor: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Execute forward pass and scaled backward pass for a single training batch/sub-batch."""
         images = batch["image"].to(self.device, non_blocking=True)
@@ -864,13 +888,22 @@ class Trainer:
         if labels is not None:
             labels = labels.to(self.device, non_blocking=True)
 
+        model_kwargs: Dict[str, Any] = {}
+        if "f_r" in batch and isinstance(batch["f_r"], torch.Tensor):
+            model_kwargs["f_r"] = batch["f_r"].to(self.device, non_blocking=True)
+        elif "gap_r" in batch and isinstance(batch["gap_r"], torch.Tensor):
+            model_kwargs["f_r"] = batch["gap_r"].to(self.device, non_blocking=True)
+        if "img_id" in batch and not (self.is_distributed or self.is_data_parallel):
+            model_kwargs["img_ids"] = batch["img_id"]
+        model_kwargs = self._filter_model_kwargs(model_kwargs)
+
         with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             try:
-                outputs = self.model(images)
+                outputs = self.model(images, **model_kwargs) if model_kwargs else self.model(images)
             except RuntimeError as exc:
                 if "FIND was unable to find an engine" in str(exc) or "cuDNN" in str(exc):
                     with torch.backends.cudnn.flags(enabled=False):
-                        outputs = self.model(images)
+                        outputs = self.model(images, **model_kwargs) if model_kwargs else self.model(images)
                 else:
                     raise exc
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
@@ -1089,8 +1122,17 @@ class Trainer:
         if labels is not None:
             labels = labels.to(self.device, non_blocking=True)
 
+        model_kwargs: Dict[str, Any] = {}
+        if "f_r" in batch and isinstance(batch["f_r"], torch.Tensor):
+            model_kwargs["f_r"] = batch["f_r"].to(self.device, non_blocking=True)
+        elif "gap_r" in batch and isinstance(batch["gap_r"], torch.Tensor):
+            model_kwargs["f_r"] = batch["gap_r"].to(self.device, non_blocking=True)
+        if "img_id" in batch and not (self.is_distributed or self.is_data_parallel):
+            model_kwargs["img_ids"] = batch["img_id"]
+        model_kwargs = self._filter_model_kwargs(model_kwargs)
+
         with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            outputs = self.model(images)
+            outputs = self.model(images, **model_kwargs) if model_kwargs else self.model(images)
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
         metric_logger.update_dict(loss_dict, n=images.size(0))

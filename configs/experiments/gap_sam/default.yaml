@@ -60,6 +60,8 @@ model:
   use_dummy_vae: false
   artifact_weight: 1.0
   enable_artifact_classifier: true
+  enable_artifact_cache: true
+  artifact_cache_size: 50000
 
 loss:
   mask_loss_type: "combined"

@@ -166,6 +166,42 @@ class DiffusionDiffExtractor(BaseCacheExtractor):
         return meta
 
 
+class GAPSAMCacheExtractor(BaseCacheExtractor):
+    """Cache extractor for GAPSAM models (Global Artifact Prior with sam-distil backbones)."""
+
+    @property
+    def model_name(self) -> str:
+        return "gap_sam"
+
+    @property
+    def total_channels(self) -> int:
+        return 256
+
+    @torch.no_grad()
+    def extract_batch(self, images: torch.Tensor) -> torch.Tensor:
+        self.model.eval()
+        if hasattr(self.model, "extract_cache_tensors"):
+            z = self.model.extract_cache_tensors(images)
+        else:
+            raise NotImplementedError("GAPSAM model does not implement extract_cache_tensors")
+
+        if self.fp16 and z.dtype != torch.float16:
+            z = z.half()
+        return z
+
+    def get_metadata(self) -> Dict[str, Any]:
+        meta = super().get_metadata()
+        meta.update({
+            "backbone_type": getattr(self.model, "backbone_type", "tinyvit"),
+            "model_variant": getattr(self.model, "model_name", "11m"),
+            "vae_pretrained_model_name_or_path": getattr(
+                self.model, "vae_pretrained_model_name_or_path", "stabilityai/sd-vae-ft-mse"
+            ),
+            "target_size": getattr(self.model, "target_size", (1008, 1008)),
+        })
+        return meta
+
+
 # Registry of model extractors
 _EXTRACTOR_REGISTRY: Dict[str, Type[BaseCacheExtractor]] = {
     "diffusion_diff_minimized": DiffusionDiffMinimizedExtractor,
@@ -177,6 +213,9 @@ _EXTRACTOR_REGISTRY: Dict[str, Type[BaseCacheExtractor]] = {
     "diff_v2": DiffusionDiffV2Extractor,
     "diffusion_diff": DiffusionDiffExtractor,
     "diffusion-diff": DiffusionDiffExtractor,
+    "gap_sam": GAPSAMCacheExtractor,
+    "gap-sam": GAPSAMCacheExtractor,
+    "gapsam": GAPSAMCacheExtractor,
 }
 
 

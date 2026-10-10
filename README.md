@@ -1794,9 +1794,11 @@ sid-predict \
 
 ### 5. Dataset Feature Caching & High-Speed Training (`sid-cache`)
 
-For generative diffusion forensic models (such as `diffusion-diff-minimized`, `diffusion-diff-v2`, and `diffusion-diff`), repeated feature extraction through frozen diffusion UNets is the dominant training bottleneck (~500 ms per batch).
+For generative forensic models (`diffusion-diff-minimized`, `diffusion-diff-v2`) and foundation prior models (**`gap-sam`**), repeated feature extraction through frozen components (diffusion UNets or high-resolution Stable Diffusion VAEs + frozen vision backbones) is the dominant training bottleneck:
+- **Diffusion models:** Repeated frozen Diffuser UNet forward passes (~500 ms per batch).
+- **GAP-SAM:** Repeated frozen high-resolution ($1008 \times 1008$) VAE reconstructions and frozen SAM backbone passes (~4.5s per batch) solely to extract a 256-dimensional pooled prior vector $\mathbf{gap}_r$.
 
-The `sid-cache` (or `sid-dataset-cache`) CLI extracts representations $Z$ once and packages them into compressed Parquet shards synced directly to Hugging Face Hub (e.g., `KhangTruong/COCO-inpainted-cache`) or saved locally. During subsequent training via `sid-train --cached-hf-repo <repo_or_dir>`, the heavy frozen Diffuser UNet is completely bypassed and purged from GPU memory (`bypass_diffuser_for_cached_training()`), cutting batch time from ~500 ms down to <25 ms (~20x faster) and freeing ~1.5 GB VRAM.
+The `sid-cache` (or `sid-dataset-cache`) CLI extracts representations once and packages them into compressed Parquet shards synced directly to Hugging Face Hub (e.g., `KhangTruong/COCO-inpainted-cache` or `KhangTruong/gap-sam-coco-cache`) or saved locally. During subsequent training via `sid-train --cached-hf-repo <repo_or_dir>`, the heavy frozen modules (`AutoencoderKL` or Diffuser UNet) are completely bypassed and purged from GPU memory (`bypass_vae_for_cached_training()` / `bypass_diffuser_for_cached_training()`), slashing compute time and dramatically reducing VRAM footprint. Additionally, GAP-SAM provides an in-memory dynamic artifact cache (`enable_artifact_cache: true`) that automatically memoizes descriptors during training without offline steps.
 
 #### Disk Size Comparison:
 - **Original Dataset (`KhangTruong/COCO-inpainted`)**: ~67 GB total (~529 KB / example across 126k images).

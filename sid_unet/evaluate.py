@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import inspect
 import json
 import os
 import shutil
@@ -218,7 +219,25 @@ def eval_single_batch(
     if labels is not None:
         labels = labels.to(device, non_blocking=True)
 
-    outputs = model(images)
+    model_kwargs: Dict[str, Any] = {}
+    if "f_r" in batch and isinstance(batch["f_r"], torch.Tensor):
+        model_kwargs["f_r"] = batch["f_r"].to(device, non_blocking=True)
+    elif "gap_r" in batch and isinstance(batch["gap_r"], torch.Tensor):
+        model_kwargs["f_r"] = batch["gap_r"].to(device, non_blocking=True)
+    if "img_id" in batch:
+        model_kwargs["img_ids"] = batch["img_id"]
+
+    if model_kwargs:
+        try:
+            raw_target = getattr(model, "module", model)
+            sig = inspect.signature(raw_target.forward)
+            accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not accepts_var_kwargs:
+                model_kwargs = {k: v for k, v in model_kwargs.items() if k in sig.parameters}
+        except Exception:
+            pass
+
+    outputs = model(images, **model_kwargs) if model_kwargs else model(images)
     loss, _ = loss_fn(outputs, masks, labels)
 
     b_size = images.size(0)

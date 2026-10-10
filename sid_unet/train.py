@@ -661,7 +661,7 @@ def train_single_run(
         custom_logger=logger,
     )
 
-    # If training with cached representations, bypass heavy diffuser UNet to save VRAM and latency
+    # If training with cached representations, bypass heavy diffuser UNet or frozen VAE to save VRAM and latency
     if getattr(config.data, "cached_hf_repo", None):
         raw_m = getattr(trainer, "raw_model", getattr(trainer, "model", None))
         if hasattr(raw_m, "bypass_diffuser_for_cached_training"):
@@ -670,6 +670,13 @@ def train_single_run(
                 logger.info(
                     f"⚡ [DATASET CACHE] High-dimensional latent training active with repository '{config.data.cached_hf_repo}'. "
                     "Diffuser UNet bypassed for extreme throughput!"
+                )
+        if hasattr(raw_m, "bypass_vae_for_cached_training"):
+            raw_m.bypass_vae_for_cached_training()
+            if is_main_process():
+                logger.info(
+                    f"⚡ [DATASET CACHE] High-dimensional latent training active with repository '{config.data.cached_hf_repo}'. "
+                    "GAP-SAM frozen VAE bypassed and purged from GPU memory for extreme throughput!"
                 )
 
     # Resume training state if checkpoint found

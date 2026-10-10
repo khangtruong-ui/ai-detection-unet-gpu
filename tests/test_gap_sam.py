@@ -40,9 +40,19 @@ from sid_unet.losses.auxiliary import build_loss, SIDTotalLoss
 from sid_unet.utils.config import ConfigDict, load_config
 
 
+import gc
+
 @pytest.fixture(scope="module")
 def device():
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+@pytest.fixture(autouse=True)
+def clean_cuda():
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 def test_paired_artifact_encoder_standalone(device):
@@ -354,3 +364,183 @@ def test_gap_sam_yaml_configs():
         assert cfg.model.name == "gap_sam"
         assert cfg.model.backbone in ("tinyvit", "efficientvit", "repvit")
         assert cfg.loss.artifact_weight == 1.0
+
+
+def test_gap_sam_text_cache_and_preload(device):
+    """Verify GAP-SAM text prompt caching, preloading, and cache stats."""
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        use_dummy_vae=True,
+        device=device,
+    )
+    try:
+        model.clear_text_cache()
+        stats0 = model.get_cache_stats()
+        assert stats0["text_cache_entries"] == 0
+        assert stats0["text_cache_hits"] == 0
+
+        # Preload prompt
+        model.preload_text_prompt("tampered region", device=device)
+        stats1 = model.get_cache_stats()
+        assert stats1["text_cache_entries"] == 1
+
+        x = torch.randn(1, 3, 256, 256, device=device)
+        model.eval()
+        _ = model(x)
+        stats2 = model.get_cache_stats()
+        # Second access must be a cache hit
+        assert stats2["text_cache_hits"] >= 1
+
+        model.clear_text_cache()
+        assert len(model._text_cache) == 0
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def test_gap_sam_dynamic_artifact_cache(device):
+    """Verify dynamic in-memory artifact caching skips VAE and yields identical outputs."""
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        use_dummy_vae=True,
+        enable_artifact_cache=True,
+        device=device,
+    )
+    try:
+        model.eval()
+        model.clear_artifact_cache()
+
+        x = torch.randn(1, 3, 256, 256, device=device)
+        img_ids = ["test_sample_0"]
+
+        # Step 1: Cache miss (fills cache)
+        out1 = model(x, img_ids=img_ids)
+        stats1 = model.get_cache_stats()
+        assert stats1["artifact_cache_size"] == 1
+        assert stats1["artifact_cache_misses"] == 1
+        assert stats1["artifact_cache_hits"] == 0
+
+        # Step 2: Cache hit (reuses cached artifact prior)
+        out2 = model(x, img_ids=img_ids)
+        stats2 = model.get_cache_stats()
+        assert stats2["artifact_cache_hits"] == 1
+        assert stats2["artifact_hit_rate"] == 0.5  # 1 hit out of 2 total queries
+
+        # Outputs must be numerically identical
+        assert torch.allclose(out1[0], out2[0], atol=1e-5)
+        if isinstance(out1, tuple) and len(out1) > 1 and out1[1] is not None:
+            assert torch.allclose(out1[1], out2[1], atol=1e-5)
+
+        model.clear_artifact_cache()
+        assert model.get_cache_stats()["artifact_cache_size"] == 0
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def test_gap_sam_forward_cached_and_extract_cache_tensors(device):
+    """Verify extract_cache_tensors produces [B, 256] and forward_cached matches direct forward."""
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        use_dummy_vae=True,
+        device=device,
+    )
+    try:
+        model.eval()
+
+        x = torch.randn(1, 3, 256, 256, device=device)
+
+        # 1. Extract offline cache tensor
+        f_r = model.extract_cache_tensors(x)
+        assert f_r.shape == (1, 256), f"Expected shape (1, 256), got {f_r.shape}"
+
+        # 2. Run forward_cached with pre-computed f_r
+        out_cached = model.forward_cached(x, f_r=f_r)
+
+        # 3. Run forward with explicit f_r
+        out_direct = model(x, f_r=f_r)
+
+        assert torch.allclose(out_cached[0], out_direct[0], atol=1e-5)
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def test_gap_sam_bypass_vae_for_cached_training(device):
+    """Verify that frozen VAE can be purged to save VRAM while cached forward still executes."""
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        use_dummy_vae=True,
+        device=device,
+    )
+    try:
+        model.eval()
+
+        x = torch.randn(1, 3, 256, 256, device=device)
+        f_r = model.extract_cache_tensors(x)
+
+        # Bypass and purge VAE
+        assert model.vae is not None
+        model.bypass_vae_for_cached_training()
+        assert model.vae is None
+
+        # Cached forward works without VAE present
+        out = model.forward_cached(x, f_r=f_r)
+        assert out[0].shape == (1, 1, 256, 256)
+
+        # Uncached forward without f_r correctly raises informative RuntimeError
+        with pytest.raises(RuntimeError, match="bypass_vae_for_cached_training"):
+            model(x)
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def test_gap_sam_cache_extractor_registration(device):
+    """Verify GAPSAMCacheExtractor in sid_unet.cache.extractor."""
+    from sid_unet.cache.extractor import get_extractor_for_model, GAPSAMCacheExtractor
+
+    model = GAPSAM(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        use_dummy_vae=True,
+        device=device,
+    )
+    try:
+        extractor = get_extractor_for_model(model)
+        assert isinstance(extractor, GAPSAMCacheExtractor)
+        assert extractor.model_name == "gap_sam"
+        assert extractor.total_channels == 256
+
+        x = torch.randn(1, 3, 256, 256, device=device)
+        z = extractor.extract_batch(x)
+        assert z.shape == (1, 256)
+        assert z.dtype == torch.float16
+
+        meta = extractor.get_metadata()
+        assert meta["model_name"] == "gap_sam"
+        assert meta["total_channels"] == 256
+        assert meta["model_variant"] == "11m"
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
