@@ -30,8 +30,11 @@ from sid_unet.utils.compatibility import (
 
 from sid_unet.utils.signals import (
     shield_process_signals,
+    shield_worker_signals,
     SSH_DISCONNECT_SIGNALS,
     SSH_DISCONNECT_SIGNAL_NAMES,
+    WORKER_DISCONNECT_SIGNALS,
+    WORKER_DISCONNECT_SIGNAL_NAMES,
 )
 
 __all__ = [
@@ -64,8 +67,11 @@ __all__ = [
     "installation_check_8bit",
     "cli_check_8bit",
     "shield_process_signals",
+    "shield_worker_signals",
     "SSH_DISCONNECT_SIGNALS",
     "SSH_DISCONNECT_SIGNAL_NAMES",
+    "WORKER_DISCONNECT_SIGNALS",
+    "WORKER_DISCONNECT_SIGNAL_NAMES",
 ]
 
 

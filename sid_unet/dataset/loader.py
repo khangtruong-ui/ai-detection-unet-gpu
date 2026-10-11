@@ -141,8 +141,8 @@ except Exception:
 def worker_init_fn(worker_id: int) -> None:
     """Worker initialization function to configure PIL and signal immunity for DataLoader workers."""
     try:
-        from sid_unet.utils.signals import shield_process_signals
-        shield_process_signals(detach_terminal=False)
+        from sid_unet.utils.signals import shield_worker_signals
+        shield_worker_signals()
     except Exception:
         pass
     from PIL import ImageFile

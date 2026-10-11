@@ -139,11 +139,15 @@ class Trainer:
                 self.num_gpus = 1
             self.is_data_parallel = (self.num_gpus > 1)
 
+        model_name = str(getattr(config.model, "name", "")).lower()
+        is_attention_or_sam = any(k in model_name for k in ("sam", "vit", "transformer", "gap"))
+        default_benchmark = not is_attention_or_sam
+
         cudnn_benchmark = bool(
-            config.training.get("cudnn_benchmark", config.training.get("benchmark", True))
+            config.training.get("cudnn_benchmark", config.training.get("benchmark", default_benchmark))
         )
-        if self.device.type == "cuda" and torch.cuda.is_available() and cudnn_benchmark:
-            torch.backends.cudnn.benchmark = True
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = cudnn_benchmark
 
         # 2. Output and logging setup
         self.output_dir = config.project.get("output_dir", "outputs")
@@ -583,11 +587,24 @@ class Trainer:
             except Exception:
                 pass
         for loader in (self.train_loader, self.val_loader, self.test_loader):
-            if loader is not None and hasattr(loader, "close") and callable(loader.close):
-                try:
-                    loader.close()
-                except Exception:
-                    pass
+            if loader is not None:
+                if hasattr(loader, "close") and callable(loader.close):
+                    try:
+                        loader.close()
+                    except Exception:
+                        pass
+                ds = getattr(loader, "dataset", None)
+                if ds is not None and hasattr(ds, "close") and callable(ds.close):
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                iter_obj = getattr(loader, "_iterator", None)
+                if iter_obj is not None and hasattr(iter_obj, "_shutdown_workers") and callable(iter_obj._shutdown_workers):
+                    try:
+                        iter_obj._shutdown_workers()
+                    except Exception:
+                        pass
 
     def __del__(self) -> None:
         try:
@@ -933,7 +950,22 @@ class Trainer:
             return loss, loss_dict
 
         scaled_loss = loss / max(1.0, float(loss_divisor))
-        self.scaler.scale(scaled_loss).backward()
+        try:
+            self.scaler.scale(scaled_loss).backward()
+        except Exception as exc:
+            is_cuda_fault = (
+                isinstance(exc, getattr(torch, "AcceleratorError", ()))
+                or "CUDA error" in str(exc)
+                or "AcceleratorError" in str(type(exc))
+                or "cudaError" in str(exc)
+            )
+            if is_cuda_fault:
+                self.logger.error(
+                    f"🛑 Fatal CUDA accelerator error during backward pass at step {self.global_step}: {exc}. "
+                    "Closing active DataLoader workers and pipelines to prevent indefinite hang."
+                )
+                self.close()
+            raise exc
 
         # Compute training IoU metric on batch
         with torch.no_grad():
@@ -1118,7 +1150,10 @@ class Trainer:
                     pass
             self.hard_miner.end_epoch(epoch)
             if self.empty_cache_per_epoch:
-                clear_memory_cache(self.device)
+                try:
+                    clear_memory_cache(self.device)
+                except Exception:
+                    pass
 
         averages = metric_logger.averages()
         if self.is_distributed:
@@ -1400,6 +1435,10 @@ class Trainer:
                     self.logger.error(f"Failed to save emergency checkpoint: {save_err}")
                 self.close()
                 raise
+            except BaseException as exc:
+                self.logger.error(f"🛑 Error encountered during training execution: {exc}. Closing DataLoader workers and resources...")
+                self.close()
+                raise exc
 
         total_time = time.time() - start_time
         self.logger.info(f"Training completed in {total_time/60:.2f} minutes.")

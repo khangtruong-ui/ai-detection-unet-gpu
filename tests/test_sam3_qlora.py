@@ -130,6 +130,7 @@ def test_sam3_qlora_build_model_and_checkpoint():
         assert out.shape == (1, 1, 64, 64)
 
 
+@pytest.mark.timeout(240)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required for memory fit benchmark")
 def test_sam3_qlora_gpu_memory_fit():
     """

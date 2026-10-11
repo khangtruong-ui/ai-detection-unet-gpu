@@ -1072,24 +1072,21 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
 4. **Terminal Stream Broken Pipes**: When the pseudo-terminal device (`/dev/pts/*`) vanished upon SSH drop, writing progress bars (`tqdm`) or logging to `sys.stdout` and `sys.stderr` raised unhandled `BrokenPipeError` or `OSError(errno.EIO)`.
 
 #### Implemented Hardening & Architecture
-1. **Worker-Level Signal Shields**:
-   - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_process_signals(detach_terminal=False)`, ensuring all background DataLoader worker processes ignore:
-     - `SIGHUP` (1: Terminal hangup)
-     - `SIGTERM` (15: Termination signal)
-     - `SIGPIPE` (13: Broken pipe)
-     - `SIGQUIT` (3: Terminal quit)
-     - `SIGTSTP`, `SIGTTIN`, `SIGTTOU` (Job control signals)
-     - `SIGWINCH` (Window resize on SSH attach/detach)
-     - `SIGIO` (Asynchronous I/O)
+1. **Worker-Level Signal Shields & Deterministic Termination**:
+   - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_worker_signals()` from `sid_unet/utils/signals.py`:
+     - Shields workers against terminal disconnects and stream aborts: `SIGHUP` (terminal hangup), `SIGPIPE` (broken pipe), `SIGWINCH` (window resize), `SIGIO` (asynchronous I/O), and `SIGQUIT`.
+     - **Preserves `SIGTERM` & `SIGINT`**: Workers explicitly maintain default termination handlers (`signal.SIG_DFL`) rather than masking `SIGTERM`. This ensures that PyTorch DataLoader's `_shutdown_workers()` and parent process terminations kill workers instantly, eliminating process hangs and orphaned CUDA memory leaks.
 2. **Controlling Terminal Detachment**:
    - `sid_unet/utils/signals.py` executes `detach_controlling_terminal()` via `os.setsid()` / `os.setpgrp()` so that closing terminal windows does not cascade kernel hangups to the training process tree.
 3. **Safe Text Stream Wrappers**:
    - Wraps `sys.stdout` and `sys.stderr` with `SafeStreamWrapper`, silently absorbing `BrokenPipeError` and `OSError` with `EIO`/`EPIPE`/`EBADF` errnos.
 4. **Fatal CUDA Fault Detection & Guarded Caches**:
-   - `GAPSAM.forward()` and `SAM3DistilModel.forward()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and immediately re-raise without attempting further CUDA operations.
-   - All `torch.cuda.empty_cache()` calls across models and trainers are wrapped in exception handlers, preventing C++ `std::terminate` aborts.
-5. **Test Timeout Protection**:
-   - Integrated `pytest-timeout>=2.2.0` with `--timeout=60` in `pyproject.toml` so runaway test processes are terminated before causing indefinite hangs.
+   - `GAPSAM.forward()`, `SAM3DistilModel.forward()`, and `Trainer._step_batch_train()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and cleanly drain DataLoader workers via `self.close()` before propagating exceptions.
+   - All `torch.cuda.empty_cache()` calls across models, trainers, and epoch cleanup hooks are wrapped in exception handlers, preventing C++ `std::terminate` aborts when device context is invalidated.
+5. **cuDNN Benchmark Safeguards for Attention & Foundation Models**:
+   - `Trainer` enables `torch.backends.cudnn.benchmark = True` for CNN architectures (e.g., standard UNet), while defaulting to `False` for attention/ViT/SAM3/GAP-SAM foundation backbones to avoid cuDNN autotuner workspace allocation crashes and kernel launch failures during activation checkpointing recomputation.
+6. **Task Timeout Protection**:
+   - Integrated `pytest-timeout>=2.2.0` with `--timeout=240` (4 minutes) in `pyproject.toml` and per-test timeout annotations (`@pytest.mark.timeout(240)`), ensuring long-running tasks have sufficient headroom while guaranteeing any hung test is automatically aborted.
 
 ---
 

@@ -208,15 +208,16 @@ In-depth kernel and runtime investigation revealed three interdependent root cau
 
 ### Implemented Solutions
 
-1. **DataLoader Worker Signal Immunity**:
-   - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_process_signals(detach_terminal=False)`, ensuring every DataLoader worker ignores `SIGHUP`, `SIGTERM`, `SIGPIPE`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `SIGWINCH`, and `SIGIO`.
+1. **DataLoader Worker Signal Immunity & Clean Termination**:
+   - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_worker_signals()`, ensuring every DataLoader worker ignores `SIGHUP`, `SIGPIPE`, `SIGQUIT`, `SIGWINCH`, and `SIGIO` while **explicitly preserving `SIGTERM` and `SIGINT`** (`signal.SIG_DFL`). This ensures PyTorch's `_shutdown_workers()` can terminate workers cleanly without hanging indefinitely.
 2. **Controlling Terminal Detachment & Stream Protection**:
    - `sid_unet/utils/signals.py` detaches the process group via `detach_controlling_terminal()` (`os.setsid()` / `os.setpgrp()`) and wraps `sys.stdout` and `sys.stderr` with `SafeStreamWrapper` to safely absorb broken pipe and `EIO` errors when terminals detach.
 3. **Fatal CUDA Fault Isolation & Guarded Memory Cleanup**:
-   - In `GAPSAM.forward()` and `SAM3DistilModel.forward()`, fatal CUDA accelerator faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) are detected immediately and re-raised without attempting fallback GPU operations.
+   - In `GAPSAM.forward()`, `SAM3DistilModel.forward()`, and `Trainer._step_batch_train()`, fatal CUDA accelerator faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) are detected immediately, triggering `trainer.close()` to drain loader workers before re-raising.
    - All `torch.cuda.empty_cache()` calls are safely wrapped in `try...except Exception: pass` to prevent secondary exceptions from crashing the runtime.
+   - `torch.backends.cudnn.benchmark` defaults to `False` for GAP-SAM/SAM3 models, preventing cuDNN autotuner workspace allocation crashes during activation checkpointing.
 4. **Automated Test Timeout Safeguards**:
-   - Configured `pytest-timeout>=2.2.0` with `--timeout=60` in `pyproject.toml` to guarantee no unit or integration tests can block indefinitely.
+   - Configured `pytest-timeout>=2.2.0` with `--timeout=240` (4 minutes) in `pyproject.toml` to guarantee long-running tasks have headroom while no unit or integration tests can run forever.
 
 
 

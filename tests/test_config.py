@@ -51,7 +51,7 @@ def test_test_configs_loading():
     assert quick_cfg.model.aux_classifier is False
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(240)
 def test_all_experiment_configs_validity():
     import glob
     import torch

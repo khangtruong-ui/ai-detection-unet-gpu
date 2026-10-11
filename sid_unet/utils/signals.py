@@ -32,6 +32,25 @@ SSH_DISCONNECT_SIGNALS: tuple[int, ...] = tuple(
     if hasattr(signal, name)
 )
 
+# Signals to shield for DataLoader worker processes.
+# CRITICAL: DataLoader workers must NEVER mask SIGTERM or SIGINT because PyTorch's
+# DataLoader shutdown (_shutdown_workers) relies on SIGTERM (via worker.terminate())
+# to terminate worker processes. Ignoring SIGTERM causes DataLoader shutdowns,
+# test teardowns, and multiprocessing atexit handlers to hang indefinitely.
+WORKER_DISCONNECT_SIGNAL_NAMES = (
+    "SIGHUP",    # 1: Controlling terminal closed / SSH dropped
+    "SIGPIPE",   # 13: Broken pipe (closed stdout/stderr)
+    "SIGWINCH",  # 28: Terminal window resize
+    "SIGIO",     # 29: Asynchronous I/O signal
+    "SIGQUIT",   # 3: Terminal quit
+)
+
+WORKER_DISCONNECT_SIGNALS: tuple[int, ...] = tuple(
+    getattr(signal, name)
+    for name in WORKER_DISCONNECT_SIGNAL_NAMES
+    if hasattr(signal, name)
+)
+
 
 class SafeStreamWrapper:
     """Wraps a text stream (sys.stdout/sys.stderr) to silently ignore EIO and EPIPE.
@@ -140,3 +159,28 @@ def shield_process_signals(
                 logger.debug(f"Could not ignore signal {sig}: {e}")
 
     return ignored
+
+
+def shield_worker_signals(
+    log_info: bool = False,
+) -> Set[int]:
+    """Shield DataLoader worker processes from SSH disconnects while preserving terminability on SIGTERM.
+
+    DataLoader workers must NEVER mask SIGTERM because PyTorch's DataLoader
+    shutdown mechanism (_shutdown_workers) relies on SIGTERM (via worker.terminate())
+    to cleanly stop worker processes. Ignoring SIGTERM causes DataLoader shutdowns,
+    test teardowns, and multiprocessing atexit handlers to hang indefinitely.
+    """
+    # Ensure SIGTERM and SIGINT are explicitly set to default termination handlers
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+
+    return shield_process_signals(
+        signals_to_ignore=WORKER_DISCONNECT_SIGNALS,
+        log_info=log_info,
+        detach_terminal=False,
+        protect_streams=True,
+    )
