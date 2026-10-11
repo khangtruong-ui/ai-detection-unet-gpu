@@ -148,6 +148,11 @@ class Trainer:
         )
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.backends.cudnn.benchmark = cudnn_benchmark
+            if is_attention_or_sam and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+                try:
+                    torch.backends.cuda.enable_cudnn_sdp(False)
+                except Exception:
+                    pass
 
         # 2. Output and logging setup
         self.output_dir = config.project.get("output_dir", "outputs")
@@ -596,7 +601,18 @@ class Trainer:
                 self.network_monitor.stop()
             except Exception:
                 pass
-        for loader in (self.train_loader, self.val_loader, self.test_loader):
+
+        loaders = [self.train_loader, self.val_loader, self.test_loader]
+        if getattr(self, "_active_train_loader", None) is not None:
+            loaders.append(self._active_train_loader)
+            self._active_train_loader = None
+
+        active_iters = []
+        if getattr(self, "_active_loader_iter", None) is not None:
+            active_iters.append(self._active_loader_iter)
+            self._active_loader_iter = None
+
+        for loader in loaders:
             if loader is not None:
                 if hasattr(loader, "close") and callable(loader.close):
                     try:
@@ -610,11 +626,41 @@ class Trainer:
                     except Exception:
                         pass
                 iter_obj = getattr(loader, "_iterator", None)
-                if iter_obj is not None and hasattr(iter_obj, "_shutdown_workers") and callable(iter_obj._shutdown_workers):
+                if iter_obj is not None:
+                    active_iters.append(iter_obj)
+
+        for it in active_iters:
+            try:
+                if hasattr(it, "_shutdown_workers") and callable(it._shutdown_workers):
+                    it._shutdown_workers()
+            except Exception:
+                pass
+            workers = getattr(it, "_workers", None)
+            if workers:
+                for w in workers:
                     try:
-                        iter_obj._shutdown_workers()
+                        if w.is_alive():
+                            w.terminate()
                     except Exception:
                         pass
+                for w in workers:
+                    try:
+                        w.join(timeout=1.0)
+                        if w.is_alive():
+                            w.kill()
+                            w.join(timeout=0.5)
+                    except Exception:
+                        pass
+            for q_name in ("_index_queues", "_data_queue", "_worker_result_queue"):
+                q_container = getattr(it, q_name, None)
+                if q_container is not None:
+                    queues = q_container if isinstance(q_container, (list, tuple)) else [q_container]
+                    for q in queues:
+                        try:
+                            if hasattr(q, "cancel_join_thread"):
+                                q.cancel_join_thread()
+                        except Exception:
+                            pass
 
     def __del__(self) -> None:
         try:
@@ -1003,6 +1049,7 @@ class Trainer:
         # Hard Mining: configure epoch and wrap dataloader if active
         self.hard_miner.start_epoch(epoch)
         effective_loader = self.hard_miner.wrap_dataloader(self.train_loader)
+        self._active_train_loader = effective_loader
 
         # Sync DistributedSampler epoch if present using cycle anchor epoch during hard mining
         sampler_epoch = self.hard_miner.get_sampler_epoch(epoch)
@@ -1158,6 +1205,7 @@ class Trainer:
                     effective_loader.close()
                 except Exception:
                     pass
+            self._active_train_loader = None
             self.hard_miner.end_epoch(epoch)
             if self.empty_cache_per_epoch:
                 try:

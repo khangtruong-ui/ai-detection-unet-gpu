@@ -448,6 +448,14 @@ class GAPSAM(SAM3DistilLoRA):
         else:
             self.artifact_classifier = None
 
+        # 5. Initialize dummy prompt for single-image prompt decoding / fallback
+        if hasattr(self.base_model, "dummy_prompt") and self.base_model.dummy_prompt is not None:
+            self.dummy_prompt = self.base_model.dummy_prompt
+        elif hasattr(self.base_model, "_get_dummy_prompt"):
+            self.dummy_prompt = self.base_model._get_dummy_prompt()
+        else:
+            self.dummy_prompt = None
+
         logger.info(
             f"Initialized GAP-SAM ({self.backbone_type}-{self.model_name}) | "
             f"Artifact Weight: {self.artifact_weight} | "
@@ -772,6 +780,18 @@ class GAPSAM(SAM3DistilLoRA):
         model_device, param_dtype = get_submodule_device_dtype(
             self.peft_model, x.device, torch.float32
         )
+
+        if model_device.type == "cuda" and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            try:
+                torch.backends.cuda.enable_cudnn_sdp(False)
+            except Exception:
+                pass
+
+        if self.dummy_prompt is None or getattr(self.dummy_prompt.box_embeddings, "device", None) != model_device:
+            self.dummy_prompt = Prompt(
+                box_embeddings=torch.zeros(0, 1, 4, device=model_device),
+                box_mask=torch.zeros(1, 0, device=model_device, dtype=torch.bool),
+            )
 
         # 1. Resize observed image to native EfficientSAM3 target resolution (1008, 1008)
         if (orig_h, orig_w) != self.target_size:

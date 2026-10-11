@@ -74,17 +74,21 @@ def test_cli_main_dry_run():
 
 
 def test_shield_process_signals():
-    import signal
-    from sid_unet.utils.signals import shield_process_signals, SSH_DISCONNECT_SIGNALS
-
-    ignored = shield_process_signals()
-    assert signal.SIGTERM in ignored
-    if hasattr(signal, "SIGHUP"):
-        assert signal.SIGHUP in ignored
-
-    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
-    if hasattr(signal, "SIGHUP"):
-        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    """Verify that shield_process_signals shields all SSH disconnect signals in an isolated process."""
+    code = (
+        "import signal, sys\n"
+        "from sid_unet.utils.signals import shield_process_signals, SSH_DISCONNECT_SIGNALS\n"
+        "ignored = shield_process_signals(detach_terminal=False, protect_streams=False)\n"
+        "assert signal.SIGTERM in ignored\n"
+        "if hasattr(signal, 'SIGHUP'):\n"
+        "    assert signal.SIGHUP in ignored\n"
+        "assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN\n"
+        "if hasattr(signal, 'SIGHUP'):\n"
+        "    assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN\n"
+        "sys.exit(0)\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert res.returncode == 0, f"Failed: {res.stderr}"
 
 
 def test_kill_shielded_background_process_gracefully():

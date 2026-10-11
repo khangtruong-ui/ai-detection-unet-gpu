@@ -175,9 +175,15 @@ class AsyncHubUploader:
         except Exception as e:
             logger.warning(f"Sync upload for '{rel_repo_path}' failed: {e}")
 
-    def wait_all(self) -> None:
-        """Block until all queued shard uploads are finished."""
-        self.queue.join()
+    def wait_all(self, timeout: Optional[float] = 240.0) -> None:
+        """Block until all queued shard uploads are finished or timeout expires."""
+        start_t = time.time()
+        while self.queue.unfinished_tasks > 0:
+            if timeout is not None and (time.time() - start_t) > timeout:
+                raise TimeoutError(f"AsyncHubUploader.wait_all timed out after {timeout}s with {self.queue.unfinished_tasks} unfinished tasks.")
+            if not self.worker_thread.is_alive():
+                break
+            time.sleep(0.1)
         if self.failed_error is not None:
             raise RuntimeError(f"AsyncHubUploader encountered fatal error: {self.failed_error}")
 

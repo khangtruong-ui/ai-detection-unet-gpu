@@ -1083,10 +1083,16 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
 4. **Fatal CUDA Fault Detection & Guarded Caches**:
    - `GAPSAM.forward()`, `SAM3DistilModel.forward()`, and `Trainer._step_batch_train()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and cleanly drain DataLoader workers via `self.close()` before propagating exceptions.
    - All `torch.cuda.empty_cache()` calls across models, trainers, and epoch cleanup hooks are wrapped in exception handlers, preventing C++ `std::terminate` aborts when device context is invalidated.
-5. **cuDNN Benchmark Safeguards for Attention & Foundation Models**:
-   - `Trainer` enables `torch.backends.cudnn.benchmark = True` for CNN architectures (e.g., standard UNet), while defaulting to `False` for attention/ViT/SAM3/GAP-SAM foundation backbones to avoid cuDNN autotuner workspace allocation crashes and kernel launch failures during activation checkpointing recomputation.
-6. **Task Timeout Protection**:
+5. **cuDNN Benchmark & SDPA Safeguards for Attention & Foundation Models**:
+   - `Trainer` enables `torch.backends.cudnn.benchmark = True` for CNN architectures (e.g., standard UNet), while strictly disabling it (`False`) for attention/ViT/SAM3/GAP-SAM foundation backbones to avoid cuDNN autotuner workspace allocation collisions and kernel launch failures.
+   - For attention and transformer backbones (SAM3, GAP-SAM), cuDNN Scaled Dot-Product Attention (`torch.backends.cuda.enable_cudnn_sdp(False)`) is explicitly disabled on CUDA. This avoids multi-scale deformable attention kernel launch failures (`cudaErrorLaunchFailure`) on Ampere architecture GPUs (e.g. RTX 3080 Ti, SM 8.6) when handling large token sequences (19,845 tokens per image).
+6. **Active DataLoader Process Tracking & Hardened Worker Reaping**:
+   - `Trainer` tracks active DataLoader iterators (`self._active_train_loader`) during `train_epoch()`. Upon exceptions or clean shutdown, `Trainer.close()` aggressively discovers and terminates all active worker processes (`w.terminate()`, bounded `w.join(timeout=1.0)`, followed by `w.kill()` if necessary) and cancels queue join threads (`cancel_join_thread()`), preventing DataLoader worker deadlocks and python interpreter teardown hangs.
+7. **Process Signal Isolation in Test Suites**:
+   - Unit tests verifying signal shielding (`shield_process_signals()`, `worker_init_fn()`) are executed within isolated subprocesses via `subprocess.run()`. This ensures that process-level signal modifications (e.g., `SIGTERM = SIG_IGN`) cannot pollute the main pytest test runner, allowing subsequent tests that spawn PyTorch DataLoaders to terminate worker processes normally.
+8. **Task Timeout Protection**:
    - Integrated `pytest-timeout>=2.2.0` with `--timeout=240` (4 minutes) in `pyproject.toml` and per-test timeout annotations (`@pytest.mark.timeout(240)`), ensuring long-running tasks have sufficient headroom while guaranteeing any hung test is automatically aborted.
+   - Asynchronous hub upload workers (`AsyncHubUploader`) enforce bounded timeouts (`timeout=240.0`) on `wait_all()` instead of unbounded thread queue joins.
 
 ---
 

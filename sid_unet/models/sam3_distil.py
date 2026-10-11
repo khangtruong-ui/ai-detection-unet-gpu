@@ -405,6 +405,18 @@ class SAM3DistilLoRA(nn.Module):
             self.peft_model, x.device, torch.float32
         )
 
+        if model_device.type == "cuda" and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            try:
+                torch.backends.cuda.enable_cudnn_sdp(False)
+            except Exception:
+                pass
+
+        if self.dummy_prompt is None or getattr(self.dummy_prompt.box_embeddings, "device", None) != model_device:
+            self.dummy_prompt = Prompt(
+                box_embeddings=torch.zeros(0, 1, 4, device=model_device),
+                box_mask=torch.zeros(1, 0, device=model_device, dtype=torch.bool),
+            )
+
         # 1. Resize to native target size (1008, 1008)
         if (orig_h, orig_w) != self.target_size:
             x_proc = F.interpolate(x, size=self.target_size, mode="bilinear", align_corners=False)

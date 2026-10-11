@@ -52,7 +52,7 @@ from sid_unet.utils.distributed import (
 
 
 
-def set_seed(seed: int = 42):
+def set_seed(seed: int = 42, benchmark: bool = False):
     """Set deterministic seeds."""
     random.seed(seed)
     np.random.seed(seed)
@@ -60,7 +60,7 @@ def set_seed(seed: int = 42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = benchmark
 
 
 def parse_args():
@@ -462,7 +462,11 @@ def train_single_run(
 
     # Set random seed
     seed = int(config.project.get("seed", 42))
-    set_seed(seed)
+    model_name = str(config.model.get("name", "")).lower()
+    is_attention_or_sam = any(k in model_name for k in ("sam", "vit", "transformer", "gap"))
+    default_benchmark = not is_attention_or_sam
+    cudnn_benchmark = bool(config.training.get("cudnn_benchmark", config.training.get("benchmark", default_benchmark)))
+    set_seed(seed, benchmark=cudnn_benchmark)
 
     # Unification folder 'RUN': name each subfolder after its config (no numbering)
     cfg_stem = os.path.splitext(os.path.basename(config_path))[0]

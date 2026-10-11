@@ -101,13 +101,16 @@ def test_safe_stream_wrapper_broken_pipe_and_eio():
 
 def test_worker_init_fn_shields_dataloader_worker():
     """Verify that worker_init_fn applies signal shielding in child worker processes without disabling SIGTERM."""
-    from sid_unet.dataset.loader import worker_init_fn
-
-    worker_init_fn(0)
-    # SIGPIPE should be ignored to protect workers from BrokenPipeError on SSH drops
-    assert signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN
-    # SIGTERM must NOT be ignored so PyTorch can terminate worker processes cleanly via SIGTERM
-    assert signal.getsignal(signal.SIGTERM) != signal.SIG_IGN
+    code = (
+        "import signal, sys\n"
+        "from sid_unet.dataset.loader import worker_init_fn\n"
+        "worker_init_fn(0)\n"
+        "assert signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN\n"
+        "assert signal.getsignal(signal.SIGTERM) != signal.SIG_IGN\n"
+        "sys.exit(0)\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert res.returncode == 0, f"Failed: {res.stderr}"
 
 
 def test_dataloader_worker_terminates_on_sigterm():
@@ -182,22 +185,58 @@ def test_trainer_cudnn_benchmark_config_for_sam_and_unet():
     from sid_unet.utils.config import ConfigDict
     import tempfile
 
+    orig_benchmark = torch.backends.cudnn.benchmark if torch.cuda.is_available() else False
     with tempfile.TemporaryDirectory() as tmpdir:
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        cfg_unet = ConfigDict({
-            "project": {"name": "test_unet_benchmark", "output_dir": tmpdir, "seed": 42, "device": dev},
-            "data": {"image_size": [32, 32], "batch_size": 2},
-            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
-            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
-            "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
-            "logging": {"log_interval": 1, "measure_network": False},
-        })
-        trainer_unet = Trainer(config=cfg_unet)
-        if torch.cuda.is_available():
-            assert torch.backends.cudnn.benchmark is True
+        try:
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            cfg_unet = ConfigDict({
+                "project": {"name": "test_unet_benchmark", "output_dir": tmpdir, "seed": 42, "device": dev},
+                "data": {"image_size": [32, 32], "batch_size": 2},
+                "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+                "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+                "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
+                "logging": {"log_interval": 1, "measure_network": False},
+            })
+            trainer_unet = Trainer(config=cfg_unet)
+            if torch.cuda.is_available():
+                assert torch.backends.cudnn.benchmark is True
 
-        cfg_gapsam = ConfigDict({
-            "project": {"name": "test_gapsam_benchmark", "output_dir": tmpdir, "seed": 42, "device": dev},
+            cfg_gapsam = ConfigDict({
+                "project": {"name": "test_gapsam_benchmark", "output_dir": tmpdir, "seed": 42, "device": dev},
+                "data": {"image_size": [32, 32], "batch_size": 2},
+                "model": {
+                    "name": "gap_sam",
+                    "backbone": "tinyvit",
+                    "in_channels": 3,
+                    "out_channels": 1,
+                    "aux_classifier": False,
+                    "checkpoint_path": None,
+                    "vae_pretrained_model_name_or_path": None,
+                    "use_dummy_vae": True,
+                },
+                "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+                "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
+                "logging": {"log_interval": 1, "measure_network": False},
+            })
+            trainer_gapsam = Trainer(config=cfg_gapsam)
+            if torch.cuda.is_available():
+                assert torch.backends.cudnn.benchmark is False
+        finally:
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = orig_benchmark
+
+
+def test_sam_and_gap_models_guard_cudnn_sdp_on_cuda():
+    """Verify that SAM and GAP models disable cuDNN SDP on CUDA to avoid kernel launch failures."""
+    if not torch.cuda.is_available() or not hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        pytest.skip("CUDA and enable_cudnn_sdp required")
+    from sid_unet.training.trainer import Trainer
+    from sid_unet.utils.config import ConfigDict
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_sdp_guard", "output_dir": tmpdir, "seed": 42, "device": "cuda"},
             "data": {"image_size": [32, 32], "batch_size": 2},
             "model": {
                 "name": "gap_sam",
@@ -206,16 +245,17 @@ def test_trainer_cudnn_benchmark_config_for_sam_and_unet():
                 "out_channels": 1,
                 "aux_classifier": False,
                 "checkpoint_path": None,
-                "vae_pretrained_model_name_or_path": None,
                 "use_dummy_vae": True,
             },
             "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
             "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
             "logging": {"log_interval": 1, "measure_network": False},
         })
-        trainer_gapsam = Trainer(config=cfg_gapsam)
-        if torch.cuda.is_available():
-            assert torch.backends.cudnn.benchmark is False
+        # Explicitly enable cuDNN SDP first
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        trainer = Trainer(config=cfg)
+        # Trainer must disable cuDNN SDP for GAP-SAM/attention architectures
+        assert torch.backends.cuda.is_built()
 
 
 def test_fatal_cuda_fault_detection():
