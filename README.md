@@ -1381,6 +1381,12 @@ During training, up to three checkpoints are managed in `outputs/RUN/<stem>/chec
 #### C. Cross-Precision Resume Synchronization
 - **Resume Format Synchronization**: When resuming a checkpoint from another environment (e.g. 4-bit CUDA NF4 loaded onto CPU float32), `resume_from_checkpoint` automatically synchronizes `checkpoint_latest.pt` in the current machine's native representation, eliminating parameter shape mismatch notices on subsequent runs.
 
+#### D. Checkpoint Score Safeguards & Recovery
+- **Non-Finite Score Safeguards**: Checkpoints saved with non-finite `best_score` values (`inf`, `-inf`, or `NaN`) due to unvalidated early saves or metric key discrepancies (`val_loss` vs `val_total_loss`) are safeguarded upon loading.
+- **Metric Score Recovery**: If the checkpoint contains valid finite metrics (e.g., `val_total_loss`, `val_loss`, `val_iou`), the true validation score is automatically recovered and assigned to `best_score`.
+- **Sentinel Normalization**: If unrecoverable, `best_score` is reset to the appropriate mode sentinel (`-inf` for max mode, `+inf` for min mode) and flagged with an explicit error in both logs and the on-screen auto-resume banner rather than displaying an invalid score (`Best Score: inf`).
+- **Metric Alias Resolution**: `CheckpointManager.save()`, `lr_scheduler.step()`, and early stopping resolve metric name aliases (such as `val_loss` and `val_total_loss`) to ensure `best_score` updates reliably.
+
 ---
 
 ### 3. Architecture-Specific Config Examples

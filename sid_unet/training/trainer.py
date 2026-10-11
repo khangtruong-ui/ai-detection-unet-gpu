@@ -541,9 +541,19 @@ class Trainer:
                 except Exception:
                     pass
 
+        _score_val = self.ckpt_manager.best_score
+        if isinstance(_score_val, float) and (math.isinf(_score_val) or math.isnan(_score_val)):
+            self.logger.error(
+                f"❌ [CHECKPOINT ERROR] Checkpoint had invalid non-finite best_score ({_score_val}) "
+                f"(error provided by previous code). Safeguarded on load."
+            )
+            score_display = f"None [invalid sentinel {_score_val} from previous code; safeguarded]"
+        else:
+            score_display = f"{_score_val:.4f}"
+
         self.logger.info(
             f"✅ Checkpoint state loaded successfully: Resumed Epoch {self.start_epoch}, "
-            f"Step {self.global_step}, Best Score: {self.ckpt_manager.best_score}"
+            f"Step {self.global_step}, Best Score: {score_display}"
         )
 
         # Synchronize checkpoint_latest.pt with current model format so subsequent runs resume cleanly
@@ -1369,7 +1379,11 @@ class Trainer:
                     # Step scheduler
                     if self.scheduler is not None:
                         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            monitored_val = val_summary.get(self.ckpt_manager.metric_name, 0.0)
+                            _mname = self.ckpt_manager.metric_name
+                            monitored_val = val_summary.get(
+                                _mname,
+                                val_summary.get("val_total_loss" if _mname in ("val_loss", "loss") else _mname, 0.0),
+                            )
                             self.scheduler.step(monitored_val)
                         else:
                             self.scheduler.step()
@@ -1407,7 +1421,11 @@ class Trainer:
                         self.logger.info(f"⭐ New best model saved to {saved_paths['best']} (score: {self.ckpt_manager.best_score:.4f})")
 
                     # Check early stopping
-                    monitored_score = val_summary.get(self.ckpt_manager.metric_name, 0.0)
+                    _mname = self.ckpt_manager.metric_name
+                    monitored_score = val_summary.get(
+                        _mname,
+                        val_summary.get("val_total_loss" if _mname in ("val_loss", "loss") else _mname, 0.0),
+                    )
                     if self.early_stopping(monitored_score):
                         self.logger.info(f"Early stopping triggered at epoch {epoch}!")
                         break

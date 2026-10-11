@@ -7,6 +7,7 @@ inspecting checkpoint metadata, and formatting on-screen resume notifications.
 from __future__ import annotations
 
 import glob
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -368,7 +369,15 @@ def find_auto_resume_checkpoint(
 
 
 def format_resume_notification(info: Dict[str, Any]) -> str:
-    """Format an informative, highlighted on-screen notification when a checkpoint is found."""
+    """Format an informative, highlighted on-screen notification when a checkpoint is found.
+
+    Safeguard: if the stored best_score is a non-finite sentinel value (±inf or NaN),
+    the banner renders an explicit ERROR label rather than a raw 'inf' string.  A raw
+    'inf' in the logs looks like a legitimate score but actually means the checkpoint
+    was saved before any validation epoch completed (or originated from the wrong
+    optimisation mode).  CheckpointManager.load_checkpoint() will reset the sentinel
+    automatically, but surfacing it here lets operators catch the issue immediately.
+    """
     source_label = "Local Repository" if info.get("source") == "local_repo" else f"Hugging Face Hub ({info.get('repo_id', 'remote')})"
     path = info.get("checkpoint_path", "")
     epoch = info.get("epoch", 0)
@@ -386,7 +395,17 @@ def format_resume_notification(info: Dict[str, Any]) -> str:
     if step is not None:
         lines.append(f"   ⏱️ Global Step:      {step}")
     if best_score is not None:
-        lines.append(f"   ⭐ Best Score:       {best_score:.4f}")
+        _score_is_invalid = (
+            isinstance(best_score, float)
+            and (math.isinf(best_score) or math.isnan(best_score))
+        )
+        if _score_is_invalid:
+            lines.append(
+                f"   ⭐ Best Score:       [ERROR: invalid sentinel {best_score!r} — "
+                "error provided by previous code; will be safeguarded on load]"
+            )
+        else:
+            lines.append(f"   ⭐ Best Score:       {best_score:.4f}")
     lines.append("================================================================================")
     lines.append("")
     return "\n".join(lines)

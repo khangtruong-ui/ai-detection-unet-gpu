@@ -417,6 +417,13 @@ class CheckpointManager:
     ) -> Dict[str, str]:
         """Save checkpoints to disk."""
         current_score = metrics.get(self.metric_name, None)
+        if current_score is None:
+            if self.metric_name in ("val_loss", "loss"):
+                current_score = metrics.get("val_total_loss", metrics.get("val_loss", None))
+            elif self.metric_name == "val_total_loss":
+                current_score = metrics.get("val_loss", None)
+            elif self.metric_name in ("val_iou", "iou"):
+                current_score = metrics.get("val_iou", metrics.get("iou", None))
         if current_score is not None and self.is_better(current_score):
             self.best_score = current_score
             self.best_epoch = epoch
@@ -573,40 +580,78 @@ class CheckpointManager:
             except Exception as scaler_err:
                 logger.warning(f"Could not restore scaler state ({scaler_err}); continuing.")
 
+        had_inf_score_error = False
+        raw_score = None
         if isinstance(checkpoint, dict):
             if "best_score" in checkpoint and checkpoint["best_score"] is not None:
-                self.best_score = float(checkpoint["best_score"])
-            elif "metrics" in checkpoint and isinstance(checkpoint["metrics"], dict):
-                m = checkpoint["metrics"]
-                for candidate in [self.metric_name, f"val_{self.metric_name}", "val_iou", "iou", "val_dice", "val_f1"]:
-                    if candidate in m and m[candidate] is not None:
-                        self.best_score = float(m[candidate])
-                        break
+                raw_score = checkpoint["best_score"]
+                try:
+                    val = float(raw_score)
+                    if math.isinf(val) or math.isnan(val):
+                        had_inf_score_error = True
+                    else:
+                        self.best_score = val
+                except (ValueError, TypeError):
+                    had_inf_score_error = True
+            else:
+                had_inf_score_error = False
+
+            # If raw best_score was missing, None, or an invalid non-finite sentinel (inf/NaN error from previous code),
+            # attempt to recover a valid finite score from checkpoint["metrics"]
+            if had_inf_score_error or ("best_score" not in checkpoint or checkpoint["best_score"] is None):
+                m = checkpoint.get("metrics")
+                if isinstance(m, dict):
+                    candidates = [
+                        self.metric_name,
+                        f"val_{self.metric_name}",
+                        "val_total_loss",
+                        "val_loss",
+                        "loss",
+                        "val_iou",
+                        "iou",
+                        "val_dice",
+                        "val_f1",
+                    ]
+                    for candidate in candidates:
+                        if candidate in m and m[candidate] is not None:
+                            try:
+                                c_val = float(m[candidate])
+                                if not math.isinf(c_val) and not math.isnan(c_val):
+                                    self.best_score = c_val
+                                    break
+                            except (ValueError, TypeError):
+                                continue
+
             if "best_epoch" in checkpoint and checkpoint["best_epoch"] is not None:
                 self.best_epoch = int(checkpoint["best_epoch"])
             elif "epoch" in checkpoint and checkpoint["epoch"] is not None:
                 self.best_epoch = int(checkpoint["epoch"])
 
-        # Sanitize best_score: if the loaded value is NaN or the wrong-side sentinel for
-        # the current mode, reset it to the correct initial sentinel so that is_better()
-        # works correctly from the very first epoch.
-        #
-        # Sentinel clash scenarios that cause silent corruption:
-        #   - mode="max" but best_score=+inf  → is_better(x) = x > inf = always False
-        #     (checkpoint was saved before any validation, or originated from a mode="min" run)
-        #   - mode="min" but best_score=-inf  → is_better(x) = x < -inf = always False
-        #     (same, but the other direction)
-        #   - best_score=NaN                  → all comparisons return False
+        # Sanitize and safeguard best_score:
+        # Notice any invalid inf/NaN sentinel loaded from previous code as an error.
         _correct_sentinel = float("-inf") if self.mode == "max" else float("inf")
         _wrong_sentinel   = float("inf")  if self.mode == "max" else float("-inf")
-        if math.isnan(self.best_score) or self.best_score == _wrong_sentinel:
-            logger.warning(
-                f"⚠️ [CHECKPOINT] Restored best_score={self.best_score!r} is incompatible with "
-                f"mode='{self.mode}' (would make is_better() always return False). "
-                f"Resetting to initial sentinel {_correct_sentinel!r} so the first real validation "
-                f"score will be accepted as the new best."
-            )
-            self.best_score = _correct_sentinel
+
+        if had_inf_score_error or math.isnan(self.best_score) or math.isinf(self.best_score):
+            if math.isnan(self.best_score) or self.best_score == _wrong_sentinel:
+                logger.error(
+                    f"❌ [CHECKPOINT ERROR] Checkpoint loaded with invalid best_score sentinel ({raw_score!r}) "
+                    f"incompatible with mode='{self.mode}' (error provided by previous code). "
+                    f"Safeguard applied: resetting to initial sentinel {_correct_sentinel!r} so is_better() functions correctly."
+                )
+                self.best_score = _correct_sentinel
+            elif had_inf_score_error:
+                if self.best_score == _correct_sentinel:
+                    logger.error(
+                        f"❌ [CHECKPOINT ERROR] Checkpoint loaded with non-finite best_score ({raw_score!r}) "
+                        f"(error provided by previous code). Safeguard applied: using initial sentinel {_correct_sentinel!r} for mode='{self.mode}'."
+                    )
+                else:
+                    logger.error(
+                        f"❌ [CHECKPOINT ERROR] Checkpoint loaded with invalid best_score ({raw_score!r}) "
+                        f"(error provided by previous code). Safeguard applied: successfully recovered valid score "
+                        f"{self.best_score:.4f} from checkpoint metrics."
+                    )
 
         epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
         step = int(checkpoint.get("step", 0)) if isinstance(checkpoint, dict) and checkpoint.get("step") is not None else None

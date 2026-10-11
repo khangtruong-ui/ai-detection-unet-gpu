@@ -931,5 +931,92 @@ def test_is_better_never_frozen_after_inf_checkpoint_reload():
         )
 
 
+def test_load_checkpoint_inf_best_score_recovers_from_metrics(caplog):
+    """
+    Test that when a checkpoint has best_score=inf (error from previous code),
+    load_checkpoint notices the error and recovers the real validation score
+    from the checkpoint's metrics dictionary.
+    """
+    import logging
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(4, 4)
+        ckpt_path = os.path.join(tmpdir, "checkpoint_latest.pt")
+        torch.save({
+            "epoch": 1,
+            "step": 18324,
+            "model_state_dict": model.state_dict(),
+            "best_score": float("inf"),  # corrupted by previous code
+            "best_epoch": -1,
+            "metrics": {
+                "val_total_loss": 0.5743,
+                "val_iou": 0.0056,
+            },
+        }, ckpt_path)
+
+        # Test recovery for min mode (val_loss)
+        with caplog.at_level(logging.ERROR):
+            mgr_min = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_loss", mode="min")
+            mgr_min.load_checkpoint(ckpt_path, model=model)
+            assert abs(mgr_min.best_score - 0.5743) < 1e-4
+            assert any("[CHECKPOINT ERROR]" in record.message for record in caplog.records)
+
+        # Test recovery for max mode (val_iou)
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            mgr_max = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_iou", mode="max")
+            mgr_max.load_checkpoint(ckpt_path, model=model)
+            assert abs(mgr_max.best_score - 0.0056) < 1e-4
+            assert any("[CHECKPOINT ERROR]" in record.message for record in caplog.records)
+
+
+def test_format_resume_notification_inf_sentinel_error_banner():
+    """
+    Test that format_resume_notification flags non-finite best_score with an explicit ERROR label.
+    """
+    info_inf = {
+        "checkpoint_path": "/path/to/checkpoint_latest.pt",
+        "epoch": 1,
+        "step": 18324,
+        "best_score": float("inf"),
+        "source": "local_repo",
+    }
+    banner = format_resume_notification(info_inf)
+    assert "[ERROR: invalid sentinel inf" in banner
+    assert "error provided by previous code; will be safeguarded on load" in banner
+
+    info_nan = {
+        "checkpoint_path": "/path/to/checkpoint_latest.pt",
+        "epoch": 1,
+        "step": 18324,
+        "best_score": float("nan"),
+        "source": "local_repo",
+    }
+    banner_nan = format_resume_notification(info_nan)
+    assert "[ERROR: invalid sentinel nan" in banner_nan
+
+
+def test_checkpoint_manager_save_metric_alias_val_loss():
+    """
+    Test that CheckpointManager.save resolves 'val_loss' to 'val_total_loss' in metrics.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(2, 2)
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_loss", mode="min")
+        assert mgr.best_score == float("inf")
+
+        # Save with metrics having val_total_loss
+        mgr.save(
+            epoch=1,
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+            scheduler=None,
+            metrics={"val_total_loss": 0.42},
+            config={},
+        )
+        assert abs(mgr.best_score - 0.42) < 1e-4
+        assert mgr.best_epoch == 1
+
+
+
 
 
