@@ -1,5 +1,13 @@
 from sid_unet.utils.config import ConfigDict, load_config, save_config, apply_overrides
-from sid_unet.utils.logger import setup_logger, MetricLogger
+from sid_unet.utils.logger import (
+    setup_logger,
+    get_logger,
+    install_exception_logger,
+    flush_loggers,
+    SafeStreamHandler,
+    MetricLogger,
+    DEFAULT_LOG_DIR,
+)
 from sid_unet.utils.report import generate_evaluation_report, format_metrics_table
 from sid_unet.utils.plotting import plot_training_curves, plot_multi_experiment_curves, save_history_data
 from sid_unet.utils.memory import (
@@ -43,6 +51,11 @@ __all__ = [
     "save_config",
     "apply_overrides",
     "setup_logger",
+    "get_logger",
+    "install_exception_logger",
+    "flush_loggers",
+    "SafeStreamHandler",
+    "DEFAULT_LOG_DIR",
     "MetricLogger",
     "generate_evaluation_report",
     "format_metrics_table",

@@ -64,7 +64,11 @@ uv.lock
 # Project specific: checkpoints, datasets, outputs, tensorboard logs
 checkpoints/
 runs/
+log/
 logs/
+*.log
+*.logs.txt
+.logs.txt
 outputs/
 reports/
 *.pt

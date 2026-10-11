@@ -320,7 +320,30 @@ class SAM3DistilLoRA(nn.Module):
         for p in base_model.parameters():
             p.requires_grad = False
 
-        # 3. Patch forward_grounding to safely bypass DETR bipartite matching when find_target is None
+        # 3. Patch back_convert and _compute_matching to safely bypass DETR bipartite matching when find_target is None.
+        # CRITICAL FIX: Do NOT set base_model.training = False when find_target is None!
+        # Setting base_model.training = False disables activation checkpointing in SAM3's decoder
+        # (self.use_act_checkpoint and self.training), RPB embedder, and segmentation head, causing peak
+        # VRAM to balloon from ~3.5GB to >11GB on 12GB GPUs, triggering CUDA launch failures and OOMs.
+        orig_back_convert = getattr(base_model, "back_convert", None)
+        orig_compute_matching = getattr(base_model, "_compute_matching", None)
+
+        def safe_back_convert(targets):
+            if targets is None:
+                return None
+            if orig_back_convert is not None:
+                return orig_back_convert(targets)
+            return None
+
+        def safe_compute_matching(out, targets):
+            if targets is None:
+                return
+            if orig_compute_matching is not None:
+                return orig_compute_matching(out, targets)
+
+        base_model.back_convert = safe_back_convert
+        base_model._compute_matching = safe_compute_matching
+
         orig_forward_grounding = base_model.forward_grounding
 
         def safe_forward_grounding(
@@ -329,18 +352,12 @@ class SAM3DistilLoRA(nn.Module):
             find_target=None,
             geometric_prompt=None,
         ):
-            was_training = base_model.training
-            if find_target is None:
-                base_model.training = False
-            try:
-                return orig_forward_grounding(
-                    backbone_out=backbone_out,
-                    find_input=find_input,
-                    find_target=find_target,
-                    geometric_prompt=geometric_prompt,
-                )
-            finally:
-                base_model.training = was_training
+            return orig_forward_grounding(
+                backbone_out=backbone_out,
+                find_input=find_input,
+                find_target=find_target,
+                geometric_prompt=geometric_prompt,
+            )
 
         base_model.forward_grounding = safe_forward_grounding
 

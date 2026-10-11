@@ -639,10 +639,36 @@ def main():
 
 def cli_main():
     import sys
-    main()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    try:
+        main()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    except BaseException as exc:
+        try:
+            logger = logging.getLogger("sid_unet")
+            if logger.handlers:
+                logger.critical(f"🛑 Fatal unhandled error in illustration execution: {exc}", exc_info=True)
+            else:
+                import traceback
+                sys.stderr.write(f"🛑 Fatal unhandled error in illustration execution: {exc}\n")
+                sys.stderr.write(traceback.format_exc() + "\n")
+            from sid_unet.utils.logger import flush_loggers
+            flush_loggers(logger)
+        except Exception:
+            pass
+        finally:
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(1)
 
 
 if __name__ == "__main__":

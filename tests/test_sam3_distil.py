@@ -262,3 +262,48 @@ def test_pyproject_sam3_distil_dependencies():
     assert any(dep.startswith("pycocotools") for dep in all_deps)
 
 
+def test_sam3_distil_activation_checkpointing_preserved(device):
+    """
+    Verify that SAM3DistilLoRA does not forcefully disable base_model.training during forward.
+
+    Regression test for .logs.txt CUDA launch failure crash:
+    Previously, safe_forward_grounding set base_model.training = False whenever find_target was None.
+    This disabled activation checkpointing in the SAM3 decoder and segmentation head, ballooning VRAM
+    to >11GB and triggering cudaErrorLaunchFailure.
+    With the fix, base_model.training is preserved, back_convert and _compute_matching gracefully handle
+    None targets, and activation checkpointing remains enabled during training.
+    """
+    model = SAM3DistilLoRA(
+        checkpoint_path=None,
+        backbone_type="tinyvit",
+        model_name="11m",
+        device=device,
+    )
+    model.train()
+    assert model.base_model.training is True, "base_model should be in training mode"
+    assert getattr(model.base_model.transformer.decoder, "use_act_checkpoint", False) is True, (
+        "Decoder activation checkpointing should be enabled"
+    )
+    assert getattr(model.base_model, "use_act_checkpoint_seg_head", False) is True, (
+        "Segmentation head activation checkpointing should be enabled"
+    )
+
+    x = torch.randn(2, 3, 256, 256, device=device)
+    out = model(x)
+    assert model.base_model.training is True, "base_model must remain in training mode after forward"
+
+    # Verify backward pass computes gradients on LoRA parameters without issue
+    loss = out[0].sum() if isinstance(out, tuple) else out.sum()
+    loss.backward()
+
+    lora_grads = [p.grad for n, p in model.peft_model.named_parameters() if "lora_" in n and p.grad is not None]
+    base_grads = [p.grad for n, p in model.peft_model.named_parameters() if "lora_" not in n and p.grad is not None]
+    assert len(lora_grads) > 0, "Expected computed gradients on LoRA parameters"
+    assert len(base_grads) == 0, "Base parameters must not have gradients"
+
+    # Verify eval mode properly switches base_model.training to False
+    model.eval()
+    assert model.base_model.training is False, "base_model must switch to False in eval mode"
+
+
+

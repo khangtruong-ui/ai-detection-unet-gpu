@@ -1063,34 +1063,45 @@ Training large models on remote GPU clusters or cloud instances often runs over 
 Crucially, running inside `tmux` or `nohup` was historically insufficient when PyTorch `DataLoader` worker processes were active:
 
 #### Root Cause Analysis
-1. **Multiprocessing Worker Signal Reset**: In Python multiprocessing (`fork` or `spawn`), worker child processes reset signal masks to system defaults (`SIG_DFL`). Even if the main training process ignored `SIGHUP`, DataLoader worker processes belonged to the same terminal session process group and were killed instantly upon SSH disconnection.
-2. **Severed Shared Memory & CUDA Hardware Faults**: Abruptly terminating DataLoader workers while memory buffers (pinned memory or UVM shared memory) were actively queued for CUDA streaming severed IPC transfers, triggering asynchronous GPU kernel aborts:
-   ```text
-   torch.AcceleratorError: CUDA error: unspecified launch failure
-   ```
-3. **Double Exception in Fallback Handlers**: Catching `Exception` in model forward passes and unconditionally calling `torch.cuda.empty_cache()` on an errored CUDA device raised secondary unhandled `AcceleratorError` exceptions inside the `except` block, triggering immediate C++ `std::terminate`.
-4. **Terminal Stream Broken Pipes**: When the pseudo-terminal device (`/dev/pts/*`) vanished upon SSH drop, writing progress bars (`tqdm`) or logging to `sys.stdout` and `sys.stderr` raised unhandled `BrokenPipeError` or `OSError(errno.EIO)`.
+1. **SAM3 Activation Checkpointing Disablement**:
+   - In `sid_unet/models/sam3_distil.py`, `safe_forward_grounding` was previously setting `base_model.training = False` when `find_target is None` to bypass DETR bipartite Hungarian matching.
+   - Setting `base_model.training = False` disabled activation checkpointing throughout SAM3's decoder (`act_ckpt_enable = self.training and self.use_act_checkpoint`), RPB embedder (`boxRPB_embed_x/y`), and segmentation heads (`self.training and self.use_act_checkpoint_seg_head`).
+   - Consequently, all intermediate activations throughout the entire SAM3 decoder were retained in VRAM during training, ballooning peak memory to **11,079 MB / 12,045 MB (92%)**. During prolonged headless training (~30+ minutes), memory fragmentation in RPB coordinate matrix allocations eventually triggered `cudaErrorLaunchFailure`.
+2. **Double Crash on Teardown (`std::terminate`)**:
+   - When an unhandled CUDA error occurred during training, `trainer.py` raised the exception through `main()` to `cli_main()`.
+   - Python executed `Py_FinalizeEx()` during process exit. Deleting active CUDA `TensorImpl` objects on an invalidated CUDA context triggered `c10::TensorImpl::~TensorImpl()`, which threw `c10::AcceleratorError` inside a C++ destructor, triggering `std::terminate()` (`SIGABRT`).
+3. **Multiprocessing Worker Signal Reset**: In Python multiprocessing (`fork` or `spawn`), worker child processes reset signal masks to system defaults (`SIG_DFL`). Even if the main training process ignored `SIGHUP`, DataLoader worker processes belonged to the same terminal session process group and were killed upon SSH disconnection.
+4. **Severed Shared Memory & CUDA Hardware Faults**: Abruptly terminating DataLoader workers while memory buffers (pinned memory or UVM shared memory) were actively queued for CUDA streaming severed IPC transfers, triggering asynchronous GPU kernel aborts.
+5. **Terminal Stream Broken Pipes & Missing Log Files**: When pseudo-terminal devices vanished upon SSH drop, writing progress bars or logging to standard streams raised unhandled `BrokenPipeError` or `OSError(errno.EIO)`, while exceptions failed to flush to disk without a persistent file logging module.
 
 #### Implemented Hardening & Architecture
-1. **Worker-Level Signal Shields & Deterministic Termination**:
+1. **Activation Checkpointing Preservation & Target Matching Fix**:
+   - In `sid_unet/models/sam3_distil.py`, `base_model.training` is strictly preserved according to the outer model's actual training state.
+   - `base_model.back_convert` and `base_model._compute_matching` are patched to gracefully handle `None` targets directly. This keeps activation checkpointing fully active in SAM3's decoder and segmentation heads, keeping peak VRAM under 5.2 GB and eliminating memory fragmentation launch failures.
+2. **Resilient Rotating Logging Modules (`sid_unet/utils/logger.py`)**:
+   - `setup_logger()` configures `RotatingFileHandler` with 20 MB file size limit and 5 backup files (`maxBytes=20MB`, `backupCount=5`).
+   - Standard `log/` and `logs/` folders are automatically created and strictly ignored by git (`.gitignore`).
+   - `SafeStreamHandler` transparently absorbs `BrokenPipeError` and `OSError` (`EIO`) when client SSH sessions disconnect.
+   - `install_exception_logger()` registers global exception hooks (`sys.excepthook` and `threading.excepthook`) to capture any uncaught fatal exception into rotating log files with full stack traces.
+3. **Clean Teardown with `os._exit` Protection**:
+   - In `cli_main()`, fatal exceptions are caught, logged with `exc_info=True`, all handlers are flushed (`flush_loggers()`), and the process exits immediately via `os._exit(code)`. This prevents secondary C++ destructor aborts (`std::terminate`) during `Py_FinalizeEx()`.
+4. **Worker-Level Signal Shields & Deterministic Termination**:
    - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_worker_signals()` from `sid_unet/utils/signals.py`:
      - Shields workers against terminal disconnects and stream aborts: `SIGHUP` (terminal hangup), `SIGPIPE` (broken pipe), `SIGWINCH` (window resize), `SIGIO` (asynchronous I/O), and `SIGQUIT`.
      - **Preserves `SIGTERM` & `SIGINT`**: Workers explicitly maintain default termination handlers (`signal.SIG_DFL`) rather than masking `SIGTERM`. This ensures that PyTorch DataLoader's `_shutdown_workers()` and parent process terminations kill workers instantly, eliminating process hangs and orphaned CUDA memory leaks.
-2. **Controlling Terminal Detachment**:
+5. **Controlling Terminal Detachment**:
    - `sid_unet/utils/signals.py` executes `detach_controlling_terminal()` via `os.setsid()` / `os.setpgrp()` so that closing terminal windows does not cascade kernel hangups to the training process tree.
-3. **Safe Text Stream Wrappers**:
-   - Wraps `sys.stdout` and `sys.stderr` with `SafeStreamWrapper`, silently absorbing `BrokenPipeError` and `OSError` with `EIO`/`EPIPE`/`EBADF` errnos.
-4. **Fatal CUDA Fault Detection & Guarded Caches**:
+6. **Fatal CUDA Fault Detection & Guarded Caches**:
    - `GAPSAM.forward()`, `SAM3DistilModel.forward()`, and `Trainer._step_batch_train()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and cleanly drain DataLoader workers via `self.close()` before propagating exceptions.
    - All `torch.cuda.empty_cache()` calls across models, trainers, and epoch cleanup hooks are wrapped in exception handlers, preventing C++ `std::terminate` aborts when device context is invalidated.
-5. **cuDNN Benchmark & SDPA Safeguards for Attention & Foundation Models**:
+7. **cuDNN Benchmark & SDPA Safeguards for Attention & Foundation Models**:
    - `Trainer` enables `torch.backends.cudnn.benchmark = True` for CNN architectures (e.g., standard UNet), while strictly disabling it (`False`) for attention/ViT/SAM3/GAP-SAM foundation backbones to avoid cuDNN autotuner workspace allocation collisions and kernel launch failures.
    - For attention and transformer backbones (SAM3, GAP-SAM), cuDNN Scaled Dot-Product Attention (`torch.backends.cuda.enable_cudnn_sdp(False)`) is explicitly disabled on CUDA. This avoids multi-scale deformable attention kernel launch failures (`cudaErrorLaunchFailure`) on Ampere architecture GPUs (e.g. RTX 3080 Ti, SM 8.6) when handling large token sequences (19,845 tokens per image).
-6. **Active DataLoader Process Tracking & Hardened Worker Reaping**:
+8. **Active DataLoader Process Tracking & Hardened Worker Reaping**:
    - `Trainer` tracks active DataLoader iterators (`self._active_train_loader`) during `train_epoch()`. Upon exceptions or clean shutdown, `Trainer.close()` aggressively discovers and terminates all active worker processes (`w.terminate()`, bounded `w.join(timeout=1.0)`, followed by `w.kill()` if necessary) and cancels queue join threads (`cancel_join_thread()`), preventing DataLoader worker deadlocks and python interpreter teardown hangs.
-7. **Process Signal Isolation in Test Suites**:
+9. **Process Signal Isolation in Test Suites**:
    - Unit tests verifying signal shielding (`shield_process_signals()`, `worker_init_fn()`) are executed within isolated subprocesses via `subprocess.run()`. This ensures that process-level signal modifications (e.g., `SIGTERM = SIG_IGN`) cannot pollute the main pytest test runner, allowing subsequent tests that spawn PyTorch DataLoaders to terminate worker processes normally.
-8. **Task Timeout Protection**:
+10. **Task Timeout Protection**:
    - Integrated `pytest-timeout>=2.2.0` with `--timeout=240` (4 minutes) in `pyproject.toml` and per-test timeout annotations (`@pytest.mark.timeout(240)`), ensuring long-running tasks have sufficient headroom while guaranteeing any hung test is automatically aborted.
    - Asynchronous hub upload workers (`AsyncHubUploader`) enforce bounded timeouts (`timeout=240.0`) on `wait_all()` instead of unbounded thread queue joins.
 

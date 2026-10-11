@@ -169,6 +169,7 @@ class Trainer:
         self.logger = custom_logger or setup_logger(
             name=log_name,
             log_file=os.path.join(self.log_dir, "training.log") if self.is_main_process else None,
+            enable_file=self.is_main_process,
         )
         if self.is_distributed and not self.is_main_process and hasattr(self.logger, "setLevel"):
             import logging
@@ -1521,7 +1522,10 @@ class Trainer:
                 self.close()
                 raise
             except BaseException as exc:
-                self.logger.error(f"🛑 Error encountered during training execution: {exc}. Closing DataLoader workers and resources...")
+                self.logger.error(
+                    f"🛑 Error encountered during training execution: {exc}. Closing DataLoader workers and resources...",
+                    exc_info=True,
+                )
                 self.close()
                 raise exc
 
