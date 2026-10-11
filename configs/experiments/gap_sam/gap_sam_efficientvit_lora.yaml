@@ -83,7 +83,6 @@ training:
   amp: true
   grad_clip_norm: 1.0
   gradient_accumulation_steps: 4
-  val_check_interval: 0.1
   save_best: true
   save_latest: true
   checkpoint_period: 1

@@ -370,7 +370,7 @@ def test_gap_sam_yaml_configs():
         assert cfg.training.epochs == 3, f"{fname} should have epochs=3"
         assert cfg.training.learning_rate == 0.0002
         assert cfg.training.weight_decay == 0.05
-        assert cfg.training.val_check_interval == 0.1
+        assert "val_check_interval" not in cfg.training
         assert cfg.training.early_stopping_patience == 5
         assert cfg.training.early_stopping_metric == "val_loss"
         assert cfg.training.early_stopping_mode == "min"
@@ -622,8 +622,8 @@ def test_artifact_classifier_loss_halving_formula(device):
     )
 
 
-def test_trainer_intra_epoch_val_check_interval():
-    """Verify Trainer correctly schedules and executes intra-epoch validation checks."""
+def test_trainer_per_epoch_validation_only():
+    """Verify Trainer executes validation only once per epoch at epoch end, without intra-epoch checks."""
     from sid_unet.training.trainer import Trainer
     from torch.utils.data import DataLoader, TensorDataset
 
@@ -654,7 +654,7 @@ def test_trainer_intra_epoch_val_check_interval():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = ConfigDict({
-            "project": {"name": "test_intra_val", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
+            "project": {"name": "test_per_epoch_val", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
             "data": {"image_size": [32, 32], "batch_size": 2, "train_samples_per_epoch": -1, "val_samples": -1},
             "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
             "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
@@ -662,7 +662,6 @@ def test_trainer_intra_epoch_val_check_interval():
                 "epochs": 1,
                 "learning_rate": 0.001,
                 "optimizer": "adamw",
-                "val_check_interval": 0.5,  # Validate twice in an epoch (at step 2 of 4 and step 4)
                 "early_stopping_patience": 5,
                 "early_stopping_metric": "val_loss",
                 "early_stopping_mode": "min",
@@ -679,7 +678,7 @@ def test_trainer_intra_epoch_val_check_interval():
             val_loader=val_loader,
         )
 
-        assert trainer.val_check_interval == 0.5
+        assert not hasattr(trainer, "val_check_interval") or trainer.val_check_interval is None
         val_calls = 0
         orig_val = trainer.validate
         def mock_val(*args, **kwargs):
@@ -688,11 +687,22 @@ def test_trainer_intra_epoch_val_check_interval():
             return orig_val(*args, **kwargs)
         trainer.validate = mock_val
 
+        val_calls_during_train_epoch = 0
+        orig_train_epoch = trainer.train_epoch
+        def mock_train_epoch(epoch):
+            nonlocal val_calls_during_train_epoch
+            before = val_calls
+            res = orig_train_epoch(epoch)
+            val_calls_during_train_epoch += (val_calls - before)
+            return res
+        trainer.train_epoch = mock_train_epoch
+
         trainer.train()
-        # With 4 batches total and val_check_interval=0.5:
-        # step 2 triggers intra-epoch validate (1st call),
-        # epoch end triggers regular validate (2nd call).
-        assert val_calls >= 2, f"Expected at least 2 validation evaluations, got {val_calls}"
+        # With 4 batches total across 1 epoch:
+        # No validation must occur during train_epoch (zero intra-epoch evaluations).
+        assert val_calls_during_train_epoch == 0, f"Expected 0 intra-epoch validation calls, got {val_calls_during_train_epoch}"
+        # Exactly 2 calls: 1 at epoch completion and 1 for final evaluation report.
+        assert val_calls == 2, f"Expected exactly 2 validation evaluations, got {val_calls}"
 
 
 def test_gap_sam_batched_grounding_forward_and_fallback(device):

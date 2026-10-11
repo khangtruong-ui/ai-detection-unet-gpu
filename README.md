@@ -1591,8 +1591,7 @@ training:
   epochs: 3                                      # 3 epochs (matching paper)
   learning_rate: 0.0002
   weight_decay: 0.05
-  val_check_interval: 0.1                        # Evaluate val loss every 0.1 epoch (matching paper)
-  early_stopping_patience: 5                     # Patience of 5 evaluations (matching paper)
+  early_stopping_patience: 5                     # Patience of 5 epochs
   early_stopping_metric: "val_loss"
   early_stopping_mode: "min"
   amp: true
