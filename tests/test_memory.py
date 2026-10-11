@@ -16,12 +16,15 @@ from sid_unet.models.unet import UNet, build_model
 from sid_unet.training.trainer import Trainer
 from sid_unet.utils.config import load_config
 from sid_unet.utils.memory import (
+    MemoryGuard,
     auto_scale_batch_size_and_grad_accum,
     clear_memory_cache,
+    estimate_memory_profile,
     find_optimal_batch_size,
     format_memory_summary,
     get_memory_summary,
     is_oom_error,
+    predict_safe_batch_size,
     split_batch,
 )
 
@@ -266,3 +269,166 @@ def test_oom_raises_in_train_epoch(monkeypatch):
         # Training should raise the OOM error directly
         with pytest.raises(RuntimeError, match="CUDA out of memory"):
             trainer.train()
+
+
+def test_memory_summary_fractions():
+    """Verify usage_fraction and peak_fraction fields in memory summary."""
+    summary_cpu = get_memory_summary("cpu")
+    assert "usage_fraction" in summary_cpu
+    assert "peak_fraction" in summary_cpu
+    assert 0.0 <= summary_cpu["usage_fraction"] <= 1.0
+
+    if torch.cuda.is_available():
+        summary_cuda = get_memory_summary("cuda")
+        assert "usage_fraction" in summary_cuda
+        assert "peak_fraction" in summary_cuda
+        assert 0.0 <= summary_cuda["usage_fraction"] <= 1.0
+        assert summary_cuda["total_mb"] > 0
+
+
+def test_memory_guard_core_functionality():
+    """Verify MemoryGuard lifecycle: status, threshold checks, recovery, and batch scaling."""
+    guard = MemoryGuard(device="cpu", max_memory_fraction=0.80, warning_threshold=0.75)
+    assert guard.max_memory_fraction == 0.80
+    assert guard.warning_threshold == 0.75
+
+    status = guard.get_memory_status()
+    assert isinstance(status, dict)
+    assert "usage_fraction" in status
+
+    # Verify batch scaling recommendation preserves effective batch size
+    scaled_bs, scaled_accum = guard.recommend_batch_scaling(current_batch_size=16, current_grad_accum=1)
+    assert scaled_bs == 8
+    assert scaled_accum == 2
+    assert scaled_bs * scaled_accum == 16
+
+    # Verify recover_memory calls cache clear without exception
+    new_frac = guard.recover_memory()
+    assert isinstance(new_frac, float)
+
+    # Verify format_status returns string representation
+    fmt = guard.format_status()
+    assert isinstance(fmt, str)
+    assert "%" in fmt
+
+
+def test_memory_guard_threshold_detection(monkeypatch):
+    """Verify MemoryGuard correctly identifies when memory limits are exceeded."""
+    guard = MemoryGuard(device="cpu", max_memory_fraction=0.80)
+
+    # Mock normal memory state (60% usage)
+    monkeypatch.setattr(
+        guard,
+        "get_memory_status",
+        lambda: {"usage_fraction": 0.60, "peak_fraction": 0.60, "used_mb": 6000.0, "total_mb": 10000.0},
+    )
+    is_exceeded, frac = guard.check_memory(step=1)
+    assert is_exceeded is False
+    assert frac == 0.60
+    assert guard.is_memory_exceeded() is False
+
+    # Mock exceeded memory state (85% usage)
+    monkeypatch.setattr(
+        guard,
+        "get_memory_status",
+        lambda: {"usage_fraction": 0.85, "peak_fraction": 0.85, "used_mb": 8500.0, "total_mb": 10000.0},
+    )
+    is_exceeded, frac = guard.check_memory(step=2)
+    assert is_exceeded is True
+    assert frac == 0.85
+    assert guard.is_memory_exceeded() is True
+
+
+def test_estimate_memory_profile_and_predict_safe_batch_size():
+    """Verify linear memory profiling and predictive batch size calculation."""
+    model = UNet(features=[16, 32], dropout=0.0, aux_classifier=True)
+    profile = estimate_memory_profile(
+        model=model,
+        sample_shape=(3, 64, 64),
+        device=torch.device("cpu"),
+    )
+    assert isinstance(profile, dict)
+    assert "baseline_mb" in profile
+    assert "per_sample_mb" in profile
+    assert "total_mb" in profile
+    assert profile["baseline_mb"] > 0
+    assert profile["per_sample_mb"] > 0
+
+    predicted_bs = predict_safe_batch_size(
+        model=model,
+        sample_shape=(3, 64, 64),
+        max_memory_fraction=0.80,
+        device=torch.device("cpu"),
+        max_batch_size=32,
+        min_batch_size=1,
+    )
+    assert isinstance(predicted_bs, int)
+    assert 1 <= predicted_bs <= 32
+
+
+def test_find_optimal_batch_size_enforces_memory_limit(monkeypatch):
+    """Verify find_optimal_batch_size rejects candidates that exceed max_memory_fraction."""
+    model = UNet(features=[16, 32], dropout=0.0, aux_classifier=True)
+
+    # When running on CPU with force_probe=True and mocked memory returning high memory for large batch
+    class MemoryStateTracker:
+        def __init__(self):
+            self.probed_sizes = []
+
+    tracker = MemoryStateTracker()
+
+    import sid_unet.utils.memory as mem_mod
+    orig_get_summary = mem_mod.get_memory_summary
+
+    def mock_get_memory_summary(device=None):
+        base = orig_get_summary(device)
+        # Pretend host RAM is 85% full
+        base["usage_fraction"] = 0.85
+        return base
+
+    monkeypatch.setattr(mem_mod, "get_memory_summary", mock_get_memory_summary)
+
+    # With max_memory_fraction=0.80 and current usage 85%, should fall back to min_batch_size
+    optimal_bs = find_optimal_batch_size(
+        model=model,
+        sample_shape=(3, 64, 64),
+        device=torch.device("cpu"),
+        max_batch_size=16,
+        min_batch_size=1,
+        max_memory_fraction=0.80,
+    )
+    assert optimal_bs == 1
+
+
+def test_trainer_with_max_memory_fraction():
+    """Verify Trainer correctly stores max_memory_fraction and configures MemoryGuard."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=2",
+            "training.max_memory_fraction=0.75",
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "training.amp=false",
+        ])
+
+        train_ds = DummyDataset(size=4, img_size=(64, 64))
+        val_ds = DummyDataset(size=2, img_size=(64, 64))
+
+        train_loader = DataLoader(train_ds, batch_size=2)
+        val_loader = DataLoader(val_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        assert trainer.max_memory_fraction == 0.75
+        assert trainer.memory_guard.max_memory_fraction == 0.75
+        results = trainer.train()
+        assert "best_score" in results
+

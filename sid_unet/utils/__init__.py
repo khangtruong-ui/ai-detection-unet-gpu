@@ -18,6 +18,9 @@ from sid_unet.utils.memory import (
     split_batch,
     auto_scale_batch_size_and_grad_accum,
     find_optimal_batch_size,
+    estimate_memory_profile,
+    predict_safe_batch_size,
+    MemoryGuard,
 )
 
 from sid_unet.utils.network import (
@@ -69,6 +72,9 @@ __all__ = [
     "split_batch",
     "auto_scale_batch_size_and_grad_accum",
     "find_optimal_batch_size",
+    "estimate_memory_profile",
+    "predict_safe_batch_size",
+    "MemoryGuard",
     "NetworkSpeedMonitor",
     "BottleneckDetector",
     "BottleneckStatus",

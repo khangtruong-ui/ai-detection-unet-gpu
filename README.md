@@ -35,7 +35,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [7. Simultaneous Multi-Stage Ablation Evaluation](#7-simultaneous-multi-stage-ablation-evaluation)
   - [8. Continuous Master Reports & Collision Skipping](#8-continuous-master-reports--collision-skipping)
   - [9. Automated Visual Illustration (`sid-illu`) & Heatmap Generation](#9-automated-visual-illustration-sid-illu--heatmap-generation)
-  - [10. Memory Management & OOM Dynamic Auto-Recovery](#10-memory-management--oom-dynamic-auto-recovery)
+  - [10. Memory Management, Dynamic Batch Sizing & VRAM Budgeting](#10-memory-management-dynamic-batch-sizing--vram-budgeting)
   - [11. Runtime Learnability Diagnostics & Debug Mode (nn-toolbox)](#11-runtime-learnability-diagnostics--debug-mode-nn-toolbox)
   - [12. Model Kickstarting via Bootstrapping v1.0 (with nn-toolbox verification)](#12-model-kickstarting-via-bootstrapping-v10-with-nn-toolbox-verification)
   - [13. SSH Disconnection Fault Resilience & Multiprocessing Signal Immunity](#13-ssh-disconnection-fault-resilience--multiprocessing-signal-immunity)
@@ -928,11 +928,128 @@ Both training (`sid-train`) and evaluation (`sid-eval`, `sid-cross-eval`) native
 
 ---
 
-### 10. Memory Management & OOM Dynamic Auto-Recovery
+### 10. Memory Management, Dynamic Batch Sizing & VRAM Budgeting
 
-- **Pre-Execution VRAM Probing**: Automatically searches safe batch sizes and scales gradient accumulation.
-- **Activation Checkpointing**: Recomputes forward activations during backpropagation, saving 60-70% activation VRAM.
-- **Dynamic OOM Fallback Catching**: Recursively bisects batches into micro-batches on CUDA OOM without crashing.
+Deep neural network training on consumer and datacenter GPUs is frequently bottlenecked by device memory limits. In SID-UNet, a dedicated memory engineering system guarantees that memory consumption remains strictly below a configured safety threshold (such as **80% VRAM / RAM**), eliminating Out-Of-Memory (OOM) crashes while dynamically maximizing throughput.
+
+#### The Measurement Challenge: Why Measuring Memory in PyTorch is Hard
+Accurately measuring and bounding memory consumption in deep learning workloads is notoriously difficult due to several architectural factors:
+1. **PyTorch Caching Allocator Abstraction**:
+   - `torch.cuda.memory_allocated()` only reports tensors currently referenced in Python.
+   - `torch.cuda.memory_reserved()` tracks memory pools reserved by PyTorch's caching allocator. Memory is often held in reserved blocks to avoid expensive OS `cudaMalloc` calls, making raw allocated numbers deceptively low while hardware memory is actually occupied.
+2. **CUDA Driver & Non-PyTorch Footprints**:
+   - The CUDA runtime context, cuDNN convolution workspaces, NCCL communication buffers, and external system processes consume between 350 MB and 1.5 GB of VRAM that is invisible to PyTorch's internal allocator meters.
+   - Reliable accounting requires querying the hardware driver directly via `torch.cuda.mem_get_info()` ($M_{\text{used}} = M_{\text{total}} - M_{\text{free}}$) and synthesizing driver-level measurements with allocator statistics.
+3. **Transient Peak Spikes During Backpropagation**:
+   - Memory usage during training is non-stationary: peak memory occurs exclusively during the backward pass when forward activations, backward activation gradients, parameter gradients, and temporary autograd workspaces must simultaneously coexist in VRAM.
+   - Measuring memory at step boundaries misses these internal backprop peaks. Accurate measurement requires resetting peak telemetry (`torch.cuda.reset_peak_memory_stats()`) and recording peak allocations across complete forward+backward cycles.
+4. **Optimizer State Footprint Latency**:
+   - First-order optimizers with momentum (e.g., AdamW) allocate first and second moment tracking buffers ($2 \times \text{param\_bytes}$ in FP32) only upon the first `optimizer.step()`, causing a delayed memory jump that naïve static probes overlook.
+
+#### Linear Memory Scaling Model
+Memory consumption as a function of batch size $B$ adheres to a linear scaling law:
+$$M(B) = M_{\text{static}} + B \times M_{\text{per\_sample}} + M_{\text{workspace}}$$
+
+Where:
+- $M_{\text{static}}$ is the static baseline: model weights, optimizer moments, CUDA driver context, and framework buffers.
+- $M_{\text{per\_sample}}$ is the per-sample dynamic footprint: input batch tensors, output logits, loss buffers, and activation maps retained for autograd.
+- $M_{\text{workspace}}$ is cuDNN algorithm benchmarking and convolution workspace memory.
+
+Given a target memory fraction $\alpha \in (0.0, 1.0)$ (e.g., $\alpha = 0.80$ for an 80% ceiling):
+$$M_{\text{target}} = \alpha \times M_{\text{total}}$$
+$$\text{Safe Batch Size } B_{\text{safe}} = \left\lfloor \frac{M_{\text{target}} - M_{\text{static}}}{M_{\text{per\_sample}}} \right\rfloor$$
+
+#### Multi-Tiered Memory Architecture
+
+```
+                                  [ Configuration ]
+                      max_memory_fraction: 0.80 (80% Ceiling)
+                                         |
+                                         v
+   +---------------------------------------------------------------------------+
+   | Phase 1: Pre-Execution Probing & Linear Estimation (`find_optimal_batch_size`) |
+   | - Calibrated empirical forward + backward passes                          |
+   | - Rejects candidate batch sizes where Peak VRAM > 80%                     |
+   | - Probes descending candidates (64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1)        |
+   +---------------------------------------------------------------------------+
+                                         |
+                                         v
+   +---------------------------------------------------------------------------+
+   | Phase 2: Invariant Gradient Scaling (`auto_scale_batch_size_and_grad_accum`) |
+   | - Computes safe batch size B_safe <= 80% memory                           |
+   | - Adjusts gradient_accumulation_steps to preserve effective batch size:   |
+   |   effective_batch_size = B_safe * adjusted_grad_accum == B_target * accum |
+   +---------------------------------------------------------------------------+
+                                         |
+                                         v
+   +---------------------------------------------------------------------------+
+   | Phase 3: Runtime Memory Guard (`MemoryGuard`)                             |
+   | - Continuously monitors peak memory usage per step and epoch              |
+   | - Telemetry in progress bar: `mem: 68% (8192/12045MB)`                    |
+   | - Early warning notification when memory exceeds 75%                      |
+   | - Automated allocator cache recovery (`clear_memory_cache()`)             |
+   | - Runtime micro-batch splitting (`split_batch`) if spike occurs           |
+   +---------------------------------------------------------------------------+
+```
+
+#### Configuration and CLI Options
+
+Enable and configure memory constraints via configuration files or command-line flags:
+
+```yaml
+# configs/default.yaml
+training:
+  auto_batch_size: true          # Automatically scale batch size to respect memory constraint
+  max_memory_fraction: 0.80      # Ensure peak memory stays strictly below 80% of total VRAM
+  empty_cache_per_epoch: true    # Reclaim allocator cached blocks between epochs
+```
+
+From the command line:
+
+```bash
+# Train while guaranteeing VRAM usage remains <= 80%
+sid-train --config configs/default.yaml --batch-size 32 --max-memory-fraction 0.80
+
+# Run with stricter 70% memory ceiling on shared multi-tenant GPUs
+sid-train --config configs/default.yaml --max-memory-fraction 0.70
+```
+
+#### Programmatic API (`sid_unet.utils.memory`)
+
+The memory utilities are exposed in `sid_unet.utils.memory` for standalone scripting:
+
+```python
+from sid_unet.utils.memory import (
+    MemoryGuard,
+    find_optimal_batch_size,
+    predict_safe_batch_size,
+    estimate_memory_profile,
+    get_memory_summary,
+)
+
+# 1. Inspect device memory fractions
+summary = get_memory_summary("cuda")
+print(f"Used: {summary['used_mb']} MB, Usage Fraction: {summary['usage_fraction']*100:.1f}%")
+
+# 2. Predict safe batch size for <= 80% memory limit using linear model
+profile = estimate_memory_profile(model, sample_shape=(3, 256, 256), device="cuda")
+safe_bs = predict_safe_batch_size(model, sample_shape=(3, 256, 256), max_memory_fraction=0.80)
+
+# 3. Find optimal batch size with empirical forward+backward validation
+optimal_bs = find_optimal_batch_size(
+    model=model,
+    sample_shape=(3, 256, 256),
+    device="cuda",
+    max_batch_size=32,
+    max_memory_fraction=0.80, # Enforces peak usage <= 80%
+)
+
+# 4. Initialize runtime MemoryGuard
+guard = MemoryGuard(device="cuda", max_memory_fraction=0.80)
+is_exceeded, peak_frac = guard.check_memory(step=100)
+if is_exceeded:
+    guard.recover_memory()
+```
 
 ---
 

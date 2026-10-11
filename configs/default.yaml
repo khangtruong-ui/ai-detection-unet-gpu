@@ -59,6 +59,8 @@ training:
   min_lr: 0.000001
   grad_clip_norm: 1.0
   amp: true
+  auto_batch_size: true
+  max_memory_fraction: 0.80
   save_best: true
   save_latest: true
   checkpoint_period: 3600      # Periodic checkpoint interval in seconds (default: 3600 = 1 hour)

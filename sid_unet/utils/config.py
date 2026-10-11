@@ -174,6 +174,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "data_parallel": True,        # Automatically enable DataParallel across visible GPUs if > 1
         "use_hard_mining": False,     # Hard example mining starting from epoch 2
         "auto_batch_size": True,      # Automatically search and scale safe batch size to avoid OOM
+        "max_memory_fraction": 0.80,  # Maximum memory fraction (e.g. 0.80 = 80%) to maintain by auto-scaling batch size
+        "target_memory_fraction": 0.80, # Alias for max_memory_fraction
         "empty_cache_per_epoch": True,# Free PyTorch memory allocator cache between epochs
         "save_best": True,
         "save_latest": False,         # Only save best model checkpoint by default

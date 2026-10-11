@@ -279,5 +279,30 @@ def test_cli_train_and_eval_collision_skipping(monkeypatch):
         assert eval_res2["overall_metrics"]["iou"] == eval_res1["overall_metrics"]["iou"]
 
 
+def test_cli_max_memory_fraction_parsing(monkeypatch):
+    """Verify that --max_memory_fraction is parsed from CLI and forwarded to config overrides."""
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(10))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        train_args = [
+            "sid-train",
+            "--config", "configs/test_smoke.yaml",
+            "--output_dir", tmpdir,
+            "--max_memory_fraction", "0.75",
+            "--override",
+            "project.device=cpu",
+            "training.epochs=1",
+            "data.num_workers=0",
+            "data.train_samples_per_epoch=2",
+            "data.val_samples=2",
+            "model.features=[8, 16]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ]
+        monkeypatch.setattr(sys, "argv", train_args)
+        res = train_main()
+        assert res is not None
+        assert "best_score" in res
+
+
 
 

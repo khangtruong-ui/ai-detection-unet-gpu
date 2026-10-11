@@ -109,6 +109,16 @@ def parse_args():
         help="Disable automatic batch size scaling",
     )
     parser.add_argument(
+        "--max_memory_fraction",
+        "--max-memory-fraction",
+        "--target_memory_fraction",
+        "--target-memory-fraction",
+        type=float,
+        default=None,
+        dest="max_memory_fraction",
+        help="Target maximum memory fraction (e.g. 0.80 for 80%%) to maintain by scaling batch size (default: 0.80)",
+    )
+    parser.add_argument(
         "--gradient_accumulation_steps",
         "--gradient-accumulation-steps",
         type=int,
@@ -730,6 +740,9 @@ def main():
         overrides.append("training.auto_batch_size=true")
     elif args.auto_batch_size is False:
         overrides.append("training.auto_batch_size=false")
+    if getattr(args, "max_memory_fraction", None) is not None:
+        overrides.append(f"training.max_memory_fraction={args.max_memory_fraction}")
+        overrides.append(f"training.target_memory_fraction={args.max_memory_fraction}")
     if args.gradient_accumulation_steps is not None:
         overrides.append(f"training.gradient_accumulation_steps={args.gradient_accumulation_steps}")
     if args.gradient_checkpointing:

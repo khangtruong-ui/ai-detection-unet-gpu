@@ -37,6 +37,7 @@ from sid_unet.training.callbacks import CheckpointManager, EarlyStopping
 from sid_unet.training.hard_mining import HardMiner
 from sid_unet.utils.logger import MetricLogger, setup_logger
 from sid_unet.utils.memory import (
+    MemoryGuard,
     auto_scale_batch_size_and_grad_accum,
     clear_memory_cache,
     find_optimal_batch_size,
@@ -318,6 +319,14 @@ class Trainer:
         self.grad_clip = float(config.training.get("grad_clip_norm", 1.0))
         self.gradient_accumulation_steps = max(1, int(config.training.get("gradient_accumulation_steps", 1)))
         self.auto_batch_size = bool(config.training.get("auto_batch_size", True))
+        self.max_memory_fraction = float(
+            config.training.get("max_memory_fraction", config.training.get("target_memory_fraction", 0.80))
+        )
+        self.memory_guard = MemoryGuard(
+            device=self.device,
+            max_memory_fraction=self.max_memory_fraction,
+            logger=self.logger,
+        )
         self.empty_cache_per_epoch = bool(config.training.get("empty_cache_per_epoch", True))
         self.log_memory = bool(config.logging.get("log_memory", True))
 
@@ -909,6 +918,7 @@ class Trainer:
                         num_classes=int(self.config.model.get("num_classes", 3)),
                         logger=self.logger,
                         mask_shape=img_size,
+                        max_memory_fraction=self.max_memory_fraction,
                     )
                 else:
                     safe_bs = current_bs
@@ -926,6 +936,7 @@ class Trainer:
                     num_classes=int(self.config.model.get("num_classes", 3)),
                     logger=self.logger,
                     mask_shape=img_size,
+                    max_memory_fraction=self.max_memory_fraction,
                 )
 
             if safe_bs < current_bs:
@@ -937,7 +948,8 @@ class Trainer:
                 self.logger.warning(
                     f"⚡ Auto Batch Sizing: Scaling batch size {current_bs} -> {adjusted_bs} "
                     f"with gradient_accumulation_steps={adjusted_grad_accum} "
-                    f"(Preserving effective batch size: {current_bs * self.gradient_accumulation_steps})."
+                    f"(Preserving effective batch size: {current_bs * self.gradient_accumulation_steps}) "
+                    f"to keep memory usage <= {self.max_memory_fraction * 100:.1f}%."
                 )
                 self.config.data.batch_size = adjusted_bs
                 self.config.training.gradient_accumulation_steps = adjusted_grad_accum
@@ -1053,6 +1065,7 @@ class Trainer:
         """Run one training epoch with gradient accumulation, Out-Of-Memory (OOM) recovery, and hard example mining."""
         if self.empty_cache_per_epoch:
             clear_memory_cache(self.device)
+        self.memory_guard.reset_peak_stats()
 
         self.model.train()
         metric_logger = MetricLogger()
@@ -1180,7 +1193,14 @@ class Trainer:
                         "iou": f"{loss_dict_batch.get('iou', 0.0):.4f}",
                         "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                     }
+                    if self.log_memory:
+                        postfix_dict["mem"] = self.memory_guard.format_status().split()[0]
                     pbar.set_postfix(postfix_dict)
+
+                    if self.global_step % self.log_interval == 0:
+                        is_exceeded, _ = self.memory_guard.check_memory(step=self.global_step)
+                        if is_exceeded:
+                            self.memory_guard.recover_memory()
 
 
             # Flush pending accumulated gradients if last step did not land on accumulation boundary
