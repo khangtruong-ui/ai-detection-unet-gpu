@@ -20,6 +20,11 @@ import sys
 import warnings
 from typing import Any, Dict, List, Optional
 import numpy as np
+
+# Configure PyTorch CUDA memory allocator to reduce virtual address space fragmentation
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 from PIL import ImageFile
 import torch
 

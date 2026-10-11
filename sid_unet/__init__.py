@@ -5,8 +5,13 @@ Supports streaming datasets on saberzl/SID_Set.
 
 __version__ = "0.1.0"
 
+import os
 import logging
 import warnings
+
+# Configure PyTorch CUDA memory allocator to reduce virtual address space fragmentation
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Suppress deprecated property warnings from upstream transformers SAM modules
 warnings.filterwarnings("ignore", message=".*memory_attention_rope_theta.*")

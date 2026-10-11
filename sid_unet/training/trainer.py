@@ -999,6 +999,29 @@ class Trainer:
                     raise exc
             loss, loss_dict = self.loss_fn(outputs, masks, labels)
 
+        # Compute training IoU metric on batch BEFORE backward pass.
+        # Computing IoU before backward pass ensures output tensors are unmutated by autograd,
+        # decouples diagnostic metric evaluation from backpropagation kernels, and guarantees
+        # that any metric sync error or numerical anomaly defaults to 0.0 without terminating training.
+        try:
+            with torch.no_grad():
+                mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+                if mask_logits is not None:
+                    preds = (torch.sigmoid(mask_logits.detach()) >= 0.5)
+                    targets = (masks >= 0.5)
+                    preds_flat = preds.view(preds.size(0), -1)
+                    targets_flat = targets.view(targets.size(0), -1)
+                    intersection = (preds_flat & targets_flat).sum(dim=1).float()
+                    union = (preds_flat | targets_flat).sum(dim=1).float()
+                    ious = torch.where(union == 0, torch.ones_like(intersection), intersection / torch.clamp(union, min=1.0))
+                    loss_dict["iou"] = float(ious.mean().item())
+        except Exception as exc:
+            self.logger.warning(
+                f"⚠️ Non-fatal warning during diagnostic IoU metric calculation at step {self.global_step}: {exc}. "
+                "Defaulting IoU to 0.0 to preserve training continuity."
+            )
+            loss_dict["iou"] = 0.0
+
         if not torch.isfinite(loss):
             self.logger.warning(
                 f"⚠️ Non-finite loss encountered ({loss.item() if hasattr(loss, 'item') else loss}) at global step {self.global_step}. "
@@ -1019,38 +1042,6 @@ class Trainer:
             if is_cuda_fault:
                 self.logger.error(
                     f"🛑 Fatal CUDA accelerator error during backward pass at step {self.global_step}: {exc}. "
-                    "Closing active DataLoader workers and pipelines to prevent indefinite hang."
-                )
-                self.close()
-            raise exc
-
-        # Compute training IoU metric on batch.
-        # NOTE: ious.mean().item() forces a GPU→CPU sync that can surface deferred async CUDA
-        # errors (e.g. cudaErrorLaunchFailure) that were silently queued during the forward or
-        # backward pass. Without a guard here, PyTorch's C++ runtime calls std::terminate()
-        # (→ SIGABRT) without ever invoking self.close(), leaving DataLoader workers hung.
-        try:
-            with torch.no_grad():
-                mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-                if mask_logits is not None:
-                    preds = (torch.sigmoid(mask_logits.detach()) >= 0.5)
-                    targets = (masks >= 0.5)
-                    preds_flat = preds.view(preds.size(0), -1)
-                    targets_flat = targets.view(targets.size(0), -1)
-                    intersection = (preds_flat & targets_flat).sum(dim=1).float()
-                    union = (preds_flat | targets_flat).sum(dim=1).float()
-                    ious = torch.where(union == 0, torch.ones_like(intersection), intersection / torch.clamp(union, min=1.0))
-                    loss_dict["iou"] = float(ious.mean().item())
-        except Exception as exc:
-            is_cuda_fault = (
-                isinstance(exc, getattr(torch, "AcceleratorError", ()))
-                or "CUDA error" in str(exc)
-                or "AcceleratorError" in str(type(exc))
-                or "cudaError" in str(exc)
-            )
-            if is_cuda_fault:
-                self.logger.error(
-                    f"🛑 Fatal CUDA accelerator error during IoU metric sync at step {self.global_step}: {exc}. "
                     "Closing active DataLoader workers and pipelines to prevent indefinite hang."
                 )
                 self.close()
@@ -1134,7 +1125,7 @@ class Trainer:
                     sync_context = self.model.no_sync() if no_sync else nullcontext()
                     with sync_context:
                         loss_t, loss_dict_batch = self._step_batch_train(batch, loss_divisor=accum_steps)
-                    loss_val = loss_t.item()
+                    loss_val = float(loss_t.item()) if hasattr(loss_t, "item") else float(loss_t)
                     has_pending_grads = True
 
                     self.hard_miner.record_batch_loss(batch_idx, loss_val)

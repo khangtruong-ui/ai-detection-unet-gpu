@@ -341,3 +341,88 @@ def test_trainer_closes_loaders_on_iou_sync_cuda_error():
             "trainer.close() was not invoked when a CUDA error surfaced during IoU metric sync! "
             "DataLoader workers would have hung indefinitely (see .logs.txt bug)."
         )
+
+
+def test_step_batch_train_resilient_to_iou_metric_failure(monkeypatch):
+    """Verify that Trainer._step_batch_train does not crash when diagnostic IoU computation fails.
+    
+    Diagnostic IoU calculation should log a non-fatal warning, default loss_dict['iou'] to 0.0,
+    and proceed with backward pass and training uninterrupted.
+    """
+    from sid_unet.training.trainer import Trainer
+    from sid_unet.utils.config import ConfigDict
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_iou_resilience", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
+            "data": {"image_size": [32, 32], "batch_size": 2},
+            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+            "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False, "amp": False},
+            "logging": {"log_interval": 1, "measure_network": False},
+        })
+        trainer = Trainer(config=cfg)
+
+        batch = {
+            "image": torch.randn(2, 3, 32, 32),
+            "mask": torch.zeros(2, 1, 32, 32),
+        }
+
+        # Simulate failure in torch.sigmoid specifically during diagnostic IoU metric step
+        orig_sigmoid = torch.sigmoid
+        def mock_sigmoid(tensor):
+            if tensor.requires_grad is False:
+                raise RuntimeError("Simulated transient CUDA accelerator error or NaN in IoU calculation")
+            return orig_sigmoid(tensor)
+
+        monkeypatch.setattr(torch, "sigmoid", mock_sigmoid)
+
+        loss, loss_dict = trainer._step_batch_train(batch)
+        assert torch.isfinite(loss)
+        assert "iou" in loss_dict
+        assert loss_dict["iou"] == 0.0
+
+
+def test_step_batch_train_handles_fatal_backward_error_with_cleanup(monkeypatch):
+    """Verify that Trainer._step_batch_train invokes close() and cleans up workers when backward pass encounters fatal CUDA error."""
+    from sid_unet.training.trainer import Trainer
+    from sid_unet.utils.config import ConfigDict
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_backward_cleanup", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
+            "data": {"image_size": [32, 32], "batch_size": 2},
+            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+            "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False, "amp": False},
+            "logging": {"log_interval": 1, "measure_network": False},
+        })
+        trainer = Trainer(config=cfg)
+
+        batch = {
+            "image": torch.randn(2, 3, 32, 32),
+            "mask": torch.zeros(2, 1, 32, 32),
+        }
+
+        closed = False
+        def mock_close():
+            nonlocal closed
+            closed = True
+        trainer.close = mock_close
+
+        class FakeAcceleratorError(Exception):
+            pass
+
+        def mock_backward():
+            raise FakeAcceleratorError("CUDA error: unspecified launch failure (cudaErrorLaunchFailure)")
+
+        scaled_loss_mock = torch.tensor(1.0, requires_grad=True)
+        monkeypatch.setattr(trainer.scaler, "scale", lambda l: type("Scaled", (), {"backward": lambda self: mock_backward()})())
+
+        with pytest.raises(FakeAcceleratorError, match="CUDA error"):
+            trainer._step_batch_train(batch)
+
+        assert closed is True
+

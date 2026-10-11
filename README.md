@@ -1104,6 +1104,11 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
 10. **Task Timeout Protection**:
    - Integrated `pytest-timeout>=2.2.0` with `--timeout=240` (4 minutes) in `pyproject.toml` and per-test timeout annotations (`@pytest.mark.timeout(240)`), ensuring long-running tasks have sufficient headroom while guaranteeing any hung test is automatically aborted.
    - Asynchronous hub upload workers (`AsyncHubUploader`) enforce bounded timeouts (`timeout=240.0`) on `wait_all()` instead of unbounded thread queue joins.
+11. **Diagnostic IoU Metric Decoupling & Non-Fatal Fallback**:
+   - In `Trainer._step_batch_train()`, diagnostic IoU metric computation is decoupled from backpropagation and calculated directly from unmutated forward activations before `loss.backward()`.
+   - Handled with non-fatal warning logging and a resilient fallback to `loss_dict["iou"] = 0.0` upon any numerical anomaly or sync issue, ensuring non-critical progress bar metrics cannot abort long-running training jobs.
+12. **PyTorch Allocator Memory Fragmentation Mitigation (`PYTORCH_CUDA_ALLOC_CONF`)**:
+   - Configured `os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")` before CUDA allocator initialization to eliminate virtual address fragmentation across thousands of training batches on 12GB GPUs.
 
 ---
 

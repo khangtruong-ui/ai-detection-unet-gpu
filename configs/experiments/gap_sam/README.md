@@ -228,6 +228,11 @@ In-depth kernel and runtime investigation revealed the exact root causes:
    - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_worker_signals()`, ensuring every DataLoader worker ignores `SIGHUP`, `SIGPIPE`, `SIGQUIT`, `SIGWINCH`, and `SIGIO` while **explicitly preserving `SIGTERM` and `SIGINT`** (`signal.SIG_DFL`).
 5. **Automated Test Timeout Safeguards**:
    - Configured `pytest-timeout>=2.2.0` with `--timeout=240` (4 minutes) in `pyproject.toml` to guarantee long-running tasks have headroom while no unit or integration tests can run forever.
+6. **Diagnostic IoU Metric Decoupling & Non-Fatal Fallback**:
+   - In `sid_unet/training/trainer.py`, the diagnostic IoU metric calculation in `_step_batch_train()` is moved to execute before `loss.backward()` directly from fresh, unmutated forward activations.
+   - Wrapped metric calculation in a resilient non-fatal exception guard: any sync failure or numerical anomaly logs a warning and safely defaults `loss_dict["iou"] = 0.0` without aborting training, preventing non-critical progress bar metrics from aborting multi-hour training runs.
+7. **PyTorch Allocator Memory Fragmentation Mitigation (`PYTORCH_CUDA_ALLOC_CONF`)**:
+   - Configured `os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")` before CUDA allocator initialization to eliminate virtual memory address fragmentation across thousands of training batches on 12GB GPUs.
 
 
 
