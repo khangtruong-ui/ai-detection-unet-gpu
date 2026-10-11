@@ -1023,18 +1023,37 @@ class Trainer:
                 self.close()
             raise exc
 
-        # Compute training IoU metric on batch
-        with torch.no_grad():
-            mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-            if mask_logits is not None:
-                preds = (torch.sigmoid(mask_logits.detach()) >= 0.5)
-                targets = (masks >= 0.5)
-                preds_flat = preds.view(preds.size(0), -1)
-                targets_flat = targets.view(targets.size(0), -1)
-                intersection = (preds_flat & targets_flat).sum(dim=1).float()
-                union = (preds_flat | targets_flat).sum(dim=1).float()
-                ious = torch.where(union == 0, torch.ones_like(intersection), intersection / torch.clamp(union, min=1.0))
-                loss_dict["iou"] = float(ious.mean().item())
+        # Compute training IoU metric on batch.
+        # NOTE: ious.mean().item() forces a GPU→CPU sync that can surface deferred async CUDA
+        # errors (e.g. cudaErrorLaunchFailure) that were silently queued during the forward or
+        # backward pass. Without a guard here, PyTorch's C++ runtime calls std::terminate()
+        # (→ SIGABRT) without ever invoking self.close(), leaving DataLoader workers hung.
+        try:
+            with torch.no_grad():
+                mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+                if mask_logits is not None:
+                    preds = (torch.sigmoid(mask_logits.detach()) >= 0.5)
+                    targets = (masks >= 0.5)
+                    preds_flat = preds.view(preds.size(0), -1)
+                    targets_flat = targets.view(targets.size(0), -1)
+                    intersection = (preds_flat & targets_flat).sum(dim=1).float()
+                    union = (preds_flat | targets_flat).sum(dim=1).float()
+                    ious = torch.where(union == 0, torch.ones_like(intersection), intersection / torch.clamp(union, min=1.0))
+                    loss_dict["iou"] = float(ious.mean().item())
+        except Exception as exc:
+            is_cuda_fault = (
+                isinstance(exc, getattr(torch, "AcceleratorError", ()))
+                or "CUDA error" in str(exc)
+                or "AcceleratorError" in str(type(exc))
+                or "cudaError" in str(exc)
+            )
+            if is_cuda_fault:
+                self.logger.error(
+                    f"🛑 Fatal CUDA accelerator error during IoU metric sync at step {self.global_step}: {exc}. "
+                    "Closing active DataLoader workers and pipelines to prevent indefinite hang."
+                )
+                self.close()
+            raise exc
 
         return loss, loss_dict
 

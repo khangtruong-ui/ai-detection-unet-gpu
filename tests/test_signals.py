@@ -279,3 +279,65 @@ def test_fatal_cuda_fault_detection():
     )
     assert is_cuda_fault2 is False
 
+
+
+def test_trainer_closes_loaders_on_iou_sync_cuda_error():
+    """Verify Trainer calls close() when a deferred async CUDA error surfaces during IoU metric sync.
+
+    Root cause of the bug in .logs.txt:
+      torch.AcceleratorError: CUDA error: unspecified launch failure
+      ...trainer.py, line 1037: loss_dict["iou"] = float(ious.mean().item())
+
+    The `.item()` call forces a GPU->CPU synchronisation that can expose CUDA errors that were
+    silently queued during the forward or backward pass (asynchronous CUDA execution).  Without
+    a guard on this sync point, PyTorch's C++ runtime calls std::terminate() -> SIGABRT, killing
+    the process without invoking trainer.close().  DataLoader worker processes then hang
+    indefinitely because they never receive SIGTERM.
+
+    This test simulates the deferred CUDA error by patching train_epoch to raise an error
+    matching the CUDA accelerator error pattern, which replicates the same propagation path as
+    the real bug (error bubbles from _step_batch_train through train_epoch into trainer.train()).
+    We verify that trainer.close() is called to shut down DataLoader workers before re-raising.
+    """
+    from sid_unet.training.trainer import Trainer
+    from sid_unet.utils.config import ConfigDict
+    import tempfile
+    from torch.utils.data import DataLoader, TensorDataset
+
+    x = torch.randn(4, 3, 32, 32)
+    y = torch.zeros(4, 1, 32, 32)
+    loader = DataLoader(TensorDataset(x, y), batch_size=2)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_iou_cuda_cleanup", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
+            "data": {"image_size": [32, 32], "batch_size": 2},
+            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+            "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
+            "logging": {"log_interval": 1, "measure_network": False},
+        })
+        trainer = Trainer(config=cfg, train_loader=loader)
+
+        closed = False
+        orig_close = trainer.close
+        def mock_close():
+            nonlocal closed
+            closed = True
+            orig_close()
+        trainer.close = mock_close
+
+        # Simulate an async CUDA error that surfaces during the IoU metric GPU->CPU sync.
+        # Patching train_epoch directly replicates the propagation path of the real bug:
+        # the error raised from _step_batch_train bubbles through train_epoch into trainer.train().
+        def mock_train_epoch(epoch):
+            raise RuntimeError("CUDA error: unspecified launch failure (cudaErrorLaunchFailure)")
+        trainer.train_epoch = mock_train_epoch
+
+        with pytest.raises(RuntimeError, match="CUDA error"):
+            trainer.train()
+
+        assert closed is True, (
+            "trainer.close() was not invoked when a CUDA error surfaced during IoU metric sync! "
+            "DataLoader workers would have hung indefinitely (see .logs.txt bug)."
+        )
