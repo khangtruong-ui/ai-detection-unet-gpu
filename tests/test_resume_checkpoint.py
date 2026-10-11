@@ -750,4 +750,186 @@ def test_hard_mining_anchor_epoch_shuffle_reproducibility():
         assert miner.is_hard_mining_active(ep) is True
 
 
+# ---------------------------------------------------------------------------
+# Tests for the best_score sentinel corruption bug (best_score = inf / -inf)
+# ---------------------------------------------------------------------------
+
+def test_load_checkpoint_inf_best_score_reset_for_max_mode():
+    """
+    Regression test: if a checkpoint was saved with best_score=+inf (the initial sentinel for
+    mode='min', or a run interrupted before any validation), loading it into a mode='max'
+    CheckpointManager must NOT keep best_score=+inf — that would make is_better() always return
+    False and prevent any checkpoint from ever being saved as 'best'.
+
+    The fix resets best_score to the correct sentinel for the current mode (-inf for mode='max').
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(4, 4)
+        ckpt_path = os.path.join(tmpdir, "ckpt_inf_best.pt")
+        torch.save({
+            "epoch": 1,
+            "step": 100,
+            "model_state_dict": model.state_dict(),
+            "best_score": float("inf"),   # <- corrupted / wrong-side sentinel
+            "best_epoch": -1,
+            "metrics": {},
+        }, ckpt_path)
+
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_iou", mode="max")
+        mgr.load_checkpoint(ckpt_path, model=model)
+
+        # Must NOT be +inf after loading — that would freeze is_better() to always-False
+        assert mgr.best_score != float("inf"), (
+            "best_score must not remain +inf for a mode='max' manager after loading a corrupted "
+            "checkpoint; is_better() would always return False."
+        )
+        # Must be reset to the correct max-mode sentinel
+        assert mgr.best_score == float("-inf"), (
+            f"Expected best_score to be reset to -inf (max-mode sentinel) but got {mgr.best_score}"
+        )
+        # is_better() must now work: any finite score beats -inf
+        assert mgr.is_better(0.5) is True
+        assert mgr.is_better(0.0) is True
+
+
+def test_load_checkpoint_neg_inf_best_score_reset_for_min_mode():
+    """
+    Symmetric case: a checkpoint saved with best_score=-inf (the initial sentinel for
+    mode='max') loaded into a mode='min' CheckpointManager must be reset to +inf (the
+    correct sentinel for min mode) so is_better() isn't permanently frozen to False.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(4, 4)
+        ckpt_path = os.path.join(tmpdir, "ckpt_neginf_best.pt")
+        torch.save({
+            "epoch": 2,
+            "step": 200,
+            "model_state_dict": model.state_dict(),
+            "best_score": float("-inf"),  # <- wrong-side sentinel for mode='min'
+            "best_epoch": -1,
+            "metrics": {},
+        }, ckpt_path)
+
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_loss", mode="min")
+        mgr.load_checkpoint(ckpt_path, model=model)
+
+        assert mgr.best_score != float("-inf"), (
+            "best_score must not remain -inf for a mode='min' manager."
+        )
+        assert mgr.best_score == float("inf"), (
+            f"Expected best_score to be reset to +inf (min-mode sentinel) but got {mgr.best_score}"
+        )
+        # is_better() must now work: any finite loss beats +inf
+        assert mgr.is_better(0.5) is True
+        assert mgr.is_better(99.0) is True
+
+
+def test_load_checkpoint_nan_best_score_reset_for_max_mode():
+    """
+    A NaN best_score must also be sanitized (all comparisons with NaN return False, permanently
+    freezing is_better()).
+    """
+    import math
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(4, 4)
+        ckpt_path = os.path.join(tmpdir, "ckpt_nan_best.pt")
+        torch.save({
+            "epoch": 3,
+            "model_state_dict": model.state_dict(),
+            "best_score": float("nan"),
+            "metrics": {},
+        }, ckpt_path)
+
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_iou", mode="max")
+        mgr.load_checkpoint(ckpt_path, model=model)
+
+        assert not math.isnan(mgr.best_score), "NaN best_score must be sanitized after load."
+        assert mgr.best_score == float("-inf")
+        assert mgr.is_better(0.01) is True
+
+
+def test_load_checkpoint_valid_best_score_preserved():
+    """
+    A valid, finite best_score that is compatible with the current mode must be preserved exactly
+    (no inadvertent reset).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(4, 4)
+        ckpt_path = os.path.join(tmpdir, "ckpt_valid_best.pt")
+        torch.save({
+            "epoch": 5,
+            "model_state_dict": model.state_dict(),
+            "best_score": 0.812,
+            "metrics": {},
+        }, ckpt_path)
+
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_iou", mode="max")
+        mgr.load_checkpoint(ckpt_path, model=model)
+
+        assert abs(mgr.best_score - 0.812) < 1e-9, (
+            f"Valid best_score 0.812 must not be modified; got {mgr.best_score}"
+        )
+        # A score less than the best must not be accepted
+        assert mgr.is_better(0.5) is False
+        # A score greater than the best must be accepted
+        assert mgr.is_better(0.9) is True
+
+
+def test_is_better_never_frozen_after_inf_checkpoint_reload():
+    """
+    End-to-end regression: simulate the exact production failure scenario.
+
+    1. A training run is interrupted before any validation; the emergency checkpoint is
+       saved with best_score=inf (the initial mode='min' sentinel — wrong for mode='max').
+    2. The run is resumed; CheckpointManager loads the checkpoint.
+    3. After the fix, is_better() must correctly identify improvement so that a new best
+       checkpoint is saved when validation produces a real IoU score.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = torch.nn.Linear(4, 4)
+
+        # Step 1: Simulate a checkpoint saved before any validation epoch completed,
+        # e.g. interrupted mid-epoch with best_score still at its initial inf value.
+        interrupted_ckpt = os.path.join(tmpdir, "checkpoint_latest.pt")
+        torch.save({
+            "epoch": 1,
+            "step": 18324,
+            "model_state_dict": model.state_dict(),
+            "best_score": float("inf"),   # <- exactly what we saw in the production logs
+            "best_epoch": -1,
+            "metrics": {"resumed_from": "/some/previous.pt", "step": 18324},
+            "history": [],
+        }, interrupted_ckpt)
+
+        # Step 2: Resume with mode='max' (IoU-based) — the standard training configuration
+        mgr = CheckpointManager(checkpoint_dir=tmpdir, metric_name="val_iou", mode="max")
+        mgr.load_checkpoint(interrupted_ckpt, model=model)
+
+        # Step 3: Simulate first validation after resume reporting a real IoU score
+        val_iou_epoch_1 = 0.73
+
+        # Before the fix this returned False, silently preventing any best checkpoint
+        assert mgr.is_better(val_iou_epoch_1) is True, (
+            "is_better() must return True for the first real validation score after resuming "
+            "from a checkpoint that had best_score=inf. "
+            "This was the root cause of the production bug where best_score remained inf forever."
+        )
+
+        # Saving the checkpoint should update best_score
+        mgr.save(
+            epoch=1,
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+            scheduler=None,
+            metrics={"val_iou": val_iou_epoch_1},
+            config={},
+            step=18324,
+        )
+        assert abs(mgr.best_score - val_iou_epoch_1) < 1e-9, (
+            f"After the first valid epoch, best_score must be updated to {val_iou_epoch_1}, "
+            f"got {mgr.best_score}"
+        )
+
+
+
 

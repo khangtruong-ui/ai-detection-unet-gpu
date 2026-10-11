@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import math
 import os
 import time
 import warnings
@@ -585,6 +586,27 @@ class CheckpointManager:
                 self.best_epoch = int(checkpoint["best_epoch"])
             elif "epoch" in checkpoint and checkpoint["epoch"] is not None:
                 self.best_epoch = int(checkpoint["epoch"])
+
+        # Sanitize best_score: if the loaded value is NaN or the wrong-side sentinel for
+        # the current mode, reset it to the correct initial sentinel so that is_better()
+        # works correctly from the very first epoch.
+        #
+        # Sentinel clash scenarios that cause silent corruption:
+        #   - mode="max" but best_score=+inf  → is_better(x) = x > inf = always False
+        #     (checkpoint was saved before any validation, or originated from a mode="min" run)
+        #   - mode="min" but best_score=-inf  → is_better(x) = x < -inf = always False
+        #     (same, but the other direction)
+        #   - best_score=NaN                  → all comparisons return False
+        _correct_sentinel = float("-inf") if self.mode == "max" else float("inf")
+        _wrong_sentinel   = float("inf")  if self.mode == "max" else float("-inf")
+        if math.isnan(self.best_score) or self.best_score == _wrong_sentinel:
+            logger.warning(
+                f"⚠️ [CHECKPOINT] Restored best_score={self.best_score!r} is incompatible with "
+                f"mode='{self.mode}' (would make is_better() always return False). "
+                f"Resetting to initial sentinel {_correct_sentinel!r} so the first real validation "
+                f"score will be accepted as the new best."
+            )
+            self.best_score = _correct_sentinel
 
         epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
         step = int(checkpoint.get("step", 0)) if isinstance(checkpoint, dict) and checkpoint.get("step") is not None else None

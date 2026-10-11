@@ -1989,7 +1989,7 @@ $$
 Run the complete test suite with `pytest`:
 
 ```bash
-# Run all unit and integration tests (default 60s timeout enforced via pytest-timeout)
+# Run all unit and integration tests (4-minute timeout enforced via pytest-timeout)
 pytest
 
 # Run tests with detailed verbose output
@@ -2005,7 +2005,7 @@ pytest --timeout=30
 pytest --cov=sid_unet
 ```
 
-All tests run cleanly in offline environments without network access. Automatic 60-second timeouts are configured in `pyproject.toml` via `pytest-timeout` to prevent hanging processes.
+All tests run cleanly in offline environments without network access. Automatic **240-second (4-minute) timeouts** are configured in `pyproject.toml` via `pytest-timeout` to prevent hanging processes.
 
 ---
 
