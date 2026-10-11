@@ -1051,6 +1051,14 @@ if is_exceeded:
     guard.recover_memory()
 ```
 
+##### Resilient OOM & cuBLAS/cuDNN Workspace Error Recovery
+Under near-exhausted VRAM conditions, matrix multiplication operations in cuBLAS and convolutions in cuDNN frequently raise driver-level workspace failures (e.g., `gemm_and_bias error: CUBLAS_STATUS_INTERNAL_ERROR`, `cublasSgemm: CUBLAS_STATUS_INTERNAL_ERROR`, `CUDNN_STATUS_ALLOC_FAILED`) rather than standard `torch.cuda.OutOfMemoryError`.
+
+To guarantee robust automated batch sizing:
+1. **Comprehensive Error Recognition (`is_oom_error`)**: Matches standard PyTorch OOM exceptions as well as cuBLAS/cuDNN status internal errors, workspace allocation failures, and CUDA memory allocation faults.
+2. **Traceback Reference Purging**: Explicitly deletes all candidate activation, output, loss tensors, and the exception traceback object (`del exc`) upon probe failures to immediately return VRAM to the CUDA caching allocator before probing subsequent smaller candidates.
+3. **Safe Auto-Scaling Fallback**: If an unhandled probe exception occurs, `Trainer` falls back conservatively (`max(1, min(current_bs // 2, 4))`) and scales `gradient_accumulation_steps` rather than proceeding with an unverified large batch size, eliminating step-0 crashes.
+
 ---
 
 ### 11. Runtime Learnability Diagnostics & Debug Mode (nn-toolbox)

@@ -432,3 +432,107 @@ def test_trainer_with_max_memory_fraction():
         results = trainer.train()
         assert "best_score" in results
 
+
+def test_is_oom_error_recognizes_cublas_and_cudnn_status_errors():
+    """Verify is_oom_error correctly identifies cuBLAS and cuDNN allocation / workspace failures from .logs.txt."""
+    cublas_sgemm_err = RuntimeError(
+        "CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling cublasSgemm( handle, opa, opb, m, n, k, &alpha, a, lda, b, ldb, &beta, c, ldc)"
+    )
+    cublas_lt_err = RuntimeError(
+        "gemm_and_bias error: CUBLAS_STATUS_INTERNAL_ERROR when calling cublasLtMatmul with transpose_mat1 1 transpose_mat2 0 m 256 n 3208 k 2048"
+    )
+    cublas_alloc_err = RuntimeError("CUBLAS_STATUS_ALLOC_FAILED")
+    cudnn_alloc_err = RuntimeError("CUDNN_STATUS_ALLOC_FAILED")
+    cudnn_internal_err = RuntimeError("CUDNN_STATUS_INTERNAL_ERROR")
+    cuda_mem_err = RuntimeError("cudaErrorMemoryAllocation")
+
+    assert is_oom_error(cublas_sgemm_err) is True
+    assert is_oom_error(cublas_lt_err) is True
+    assert is_oom_error(cublas_alloc_err) is True
+    assert is_oom_error(cudnn_alloc_err) is True
+    assert is_oom_error(cudnn_internal_err) is True
+    assert is_oom_error(cuda_mem_err) is True
+
+
+def test_find_optimal_batch_size_recovers_from_cublas_internal_error(monkeypatch):
+    """
+    Verify that when candidate batch size 16 fails with CUBLAS_STATUS_INTERNAL_ERROR
+    (as seen in .logs.txt), find_optimal_batch_size cleans up and recovers with a smaller batch size.
+    """
+    class MockModelWithCublasFailure(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(64, 64)
+            self.aux_classifier = False
+
+        def forward(self, x):
+            if x.shape[0] > 4:
+                raise RuntimeError(
+                    "CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling cublasSgemm( handle, opa, opb, m, n, k, &alpha, a, lda, b, ldb, &beta, c, ldc)"
+                )
+            return self.linear(x.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
+
+    model = MockModelWithCublasFailure()
+    safe_bs = find_optimal_batch_size(
+        model=model,
+        sample_shape=(3, 32, 32),
+        device=torch.device("cpu"),
+        max_batch_size=16,
+        min_batch_size=1,
+        force_probe=True,
+    )
+    # Batch size 16 and 8 should fail with CUBLAS error, recovering at batch size <= 4
+    assert safe_bs <= 4
+    assert safe_bs >= 1
+
+
+def test_trainer_auto_scale_fallback_on_probe_exception(monkeypatch):
+    """
+    Verify Trainer._check_and_auto_scale_batch_size falls back to safe batch size
+    if find_optimal_batch_size raises an unexpected exception, preventing OOM crash on step 0.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "training.batch_size=16",
+            "training.auto_batch_size=true",
+            "training.gradient_accumulation_steps=1",
+            "model.features=[16, 32]",
+            "data.image_size=[32, 32]",
+            "training.amp=false",
+        ])
+
+        train_ds = DummyDataset(size=16, img_size=(32, 32))
+        val_ds = DummyDataset(size=4, img_size=(32, 32))
+
+        train_loader = DataLoader(train_ds, batch_size=16)
+        val_loader = DataLoader(val_ds, batch_size=4)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        import sid_unet.training.trainer as tr_mod
+        def mock_failing_probe(*args, **kwargs):
+            raise RuntimeError("CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling cublasSgemm")
+
+        monkeypatch.setattr(tr_mod, "find_optimal_batch_size", mock_failing_probe)
+
+        # Force device type check bypass for test on CPU
+        from unittest.mock import MagicMock
+        mock_dev = MagicMock()
+        mock_dev.type = "cuda"
+        monkeypatch.setattr(trainer, "device", mock_dev)
+
+        # Execute auto scale probe with failing probe
+        trainer._check_and_auto_scale_batch_size()
+
+        # Should NOT remain at unsafe batch_size=16; should fall back to safe batch size <= 4
+        assert trainer.config.data.batch_size <= 4
+        assert trainer.gradient_accumulation_steps >= 4
+        assert trainer.config.data.batch_size * trainer.gradient_accumulation_steps == 16
+

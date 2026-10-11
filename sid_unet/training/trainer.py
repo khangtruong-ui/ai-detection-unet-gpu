@@ -955,15 +955,59 @@ class Trainer:
                 self.config.training.gradient_accumulation_steps = adjusted_grad_accum
                 self.gradient_accumulation_steps = adjusted_grad_accum
 
-                from sid_unet.dataset.loader import create_dataloaders
-                eval_test = bool(self.config.data.get("evaluate_on_test", False))
-                loaders = create_dataloaders(self.config, include_test=eval_test)
-                if eval_test:
-                    self.train_loader, self.val_loader, self.test_loader = loaders
-                else:
-                    self.train_loader, self.val_loader = loaders
+                try:
+                    from sid_unet.dataset.loader import create_dataloaders
+                    eval_test = bool(self.config.data.get("evaluate_on_test", False))
+                    loaders = create_dataloaders(self.config, include_test=eval_test)
+                    if eval_test:
+                        self.train_loader, self.val_loader, self.test_loader = loaders
+                    else:
+                        self.train_loader, self.val_loader = loaders
+                except Exception:
+                    if self.train_loader is not None and hasattr(self.train_loader, "dataset"):
+                        self.train_loader = DataLoader(
+                            self.train_loader.dataset,
+                            batch_size=adjusted_bs,
+                            shuffle=isinstance(getattr(self.train_loader, "sampler", None), torch.utils.data.RandomSampler),
+                            drop_last=getattr(self.train_loader, "drop_last", False),
+                        )
         except Exception as e:
-            self.logger.warning(f"Auto batch sizing probe encountered warning: {e}")
+            self.logger.warning(
+                f"⚠️ Auto batch sizing probe encountered warning: {e}. "
+                f"Falling back to conservative safe batch size to prevent OOM crash."
+            )
+            fallback_bs = max(1, min(current_bs // 2, 4))
+            if fallback_bs < current_bs:
+                adjusted_bs, adjusted_grad_accum = auto_scale_batch_size_and_grad_accum(
+                    requested_batch_size=current_bs,
+                    safe_batch_size=fallback_bs,
+                    current_grad_accum=self.gradient_accumulation_steps,
+                )
+                self.logger.warning(
+                    f"⚡ Auto Batch Sizing Fallback: Scaling batch size {current_bs} -> {adjusted_bs} "
+                    f"with gradient_accumulation_steps={adjusted_grad_accum} "
+                    f"(Preserving effective batch size: {current_bs * self.gradient_accumulation_steps})."
+                )
+                self.config.data.batch_size = adjusted_bs
+                self.config.training.gradient_accumulation_steps = adjusted_grad_accum
+                self.gradient_accumulation_steps = adjusted_grad_accum
+
+                try:
+                    from sid_unet.dataset.loader import create_dataloaders
+                    eval_test = bool(self.config.data.get("evaluate_on_test", False))
+                    loaders = create_dataloaders(self.config, include_test=eval_test)
+                    if eval_test:
+                        self.train_loader, self.val_loader, self.test_loader = loaders
+                    else:
+                        self.train_loader, self.val_loader = loaders
+                except Exception:
+                    if self.train_loader is not None and hasattr(self.train_loader, "dataset"):
+                        self.train_loader = DataLoader(
+                            self.train_loader.dataset,
+                            batch_size=adjusted_bs,
+                            shuffle=isinstance(getattr(self.train_loader, "sampler", None), torch.utils.data.RandomSampler),
+                            drop_last=getattr(self.train_loader, "drop_last", False),
+                        )
         finally:
             clear_memory_cache(self.device)
             gc.collect()

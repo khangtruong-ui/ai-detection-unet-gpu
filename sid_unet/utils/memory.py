@@ -16,9 +16,9 @@ import torch.nn as nn
 
 def is_oom_error(exc: BaseException) -> bool:
     """
-    Check whether an exception was caused by CUDA or host memory exhaustion (Out of Memory).
-    Handles torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, MemoryError, and
-    RuntimeError with CUDA OOM message patterns.
+    Check whether an exception was caused by CUDA or host memory exhaustion (Out of Memory),
+    including driver OOM, PyTorch OutOfMemoryError, CUDA allocator failures, and cuBLAS/cuDNN
+    workspace allocation failures (e.g. CUBLAS_STATUS_INTERNAL_ERROR, CUBLAS_STATUS_ALLOC_FAILED).
     """
     if isinstance(exc, (MemoryError, getattr(torch, "OutOfMemoryError", ()))) or (
         hasattr(torch.cuda, "OutOfMemoryError") and isinstance(exc, torch.cuda.OutOfMemoryError)
@@ -36,8 +36,30 @@ def is_oom_error(exc: BaseException) -> bool:
         "trying to allocate",
         "cudamalloc",
         "hip out of memory",
+        "cublas_status_alloc_failed",
+        "cublas_status_internal_error",
+        "cublas_status_not_initialized",
+        "cublassgemm",
+        "cublasltmatmul",
+        "gemm_and_bias error",
+        "cudnn_status_alloc_failed",
+        "cudnn_status_internal_error",
+        "cudaerrormemoryallocation",
+        "cuda error: memory allocation",
     ]
-    return any(pattern in exc_msg for pattern in oom_patterns)
+    if any(pattern in exc_msg for pattern in oom_patterns):
+        return True
+
+    # General cuBLAS and cuDNN allocation / workspace exhaustion failures
+    if ("cublas" in exc_msg or "cudnn" in exc_msg) and (
+        "internal_error" in exc_msg
+        or "alloc" in exc_msg
+        or "not_initialized" in exc_msg
+        or "failed" in exc_msg
+    ):
+        return True
+
+    return False
 
 
 def clear_memory_cache(device: Optional[Union[str, torch.device]] = None) -> None:
@@ -455,20 +477,41 @@ def find_optimal_batch_size(
     try:
         # Pre-warmup step with min_batch_size on CUDA to initialize CUDA runtime, cuDNN algorithms and autograd engine
         if device.type == "cuda" and torch.cuda.is_available():
+            w_img = None
+            w_out = None
+            w_loss = None
             try:
                 clear_memory_cache(device)
                 w_img = torch.randn(min_batch_size, c, h, w, device=device)
+                w_kwargs: Dict[str, Any] = {}
+                is_gap_sam = (
+                    getattr(model, "model_name", "") in ("gap_sam", "gap-sam", "gapsam")
+                    or getattr(model, "is_gap_sam", False)
+                    or hasattr(model, "bypass_vae_for_cached_training")
+                    or getattr(model, "vae_bypassed", False)
+                )
+                if is_gap_sam or hasattr(model, "forward_cached"):
+                    w_kwargs["f_r"] = torch.zeros(min_batch_size, 256, device=device)
+
                 with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                    w_out = model(w_img)
+                    w_out = model(w_img, **w_kwargs) if w_kwargs else model(w_img)
                     w_loss = w_out[0].mean() if isinstance(w_out, (tuple, list)) else w_out.mean()
                 scaler.scale(w_loss).backward()
                 optimizer.zero_grad(set_to_none=True)
-                del w_img, w_out, w_loss
-                clear_memory_cache(device)
             except Exception:
                 pass
+            finally:
+                del w_img, w_out, w_loss
+                clear_memory_cache(device)
 
         for bs in candidates:
+            images = None
+            masks = None
+            labels = None
+            outputs = None
+            loss = None
+            pred_tensor = None
+            probe_kwargs = None
             clear_memory_cache(device)
             free_start = 0
             total_bytes = 1
@@ -487,7 +530,7 @@ def find_optimal_batch_size(
 
                 optimizer.zero_grad(set_to_none=True)
 
-                probe_kwargs: Dict[str, Any] = {}
+                probe_kwargs = {}
                 is_gap_sam = (
                     getattr(model, "model_name", "") in ("gap_sam", "gap-sam", "gapsam")
                     or getattr(model, "is_gap_sam", False)
@@ -538,7 +581,7 @@ def find_optimal_batch_size(
                     peak_fraction = summary.get("usage_fraction", 0.0)
 
                 # Cleanup dummy tensors
-                del images, masks, labels, outputs, loss
+                del images, masks, labels, outputs, loss, pred_tensor, probe_kwargs
                 clear_memory_cache(device)
 
                 # Evaluate against memory threshold
@@ -561,15 +604,24 @@ def find_optimal_batch_size(
                 break
 
             except Exception as exc:
+                # Crucial: release all tensor references immediately to free VRAM for next candidate
+                del images, masks, labels, outputs, loss, pred_tensor, probe_kwargs
+                if hasattr(model, "zero_grad"):
+                    model.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
+                clear_memory_cache(device)
+
                 if is_oom_error(exc):
                     if logger:
                         logger.warning(f"⚠️ Batch size {bs} triggered OOM on {device}. Trying smaller candidate...")
-                    clear_memory_cache(device)
-                    optimizer.zero_grad(set_to_none=True)
                 else:
-                    # If error is not memory related, raise it
-                    clear_memory_cache(device)
-                    raise exc
+                    if logger:
+                        logger.warning(
+                            f"⚠️ Batch size {bs} probe encountered error on {device}: {exc}. "
+                            f"Trying smaller candidate..."
+                        )
+                del exc
+                continue
 
         if not found_safe_candidate and logger:
             logger.warning(
