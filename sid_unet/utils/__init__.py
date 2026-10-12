@@ -1,4 +1,4 @@
-from sid_unet.utils.config import ConfigDict, load_config, save_config, apply_overrides
+from sid_unet.utils.config import ConfigDict, load_config, save_config, apply_overrides, copy_config
 from sid_unet.utils.logger import (
     setup_logger,
     get_logger,
@@ -50,6 +50,7 @@ __all__ = [
     "load_config",
     "save_config",
     "apply_overrides",
+    "copy_config",
     "setup_logger",
     "get_logger",
     "install_exception_logger",

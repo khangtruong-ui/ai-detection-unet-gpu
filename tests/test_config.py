@@ -1,7 +1,7 @@
 import os
 import tempfile
 import pytest
-from sid_unet.utils.config import load_config, save_config, apply_overrides, ConfigDict, DEFAULT_CONFIG
+from sid_unet.utils.config import load_config, save_config, apply_overrides, copy_config, ConfigDict, DEFAULT_CONFIG
 
 
 def test_default_config_loading():
@@ -35,6 +35,21 @@ def test_save_and_load_config():
         loaded_cfg = load_config(config_path)
         assert loaded_cfg.project.name == "custom_experiment"
         assert loaded_cfg.model.name == "unet"
+
+
+def test_copy_config_utility():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = os.path.join(tmpdir, "base.yaml")
+        dst = os.path.join(tmpdir, "copied.yaml")
+        save_config({"data": {"image_size": [256, 256], "batch_size": 8}}, src)
+
+        res = copy_config(src, dst, overrides=["data.image_size=[512,512]", "data.batch_size=4"])
+        assert res["data"]["image_size"] == [512, 512]
+        assert res["data"]["batch_size"] == 4
+
+        loaded = load_config(dst)
+        assert loaded.data.image_size == [512, 512]
+        assert loaded.data.batch_size == 4
 
 
 def test_test_configs_loading():

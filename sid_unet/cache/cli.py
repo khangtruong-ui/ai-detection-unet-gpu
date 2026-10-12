@@ -54,11 +54,17 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Local directory to store cached Parquet shards (default: 'outputs/dataset_cache')",
     )
     parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help="Config overrides in key.nested=value format (e.g., --override data.image_size=[512,512])",
+    )
+    parser.add_argument(
         "--batch-size",
         "--batch_size",
         type=int,
-        default=8,
-        help="Batch size for feature extraction (default: 8)",
+        default=None,
+        help="Batch size for feature extraction (default: 8 or from config)",
     )
     parser.add_argument(
         "--splits",
@@ -159,7 +165,8 @@ def cli_main(args: Optional[list] = None) -> None:
         logger.error(f"Config file not found: {parsed_args.config}")
         sys.exit(1)
 
-    cfg = load_config(parsed_args.config)
+    overrides = list(parsed_args.override or [])
+    cfg = load_config(parsed_args.config, overrides=overrides)
     source_dataset = parsed_args.dataset_name or cfg.data.get("dataset_name", "KhangTruong/COCO-inpainted")
     hf_repo = parsed_args.hf_repo or cfg.data.get("cached_hf_repo", None)
 
@@ -177,13 +184,14 @@ def cli_main(args: Optional[list] = None) -> None:
     model = build_model(cfg).to(device)
 
     img_size = tuple(cfg.data.get("image_size", [256, 256]))
+    batch_size = parsed_args.batch_size if parsed_args.batch_size is not None else cfg.data.get("batch_size", 8)
 
     manager = DatasetCacheManager(
         model=model,
         source_dataset_name=source_dataset,
         output_dir=parsed_args.output_dir,
         hf_repo_id=hf_repo,
-        batch_size=parsed_args.batch_size,
+        batch_size=batch_size,
         samples_per_shard=parsed_args.samples_per_shard,
         image_size=img_size,
         device=device,

@@ -1219,7 +1219,14 @@ python -m sid_unet.train --check-8bit
 │   ├── evaluate.py                   # CLI: sid-eval
 │   ├── cross_eval.py                 # CLI: sid-cross-eval
 │   ├── predict.py                    # CLI: sid-predict
-│   └── illustration.py               # CLI: sid-illu
+│   ├── illustration.py               # CLI: sid-illu
+│   ├── config_copy.py                # CLI: sid-copy-config
+│   ├── cache/                        # CLI: sid-cache / sid-dataset-cache
+│   │   ├── cli.py                    # CLI parser and cache extraction runner
+│   │   ├── manager.py                # Asynchronous sharded dataset caching pipeline
+│   │   ├── extractor.py              # Zero-leakage representation extractors
+│   │   └── dataset.py                # Cached parquet dataset and PyTorch dataloaders
+│   └── checkpoint_sync.py            # CLI: sid-push / sid-pull / sid-checkpoint
 ├── tests/
 ├── pyproject.toml
 └── README.md
@@ -1230,6 +1237,21 @@ python -m sid_unet.train --check-8bit
 ## Configuration System
 
 Configurations are organized into modular, human-readable YAML files located in `configs/`. Any config setting can also be dynamically overridden from the CLI using `--override key.nested=value`.
+
+### Fast Configuration Duplication & Modification (`sid-copy-config`)
+
+Easily duplicate, specialize, and override any configuration file in a single command using `sid-copy-config`:
+
+```bash
+# Duplicate and modify configuration with dot-notation overrides:
+sid-copy-config \
+  configs/experiments/diffusion_diff_minimized/default.yaml \
+  configs/experiments/diffusion_diff_minimized/diffusion_diff_minimized_512.yaml \
+  --override data.image_size=[512,512] project.name="diffusion_diff_minimized_512" project.output_dir="outputs/experiments/diffusion_diff_minimized_512"
+
+# Inspect modified YAML directly on stdout without writing to disk:
+sid-copy-config configs/default.yaml --print --override data.batch_size=32 data.streaming=true
+```
 
 ### 1. Configuration Field Reference
 
@@ -1921,6 +1943,13 @@ sid-cache \
   --output-dir datasets/test-cache \
   --max-samples 100 \
   --no-push-to-hub
+
+# 6. High-resolution cache extraction with dynamic CLI overrides:
+sid-cache \
+  --config configs/experiments/diffusion_diff_minimized/default.yaml \
+  --override data.image_size=[512,512] \
+  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --delete-local-on-upload
 ```
 
 #### B. High-Speed Training with Cached Representations (`--cached-hf-repo`)

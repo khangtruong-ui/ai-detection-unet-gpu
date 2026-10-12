@@ -254,3 +254,56 @@ def save_config(config: Union[ConfigDict, Dict[str, Any]], save_path: str) -> No
     dict_data = config.to_dict() if isinstance(config, ConfigDict) else config
     with open(save_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(dict_data, f, default_flow_style=False, sort_keys=False)
+
+
+def copy_config(
+    source_path: str,
+    dest_path: Optional[str] = None,
+    overrides: Optional[Union[list[str], Sequence[str], str]] = None,
+    merge_defaults: bool = False,
+) -> Dict[str, Any]:
+    """
+    Duplicate a YAML configuration file, apply key.nested=value overrides,
+    and optionally save to a destination path.
+
+    Args:
+        source_path: Path to source YAML configuration file.
+        dest_path: Optional destination path to write the modified config.
+                   If dest_path is an existing directory or ends with '/', the source filename is appended.
+        overrides: List of CLI override strings in 'key.nested=value' format.
+        merge_defaults: Whether to deep merge source with DEFAULT_CONFIG first
+                        (default: False, preserving source file keys and structure).
+
+    Returns:
+        The resulting configuration dictionary.
+    """
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Configuration file not found: {source_path}")
+
+    if isinstance(overrides, str):
+        overrides_list = [overrides]
+    elif overrides:
+        overrides_list = list(overrides)
+    else:
+        overrides_list = []
+
+    if merge_defaults:
+        cfg = load_config(source_path, overrides=overrides_list if overrides_list else None)
+        config_dict = cfg.to_dict()
+    else:
+        with open(source_path, "r", encoding="utf-8") as f:
+            raw_dict = yaml.safe_load(f) or {}
+        if not isinstance(raw_dict, dict):
+            raise ValueError(f"Invalid YAML content in '{source_path}': expected dictionary root, got {type(raw_dict).__name__}")
+        if overrides_list:
+            raw_dict = apply_overrides(raw_dict, overrides_list)
+        config_dict = raw_dict
+
+    if dest_path is not None and dest_path != "-":
+        target_file = dest_path
+        if os.path.isdir(target_file) or target_file.endswith(("/", "\\")):
+            target_file = os.path.join(target_file, os.path.basename(source_path))
+        save_config(config_dict, target_file)
+
+    return config_dict
+

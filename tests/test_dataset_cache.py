@@ -213,6 +213,7 @@ def test_cache_cli_parser():
         "--config", "configs/experiments/diffusion_diff_minimized/default.yaml",
         "--dataset", "KhangTruong/COCO-inpainted",
         "--hf-repo", "KhangTruong/COCO-inpainted-cache",
+        "--override", "data.image_size=[512,512]", "data.batch_size=4",
         "--batch-size", "16",
         "--max-samples", "100",
         "--push-to-hub",
@@ -220,9 +221,37 @@ def test_cache_cli_parser():
     assert args.config == "configs/experiments/diffusion_diff_minimized/default.yaml"
     assert args.dataset_name == "KhangTruong/COCO-inpainted"
     assert args.hf_repo == "KhangTruong/COCO-inpainted-cache"
+    assert args.override == ["data.image_size=[512,512]", "data.batch_size=4"]
     assert args.batch_size == 16
     assert args.max_samples == 100
     assert args.push_to_hub is True
+
+
+def test_cache_cli_with_override(monkeypatch):
+    """Test sid-cache CLI invocation with --override data.image_size=[512,512]."""
+    from sid_unet.cache.cli import cli_main
+
+    captured_kwargs = {}
+
+    class MockDatasetCacheManager:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def cache_all_splits(self, **kwargs):
+            return {"train": ["mock_shard_0.parquet"]}
+
+    monkeypatch.setattr("sid_unet.cache.cli.DatasetCacheManager", MockDatasetCacheManager)
+    monkeypatch.setattr("sid_unet.cache.cli.build_model", lambda cfg: torch.nn.Identity())
+
+    cli_main([
+        "--config", "configs/experiments/diffusion_diff_minimized/default.yaml",
+        "--override", "data.image_size=[512,512]",
+        "--no-push-to-hub",
+        "--max-samples", "2",
+    ])
+
+    assert captured_kwargs["image_size"] == (512, 512)
+    assert captured_kwargs["push_to_hub"] is False
 
 
 def test_sid_train_with_cached_hf_repo_integration(temp_cache_dir):
