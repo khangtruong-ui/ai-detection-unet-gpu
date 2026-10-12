@@ -211,10 +211,11 @@ class BackgroundRowGroupPrefetcher:
     """
     Prefetches upcoming Parquet row groups into RowGroupMemoryCache in a background thread,
     completely eliminating 5-8s network latency stalls during row group transitions.
+    Thread-safe double-checked caching prevents HTTP connection conflicts and transient errors.
     """
 
-    def __init__(self, dataset: Any, start_idx: int = 0, lookahead: int = 2):
-        self.lookahead = max(1, int(lookahead))
+    def __init__(self, dataset: Any, start_idx: int = 0, lookahead: int = 4):
+        self.lookahead = max(2, int(lookahead))
         self.stop_event = threading.Event()
         self.current_idx = start_idx
         self.lock = threading.Lock()
@@ -225,9 +226,32 @@ class BackgroundRowGroupPrefetcher:
         self.target_ds = target_ds
 
         if hasattr(target_ds, "reader") and hasattr(target_ds, "index"):
+            reader = target_ds.reader
             # Enlarge memory cache capacity so prefetched row groups don't prematurely evict active ones
-            if hasattr(target_ds.reader, "memory_cache") and hasattr(target_ds.reader.memory_cache, "max_entries"):
-                target_ds.reader.memory_cache.max_entries = max(target_ds.reader.memory_cache.max_entries, 8)
+            if hasattr(reader, "memory_cache") and hasattr(reader.memory_cache, "max_entries"):
+                reader.memory_cache.max_entries = max(reader.memory_cache.max_entries, 16)
+
+            # Ensure thread-safe reader execution to eliminate race conditions on shared HTTP file streams
+            if hasattr(reader, "read_row_group") and not getattr(reader, "_thread_safe_patched", False):
+                orig_read_rg = reader.read_row_group
+                io_lock = threading.Lock()
+
+                def _safe_read_row_group(file_url: str, rg_index: int, columns: Optional[Sequence[str]] = None, file_index: int = 0):
+                    # Fast-path lock-free check in memory cache
+                    cached = reader.memory_cache.get(file_url, rg_index, columns)
+                    if cached is not None:
+                        return cached
+                    # Synchronize remote I/O and file access
+                    with io_lock:
+                        # Double-check cache after acquiring lock
+                        cached = reader.memory_cache.get(file_url, rg_index, columns)
+                        if cached is not None:
+                            return cached
+                        return orig_read_rg(file_url=file_url, rg_index=rg_index, columns=columns, file_index=file_index)
+
+                reader.read_row_group = _safe_read_row_group
+                reader._thread_safe_patched = True
+
             self.thread = threading.Thread(
                 target=self._worker_loop, daemon=True, name="pdl-row-group-prefetcher"
             )
@@ -424,8 +448,13 @@ class AsyncShardWriter:
 
 class PrefetchedBatchLoader:
     """
-    Background batch prefetcher that decouples dataset iteration and CPU image/mask preprocessing
-    from GPU feature extraction. Batches are assembled, pinned into memory, and queued for the GPU.
+    High-throughput pipelined batch loader that decouples:
+    1. Dataset sample iteration (background reader thread pre-buffering raw samples)
+    2. Concurrent sample decoding/transformation across worker threads
+    3. Batched tensor stacking, memory pinning, and queueing for the GPU.
+
+    Maintains strict sequential sample ordering via an index-based reassembly buffer
+    while maximizing multi-core CPU utilization and non-blocking GPU batch delivery.
     """
 
     def __init__(
@@ -435,36 +464,123 @@ class PrefetchedBatchLoader:
         batch_size: int,
         max_samples: Optional[int] = None,
         store_images: bool = False,
-        queue_size: int = 16,
-        num_workers: int = 4,
+        queue_size: int = 32,
+        num_workers: int = 8,
+        prefetcher_update_fn: Optional[Callable[[int], None]] = None,
     ):
         self.dataset = dataset
         self.process_sample_fn = process_sample_fn
         self.batch_size = max(1, int(batch_size))
         self.max_samples = max_samples
-        self.store_images = store_images
-        self.queue: queue.Queue = queue.Queue(maxsize=max(2, int(queue_size)))
-        self.stop_event = threading.Event()
+        self.store_images = bool(store_images)
         self.num_workers = max(1, int(num_workers))
-        self.producer_thread = threading.Thread(
-            target=self._produce_loop, daemon=True, name="cache-batch-loader"
+        self.prefetcher_update_fn = prefetcher_update_fn
+
+        q_cap = max(64, self.num_workers * 8)
+        self.raw_queue: queue.Queue = queue.Queue(maxsize=q_cap)
+        self.processed_queue: queue.Queue = queue.Queue(maxsize=q_cap)
+        self.batch_queue: queue.Queue = queue.Queue(maxsize=max(2, int(queue_size)))
+
+        self.stop_event = threading.Event()
+
+        # 1. Background Reader Thread
+        self.reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="cache-reader-thread"
         )
-        self.producer_thread.start()
+        self.reader_thread.start()
 
-    def _produce_loop(self) -> None:
-        from concurrent.futures import ThreadPoolExecutor
+        # 2. Worker Pool Threads
+        self.worker_threads = [
+            threading.Thread(
+                target=self._worker_loop, daemon=True, name=f"cache-worker-{i}"
+            )
+            for i in range(self.num_workers)
+        ]
+        for w in self.worker_threads:
+            w.start()
 
+        # 3. Background Batch Assembler Thread
+        self.assembler_thread = threading.Thread(
+            target=self._assembler_loop, daemon=True, name="cache-batch-assembler"
+        )
+        self.assembler_thread.start()
+
+    def _reader_loop(self) -> None:
+        """Reads raw dataset samples sequentially and deposits them into the raw_queue."""
+        sample_idx = 0
+        try:
+            it = iter(self.dataset)
+            while not self.stop_event.is_set():
+                if self.max_samples is not None and sample_idx >= self.max_samples:
+                    break
+                try:
+                    s = next(it)
+                except (StopIteration, IndexError):
+                    break
+
+                while not self.stop_event.is_set():
+                    try:
+                        self.raw_queue.put((sample_idx, s), timeout=0.1)
+                        sample_idx += 1
+                        if self.prefetcher_update_fn:
+                            self.prefetcher_update_fn(sample_idx)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:
+            if not self.stop_event.is_set():
+                self.processed_queue.put((-1, _ExceptionWrapper(e)))
+        finally:
+            # Broadcast shutdown sentinel to all workers
+            for _ in range(self.num_workers):
+                while not self.stop_event.is_set():
+                    try:
+                        self.raw_queue.put((None, _SENTINEL), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+    def _worker_loop(self) -> None:
+        """Worker thread processing raw samples concurrently without lockstep barriers."""
+        while not self.stop_event.is_set():
+            try:
+                task = self.raw_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            idx, sample = task
+            if sample is _SENTINEL:
+                self.raw_queue.task_done()
+                break
+
+            try:
+                res = self.process_sample_fn(sample)
+                packet = (idx, res)
+            except Exception as e:
+                packet = (idx, _ExceptionWrapper(e))
+
+            while not self.stop_event.is_set():
+                try:
+                    self.processed_queue.put(packet, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+            self.raw_queue.task_done()
+
+    def _assembler_loop(self) -> None:
+        """Collects processed items, re-establishes deterministic order, stacks tensors, and queues batches."""
         consecutive_failures = 0
         max_consecutive_failures = 50
-        total_queued = 0
+        next_expected_idx = 0
+        total_assembled = 0
+        pending: Dict[int, Any] = {}
 
         batch_images: List[torch.Tensor] = []
         batch_masks: List[bytes] = []
         batch_labels: List[int] = []
         batch_ids: List[str] = []
         batch_raw_images: List[Optional[bytes]] = []
-
-        executor = ThreadPoolExecutor(max_workers=self.num_workers) if self.num_workers > 1 else None
 
         def put_batch() -> bool:
             nonlocal batch_images, batch_masks, batch_labels, batch_ids, batch_raw_images
@@ -486,7 +602,7 @@ class PrefetchedBatchLoader:
                 }
                 while not self.stop_event.is_set():
                     try:
-                        self.queue.put(packet, timeout=0.1)
+                        self.batch_queue.put(packet, timeout=0.1)
                         break
                     except queue.Full:
                         continue
@@ -497,100 +613,81 @@ class PrefetchedBatchLoader:
                 batch_raw_images.clear()
                 return not self.stop_event.is_set()
             except Exception as e:
-                self.queue.put(_ExceptionWrapper(e))
+                self.batch_queue.put(_ExceptionWrapper(e))
                 return False
 
         try:
-            it = iter(self.dataset)
             while not self.stop_event.is_set():
-                if self.max_samples is not None and total_queued >= self.max_samples:
+                try:
+                    item = self.processed_queue.get(timeout=0.1)
+                except queue.Empty:
+                    # Check if all workers have finished and no more samples are pending
+                    if all(not w.is_alive() for w in self.worker_threads) and self.processed_queue.empty() and not pending:
+                        break
+                    continue
+
+                idx, res = item
+                if idx == -1 and isinstance(res, _ExceptionWrapper):
+                    self.batch_queue.put(res)
                     break
 
-                chunk_size = self.batch_size
-                if self.max_samples is not None:
-                    chunk_size = min(chunk_size, self.max_samples - total_queued)
+                pending[idx] = res
+                self.processed_queue.task_done()
 
-                raw_chunk = []
-                for _ in range(chunk_size):
-                    try:
-                        raw_s = next(it)
-                        raw_chunk.append(raw_s)
-                    except (StopIteration, IndexError):
+                # Process consecutive samples strictly in order
+                while next_expected_idx in pending:
+                    sample_res = pending.pop(next_expected_idx)
+                    next_expected_idx += 1
+
+                    if isinstance(sample_res, _ExceptionWrapper):
+                        err = sample_res.exc
+                        if "CUDA error" in str(err) or "cudaError" in str(err):
+                            self.batch_queue.put(sample_res)
+                            return
+                        consecutive_failures += 1
+                        logger.warning(f"Skipping corrupt sample: {err}")
+                        if consecutive_failures >= max_consecutive_failures:
+                            self.batch_queue.put(
+                                _ExceptionWrapper(
+                                    RuntimeError(
+                                        f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples."
+                                    )
+                                )
+                            )
+                            return
+                        continue
+
+                    if sample_res is None:
+                        continue
+
+                    img_t, mask_b, lbl, i_id, img_b = sample_res
+                    batch_images.append(img_t)
+                    batch_masks.append(mask_b)
+                    batch_labels.append(lbl)
+                    batch_ids.append(i_id)
+                    if self.store_images:
+                        batch_raw_images.append(img_b)
+
+                    total_assembled += 1
+                    consecutive_failures = 0
+
+                    if len(batch_images) >= self.batch_size:
+                        if not put_batch():
+                            return
+
+                    if self.max_samples is not None and total_assembled >= self.max_samples:
                         break
 
-                if not raw_chunk:
+                if self.max_samples is not None and total_assembled >= self.max_samples:
                     break
-
-                if executor is not None:
-                    futures = [executor.submit(self.process_sample_fn, s) for s in raw_chunk]
-                    for fut in futures:
-                        try:
-                            res = fut.result()
-                            if res is not None:
-                                img_t, mask_b, lbl, i_id, img_b = res
-                                batch_images.append(img_t)
-                                batch_masks.append(mask_b)
-                                batch_labels.append(lbl)
-                                batch_ids.append(i_id)
-                                if self.store_images:
-                                    batch_raw_images.append(img_b)
-                                total_queued += 1
-                                consecutive_failures = 0
-                        except Exception as s_err:
-                            if "CUDA error" in str(s_err) or "cudaError" in str(s_err):
-                                raise s_err
-                            consecutive_failures += 1
-                            logger.warning(f"Skipping corrupt sample: {s_err}")
-                            if consecutive_failures >= max_consecutive_failures:
-                                raise RuntimeError(
-                                    f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples."
-                                )
-                else:
-                    for s in raw_chunk:
-                        try:
-                            res = self.process_sample_fn(s)
-                            if res is not None:
-                                img_t, mask_b, lbl, i_id, img_b = res
-                                batch_images.append(img_t)
-                                batch_masks.append(mask_b)
-                                batch_labels.append(lbl)
-                                batch_ids.append(i_id)
-                                if self.store_images:
-                                    batch_raw_images.append(img_b)
-                                total_queued += 1
-                                consecutive_failures = 0
-                        except Exception as s_err:
-                            if "CUDA error" in str(s_err) or "cudaError" in str(s_err):
-                                raise s_err
-                            consecutive_failures += 1
-                            logger.warning(f"Skipping corrupt sample: {s_err}")
-                            if consecutive_failures >= max_consecutive_failures:
-                                raise RuntimeError(
-                                    f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples."
-                                )
-
-                if len(batch_images) >= self.batch_size:
-                    if not put_batch():
-                        break
 
             if batch_images and not self.stop_event.is_set():
                 put_batch()
 
-        except Exception as e:
-            if not self.stop_event.is_set():
-                try:
-                    self.queue.put(_ExceptionWrapper(e), timeout=0.5)
-                except Exception:
-                    pass
         finally:
-            if executor is not None:
-                try:
-                    executor.shutdown(wait=True, cancel_futures=True)
-                except Exception:
-                    pass
             while not self.stop_event.is_set():
                 try:
-                    self.queue.put(_SENTINEL, timeout=0.1)
+                    self.batch_queue.put(_SENTINEL, timeout=0.1)
                     break
                 except queue.Full:
                     continue
@@ -601,9 +698,9 @@ class PrefetchedBatchLoader:
     def __next__(self) -> Dict[str, Any]:
         while not self.stop_event.is_set():
             try:
-                item = self.queue.get(timeout=0.2)
+                item = self.batch_queue.get(timeout=0.2)
             except queue.Empty:
-                if not self.producer_thread.is_alive() and self.queue.empty():
+                if not self.assembler_thread.is_alive() and self.batch_queue.empty():
                     raise StopIteration
                 continue
 
@@ -616,13 +713,15 @@ class PrefetchedBatchLoader:
 
     def close(self) -> None:
         self.stop_event.set()
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except Exception:
-                break
-        if self.producer_thread.is_alive():
-            self.producer_thread.join(timeout=5.0)
+        for q in (self.batch_queue, self.raw_queue, self.processed_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+        for t in (self.reader_thread, *self.worker_threads, self.assembler_thread):
+            if t.is_alive():
+                t.join(timeout=1.0)
 
 
 class DatasetCacheManager:
@@ -675,8 +774,16 @@ class DatasetCacheManager:
         self.resume = bool(resume)
         self.delete_local_on_upload = bool(delete_local_on_upload)
         self.push_to_hub_flag = bool(push_to_hub)
-        self.num_workers = int(num_workers) if num_workers is not None else min(4, os.cpu_count() or 4)
+        if num_workers is not None and num_workers < 0:
+            self.num_workers = min(16, max(4, os.cpu_count() or 4))
+        elif num_workers is not None:
+            self.num_workers = int(num_workers)
+        else:
+            self.num_workers = min(4, os.cpu_count() or 4)
         self.prefetch_batches = max(2, int(prefetch_batches))
+
+        self._blank_0_png: Optional[bytes] = None
+        self._blank_1_png: Optional[bytes] = None
 
         if store_images is None:
             self.store_images = bool(
@@ -710,6 +817,23 @@ class DatasetCacheManager:
             write_shard_fn=self._write_shard_columnar,
         )
 
+    def _get_blank_mask_bytes(self, label: int) -> bytes:
+        """Returns memoized PNG bytes for uniform blank masks (label 0: black, label 1: white)."""
+        if label == 0:
+            if self._blank_0_png is None:
+                mask_pil = Image.fromarray(np.zeros((self.image_size[0], self.image_size[1]), dtype=np.uint8), mode="L")
+                buf = io.BytesIO()
+                mask_pil.save(buf, format="PNG", compress_level=1, optimize=False)
+                self._blank_0_png = buf.getvalue()
+            return self._blank_0_png
+        else:
+            if self._blank_1_png is None:
+                mask_pil = Image.fromarray(np.full((self.image_size[0], self.image_size[1]), 255, dtype=np.uint8), mode="L")
+                buf = io.BytesIO()
+                mask_pil.save(buf, format="PNG", compress_level=1, optimize=False)
+                self._blank_1_png = buf.getvalue()
+            return self._blank_1_png
+
     def _process_sample_to_tensors(self, sample: Dict[str, Any]) -> Tuple[torch.Tensor, bytes, int, str, Optional[bytes]]:
         """Convert a raw dataset sample dict into an RGB tensor, mask PNG bytes, and optional JPEG bytes."""
         raw_img = sample.get("image")
@@ -731,22 +855,43 @@ class DatasetCacheManager:
         # (3, H, W) in range [0, 1]
         img_tensor = torch.from_numpy(img_arr.transpose(2, 0, 1))
 
-        mask_arr = process_sample_mask(
-            mask_input=raw_mask,
-            label=int(raw_label) if raw_label is not None else None,
-            image_size=(self.image_size[1], self.image_size[0]),
-        )
-        if mask_arr.shape != (self.image_size[0], self.image_size[1]):
-            mask_pil = Image.fromarray((mask_arr * 255).astype(np.uint8)).resize(
-                (self.image_size[1], self.image_size[0]), Image.NEAREST
+        # Fast-path for explicit labels 0 (real / black mask) and 1 (fully synthetic / white mask)
+        # Bypasses expensive mask resizing, array allocation, and PNG compression
+        if raw_label is not None and int(raw_label) in (0, 1):
+            label = int(raw_label)
+            mask_bytes = self._get_blank_mask_bytes(label)
+        else:
+            mask_arr = process_sample_mask(
+                mask_input=raw_mask,
+                label=int(raw_label) if raw_label is not None else None,
+                image_size=(self.image_size[1], self.image_size[0]),
             )
-            mask_arr = np.array(mask_pil, dtype=np.float32) / 255.0
+            if mask_arr.shape != (self.image_size[0], self.image_size[1]):
+                mask_pil = Image.fromarray((mask_arr * 255).astype(np.uint8)).resize(
+                    (self.image_size[1], self.image_size[0]), Image.NEAREST
+                )
+                mask_arr = np.array(mask_pil, dtype=np.float32) / 255.0
 
-        # Encode mask as PNG bytes for compact storage (optimize=False for 30% faster CPU throughput)
-        mask_pil = Image.fromarray((mask_arr * 255).astype(np.uint8), mode="L")
-        buf = io.BytesIO()
-        mask_pil.save(buf, format="PNG", optimize=False)
-        mask_bytes = buf.getvalue()
+            if raw_label is not None:
+                label = int(raw_label)
+            else:
+                m_sum = float(mask_arr.sum())
+                total_px = float(mask_arr.size)
+                if m_sum == 0.0:
+                    label = 0
+                elif m_sum >= total_px:
+                    label = 1
+                else:
+                    label = 2
+
+            if label in (0, 1):
+                mask_bytes = self._get_blank_mask_bytes(label)
+            else:
+                # Fast PNG encode with compress_level=1 and optimize=False (6x faster than level 6)
+                mask_pil = Image.fromarray((mask_arr * 255).astype(np.uint8), mode="L")
+                buf = io.BytesIO()
+                mask_pil.save(buf, format="PNG", compress_level=1, optimize=False)
+                mask_bytes = buf.getvalue()
 
         # Safely close PIL handles to prevent handle/buffer leaks
         if hasattr(raw_img, "close"):
@@ -759,18 +904,6 @@ class DatasetCacheManager:
                 raw_mask.close()
             except Exception:
                 pass
-
-        if raw_label is not None:
-            label = int(raw_label)
-        else:
-            m_sum = float(mask_arr.sum())
-            total_px = float(mask_arr.size)
-            if m_sum == 0.0:
-                label = 0
-            elif m_sum >= total_px:
-                label = 1
-            else:
-                label = 2
 
         return img_tensor, mask_bytes, label, img_id, img_bytes
 
@@ -1009,7 +1142,6 @@ class DatasetCacheManager:
 
             self.shard_writer.submit_shard(shard_data)
             shard_idx += 1
-            clear_memory_cache(self.device)
 
         # 1. Background Parquet Row-Group Prefetcher
         prefetcher = BackgroundRowGroupPrefetcher(
@@ -1033,6 +1165,7 @@ class DatasetCacheManager:
             store_images=self.store_images,
             queue_size=self.prefetch_batches,
             num_workers=self.num_workers,
+            prefetcher_update_fn=prefetcher.update_index,
         )
 
         try:

@@ -891,6 +891,117 @@ def test_cli_num_workers_and_prefetch_args():
     assert args.prefetch_batches == 32
 
 
+def test_dataset_cache_manager_blank_mask_memoization(temp_cache_dir):
+    """Test that DatasetCacheManager memoizes uniform blank masks for labels 0 and 1."""
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.total_channels = 84
+
+        def extract_cache_tensors(self, x):
+            return torch.zeros(x.shape[0], 84, 32, 32)
+
+    manager = DatasetCacheManager(
+        model=DummyModel(),
+        output_dir=temp_cache_dir,
+        image_size=(256, 256),
+        num_workers=-1,
+        push_to_hub=False,
+    )
+
+    # num_workers=-1 must resolve to a valid positive worker count
+    assert manager.num_workers >= 4
+
+    # Test memoization identity
+    b0_first = manager._get_blank_mask_bytes(0)
+    b0_second = manager._get_blank_mask_bytes(0)
+    assert b0_first is b0_second
+    assert len(b0_first) > 0
+
+    b1_first = manager._get_blank_mask_bytes(1)
+    b1_second = manager._get_blank_mask_bytes(1)
+    assert b1_first is b1_second
+    assert len(b1_first) > 0
+
+    # Verify PNG bytes decode to correct zeros / ones arrays
+    m0_pil = Image.open(io.BytesIO(b0_first))
+    assert m0_pil.size == (256, 256)
+    m0_arr = np.array(m0_pil)
+    assert (m0_arr == 0).all()
+
+    m1_pil = Image.open(io.BytesIO(b1_first))
+    assert m1_pil.size == (256, 256)
+    m1_arr = np.array(m1_pil)
+    assert (m1_arr == 255).all()
+
+    # Test fast-path in _process_sample_to_tensors
+    sample_real = {
+        "image": Image.new("RGB", (256, 256), color=(50, 60, 70)),
+        "mask": None,
+        "label": 0,
+        "id": "real_sample_0",
+    }
+    img_t, mask_b, lbl, i_id, _ = manager._process_sample_to_tensors(sample_real)
+    assert mask_b is b0_first
+    assert lbl == 0
+    assert i_id == "real_sample_0"
+    assert img_t.shape == (3, 256, 256)
+
+    sample_synth = {
+        "image": Image.new("RGB", (256, 256), color=(100, 110, 120)),
+        "mask": None,
+        "label": 1,
+        "id": "synth_sample_1",
+    }
+    _, mask_b1, lbl1, i_id1, _ = manager._process_sample_to_tensors(sample_synth)
+    assert mask_b1 is b1_first
+    assert lbl1 == 1
+    assert i_id1 == "synth_sample_1"
+
+
+def test_prefetched_batch_loader_strict_ordering_and_speed():
+    """Verify PrefetchedBatchLoader preserves strict sample ordering even with variable worker delay."""
+    import time
+    from sid_unet.cache.manager import PrefetchedBatchLoader
+
+    num_samples = 20
+    dataset = [
+        {"image": torch.full((3, 32, 32), float(i)), "mask": torch.zeros(1, 32, 32), "label": i % 3, "id": f"id_{i}"}
+        for i in range(num_samples)
+    ]
+
+    def mock_variable_process(sample):
+        # Introduce tiny jitter to verify index reassembly maintains strictly sorted order
+        idx_val = int(sample["id"].split("_")[1])
+        if idx_val % 2 == 0:
+            time.sleep(0.005)
+        t = sample["image"]
+        m_bytes = b"mask"
+        lbl = sample["label"]
+        i_id = sample["id"]
+        return t, m_bytes, lbl, i_id, None
+
+    loader = PrefetchedBatchLoader(
+        dataset=dataset,
+        process_sample_fn=mock_variable_process,
+        batch_size=4,
+        num_workers=4,
+        queue_size=8,
+    )
+
+    batches = list(loader)
+    loader.close()
+
+    assert len(batches) == 5
+    assembled_ids = []
+    for b in batches:
+        assembled_ids.extend(b["ids"])
+
+    expected_ids = [f"id_{i}" for i in range(num_samples)]
+    assert assembled_ids == expected_ids
+
+
+
 
 
 

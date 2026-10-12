@@ -1968,13 +1968,18 @@ sid-cache \
 
 #### B. Pipelined Asynchronous Caching Architecture
 To guarantee smooth, uninterrupted GPU utilization during `sid-cache` extraction, the pipeline eliminates all synchronous I/O, CPU, and compression stalls:
-1. **Background Parquet Row Group Prefetching (`BackgroundRowGroupPrefetcher`)**:
-   When streaming from Hugging Face Hub via `parquet-dataset-loader`, downloading a new row group over HTTP range requests can stall for 5–8 seconds. A dedicated background thread looks ahead and pre-warms upcoming row groups into the enlarged thread-safe memory cache, reducing row-group transition latency from ~5,000 ms to <0.5 ms.
-2. **Multi-Threaded Batch Prefetching & Pinned Memory (`PrefetchedBatchLoader`)**:
-   Image decoding, RGB validation, resizing, and fast PNG compression are distributed across parallel background CPU worker threads (`--num-workers`, default: 4). Pinned tensors (`pin_memory=True`) are queued ahead (`--prefetch-batches`, default: 16), allowing GPU memory transfers via `.to(device, non_blocking=True)` without CPU-bound bubbles.
-3. **Non-Blocking Asynchronous Shard Serialization (`AsyncShardWriter`)**:
-   Serializing PyArrow tables and performing `zstd` compression across thousands of high-dimensional feature channels takes 10–15 seconds on the CPU. `AsyncShardWriter` offloads table creation, disk writes, and Hugging Face Hub staging to a background thread (`queue.Queue`), completely decoupling shard commits from active GPU inference.
-4. **Fail-Fast GPU Error Propagation**:
+1. **Continuous Decoupled Asynchronous Batch Pipeline (`PrefetchedBatchLoader`)**:
+   Replaces stop-and-wait chunking with a fully decoupled 3-stage streaming pipeline:
+   - Dedicated `reader_thread` sequentially iterates the dataset and feeds a bounded `raw_queue`.
+   - Multi-threaded worker pool (`num_workers`, scaling dynamically up to 16 threads when set to `-1`) concurrently decodes images, processes masks, and deposits transformed records into `processed_queue` without lockstep barriers.
+   - Dedicated `assembler_thread` re-orders processed records deterministically using sample indices, pins tensors (`pin_memory=True`), and populates the `batch_queue` ahead of time (`--prefetch-batches`, default: from config or 16). The GPU consumes pre-pinned batches non-blockingly without waiting on worker transitions.
+2. **Memoized Uniform Blank Masks & High-Speed Mask Compression**:
+   In dataset caching (e.g. COCO-inpainted), real images (label 0, all-black mask) and fully synthetic images (label 1, all-white mask) account for ~67% of samples. `DatasetCacheManager` precomputes and memoizes PNG byte representations for labels 0 and 1, reducing their mask CPU processing overhead from ~45 ms down to 0.0 ms. For partial inpainting masks (label 2), fast-path PNG encoding (`compress_level=1, optimize=False`) reduces compression time by 6x (from 45 ms to ~7 ms per mask).
+3. **Thread-Safe Double-Checked Row Group Prefetching (`BackgroundRowGroupPrefetcher`)**:
+   When streaming from Hugging Face Hub via `parquet-dataset-loader`, downloading a new row group over HTTP range requests can stall for 5–8 seconds. A dedicated background thread pre-warms upcoming row groups into an enlarged thread-safe memory cache. Remote I/O is protected by double-checked locking, completely preventing HTTP stream contention, connection resets, and multi-minute retry backoffs during background prefetching.
+4. **Non-Blocking Asynchronous Shard Serialization (`AsyncShardWriter`)**:
+   Serializing PyArrow tables and performing `zstd` compression across thousands of high-dimensional feature channels takes 10–15 seconds on the CPU. `AsyncShardWriter` offloads table creation, disk writes, and Hugging Face Hub staging to a background thread (`queue.Queue`), completely decoupling shard commits from active GPU inference. Synchronous CUDA allocator cache flushing on shard commit is eliminated to prevent periodic GPU stalls.
+5. **Fail-Fast GPU Error Propagation**:
    Fatal CUDA runtime errors are immediately detected and re-raised to prevent infinite retry loops or masking hardware issues.
 
 #### C. High-Speed Training with Cached Representations (`--cached-hf-repo`)

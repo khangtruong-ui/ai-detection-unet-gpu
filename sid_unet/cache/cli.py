@@ -163,9 +163,9 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         "--prefetch-batches",
         "--prefetch_batches",
         type=int,
-        default=16,
+        default=None,
         dest="prefetch_batches",
-        help="Number of batches to prefetch ahead in RAM for non-blocking GPU execution (default: 16)",
+        help="Number of batches to prefetch ahead in RAM for non-blocking GPU execution (default: 16 or from config)",
     )
     return parser.parse_args(args)
 
@@ -213,8 +213,16 @@ def cli_main(args: Optional[list] = None) -> None:
         cfg_workers = cfg.data.get("num_workers", None)
         if cfg_workers is not None and cfg_workers > 0:
             num_workers = int(cfg_workers)
+        elif cfg_workers is not None and cfg_workers < 0:
+            num_workers = min(16, max(4, os.cpu_count() or 4))
         else:
             num_workers = min(4, os.cpu_count() or 4)
+    elif num_workers < 0:
+        num_workers = min(16, max(4, os.cpu_count() or 4))
+
+    prefetch_batches = parsed_args.prefetch_batches
+    if prefetch_batches is None:
+        prefetch_batches = int(cfg.data.get("prefetch_batches", 16))
 
     manager = DatasetCacheManager(
         model=model,
@@ -232,7 +240,7 @@ def cli_main(args: Optional[list] = None) -> None:
         push_to_hub=push_hub,
         store_images=parsed_args.store_images,
         num_workers=num_workers,
-        prefetch_batches=parsed_args.prefetch_batches,
+        prefetch_batches=prefetch_batches,
     )
 
     logger.info(
