@@ -197,6 +197,12 @@ def cli_main(args: Optional[list] = None) -> None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
 
+    if device.type == "cuda" and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        try:
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        except Exception:
+            pass
+
     logger.info(f"🏗️ Building model from config: {parsed_args.config} on device {device}...")
     model = build_model(cfg).to(device)
 

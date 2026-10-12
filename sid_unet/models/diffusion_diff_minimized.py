@@ -112,6 +112,13 @@ class DiffusionDiffMinimizedModel(nn.Module):
         self.diffuser_fp16 = bool(kwargs.get("diffuser_fp16", diffuser_fp16))
         self.device_map = device_map
 
+        # Guard against cuDNN SDPA kernel launch failures on CUDA
+        if torch.cuda.is_available() and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            try:
+                torch.backends.cuda.enable_cudnn_sdp(False)
+            except Exception:
+                pass
+
         # Handle freeze_encoder / autoencoder_trainable configurations
         if "autoencoder_trainable" in kwargs:
             self.freeze_encoder = not bool(kwargs["autoencoder_trainable"])
@@ -802,9 +809,7 @@ class DiffusionDiffMinimizedModel(nn.Module):
             t_emb = sinusoidal_embedding(t_tensor_dev.float(), dim=self.timestep_embed_dim)
             t_spatial = expand_to_spatial(t_emb, h_z, w_z).to(dtype=dtype)
 
-            sigma_tensor = torch.full(
-                (b_sz,), sigma_val.item(), device=device, dtype=torch.float32
-            )
+            sigma_tensor = sigma_val.to(device=device, dtype=torch.float32).view(1).expand(b_sz)
             sigma_emb = sinusoidal_embedding(sigma_tensor, dim=self.sigma_embed_dim)
             sigma_spatial = expand_to_spatial(sigma_emb, h_z, w_z).to(dtype=dtype)
 
@@ -977,7 +982,7 @@ class DiffusionDiffMinimizedModel(nn.Module):
             t_emb = sinusoidal_embedding(t_tensor_dev.float(), dim=self.timestep_embed_dim)
             t_spatial = expand_to_spatial(t_emb, h_z, w_z).to(dtype=dtype)
 
-            sigma_tensor = torch.full((b_sz,), sigma_val.item(), device=device, dtype=torch.float32)
+            sigma_tensor = sigma_val.to(device=device, dtype=torch.float32).view(1).expand(b_sz)
             sigma_emb = sinusoidal_embedding(sigma_tensor, dim=self.sigma_embed_dim)
             sigma_spatial = expand_to_spatial(sigma_emb, h_z, w_z).to(dtype=dtype)
 

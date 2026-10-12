@@ -251,11 +251,15 @@ def test_sam_and_gap_models_guard_cudnn_sdp_on_cuda():
             "training": {"epochs": 1, "learning_rate": 0.001, "save_best": False, "save_latest": False},
             "logging": {"log_interval": 1, "measure_network": False},
         })
-        # Explicitly enable cuDNN SDP first
-        torch.backends.cuda.enable_cudnn_sdp(True)
-        trainer = Trainer(config=cfg)
-        # Trainer must disable cuDNN SDP for GAP-SAM/attention architectures
-        assert torch.backends.cuda.is_built()
+        orig_sdp = torch.backends.cuda.cudnn_sdp_enabled()
+        try:
+            # Explicitly enable cuDNN SDP first
+            torch.backends.cuda.enable_cudnn_sdp(True)
+            trainer = Trainer(config=cfg)
+            # Trainer must disable cuDNN SDP for GAP-SAM/attention architectures
+            assert torch.backends.cuda.cudnn_sdp_enabled() is False
+        finally:
+            torch.backends.cuda.enable_cudnn_sdp(orig_sdp)
 
 
 def test_fatal_cuda_fault_detection():
@@ -425,4 +429,78 @@ def test_step_batch_train_handles_fatal_backward_error_with_cleanup(monkeypatch)
             trainer._step_batch_train(batch)
 
         assert closed is True
+
+
+def test_diffusion_models_guard_cudnn_sdp_on_cuda():
+    """Verify that Diffusion models disable cuDNN SDP on CUDA to avoid kernel launch failures."""
+    if not torch.cuda.is_available() or not hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        pytest.skip("CUDA and enable_cudnn_sdp required")
+    from sid_unet.models.diffusion_diff_minimized import DiffusionDiffMinimizedModel
+
+    orig_sdp = torch.backends.cuda.cudnn_sdp_enabled()
+    try:
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        # Instantiating DiffusionDiffMinimizedModel on CUDA should disable cuDNN SDP
+        model = DiffusionDiffMinimizedModel(
+            pretrained_model_name_or_path="dummy",
+            use_dummy=True,
+            device_map="cuda",
+        )
+        assert torch.backends.cuda.cudnn_sdp_enabled() is False
+    finally:
+        torch.backends.cuda.enable_cudnn_sdp(orig_sdp)
+
+
+def test_trainer_intra_epoch_validation_and_empty_cache():
+    """Verify Trainer correctly schedules intra-epoch validation and periodic cache clearing."""
+    from sid_unet.training.trainer import Trainer
+    from sid_unet.utils.config import ConfigDict
+    import tempfile
+    from torch.utils.data import DataLoader, TensorDataset
+
+    class DictDataset(torch.utils.data.Dataset):
+        def __init__(self, imgs, masks):
+            self.imgs = imgs
+            self.masks = masks
+        def __len__(self):
+            return len(self.imgs)
+        def __getitem__(self, idx):
+            return {"image": self.imgs[idx], "mask": self.masks[idx]}
+
+    x = torch.randn(8, 3, 32, 32)
+    y = torch.zeros(8, 1, 32, 32)
+    train_loader = DataLoader(DictDataset(x, y), batch_size=2)
+    val_loader = DataLoader(DictDataset(x[:2], y[:2]), batch_size=2)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = ConfigDict({
+            "project": {"name": "test_intra_val", "output_dir": tmpdir, "seed": 42, "device": "cpu"},
+            "data": {"image_size": [32, 32], "batch_size": 2},
+            "model": {"name": "unet", "in_channels": 3, "out_channels": 1, "aux_classifier": False},
+            "loss": {"mask_loss_type": "bce", "bce_weight": 1.0, "aux_classifier": False},
+            "training": {
+                "epochs": 1,
+                "learning_rate": 0.001,
+                "save_best": False,
+                "save_latest": False,
+                "amp": False,
+                "val_check_steps": 2,
+                "empty_cache_steps": 2,
+            },
+            "logging": {"log_interval": 1, "measure_network": False},
+        })
+        trainer = Trainer(config=cfg, train_loader=train_loader, val_loader=val_loader)
+
+        val_call_count = 0
+        orig_validate = trainer.validate
+        def mock_val(*args, **kwargs):
+            nonlocal val_call_count
+            val_call_count += 1
+            return orig_validate(*args, **kwargs)
+        trainer.validate = mock_val
+
+        trainer.train()
+        # 4 batches total: step 2 triggers intra-epoch val, plus 1 end-of-epoch val = 2 calls
+        assert val_call_count >= 2, f"Expected at least 2 validation calls, got {val_call_count}"
+
 

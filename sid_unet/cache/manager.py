@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 from sid_unet.cache.extractor import BaseCacheExtractor, get_extractor_for_model
 from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask
 from sid_unet.dataset.loader import load_parquet_or_hf_dataset
+from sid_unet.utils.memory import clear_memory_cache
 
 logger = logging.getLogger(__name__)
 
@@ -656,6 +657,11 @@ class DatasetCacheManager:
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        if self.device.type == "cuda" and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            try:
+                torch.backends.cuda.enable_cudnn_sdp(False)
+            except Exception:
+                pass
         self.model = model.to(self.device)
         self.extractor = get_extractor_for_model(model, fp16=fp16)
         self.source_dataset_name = source_dataset_name
@@ -1003,6 +1009,7 @@ class DatasetCacheManager:
 
             self.shard_writer.submit_shard(shard_data)
             shard_idx += 1
+            clear_memory_cache(self.device)
 
         # 1. Background Parquet Row-Group Prefetcher
         prefetcher = BackgroundRowGroupPrefetcher(

@@ -140,7 +140,7 @@ class Trainer:
             self.is_data_parallel = (self.num_gpus > 1)
 
         model_name = str(getattr(config.model, "name", "")).lower()
-        is_attention_or_sam = any(k in model_name for k in ("sam", "vit", "transformer", "gap"))
+        is_attention_or_sam = any(k in model_name for k in ("sam", "vit", "transformer", "gap", "diffusion", "diff"))
         default_benchmark = not is_attention_or_sam
 
         cudnn_benchmark = bool(
@@ -399,6 +399,20 @@ class Trainer:
         self.history: list = []
         self.log_interval = int(config.logging.get("log_interval", 20))
 
+        # Periodic memory cache clearing during training epoch
+        training_cfg = config.get("training", {}) if hasattr(config, "get") else getattr(config, "training", {})
+        self.empty_cache_steps = training_cfg.get("empty_cache_steps", None)
+        if self.empty_cache_steps is not None:
+            self.empty_cache_steps = int(self.empty_cache_steps)
+
+        # Intra-epoch validation schedule (e.g. val_check_interval=0.1 or val_check_steps)
+        self.val_check_interval = training_cfg.get("val_check_interval", None)
+        if self.val_check_interval is not None:
+            self.val_check_interval = float(self.val_check_interval)
+        self.val_check_steps = training_cfg.get("val_check_steps", None)
+        if self.val_check_steps is not None:
+            self.val_check_steps = int(self.val_check_steps)
+        self._early_stopped = False
 
         # 5. Network Speed & Pipeline Bottleneck Monitoring
         logging_cfg = config.get("logging", {}) if hasattr(config, "get") else getattr(config, "logging", {})
@@ -1152,6 +1166,56 @@ class Trainer:
                         self.optimizer.zero_grad()
                         has_pending_grads = False
 
+                    # Periodic memory cache clearing during epoch
+                    if self.empty_cache_steps and (step_in_epoch % self.empty_cache_steps == 0):
+                        clear_memory_cache(self.device)
+
+                    # Intra-epoch validation schedule (e.g. val_check_interval=0.1 or val_check_steps)
+                    should_val_step = False
+                    if self.val_check_steps is not None and self.val_check_steps > 0:
+                        should_val_step = (step_in_epoch % self.val_check_steps == 0)
+                    elif self.val_check_interval is not None and self.val_check_interval > 0:
+                        if total_batches is not None and total_batches > 0:
+                            interval_steps = max(1, int(total_batches * self.val_check_interval))
+                            should_val_step = (step_in_epoch % interval_steps == 0) and (step_in_epoch < total_batches)
+
+                    if should_val_step and not self._early_stopped:
+                        self.logger.info(
+                            f"🔍 Running intra-epoch validation at batch {step_in_epoch}/{total_batches or '?'} "
+                            f"(Epoch {epoch}, interval {self.val_check_interval or self.val_check_steps})..."
+                        )
+                        intra_val_summary, _, _ = self.validate(epoch)
+                        monitored_score = intra_val_summary.get(self.ckpt_manager.metric_name, 0.0)
+
+                        if self.ckpt_manager.save_best:
+                            saved_paths = self.ckpt_manager.save(
+                                epoch=epoch,
+                                model=self.model,
+                                optimizer=self.optimizer,
+                                scheduler=self.scheduler,
+                                metrics=intra_val_summary,
+                                config=self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config),
+                                step=self.global_step,
+                                scaler=self.scaler,
+                                history=self.history,
+                                hard_mining=self.hard_miner.state_dict(),
+                            ) if self.is_main_process else {}
+                            if "best" in saved_paths:
+                                self.logger.info(
+                                    f"⭐ New best model saved during intra-epoch evaluation: {saved_paths['best']} "
+                                    f"({self.ckpt_manager.metric_name}: {self.ckpt_manager.best_score:.4f})"
+                                )
+
+                        if self.early_stopping(monitored_score):
+                            self.logger.info(
+                                f"Early stopping triggered during intra-epoch evaluation at step {self.global_step} (Epoch {epoch})!"
+                            )
+                            self._early_stopped = True
+                            self.model.train()
+                            break
+
+                        self.model.train()
+
                     if self.is_main_process and step_in_epoch > 1 and self.ckpt_manager.should_save_periodic(step=self.global_step):
                         p_paths = self.ckpt_manager.save_periodic(
                             epoch=epoch,
@@ -1403,6 +1467,10 @@ class Trainer:
                     self._current_epoch = epoch
                     epoch_start = time.time()
                     train_metrics = self.train_epoch(epoch)
+
+                    if self._early_stopped:
+                        self.logger.info(f"Training finished early during epoch {epoch} (intra-epoch early stopping).")
+                        break
 
                     # Run validation
                     val_summary, per_label_metrics, confusion_mat = self.validate(epoch)

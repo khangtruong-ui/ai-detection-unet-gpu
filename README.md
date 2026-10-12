@@ -1095,8 +1095,8 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
    - `GAPSAM.forward()`, `SAM3DistilModel.forward()`, and `Trainer._step_batch_train()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and cleanly drain DataLoader workers via `self.close()` before propagating exceptions.
    - All `torch.cuda.empty_cache()` calls across models, trainers, and epoch cleanup hooks are wrapped in exception handlers, preventing C++ `std::terminate` aborts when device context is invalidated.
 7. **cuDNN Benchmark & SDPA Safeguards for Attention & Foundation Models**:
-   - `Trainer` enables `torch.backends.cudnn.benchmark = True` for CNN architectures (e.g., standard UNet), while strictly disabling it (`False`) for attention/ViT/SAM3/GAP-SAM foundation backbones to avoid cuDNN autotuner workspace allocation collisions and kernel launch failures.
-   - For attention and transformer backbones (SAM3, GAP-SAM), cuDNN Scaled Dot-Product Attention (`torch.backends.cuda.enable_cudnn_sdp(False)`) is explicitly disabled on CUDA. This avoids multi-scale deformable attention kernel launch failures (`cudaErrorLaunchFailure`) on Ampere architecture GPUs (e.g. RTX 3080 Ti, SM 8.6) when handling large token sequences (19,845 tokens per image).
+   - `Trainer` enables `torch.backends.cudnn.benchmark = True` for CNN architectures (e.g., standard UNet), while strictly disabling it (`False`) for attention/ViT/SAM3/GAP-SAM and Diffusion foundation backbones to avoid cuDNN autotuner workspace allocation collisions and kernel launch failures.
+   - For attention, transformer, and diffusion backbones (SAM3, GAP-SAM, DiffusionDiff, DiffusionDiffMinimized, DiffusionDiffV2), cuDNN Scaled Dot-Product Attention (`torch.backends.cuda.enable_cudnn_sdp(False)`) is explicitly disabled on CUDA across model initialization, `Trainer`, and `sid-cache`. This avoids attention kernel launch failures (`cudaErrorLaunchFailure`) on Ampere architecture GPUs (e.g. RTX 3080 Ti, SM 8.6) under mismatched driver versions (Driver 535 vs CUDA 12.8 / cuDNN 9.19).
 8. **Active DataLoader Process Tracking & Hardened Worker Reaping**:
    - `Trainer` tracks active DataLoader iterators (`self._active_train_loader`) during `train_epoch()`. Upon exceptions or clean shutdown, `Trainer.close()` aggressively discovers and terminates all active worker processes (`w.terminate()`, bounded `w.join(timeout=1.0)`, followed by `w.kill()` if necessary) and cancels queue join threads (`cancel_join_thread()`), preventing DataLoader worker deadlocks and python interpreter teardown hangs.
 9. **Process Signal Isolation in Test Suites**:
@@ -1109,6 +1109,12 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
    - Handled with non-fatal warning logging and a resilient fallback to `loss_dict["iou"] = 0.0` upon any numerical anomaly or sync issue, ensuring non-critical progress bar metrics cannot abort long-running training jobs.
 12. **PyTorch Allocator Memory Fragmentation Mitigation (`PYTORCH_CUDA_ALLOC_CONF`)**:
    - Configured `os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")` before CUDA allocator initialization to eliminate virtual address fragmentation across thousands of training batches on 12GB GPUs.
+13. **Pure On-Device Tensor Expansion (Eliminating Device-to-Host Sync Bubbles)**:
+   - In all Diffusion models (`diffusion_diff`, `diffusion_diff_minimized`, `diffusion_diff_v2`), replaced `sigma_val.item()` host sync roundtrips with purely on-device tensor expansion (`sigma_val.to(device=device, dtype=torch.float32).view(1).expand(b_sz)`).
+   - This eliminates a 9.6x latency overhead per batch, eliminates stream pipeline bubbles, and prevents asynchronous CUDA errors from surfacing as deferred launch failures during inner diffusion loops.
+14. **Periodic Cache & Allocator Flushes (`clear_memory_cache()`) & Intra-Epoch Validation Schedule**:
+   - In `DatasetCacheManager`, `clear_memory_cache(self.device)` is executed at every shard boundary (`commit_shard()`), releasing PyTorch caching allocator pools and running garbage collection to prevent DMA page table exhaustion and host/device allocator fragmentation across long caching runs.
+   - In `Trainer`, periodic memory cache clearing (`empty_cache_steps`) and optional intra-epoch validation (`val_check_interval` / `val_check_steps`) ensure regular stream flushes and memory cleanup during long multi-thousand-step training epochs.
 
 ---
 
