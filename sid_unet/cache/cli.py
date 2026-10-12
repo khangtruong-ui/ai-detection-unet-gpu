@@ -150,6 +150,23 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         action="store_false",
         help="Do not store RGB images in Parquet shards",
     )
+    parser.add_argument(
+        "--num-workers",
+        "--num_workers",
+        "-j",
+        type=int,
+        default=None,
+        dest="num_workers",
+        help="Number of background CPU worker threads for image loading and preprocessing (default: 4)",
+    )
+    parser.add_argument(
+        "--prefetch-batches",
+        "--prefetch_batches",
+        type=int,
+        default=16,
+        dest="prefetch_batches",
+        help="Number of batches to prefetch ahead in RAM for non-blocking GPU execution (default: 16)",
+    )
     return parser.parse_args(args)
 
 
@@ -185,6 +202,13 @@ def cli_main(args: Optional[list] = None) -> None:
 
     img_size = tuple(cfg.data.get("image_size", [256, 256]))
     batch_size = parsed_args.batch_size if parsed_args.batch_size is not None else cfg.data.get("batch_size", 8)
+    num_workers = parsed_args.num_workers
+    if num_workers is None:
+        cfg_workers = cfg.data.get("num_workers", None)
+        if cfg_workers is not None and cfg_workers > 0:
+            num_workers = int(cfg_workers)
+        else:
+            num_workers = min(4, os.cpu_count() or 4)
 
     manager = DatasetCacheManager(
         model=model,
@@ -201,6 +225,8 @@ def cli_main(args: Optional[list] = None) -> None:
         delete_local_on_upload=parsed_args.delete_local_on_upload,
         push_to_hub=push_hub,
         store_images=parsed_args.store_images,
+        num_workers=num_workers,
+        prefetch_batches=parsed_args.prefetch_batches,
     )
 
     logger.info(

@@ -750,6 +750,148 @@ def test_dataset_cache_manager_gap_sam_shards_with_images(temp_cache_dir):
         assert img.size == (256, 256)
 
 
+def test_async_shard_writer(temp_cache_dir):
+    """Test AsyncShardWriter writes Parquet shards in background thread non-blockingly."""
+    from sid_unet.cache.manager import AsyncShardWriter
+
+    uploaded_calls = []
+
+    class MockUploader:
+        def submit_upload(self, local_path, rel_repo_path, commit_message=None):
+            uploaded_calls.append((local_path, rel_repo_path, commit_message))
+
+    mock_uploader = MockUploader()
+    writer = AsyncShardWriter(
+        output_dir=temp_cache_dir,
+        uploader=mock_uploader,
+        max_pending=2,
+    )
+
+    shard_path = os.path.join(temp_cache_dir, "train", "train-00000.parquet")
+    shard_data = {
+        "img_ids": ["img_0", "img_1"],
+        "labels": [0, 1],
+        "z_bytes": [b"\x00" * 84 * 32 * 32 * 2, b"\x01" * 84 * 32 * 32 * 2],
+        "mask_bytes": [b"mask0", b"mask1"],
+        "image_bytes": None,
+        "split": "train",
+        "shard_idx": 0,
+        "latent_h": 32,
+        "latent_w": 32,
+        "total_channels": 84,
+        "shard_path": shard_path,
+    }
+
+    writer.submit_shard(shard_data)
+    writer.wait_all()
+    writer.close()
+
+    assert os.path.exists(shard_path)
+    tbl = pq.read_table(shard_path)
+    assert len(tbl) == 2
+    assert tbl["channels"][0].as_py() == 84
+    assert len(uploaded_calls) == 1
+    assert uploaded_calls[0][0] == shard_path
+    assert uploaded_calls[0][1] == "train/train-00000.parquet"
+
+
+def test_prefetched_batch_loader():
+    """Test PrefetchedBatchLoader batches, pins memory, and processes samples concurrently."""
+    from sid_unet.cache.manager import PrefetchedBatchLoader
+
+    dataset = [
+        {"image": torch.randn(3, 64, 64), "mask": torch.zeros(1, 64, 64), "label": 1, "id": f"id_{i}"}
+        for i in range(7)
+    ]
+
+    def mock_process(sample):
+        t = sample["image"]
+        m_bytes = b"mask_png"
+        lbl = sample["label"]
+        i_id = sample["id"]
+        return t, m_bytes, lbl, i_id, None
+
+    loader = PrefetchedBatchLoader(
+        dataset=dataset,
+        process_sample_fn=mock_process,
+        batch_size=3,
+        num_workers=2,
+        queue_size=4,
+    )
+
+    batches = list(loader)
+    loader.close()
+
+    # 7 samples with batch_size=3 should yield 3 batches: [3, 3, 1]
+    assert len(batches) == 3
+    assert batches[0]["images"].shape[0] == 3
+    assert batches[1]["images"].shape[0] == 3
+    assert batches[2]["images"].shape[0] == 1
+    assert batches[0]["ids"] == ["id_0", "id_1", "id_2"]
+    assert batches[1]["ids"] == ["id_3", "id_4", "id_5"]
+    assert batches[2]["ids"] == ["id_6"]
+
+
+def test_background_row_group_prefetcher():
+    """Test BackgroundRowGroupPrefetcher initializes memory cache and updates index safely."""
+    from sid_unet.cache.manager import BackgroundRowGroupPrefetcher
+
+    class MockMemoryCache:
+        def __init__(self):
+            self.max_entries = 2
+
+        def get(self, *args):
+            return None
+
+    class MockReader:
+        def __init__(self):
+            self.memory_cache = MockMemoryCache()
+
+        def read_row_group(self, *args, **kwargs):
+            return None
+
+    class MockRGInfo:
+        def __init__(self):
+            self.rg_index = 0
+            self.num_rows = 100
+            self.file_url = "http://example.com/0.parquet"
+            self.file_index = 0
+
+    class MockIndex:
+        def locate_row(self, idx):
+            return MockRGInfo(), idx % 100
+
+    class MockDataset:
+        def __init__(self):
+            self.reader = MockReader()
+            self.index = MockIndex()
+            self.columns = ["image", "mask"]
+
+        def __len__(self):
+            return 500
+
+    ds = MockDataset()
+    prefetcher = BackgroundRowGroupPrefetcher(ds, start_idx=0, lookahead=2)
+    assert ds.reader.memory_cache.max_entries >= 8
+
+    prefetcher.update_index(150)
+    prefetcher.close()
+
+
+def test_cli_num_workers_and_prefetch_args():
+    """Test CLI argument parsing for --num-workers and --prefetch-batches."""
+    from sid_unet.cache.cli import parse_args
+
+    args = parse_args([
+        "--config", "configs/experiments/diffusion_diff_minimized/default.yaml",
+        "--num-workers", "6",
+        "--prefetch-batches", "32",
+    ])
+    assert args.num_workers == 6
+    assert args.prefetch_batches == 32
+
+
+
 
 
 

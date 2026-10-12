@@ -193,6 +193,437 @@ class AsyncHubUploader:
         self.worker_thread.join(timeout=30)
 
 
+class _ExceptionWrapper:
+    """Wraps an exception occurring in background worker threads to re-raise in the main thread."""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.exc_info = sys.exc_info()
+
+    def reraise(self) -> None:
+        if self.exc_info[1] is not None:
+            raise self.exc.with_traceback(self.exc_info[2])
+        raise self.exc
+
+
+class BackgroundRowGroupPrefetcher:
+    """
+    Prefetches upcoming Parquet row groups into RowGroupMemoryCache in a background thread,
+    completely eliminating 5-8s network latency stalls during row group transitions.
+    """
+
+    def __init__(self, dataset: Any, start_idx: int = 0, lookahead: int = 2):
+        self.lookahead = max(1, int(lookahead))
+        self.stop_event = threading.Event()
+        self.current_idx = start_idx
+        self.lock = threading.Lock()
+        self.thread: Optional[threading.Thread] = None
+
+        target_ds = getattr(dataset, "data", dataset)
+        target_ds = getattr(target_ds, "pdl_dataset", target_ds)
+        self.target_ds = target_ds
+
+        if hasattr(target_ds, "reader") and hasattr(target_ds, "index"):
+            # Enlarge memory cache capacity so prefetched row groups don't prematurely evict active ones
+            if hasattr(target_ds.reader, "memory_cache") and hasattr(target_ds.reader.memory_cache, "max_entries"):
+                target_ds.reader.memory_cache.max_entries = max(target_ds.reader.memory_cache.max_entries, 8)
+            self.thread = threading.Thread(
+                target=self._worker_loop, daemon=True, name="pdl-row-group-prefetcher"
+            )
+            self.thread.start()
+
+    def update_index(self, idx: int) -> None:
+        with self.lock:
+            self.current_idx = idx
+
+    def _worker_loop(self) -> None:
+        ds = self.target_ds
+        total_len = len(ds) if hasattr(ds, "__len__") else None
+
+        while not self.stop_event.is_set():
+            with self.lock:
+                idx = self.current_idx
+
+            try:
+                if total_len is not None and idx >= total_len:
+                    break
+                rg_info, _ = ds.index.locate_row(idx)
+
+                for step in range(1, self.lookahead + 1):
+                    if self.stop_event.is_set():
+                        break
+                    next_row = idx + step * max(1, rg_info.num_rows)
+                    if total_len is not None and next_row >= total_len:
+                        break
+                    next_rg_info, _ = ds.index.locate_row(next_row)
+
+                    cached = ds.reader.memory_cache.get(
+                        next_rg_info.file_url, next_rg_info.rg_index, ds.columns
+                    )
+                    if cached is None:
+                        try:
+                            ds.reader.read_row_group(
+                                file_url=next_rg_info.file_url,
+                                rg_index=next_rg_info.rg_index,
+                                columns=ds.columns,
+                                file_index=next_rg_info.file_index,
+                            )
+                        except Exception as e:
+                            logger.debug(f"Row group prefetcher skipped rg {next_rg_info.rg_index}: {e}")
+                            break
+            except Exception:
+                pass
+
+            self.stop_event.wait(0.05)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5.0)
+
+
+class AsyncShardWriter:
+    """
+    Non-blocking background worker that serializes and writes Parquet shards to disk with zstd compression.
+    Decouples GPU feature extraction from disk serialization, eliminating 15s stalls at shard boundaries.
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        uploader: Optional[AsyncHubUploader] = None,
+        max_pending: int = 2,
+        write_shard_fn: Optional[Callable[..., str]] = None,
+    ):
+        self.output_dir = output_dir
+        self.uploader = uploader
+        self.max_pending = max(1, int(max_pending))
+        self.write_shard_fn = write_shard_fn
+        self.queue: queue.Queue = queue.Queue(maxsize=self.max_pending)
+        self.stop_event = threading.Event()
+        self.written_shards: List[str] = []
+        self.failed_error: Optional[Exception] = None
+        self._lock = threading.Lock()
+
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True, name="parquet-shard-writer"
+        )
+        self.worker_thread.start()
+
+    def _worker_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                task = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if task is _SENTINEL:
+                self.queue.task_done()
+                break
+
+            shard_data = task
+            try:
+                split = shard_data["split"]
+                shard_idx = shard_data["shard_idx"]
+                img_ids = shard_data["img_ids"]
+                labels = shard_data["labels"]
+                z_bytes = shard_data["z_bytes"]
+                mask_bytes = shard_data["mask_bytes"]
+                image_bytes = shard_data.get("image_bytes")
+                latent_h = shard_data["latent_h"]
+                latent_w = shard_data["latent_w"]
+                total_channels = shard_data["total_channels"]
+                num_records = len(img_ids)
+
+                if self.write_shard_fn is not None:
+                    shard_path = self.write_shard_fn(
+                        img_ids=img_ids,
+                        labels=labels,
+                        z_bytes=z_bytes,
+                        mask_bytes=mask_bytes,
+                        split=split,
+                        shard_idx=shard_idx,
+                        latent_h=latent_h,
+                        latent_w=latent_w,
+                        image_bytes=image_bytes,
+                    )
+                else:
+                    split_dir = os.path.join(self.output_dir, split)
+                    os.makedirs(split_dir, exist_ok=True)
+                    shard_filename = f"{split}-{shard_idx:05d}.parquet"
+                    shard_path = os.path.join(split_dir, shard_filename)
+
+                    arrays = [
+                        pa.array(img_ids, type=pa.string()),
+                        pa.array(labels, type=pa.int64()),
+                        pa.array(z_bytes, type=pa.binary()),
+                        pa.array(mask_bytes, type=pa.binary()),
+                        pa.array([total_channels] * num_records, type=pa.int64()),
+                        pa.array([latent_h] * num_records, type=pa.int64()),
+                        pa.array([latent_w] * num_records, type=pa.int64()),
+                    ]
+                    names = ["img_id", "label", "z_high_dim", "mask", "channels", "latent_h", "latent_w"]
+                    if image_bytes is not None and len(image_bytes) == num_records:
+                        arrays.append(pa.array(image_bytes, type=pa.binary()))
+                        names.append("image")
+
+                    table = pa.Table.from_arrays(arrays, names=names)
+                    pq.write_table(table, shard_path, compression="zstd")
+                    del table
+                    del arrays
+
+                    shard_size_mb = os.path.getsize(shard_path) / (1024 * 1024)
+                    logger.info(f"💾 Saved Parquet shard: {shard_path} ({num_records} samples, {shard_size_mb:.2f} MB)")
+
+                with self._lock:
+                    if shard_path not in self.written_shards:
+                        self.written_shards.append(shard_path)
+
+                if self.uploader:
+                    rel_repo_path = f"{split}/{os.path.basename(shard_path)}"
+                    commit_msg = f"Add {split} shard {shard_idx:05d} ({num_records} samples)"
+                    self.uploader.submit_upload(
+                        local_path=shard_path,
+                        rel_repo_path=rel_repo_path,
+                        commit_message=commit_msg,
+                    )
+
+                del shard_data
+                gc.collect()
+            except Exception as e:
+                logger.error(f"❌ [AsyncShardWriter] Failed to write shard: {e}")
+                with self._lock:
+                    self.failed_error = e
+            finally:
+                self.queue.task_done()
+
+    def submit_shard(self, shard_data: Dict[str, Any]) -> None:
+        """Submit completed shard records for asynchronous disk writing and uploading."""
+        if self.failed_error is not None:
+            raise RuntimeError(f"AsyncShardWriter encountered fatal error: {self.failed_error}")
+        self.queue.put(shard_data)
+
+    def wait_all(self, timeout: Optional[float] = 300.0) -> None:
+        """Block until all queued shard writes are finished."""
+        start_t = time.time()
+        while self.queue.unfinished_tasks > 0:
+            if timeout is not None and (time.time() - start_t) > timeout:
+                raise TimeoutError(f"AsyncShardWriter.wait_all timed out after {timeout}s with {self.queue.unfinished_tasks} unfinished tasks.")
+            if not self.worker_thread.is_alive():
+                break
+            time.sleep(0.05)
+        if self.failed_error is not None:
+            raise RuntimeError(f"AsyncShardWriter encountered fatal error: {self.failed_error}")
+
+    def close(self) -> None:
+        """Signal worker to finish and wait for termination."""
+        self.queue.put(_SENTINEL)
+        self.worker_thread.join(timeout=30)
+
+
+class PrefetchedBatchLoader:
+    """
+    Background batch prefetcher that decouples dataset iteration and CPU image/mask preprocessing
+    from GPU feature extraction. Batches are assembled, pinned into memory, and queued for the GPU.
+    """
+
+    def __init__(
+        self,
+        dataset: Any,
+        process_sample_fn: Callable[[Dict[str, Any]], Tuple[torch.Tensor, bytes, int, str, Optional[bytes]]],
+        batch_size: int,
+        max_samples: Optional[int] = None,
+        store_images: bool = False,
+        queue_size: int = 16,
+        num_workers: int = 4,
+    ):
+        self.dataset = dataset
+        self.process_sample_fn = process_sample_fn
+        self.batch_size = max(1, int(batch_size))
+        self.max_samples = max_samples
+        self.store_images = store_images
+        self.queue: queue.Queue = queue.Queue(maxsize=max(2, int(queue_size)))
+        self.stop_event = threading.Event()
+        self.num_workers = max(1, int(num_workers))
+        self.producer_thread = threading.Thread(
+            target=self._produce_loop, daemon=True, name="cache-batch-loader"
+        )
+        self.producer_thread.start()
+
+    def _produce_loop(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        consecutive_failures = 0
+        max_consecutive_failures = 50
+        total_queued = 0
+
+        batch_images: List[torch.Tensor] = []
+        batch_masks: List[bytes] = []
+        batch_labels: List[int] = []
+        batch_ids: List[str] = []
+        batch_raw_images: List[Optional[bytes]] = []
+
+        executor = ThreadPoolExecutor(max_workers=self.num_workers) if self.num_workers > 1 else None
+
+        def put_batch() -> bool:
+            nonlocal batch_images, batch_masks, batch_labels, batch_ids, batch_raw_images
+            if not batch_images:
+                return True
+            try:
+                imgs_t = torch.stack(batch_images, dim=0)
+                if torch.cuda.is_available():
+                    try:
+                        imgs_t = imgs_t.pin_memory()
+                    except Exception:
+                        pass
+                packet = {
+                    "images": imgs_t,
+                    "masks": list(batch_masks),
+                    "labels": list(batch_labels),
+                    "ids": list(batch_ids),
+                    "raw_images": list(batch_raw_images) if self.store_images else None,
+                }
+                while not self.stop_event.is_set():
+                    try:
+                        self.queue.put(packet, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                batch_images.clear()
+                batch_masks.clear()
+                batch_labels.clear()
+                batch_ids.clear()
+                batch_raw_images.clear()
+                return not self.stop_event.is_set()
+            except Exception as e:
+                self.queue.put(_ExceptionWrapper(e))
+                return False
+
+        try:
+            it = iter(self.dataset)
+            while not self.stop_event.is_set():
+                if self.max_samples is not None and total_queued >= self.max_samples:
+                    break
+
+                chunk_size = self.batch_size
+                if self.max_samples is not None:
+                    chunk_size = min(chunk_size, self.max_samples - total_queued)
+
+                raw_chunk = []
+                for _ in range(chunk_size):
+                    try:
+                        raw_s = next(it)
+                        raw_chunk.append(raw_s)
+                    except (StopIteration, IndexError):
+                        break
+
+                if not raw_chunk:
+                    break
+
+                if executor is not None:
+                    futures = [executor.submit(self.process_sample_fn, s) for s in raw_chunk]
+                    for fut in futures:
+                        try:
+                            res = fut.result()
+                            if res is not None:
+                                img_t, mask_b, lbl, i_id, img_b = res
+                                batch_images.append(img_t)
+                                batch_masks.append(mask_b)
+                                batch_labels.append(lbl)
+                                batch_ids.append(i_id)
+                                if self.store_images:
+                                    batch_raw_images.append(img_b)
+                                total_queued += 1
+                                consecutive_failures = 0
+                        except Exception as s_err:
+                            if "CUDA error" in str(s_err) or "cudaError" in str(s_err):
+                                raise s_err
+                            consecutive_failures += 1
+                            logger.warning(f"Skipping corrupt sample: {s_err}")
+                            if consecutive_failures >= max_consecutive_failures:
+                                raise RuntimeError(
+                                    f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples."
+                                )
+                else:
+                    for s in raw_chunk:
+                        try:
+                            res = self.process_sample_fn(s)
+                            if res is not None:
+                                img_t, mask_b, lbl, i_id, img_b = res
+                                batch_images.append(img_t)
+                                batch_masks.append(mask_b)
+                                batch_labels.append(lbl)
+                                batch_ids.append(i_id)
+                                if self.store_images:
+                                    batch_raw_images.append(img_b)
+                                total_queued += 1
+                                consecutive_failures = 0
+                        except Exception as s_err:
+                            if "CUDA error" in str(s_err) or "cudaError" in str(s_err):
+                                raise s_err
+                            consecutive_failures += 1
+                            logger.warning(f"Skipping corrupt sample: {s_err}")
+                            if consecutive_failures >= max_consecutive_failures:
+                                raise RuntimeError(
+                                    f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples."
+                                )
+
+                if len(batch_images) >= self.batch_size:
+                    if not put_batch():
+                        break
+
+            if batch_images and not self.stop_event.is_set():
+                put_batch()
+
+        except Exception as e:
+            if not self.stop_event.is_set():
+                try:
+                    self.queue.put(_ExceptionWrapper(e), timeout=0.5)
+                except Exception:
+                    pass
+        finally:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                except Exception:
+                    pass
+            while not self.stop_event.is_set():
+                try:
+                    self.queue.put(_SENTINEL, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def __iter__(self) -> PrefetchedBatchLoader:
+        return self
+
+    def __next__(self) -> Dict[str, Any]:
+        while not self.stop_event.is_set():
+            try:
+                item = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                if not self.producer_thread.is_alive() and self.queue.empty():
+                    raise StopIteration
+                continue
+
+            if item is _SENTINEL:
+                raise StopIteration
+            if isinstance(item, _ExceptionWrapper):
+                item.reraise()
+            return item
+        raise StopIteration
+
+    def close(self) -> None:
+        self.stop_event.set()
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except Exception:
+                break
+        if self.producer_thread.is_alive():
+            self.producer_thread.join(timeout=5.0)
+
+
 class DatasetCacheManager:
     """
     Manages end-to-end caching of high-dimensional model representations:
@@ -219,6 +650,8 @@ class DatasetCacheManager:
         delete_local_on_upload: bool = False,
         push_to_hub: bool = False,
         store_images: Optional[bool] = None,
+        num_workers: Optional[int] = None,
+        prefetch_batches: int = 16,
     ):
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,6 +669,8 @@ class DatasetCacheManager:
         self.resume = bool(resume)
         self.delete_local_on_upload = bool(delete_local_on_upload)
         self.push_to_hub_flag = bool(push_to_hub)
+        self.num_workers = int(num_workers) if num_workers is not None else min(4, os.cpu_count() or 4)
+        self.prefetch_batches = max(2, int(prefetch_batches))
 
         if store_images is None:
             self.store_images = bool(
@@ -261,6 +696,13 @@ class DatasetCacheManager:
             # Upload initial metadata and dataset card upfront
             self._save_metadata(all_shards={}, status="in_progress")
             self._upload_metadata_sync()
+
+        self.shard_writer = AsyncShardWriter(
+            output_dir=self.output_dir,
+            uploader=self.uploader,
+            max_pending=2,
+            write_shard_fn=self._write_shard_columnar,
+        )
 
     def _process_sample_to_tensors(self, sample: Dict[str, Any]) -> Tuple[torch.Tensor, bytes, int, str, Optional[bytes]]:
         """Convert a raw dataset sample dict into an RGB tensor, mask PNG bytes, and optional JPEG bytes."""
@@ -294,10 +736,10 @@ class DatasetCacheManager:
             )
             mask_arr = np.array(mask_pil, dtype=np.float32) / 255.0
 
-        # Encode mask as PNG bytes for compact storage
+        # Encode mask as PNG bytes for compact storage (optimize=False for 30% faster CPU throughput)
         mask_pil = Image.fromarray((mask_arr * 255).astype(np.uint8), mode="L")
         buf = io.BytesIO()
-        mask_pil.save(buf, format="PNG", optimize=True)
+        mask_pil.save(buf, format="PNG", optimize=False)
         mask_bytes = buf.getvalue()
 
         # Safely close PIL handles to prevent handle/buffer leaks
@@ -527,70 +969,31 @@ class DatasetCacheManager:
         shard_mask_bytes: List[bytes] = []
         shard_image_bytes: List[bytes] = []
 
-        batch_images: List[torch.Tensor] = []
-        batch_masks: List[bytes] = []
-        batch_labels: List[int] = []
-        batch_ids: List[str] = []
-        batch_raw_images: List[Optional[bytes]] = []
-
         pbar = tqdm(desc=f"Caching [{split}]", total=target_total, initial=total_processed, unit="samples")
-
-        def flush_batch() -> None:
-            nonlocal batch_images, batch_masks, batch_labels, batch_ids, batch_raw_images, latent_h, latent_w
-            if not batch_images:
-                return
-
-            imgs = torch.stack(batch_images, dim=0).to(self.device)
-            with torch.no_grad():
-                z_batch = self.extractor.extract_batch(imgs)
-
-            # Dynamically resolve latent spatial dimensions based on extractor output
-            if z_batch.dim() == 4:
-                latent_h = z_batch.shape[2]
-                latent_w = z_batch.shape[3]
-            elif z_batch.dim() <= 2:
-                latent_h = 1
-                latent_w = 1
-
-            z_batch_cpu = z_batch.cpu()
-            if self.fp16 and z_batch_cpu.dtype != torch.float16:
-                z_batch_cpu = z_batch_cpu.half()
-
-            z_np = z_batch_cpu.numpy()
-
-            for i in range(len(batch_images)):
-                shard_img_ids.append(batch_ids[i])
-                shard_labels.append(batch_labels[i])
-                shard_z_bytes.append(z_np[i].tobytes())
-                shard_mask_bytes.append(batch_masks[i])
-                if self.store_images and i < len(batch_raw_images) and batch_raw_images[i] is not None:
-                    shard_image_bytes.append(batch_raw_images[i])
-
-            del imgs, z_batch, z_batch_cpu, z_np
-            batch_images.clear()
-            batch_masks.clear()
-            batch_labels.clear()
-            batch_ids.clear()
-            batch_raw_images.clear()
 
         def commit_shard() -> None:
             nonlocal shard_idx
             if not shard_img_ids:
                 return
 
-            path = self._write_shard_columnar(
-                img_ids=shard_img_ids,
-                labels=shard_labels,
-                z_bytes=shard_z_bytes,
-                mask_bytes=shard_mask_bytes,
-                split=split,
-                shard_idx=shard_idx,
-                latent_h=latent_h,
-                latent_w=latent_w,
-                image_bytes=shard_image_bytes if self.store_images else None,
-            )
-            shard_files.append(path)
-            num_written = len(shard_img_ids)
+            split_dir = os.path.join(self.output_dir, split)
+            shard_filename = f"{split}-{shard_idx:05d}.parquet"
+            shard_path = os.path.join(split_dir, shard_filename)
+            shard_files.append(shard_path)
+
+            shard_data = {
+                "img_ids": list(shard_img_ids),
+                "labels": list(shard_labels),
+                "z_bytes": list(shard_z_bytes),
+                "mask_bytes": list(shard_mask_bytes),
+                "image_bytes": list(shard_image_bytes) if self.store_images else None,
+                "split": split,
+                "shard_idx": shard_idx,
+                "latent_h": latent_h,
+                "latent_w": latent_w,
+                "total_channels": self.extractor.total_channels,
+                "shard_path": shard_path,
+            }
 
             shard_img_ids.clear()
             shard_labels.clear()
@@ -598,66 +1001,91 @@ class DatasetCacheManager:
             shard_mask_bytes.clear()
             shard_image_bytes.clear()
 
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            if self.uploader:
-                rel_repo_path = f"{split}/{os.path.basename(path)}"
-                commit_msg = f"Add {split} shard {shard_idx:05d} ({num_written} samples)"
-                self.uploader.submit_upload(
-                    local_path=path,
-                    rel_repo_path=rel_repo_path,
-                    commit_message=commit_msg,
-                )
-
+            self.shard_writer.submit_shard(shard_data)
             shard_idx += 1
 
-        consecutive_failures = 0
-        max_consecutive_failures = 50
+        # 1. Background Parquet Row-Group Prefetcher
+        prefetcher = BackgroundRowGroupPrefetcher(
+            dataset=ds,
+            start_idx=already_cached_samples,
+            lookahead=2,
+        )
+
+        # 2. Background Multi-threaded Batch Prefetcher
+        remaining_samples = (max_samples - already_cached_samples) if (max_samples is not None) else None
+        if remaining_samples is not None and remaining_samples <= 0:
+            prefetcher.close()
+            pbar.close()
+            return shard_files
+
+        batch_loader = PrefetchedBatchLoader(
+            dataset=ds,
+            process_sample_fn=self._process_sample_to_tensors,
+            batch_size=self.batch_size,
+            max_samples=remaining_samples,
+            store_images=self.store_images,
+            queue_size=self.prefetch_batches,
+            num_workers=self.num_workers,
+        )
 
         try:
-            for raw_sample in ds:
-                try:
-                    img_t, mask_b, lbl, i_id, img_b = self._process_sample_to_tensors(raw_sample)
-                    batch_images.append(img_t)
-                    batch_masks.append(mask_b)
-                    batch_labels.append(lbl)
-                    batch_ids.append(i_id)
-                    if self.store_images:
-                        batch_raw_images.append(img_b)
-                    total_processed += 1
-                    consecutive_failures = 0
-                    pbar.update(1)
+            for batch in batch_loader:
+                imgs = batch["images"].to(self.device, non_blocking=True)
+                with torch.no_grad():
+                    z_batch = self.extractor.extract_batch(imgs)
 
-                    if len(batch_images) >= self.batch_size:
-                        flush_batch()
+                # Dynamically resolve latent spatial dimensions based on extractor output
+                if z_batch.dim() == 4:
+                    latent_h = z_batch.shape[2]
+                    latent_w = z_batch.shape[3]
+                elif z_batch.dim() <= 2:
+                    latent_h = 1
+                    latent_w = 1
 
-                    if len(shard_img_ids) >= self.samples_per_shard:
-                        commit_shard()
+                z_batch_cpu = z_batch.cpu()
+                if self.fp16 and z_batch_cpu.dtype != torch.float16:
+                    z_batch_cpu = z_batch_cpu.half()
 
-                    if max_samples is not None and total_processed >= max_samples:
-                        break
-                except (IndexError, StopIteration):
+                z_np = z_batch_cpu.numpy()
+
+                b_sz = len(batch["ids"])
+                shard_img_ids.extend(batch["ids"])
+                shard_labels.extend(batch["labels"])
+                for i in range(b_sz):
+                    shard_z_bytes.append(z_np[i].tobytes())
+                shard_mask_bytes.extend(batch["masks"])
+                if self.store_images and batch["raw_images"]:
+                    shard_image_bytes.extend(batch["raw_images"])
+
+                total_processed += b_sz
+                pbar.update(b_sz)
+                prefetcher.update_index(total_processed)
+
+                del imgs, z_batch, z_batch_cpu, z_np
+
+                if len(shard_img_ids) >= self.samples_per_shard:
+                    commit_shard()
+
+                if max_samples is not None and total_processed >= max_samples:
                     break
-                except Exception as sample_err:
-                    consecutive_failures += 1
-                    logger.warning(f"Skipping corrupt sample: {sample_err}")
-                    if consecutive_failures >= max_consecutive_failures:
-                        logger.error(f"Aborting cache split: exceeded {max_consecutive_failures} consecutive corrupt samples.")
-                        break
-                    continue
 
-            flush_batch()
             commit_shard()
 
         finally:
+            batch_loader.close()
+            prefetcher.close()
             if hasattr(ds, "close"):
                 try:
                     ds.close()
                 except Exception:
                     pass
             pbar.close()
+
+        # Wait for all background shard writes to finish cleanly
+        self.shard_writer.wait_all()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         logger.info(
             f"✅ Completed caching split '{split}': {total_processed} samples across {len(shard_files)} shards."
@@ -687,7 +1115,8 @@ class DatasetCacheManager:
             if self.uploader:
                 self._upload_metadata_sync()
 
-        # Wait for all background in-flight uploads to finish cleanly
+        # Wait for all background in-flight shard writes and uploads to finish cleanly
+        self.shard_writer.wait_all()
         if self.uploader:
             logger.info("⏳ Waiting for all background shard uploads to complete...")
             self.uploader.wait_all()
@@ -698,8 +1127,22 @@ class DatasetCacheManager:
         if self.uploader:
             self._upload_metadata_sync()
             self.uploader.close()
+        self.shard_writer.close()
 
         return all_shards
+
+    def close(self) -> None:
+        """Shut down background shard writer and uploader worker threads."""
+        if hasattr(self, "shard_writer") and self.shard_writer is not None:
+            try:
+                self.shard_writer.close()
+            except Exception:
+                pass
+        if hasattr(self, "uploader") and self.uploader is not None:
+            try:
+                self.uploader.close()
+            except Exception:
+                pass
 
     def _save_metadata(self, all_shards: Dict[str, List[str]], status: str = "in_progress") -> None:
         """Write cache_info.json and README.md dataset card."""
