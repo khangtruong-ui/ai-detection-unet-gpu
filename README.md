@@ -1083,14 +1083,17 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
    - Standard `log/` and `logs/` folders are automatically created and strictly ignored by git (`.gitignore`).
    - `SafeStreamHandler` transparently absorbs `BrokenPipeError` and `OSError` (`EIO`) when client SSH sessions disconnect.
    - `install_exception_logger()` registers global exception hooks (`sys.excepthook` and `threading.excepthook`) to capture any uncaught fatal exception into rotating log files with full stack traces.
-3. **Clean Teardown with `os._exit` Protection**:
-   - In `cli_main()`, fatal exceptions are caught, logged with `exc_info=True`, all handlers are flushed (`flush_loggers()`), and the process exits immediately via `os._exit(code)`. This prevents secondary C++ destructor aborts (`std::terminate`) during `Py_FinalizeEx()`.
-4. **Worker-Level Signal Shields & Deterministic Termination**:
+3. **Clean Teardown with `os._exit` Protection & Crash Diagnostics**:
+   - In `cli_main()`, fatal exceptions are caught, formatted with full tracebacks to `sys.stderr`, logged with `exc_info=True`, and flushed (`flush_loggers()`) before immediate process exit via `os._exit(1)`.
+   - `main()` is decorated with TorchElastic's `@record` decorator, ensuring any unhandled exceptions are captured directly into `TORCHELASTIC_ERROR_FILE` so distributed multi-GPU training logs report the exact root cause instead of `<N/A>`.
+4. **Worker-Level Signal Shields & Deterministic Termination (DataLoader & DDP Workers)**:
    - In `sid_unet/dataset/loader.py`, `worker_init_fn(worker_id)` invokes `shield_worker_signals()` from `sid_unet/utils/signals.py`:
      - Shields workers against terminal disconnects and stream aborts: `SIGHUP` (terminal hangup), `SIGPIPE` (broken pipe), `SIGWINCH` (window resize), `SIGIO` (asynchronous I/O), and `SIGQUIT`.
      - **Preserves `SIGTERM` & `SIGINT`**: Workers explicitly maintain default termination handlers (`signal.SIG_DFL`) rather than masking `SIGTERM`. This ensures that PyTorch DataLoader's `_shutdown_workers()` and parent process terminations kill workers instantly, eliminating process hangs and orphaned CUDA memory leaks.
-5. **Controlling Terminal Detachment**:
-   - `sid_unet/utils/signals.py` executes `detach_controlling_terminal()` via `os.setsid()` / `os.setpgrp()` so that closing terminal windows does not cascade kernel hangups to the training process tree.
+   - **Distributed DDP Worker Shielding**: In `sid_unet/train.py`, distributed workers (`in_dist=True`) invoke `shield_worker_signals()` rather than `shield_process_signals()`, preserving responsiveness to TorchElastic's `SIGTERM` lifecycle signals and preventing worker detachment.
+5. **Controlling Terminal Detachment & Auto-Launcher Signal Forwarding**:
+   - `sid_unet/utils/signals.py` executes `detach_controlling_terminal()` via `os.setsid()` / `os.setpgrp()` for standalone entrypoints so closing SSH terminals does not cascade kernel hangups to the training process.
+   - **Multi-GPU Auto-Launcher**: In `sid_unet/train.py`, the DDP launcher hooks `SIGINT`, `SIGTERM`, and `SIGHUP`, forwarding termination signals directly down the process group via `os.killpg(proc.pid, signal.SIGTERM)`. On Linux, child processes register `PR_SET_PDEATHSIG` so child processes are automatically reaped by the kernel if the parent launcher terminates or times out.
 6. **Fatal CUDA Fault Detection & Guarded Caches**:
    - `GAPSAM.forward()`, `SAM3DistilModel.forward()`, and `Trainer._step_batch_train()` explicitly detect unrecoverable hardware/kernel faults (`torch.AcceleratorError`, `cudaErrorLaunchFailure`) and cleanly drain DataLoader workers via `self.close()` before propagating exceptions.
    - All `torch.cuda.empty_cache()` calls across models, trainers, and epoch cleanup hooks are wrapped in exception handlers, preventing C++ `std::terminate` aborts when device context is invalidated.

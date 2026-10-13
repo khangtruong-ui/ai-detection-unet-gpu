@@ -238,6 +238,14 @@ def load_config(
         with open(config_path, "r", encoding="utf-8") as f:
             user_config = yaml.safe_load(f)
             if user_config and isinstance(user_config, dict):
+                # Synchronize val_samples and val_samples_per_epoch aliases so one does not shadow the other
+                if "data" in user_config and isinstance(user_config["data"], dict):
+                    has_val_samples = "val_samples" in user_config["data"]
+                    has_val_samples_epoch = "val_samples_per_epoch" in user_config["data"]
+                    if has_val_samples and not has_val_samples_epoch:
+                        user_config["data"]["val_samples_per_epoch"] = user_config["data"]["val_samples"]
+                    elif has_val_samples_epoch and not has_val_samples:
+                        user_config["data"]["val_samples"] = user_config["data"]["val_samples_per_epoch"]
                 config = deep_merge(config, user_config)
     elif config_path is not None:
         raise FileNotFoundError(f"Configuration file not found: {config_path}")

@@ -164,12 +164,13 @@ def shield_process_signals(
 def shield_worker_signals(
     log_info: bool = False,
 ) -> Set[int]:
-    """Shield DataLoader worker processes from SSH disconnects while preserving terminability on SIGTERM.
+    """Shield DataLoader and distributed DDP worker processes from SSH disconnects while preserving terminability on SIGTERM.
 
-    DataLoader workers must NEVER mask SIGTERM because PyTorch's DataLoader
-    shutdown mechanism (_shutdown_workers) relies on SIGTERM (via worker.terminate())
-    to cleanly stop worker processes. Ignoring SIGTERM causes DataLoader shutdowns,
-    test teardowns, and multiprocessing atexit handlers to hang indefinitely.
+    DataLoader and distributed workers must NEVER mask SIGTERM because PyTorch's
+    DataLoader shutdown mechanism (_shutdown_workers) and TorchElastic agent rely
+    on SIGTERM (via worker.terminate()) to cleanly stop worker processes. Ignoring SIGTERM causes
+    DataLoader shutdowns, TorchElastic timeouts, test teardowns, and multiprocessing atexit handlers
+    to hang indefinitely.
     """
     # Ensure SIGTERM and SIGINT are explicitly set to default termination handlers
     for sig in (signal.SIGTERM, signal.SIGINT):

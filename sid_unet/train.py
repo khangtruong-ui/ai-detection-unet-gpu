@@ -705,10 +705,22 @@ def train_single_run(
     return results
 
 
+try:
+    from torch.distributed.elastic.multiprocessing.errors import record
+except ImportError:
+    record = lambda fn: fn
+
+
+@record
 def main():
-    from sid_unet.utils.signals import shield_process_signals
-    # Shield process from SSH disconnection, terminal hangup, and session teardown signals (SIGHUP, SIGTERM, etc.)
-    shield_process_signals()
+    # Distributed workers (under torchrun / DDP) must preserve SIGTERM and not detach sessions
+    in_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ) or is_dist_avail_and_initialized()
+    if in_dist:
+        from sid_unet.utils.signals import shield_worker_signals
+        shield_worker_signals()
+    else:
+        from sid_unet.utils.signals import shield_process_signals
+        shield_process_signals()
 
     args = parse_args()
 
@@ -854,25 +866,33 @@ def main():
         print(f"🚀 Auto-launching High-Performance Multi-GPU DistributedDataParallel (DDP) across {num_gpus} GPUs on port {port}...")
         sys.stdout.flush()
 
-        # Shield Torch Elastic agent from SSH disconnection / session teardown signals (SIGHUP, SIGTERM, SIGQUIT)
-        # by configuring it to only trap SIGINT for intentional termination (e.g. sid-kill or Ctrl+C)
+        # Configure environment for Torch Elastic child processes
         env = os.environ.copy()
-        env["TORCHELASTIC_SIGNALS_TO_HANDLE"] = "SIGINT"
         env["PYTHONUNBUFFERED"] = "1"
 
         sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
+        if os.name != "nt" and sys.platform.startswith("linux"):
+            def _set_pdeathsig():
+                try:
+                    import ctypes
+                    # PR_SET_PDEATHSIG = 1: ensures child receives SIGTERM if parent launcher terminates
+                    ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+                except Exception:
+                    pass
+            sub_kwargs["preexec_fn"] = _set_pdeathsig
+
         proc = subprocess.Popen(cmd, env=env, **sub_kwargs)
 
         def _forward_kill(signum=None, frame=None):
             if proc.poll() is None:
                 try:
                     if os.name != "nt":
-                        # Send SIGINT first to trigger graceful worker shutdown in Torch Elastic
-                        os.killpg(proc.pid, signal.SIGINT)
-                        time.sleep(0.5)
-                        if proc.poll() is None:
-                            os.killpg(proc.pid, signal.SIGTERM)
-                            time.sleep(0.5)
+                        # Send SIGTERM to process group so Torch Elastic and DDP workers terminate promptly
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        for _ in range(10):
+                            if proc.poll() is not None:
+                                break
+                            time.sleep(0.1)
                         if proc.poll() is None:
                             os.killpg(proc.pid, signal.SIGKILL)
                     else:
@@ -882,11 +902,13 @@ def main():
             if signum is not None:
                 sys.exit(128 + signum)
 
-        # Hook SIGINT for interactive terminal interruptions (Ctrl+C) and graceful sid-kill requests
-        try:
-            signal.signal(signal.SIGINT, _forward_kill)
-        except (ValueError, OSError):
-            pass
+        # Hook SIGINT, SIGTERM, and SIGHUP so timeouts, kill signals, and terminal closes cleanly terminate DDP
+        for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if sig is not None:
+                try:
+                    signal.signal(sig, _forward_kill)
+                except (ValueError, OSError):
+                    pass
 
         try:
             ret = proc.wait()
@@ -1014,7 +1036,10 @@ def main():
 
 
 def cli_main():
+    import logging
     import sys
+    import traceback
+
     try:
         main()
         sys.stdout.flush()
@@ -1027,13 +1052,12 @@ def cli_main():
         os._exit(code)
     except BaseException as exc:
         try:
+            sys.stderr.write(f"🛑 Fatal unhandled error in training execution: {exc}\n")
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
             logger = logging.getLogger("sid_unet")
             if logger.handlers:
                 logger.critical(f"🛑 Fatal unhandled error in training execution: {exc}", exc_info=True)
-            else:
-                import traceback
-                sys.stderr.write(f"🛑 Fatal unhandled error in training execution: {exc}\n")
-                sys.stderr.write(traceback.format_exc() + "\n")
             from sid_unet.utils.logger import flush_loggers
             flush_loggers(logger)
         except Exception:

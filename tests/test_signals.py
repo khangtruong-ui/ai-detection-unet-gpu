@@ -504,3 +504,64 @@ def test_trainer_intra_epoch_validation_and_empty_cache():
         assert val_call_count >= 2, f"Expected at least 2 validation calls, got {val_call_count}"
 
 
+def test_distributed_worker_preserves_sigterm_and_does_not_detach():
+    """Verify that distributed DDP workers preserve SIGTERM and do not detach sessions."""
+    code = (
+        "import os, signal, sys, time\n"
+        "from sid_unet.utils.signals import shield_worker_signals\n"
+        "shield_worker_signals()\n"
+        "assert signal.getsignal(signal.SIGTERM) != signal.SIG_IGN, 'SIGTERM was ignored!'\n"
+        "sys.stdout.write('DDP_WORKER_READY\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(10)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    line = proc.stdout.readline()
+    assert "DDP_WORKER_READY" in line
+
+    # Send SIGTERM - DDP worker MUST terminate promptly rather than ignoring it and hanging
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=3.0)
+    assert proc.poll() is not None, "DDP worker did not terminate upon receiving SIGTERM!"
+
+
+def test_cli_main_prints_unhandled_exception_to_stderr():
+    """Verify that cli_main writes traceback and error banner to sys.stderr on unhandled exception."""
+    code = (
+        "import sys\n"
+        "import sid_unet.train as tr\n"
+        "def broken_main():\n"
+        "    raise RuntimeError('Simulated unhandled DDP launcher fault')\n"
+        "tr.main = broken_main\n"
+        "tr.cli_main()\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 1, f"Expected exit code 1, got {res.returncode}"
+    assert "🛑 Fatal unhandled error in training execution: Simulated unhandled DDP launcher fault" in res.stderr
+    assert "RuntimeError: Simulated unhandled DDP launcher fault" in res.stderr
+
+
+def test_val_samples_alias_not_shadowed_by_default(tmp_path):
+    """Verify that specifying val_samples in YAML config is not shadowed by default val_samples_per_epoch=-1."""
+    from sid_unet.dataset.loader import get_val_samples_config
+    from sid_unet.utils.config import load_config
+
+    cfg_yaml = tmp_path / "test_cfg.yaml"
+    cfg_yaml.write_text("data:\n  val_samples: 5\n", encoding="utf-8")
+
+    cfg = load_config(str(cfg_yaml))
+    assert cfg.data.val_samples == 5
+    assert cfg.data.val_samples_per_epoch == 5
+    assert get_val_samples_config(cfg.data, default=400) == 5
+
+
+

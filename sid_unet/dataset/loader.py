@@ -481,6 +481,29 @@ def resolve_sample_limit(
     return default_samples
 
 
+def get_val_samples_config(config_data: Any, default: Optional[int] = 400) -> Any:
+    """Resolve validation samples limit from config, properly reconciling val_samples and val_samples_per_epoch aliases.
+
+    If either key is explicitly positive, prioritize the positive limit so a specific
+    sample count (e.g. val_samples: 2) is not shadowed by default -1 in the other alias.
+    """
+    if config_data is None:
+        return default
+    val_samples = config_data.get("val_samples")
+    val_samples_epoch = config_data.get("val_samples_per_epoch")
+    if val_samples is not None and int(val_samples) > 0 and (val_samples_epoch is None or int(val_samples_epoch) <= 0):
+        return int(val_samples)
+    if val_samples_epoch is not None and int(val_samples_epoch) > 0:
+        return int(val_samples_epoch)
+    if val_samples is not None and int(val_samples) > 0:
+        return int(val_samples)
+    if val_samples_epoch is not None:
+        return val_samples_epoch
+    if val_samples is not None:
+        return val_samples
+    return default
+
+
 def safe_dataloader_len(loader: Optional[DataLoader]) -> Optional[int]:
     """
     Safely return DataLoader length, or None if dataset has no length (e.g. IterableDataset).
@@ -1266,7 +1289,7 @@ def create_eval_dataloader(
         if "test" in str(eval_split).lower():
             samples_cfg = config.data.get("test_samples", -1)
         else:
-            samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", -1))
+            samples_cfg = get_val_samples_config(config.data, default=-1)
         steps_cfg = config.data.get("eval_steps", None)
         eval_max_samples = resolve_sample_limit(
             samples_val=samples_cfg,
@@ -1491,7 +1514,7 @@ def create_cached_dataloaders(
         samples_val=train_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=None
     )
 
-    val_samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", -1))
+    val_samples_cfg = get_val_samples_config(config.data, default=-1)
     val_max_samples = resolve_sample_limit(
         samples_val=val_samples_cfg, steps_val=None, batch_size=batch_size, default_samples=None
     )
@@ -1899,7 +1922,7 @@ def create_dataloaders(
         default_samples=2000,
     )
 
-    val_samples_cfg = config.data.get("val_samples_per_epoch", config.data.get("val_samples", 400))
+    val_samples_cfg = get_val_samples_config(config.data, default=400)
     val_steps_cfg = config.data.get(
         "val_steps",
         config.training.get("val_steps", None) if hasattr(config, "training") else None,
