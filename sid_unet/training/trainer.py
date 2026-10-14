@@ -954,19 +954,35 @@ class Trainer:
                     f"with gradient_accumulation_steps={adjusted_grad_accum} "
                     f"(Preserving effective batch size: {current_bs * self.gradient_accumulation_steps})."
                 )
+                sys.stdout.flush()
                 self.config.data.batch_size = adjusted_bs
                 self.config.training.gradient_accumulation_steps = adjusted_grad_accum
                 self.gradient_accumulation_steps = adjusted_grad_accum
 
-                from sid_unet.dataset.loader import create_dataloaders
                 eval_test = bool(self.config.data.get("evaluate_on_test", False))
+                try:
+                    del self.train_loader
+                    if eval_test and hasattr(self, "test_loader"):
+                        del self.test_loader
+                    del self.val_loader
+                except Exception:
+                    pass
+                gc.collect()
+
+                from sid_unet.dataset.loader import create_dataloaders
                 loaders = create_dataloaders(self.config, include_test=eval_test)
                 if eval_test:
                     self.train_loader, self.val_loader, self.test_loader = loaders
                 else:
                     self.train_loader, self.val_loader = loaders
+                self.logger.info(f"⚡ DataLoaders reloaded successfully with scaled batch size {adjusted_bs}.")
+                sys.stdout.flush()
+            else:
+                self.logger.info(f"✅ Configured batch size {current_bs} verified safe for device memory.")
+                sys.stdout.flush()
         except Exception as e:
             self.logger.warning(f"Auto batch sizing probe encountered warning: {e}")
+            sys.stdout.flush()
         finally:
             clear_memory_cache(self.device)
             gc.collect()
@@ -1096,6 +1112,11 @@ class Trainer:
             from sid_unet.utils.distributed import sync_scalar_min
             total_batches = sync_scalar_min(total_batches)
 
+        if self.is_main_process:
+            batch_count_str = str(total_batches) if total_batches is not None else "streaming"
+            self.logger.info(f"⏳ Epoch {epoch}/{self.epochs} [Train]: Loading initial batches from dataset ({batch_count_str} batches total)...")
+            sys.stdout.flush()
+
         pbar = tqdm(
             effective_loader,
             desc=f"Epoch {epoch}/{self.epochs} [Train]",
@@ -1105,6 +1126,9 @@ class Trainer:
             file=sys.stdout,
             dynamic_ncols=True,
         )
+        if self.is_main_process:
+            pbar.refresh()
+            sys.stdout.flush()
 
         self.optimizer.zero_grad()
         accum_steps = self.gradient_accumulation_steps
@@ -1120,6 +1144,9 @@ class Trainer:
         try:
             with join_context:
                 for batch_idx, batch in enumerate(pbar):
+                    if batch_idx == 0 and self.is_main_process:
+                        self.logger.info(f"🚀 First batch loaded successfully (batch size: {len(batch['image'])}). Training epoch {epoch} underway.")
+                        sys.stdout.flush()
                     data_time = time.perf_counter() - prev_batch_end_time
                     compute_start_time = time.perf_counter()
 
@@ -1362,7 +1389,16 @@ class Trainer:
         if val_total is not None and self.is_distributed and is_dist_avail_and_initialized():
             from sid_unet.utils.distributed import sync_scalar_min
             val_total = sync_scalar_min(val_total)
+
+        if self.is_main_process:
+            val_count_str = str(val_total) if val_total is not None else "streaming"
+            self.logger.info(f"⏳ [{split_name.title()}]: Evaluating model across {val_count_str} batches...")
+            sys.stdout.flush()
+
         pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=(epoch is None), disable=not self.is_main_process, file=sys.stdout, dynamic_ncols=True)
+        if self.is_main_process:
+            pbar.refresh()
+            sys.stdout.flush()
 
         try:
             for batch in pbar:

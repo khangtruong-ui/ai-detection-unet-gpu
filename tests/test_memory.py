@@ -266,3 +266,26 @@ def test_oom_raises_in_train_epoch(monkeypatch):
         # Training should raise the OOM error directly
         with pytest.raises(RuntimeError, match="CUDA out of memory"):
             trainer.train()
+
+
+def test_find_optimal_batch_size_diffusion_diff_minimized():
+    """Verify find_optimal_batch_size successfully probes DiffusionDiffMinimizedModel without f_r TypeError or deepcopy stalls."""
+    from sid_unet.models.diffusion_diff_minimized import DiffusionDiffMinimizedModel
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DiffusionDiffMinimizedModel(use_dummy=True, in_channels=84, num_classes=3).to(device)
+
+    opt_bs = find_optimal_batch_size(
+        model=model,
+        sample_shape=(84, 32, 32),
+        mask_shape=(256, 256),
+        device=device,
+        max_batch_size=8,
+        min_batch_size=1,
+        use_amp=(device.type == "cuda"),
+        aux_classifier=True,
+        num_classes=3,
+        force_probe=True,
+    )
+    assert opt_bs in (1, 2, 4, 8)
+

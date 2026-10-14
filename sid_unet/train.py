@@ -706,6 +706,12 @@ def train_single_run(
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     from sid_unet.utils.signals import shield_process_signals
     # Shield process from SSH disconnection, terminal hangup, and session teardown signals (SIGHUP, SIGTERM, etc.)
     shield_process_signals()

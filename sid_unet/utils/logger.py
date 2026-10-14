@@ -31,6 +31,7 @@ class SafeStreamHandler(logging.StreamHandler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             super().emit(record)
+            self.flush()
         except (BrokenPipeError, IOError, OSError, ValueError):
             pass
 

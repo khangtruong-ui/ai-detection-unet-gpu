@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import copy
 import gc
+import inspect
 import math
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
@@ -237,11 +239,22 @@ def find_optimal_batch_size(
 
     if logger:
         logger.info(f"🔍 Probing safe batch sizes for memory constraints: candidates = {candidates}")
+        sys.stdout.flush()
 
     # Put model in train mode on target device
     orig_device = next(model.parameters()).device if list(model.parameters()) else device
     orig_training = model.training
-    orig_state = copy.deepcopy(model.state_dict())
+
+    # Preserve BatchNorm running stats without deepcopying entire model weights
+    bn_stats = {}
+    for m in model.modules():
+        if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm,)):
+            bn_stats[m] = (
+                m.running_mean.clone() if m.running_mean is not None else None,
+                m.running_var.clone() if m.running_var is not None else None,
+                m.num_batches_tracked.clone() if m.num_batches_tracked is not None else None,
+            )
+
     model = model.to(device)
     model.train()
 
@@ -255,9 +268,29 @@ def find_optimal_batch_size(
     safe_bs = min_batch_size
     mask_h, mask_w = mask_shape if mask_shape is not None else (h, w)
 
+    # Determine whether model accepts 'f_r' (e.g. GAP-SAM) or expects only input tensor x
+    try:
+        forward_params = inspect.signature(model.forward).parameters
+        accepts_f_r = "f_r" in forward_params
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in forward_params.values())
+    except Exception:
+        accepts_f_r = False
+        accepts_kwargs = False
+
+    is_gap_sam = (
+        getattr(model, "model_name", "") in ("gap_sam", "gap-sam", "gapsam")
+        or getattr(model, "is_gap_sam", False)
+        or hasattr(model, "bypass_vae_for_cached_training")
+        or getattr(model, "vae_bypassed", False)
+    )
+    should_pass_f_r = accepts_f_r or (is_gap_sam and accepts_kwargs)
+
     try:
         for bs in candidates:
             clear_memory_cache(device)
+            if logger:
+                logger.info(f"   Testing candidate batch size {bs}...")
+                sys.stdout.flush()
             try:
                 # Generate dummy batch
                 images = torch.randn(bs, c, h, w, device=device)
@@ -267,13 +300,7 @@ def find_optimal_batch_size(
                 optimizer.zero_grad(set_to_none=True)
 
                 probe_kwargs: Dict[str, Any] = {}
-                is_gap_sam = (
-                    getattr(model, "model_name", "") in ("gap_sam", "gap-sam", "gapsam")
-                    or getattr(model, "is_gap_sam", False)
-                    or hasattr(model, "bypass_vae_for_cached_training")
-                    or getattr(model, "vae_bypassed", False)
-                )
-                if is_gap_sam or hasattr(model, "forward_cached"):
+                if should_pass_f_r:
                     probe_kwargs["f_r"] = torch.zeros(bs, 256, device=device)
 
                 with torch.amp.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
@@ -308,12 +335,14 @@ def find_optimal_batch_size(
                 safe_bs = bs
                 if logger:
                     logger.info(f"✅ Batch size {bs} succeeded within device memory ({format_memory_summary(device)}).")
+                    sys.stdout.flush()
                 break
 
             except Exception as exc:
                 if is_oom_error(exc):
                     if logger:
                         logger.warning(f"⚠️ Batch size {bs} triggered OOM on {device}. Trying smaller candidate...")
+                        sys.stdout.flush()
                     clear_memory_cache(device)
                     optimizer.zero_grad(set_to_none=True)
                 else:
@@ -321,8 +350,15 @@ def find_optimal_batch_size(
                     clear_memory_cache(device)
                     raise exc
     finally:
-        # Restore original model weights, running stats, and training mode
-        model.load_state_dict(orig_state)
+        # Restore original running stats and training mode without costly full state_dict copies
+        for m, (rm, rv, nbt) in bn_stats.items():
+            if rm is not None and m.running_mean is not None:
+                m.running_mean.copy_(rm)
+            if rv is not None and m.running_var is not None:
+                m.running_var.copy_(rv)
+            if nbt is not None and m.num_batches_tracked is not None:
+                m.num_batches_tracked.copy_(nbt)
+
         if not orig_training:
             model.eval()
         else:

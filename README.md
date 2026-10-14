@@ -2112,8 +2112,10 @@ Automatic GPU VRAM cleanup and garbage collection are automatically applied afte
 During Distributed Data Parallel (DDP) multi-GPU training:
 - **Rank 0 Progress Display**: `tqdm` progress bars are bound to `sys.stdout` with `dynamic_ncols=True` and `disable=not self.is_main_process`, ensuring only the primary coordination process renders output while non-primary ranks remain silent.
 - **Persistent Epoch Summaries**: Training epoch bars maintain `leave=True` so that full progress summaries (loss, IoU, network throughput, and learning rate) remain visible across epochs in terminal output and log files.
-- **Real-Time Stream Flushing**: `sys.stdout.flush()` is dispatched on metric updates to prevent output buffering under multi-process runners and detached subshells (`torch.distributed.run`).
+- **Real-Time Stream Flushing**: `sys.stdout.flush()` is dispatched on metric updates and log events, while `SafeStreamHandler.emit` and `sys.stdout.reconfigure(line_buffering=True)` prevent block-buffering delays when executing under background processes (`nohup ... > .logs.txt 2>&1 &`).
 - **Distributed Length Synchronization**: In distributed validation loops, batch counts are synchronized across ranks via `sync_scalar_min` to ensure identical loop boundaries.
+- **Instant Memory Probing (`auto_batch_size`)**: Auto batch sizing probes candidate batch sizes in descending order without costly `deepcopy(state_dict)` calls. BatchNorm running statistics are preserved in-place, forward signatures are dynamically inspected to pass auxiliary embeddings (`f_r`) only to models expecting them (e.g. `GAP-SAM`), and candidates that exceed VRAM trigger immediate clean recovery and scale down batch sizes automatically.
+- **Dataset Streaming Notifications**: Informative progress logs (`⏳ Loading initial batches...`, `🚀 First batch loaded successfully...`) provide immediate status visibility during remote Parquet streaming before the first training batch is processed.
 
 ---
 
