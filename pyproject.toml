@@ -118,7 +118,7 @@ include = ["sid_unet*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --timeout=240 -n auto"
+addopts = "-v --tb=short --timeout=240"
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]

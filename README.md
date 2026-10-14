@@ -2076,14 +2076,16 @@ $$
 Run the complete test suite with `pytest`:
 
 ```bash
-# Run all unit and integration tests (4-minute timeout enforced via pytest-timeout)
+# Run all unit and integration tests (sequential execution with 4-minute timeout)
 pytest
 
 # Run tests with detailed verbose output
 pytest -v
 
-# Run GAP-SAM specific tests
-pytest tests/test_gap_sam.py -v
+# Run specific test modules
+pytest tests/test_tqdm_multi_device.py -v
+pytest tests/test_kill.py -v
+pytest tests/test_signals.py -v
 
 # Override timeout for specific test runs
 pytest --timeout=30
@@ -2092,7 +2094,26 @@ pytest --timeout=30
 pytest --cov=sid_unet
 ```
 
-All tests run cleanly in offline environments without network access. Automatic **240-second (4-minute) timeouts** are configured in `pyproject.toml` via `pytest-timeout` to prevent hanging processes.
+### Test Concurrency & GPU Memory Architecture
+
+> [!NOTE]
+> **Sequential Test Execution**: PyTorch GPU tests in this repository execute sequentially by design. Parallel execution frameworks (such as `pytest-xdist` with `-n auto` or `asyncio`) are intentionally avoided because:
+> 1. **Process & Signal Isolation**: Modules like `sid_unet.kill` and `sid_unet.utils.signals` test process finding, tree-level termination (`SIGKILL`, `SIGTERM`), and signal shielding. Concurrently running workers kill or interrupt peer worker processes.
+> 2. **Distributed Process Group Ports**: Multi-device and DDP tests initialize PyTorch process groups on localhost; concurrent test workers collide on network ports.
+> 3. **GPU VRAM Pressure**: Heavy foundation models (UNet, SAM-3, DiffSeg, VAEs) require multi-gigabyte VRAM allocations. Multiplying processes across CPU cores causes instant GPU Out-of-Memory (OOM) errors.
+> 4. **Synchronous CUDA Host Semantics**: PyTorch operations are synchronous CPU dispatch calls that queue onto CUDA streams; cooperative `asyncio` provides no GPU acceleration and introduces CUDA context races.
+
+Automatic GPU VRAM cleanup and garbage collection are automatically applied after each test via `tests/conftest.py` to prevent memory leakage across test cases. Automatic **240-second (4-minute) timeouts** are configured in `pyproject.toml` via `pytest-timeout` to guard against hanging operations.
+
+---
+
+## Multi-Device Training & Progress Tracking
+
+During Distributed Data Parallel (DDP) multi-GPU training:
+- **Rank 0 Progress Display**: `tqdm` progress bars are bound to `sys.stdout` with `dynamic_ncols=True` and `disable=not self.is_main_process`, ensuring only the primary coordination process renders output while non-primary ranks remain silent.
+- **Persistent Epoch Summaries**: Training epoch bars maintain `leave=True` so that full progress summaries (loss, IoU, network throughput, and learning rate) remain visible across epochs in terminal output and log files.
+- **Real-Time Stream Flushing**: `sys.stdout.flush()` is dispatched on metric updates to prevent output buffering under multi-process runners and detached subshells (`torch.distributed.run`).
+- **Distributed Length Synchronization**: In distributed validation loops, batch counts are synchronized across ranks via `sync_scalar_min` to ensure identical loop boundaries.
 
 ---
 

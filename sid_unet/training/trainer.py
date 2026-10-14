@@ -1100,7 +1100,7 @@ class Trainer:
             effective_loader,
             desc=f"Epoch {epoch}/{self.epochs} [Train]",
             total=total_batches,
-            leave=False,
+            leave=True,
             disable=not self.is_main_process,
             file=sys.stdout,
             dynamic_ncols=True,
@@ -1248,6 +1248,8 @@ class Trainer:
                         "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                     }
                     pbar.set_postfix(postfix_dict)
+                    if self.is_main_process:
+                        sys.stdout.flush()
 
 
             # Flush pending accumulated gradients if last step did not land on accumulation boundary
@@ -1357,7 +1359,10 @@ class Trainer:
 
         desc_str = f"Epoch {epoch}/{self.epochs} [{split_name.title()}]" if epoch is not None else f"Evaluating [{split_name.title()}]"
         val_total = safe_dataloader_len(target_loader)
-        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False, disable=not self.is_main_process, file=sys.stdout, dynamic_ncols=True)
+        if val_total is not None and self.is_distributed and is_dist_avail_and_initialized():
+            from sid_unet.utils.distributed import sync_scalar_min
+            val_total = sync_scalar_min(val_total)
+        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=(epoch is None), disable=not self.is_main_process, file=sys.stdout, dynamic_ncols=True)
 
         try:
             for batch in pbar:

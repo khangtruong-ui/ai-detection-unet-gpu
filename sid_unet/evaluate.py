@@ -513,7 +513,7 @@ def evaluate_single_checkpoint(
 
     clear_memory_cache(device)
     eval_total = safe_dataloader_len(eval_loader)
-    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True)
+    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True, file=sys.stdout, dynamic_ncols=True)
     with torch.no_grad():
         for batch in pbar:
             b_sz = len(batch["image"])

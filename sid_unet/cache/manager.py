@@ -1108,7 +1108,7 @@ class DatasetCacheManager:
         shard_mask_bytes: List[bytes] = []
         shard_image_bytes: List[bytes] = []
 
-        pbar = tqdm(desc=f"Caching [{split}]", total=target_total, initial=total_processed, unit="samples")
+        pbar = tqdm(desc=f"Caching [{split}]", total=target_total, initial=total_processed, unit="samples", file=sys.stdout, dynamic_ncols=True)
 
         def commit_shard() -> None:
             nonlocal shard_idx

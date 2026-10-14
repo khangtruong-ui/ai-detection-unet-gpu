@@ -491,7 +491,9 @@ def evaluate_checkpoint_on_config(
         eval_loader,
         desc=f"Cross-Eval [{ckpt_run_name} x {cfg_proj_name}] ({resolved_split})",
         total=eval_total,
-        leave=False,
+        leave=True,
+        file=sys.stdout,
+        dynamic_ncols=True,
     )
 
     with torch.no_grad():
