@@ -11,6 +11,7 @@ import inspect
 import math
 import os
 import time
+import sys
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 import torch
@@ -1101,6 +1102,8 @@ class Trainer:
             total=total_batches,
             leave=False,
             disable=not self.is_main_process,
+            file=sys.stdout,
+            dynamic_ncols=True,
         )
 
         self.optimizer.zero_grad()
@@ -1354,7 +1357,7 @@ class Trainer:
 
         desc_str = f"Epoch {epoch}/{self.epochs} [{split_name.title()}]" if epoch is not None else f"Evaluating [{split_name.title()}]"
         val_total = safe_dataloader_len(target_loader)
-        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False, disable=not self.is_main_process)
+        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=False, disable=not self.is_main_process, file=sys.stdout, dynamic_ncols=True)
 
         try:
             for batch in pbar:
