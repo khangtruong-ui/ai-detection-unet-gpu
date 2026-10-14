@@ -1707,6 +1707,10 @@ def create_cached_dataloaders(
         train_prefetch = max(48, int(config.data.get("prefetch_batches", 48)))
         val_prefetch = max(16, train_prefetch // 2)
 
+        logger.info(
+            f"⚡ Cached streaming dataset configured with BackgroundPrefetcher (buffer: {train_prefetch} batches, "
+            f"DataLoader num_workers=0 to avoid multi-process stream races)."
+        )
         raw_train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -1963,6 +1967,10 @@ def create_dataloaders(
         train_prefetch = max(48, int(config.data.get("prefetch_batches", 48)))
         val_prefetch = max(16, train_prefetch // 2)
 
+        logger.info(
+            f"⚡ Streaming dataset configured with BackgroundPrefetcher (buffer: {train_prefetch} batches, "
+            f"DataLoader num_workers=0 to avoid multi-process stream races)."
+        )
         raw_train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,

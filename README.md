@@ -1366,6 +1366,12 @@ The configuration file is divided into modular top-level sections:
 |---|---|---|---|
 | `log_interval` | `int` | `20` | Step interval for printing batch loss, memory usage, and throughput to stdout. |
 | `log_memory` | `bool` | `true` | Logs allocated and reserved GPU VRAM in megabytes during training. |
+| `measure_network` | `bool` | `true` | Enables real-time network throughput tracking and pipeline bottleneck detection. |
+| `network_measure_method` | `str` | `"io_counters"` | Network throughput measurement mode: `"io_counters"` (passive socket I/O), `"active_probe"` (HTTP probes), or `"hybrid"`. |
+| `network_probe_url` | `str` | `"https://huggingface.co"` | Endpoint URL used for active download throughput probing in active/hybrid modes. |
+| `bottleneck_check_interval` | `float` | `30.0` | Time interval in seconds between pipeline bottleneck assessments (Internet vs. CPU vs. GPU-bound). |
+| `bottleneck_step_interval` | `int` / `null` | `null` | Step interval for evaluating pipeline bottlenecks (defaults to `log_interval`). |
+| `bottleneck_stall_threshold` | `float` | `5.0` | Immediate acute DataLoader stall threshold in seconds. Triggers instant warning when a batch wait exceeds this duration. |
 
 #### `post_processing`
 | Field | Type | Default | Description |

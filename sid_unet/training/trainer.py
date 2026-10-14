@@ -422,6 +422,9 @@ class Trainer:
             method = str(logging_cfg.get("network_measure_method", "io_counters") if hasattr(logging_cfg, "get") else "io_counters")
             active_url = str(logging_cfg.get("network_probe_url", "https://huggingface.co") if hasattr(logging_cfg, "get") else "https://huggingface.co")
             check_interval = float(logging_cfg.get("bottleneck_check_interval", 30.0) if hasattr(logging_cfg, "get") else 30.0)
+            step_interval_cfg = logging_cfg.get("bottleneck_step_interval", None) if hasattr(logging_cfg, "get") else getattr(logging_cfg, "bottleneck_step_interval", None)
+            step_interval = int(step_interval_cfg) if step_interval_cfg is not None else getattr(self, "log_interval", 10)
+            stall_threshold = float(logging_cfg.get("bottleneck_stall_threshold", 5.0) if hasattr(logging_cfg, "get") else 5.0)
             self.network_monitor = NetworkSpeedMonitor(
                 interval=1.0,
                 method=method,
@@ -431,6 +434,8 @@ class Trainer:
                 network_monitor=self.network_monitor,
                 logger=self.logger,
                 check_interval=check_interval,
+                step_interval=step_interval,
+                acute_stall_threshold=stall_threshold,
             )
             self.network_monitor.start()
         else:

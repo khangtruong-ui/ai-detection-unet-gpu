@@ -8,6 +8,7 @@ from sid_unet.utils.network import (
     NetworkSpeedMonitor,
     BottleneckDetector,
     BottleneckStatus,
+    get_cpu_utilization,
 )
 
 
@@ -111,3 +112,131 @@ def test_bottleneck_detector_internet_bound(monkeypatch):
         status = detector.record_step(data_time=0.80, compute_time=0.02)
 
     assert detector.current_status == BottleneckStatus.INTERNET_BOUND
+
+
+def test_get_cpu_utilization_multicore(monkeypatch):
+    import sid_unet.utils.network as net_mod
+
+    if net_mod.psutil is not None:
+        # 128 cores: 1 saturated at 96%, others 0%
+        per_core = [96.0] + [0.0] * 127
+        monkeypatch.setattr(net_mod.psutil, "cpu_percent", lambda interval=None, percpu=False: per_core if percpu else 0.75)
+
+        avg_cpu, max_cpu = get_cpu_utilization()
+        assert max_cpu == 96.0
+        assert avg_cpu == pytest.approx(96.0 / 128, 0.01)
+
+
+def test_bottleneck_detector_multicore_cpu_bound(monkeypatch):
+    """Ensure a single pinned worker on a high core count machine is identified as CPU bound."""
+    logger = logging.getLogger("test_multicore_cpu_bound")
+    detector = BottleneckDetector(
+        network_monitor=None,
+        logger=logger,
+        check_interval=0.0,
+        window_size=5,
+        cooldown=0.0,
+    )
+
+    import sid_unet.utils.network as net_mod
+    monkeypatch.setattr(net_mod, "get_gpu_utilization", lambda: 5.0)
+    if net_mod.psutil is not None:
+        # Single worker core at 95%, average across 128 cores is under 1%
+        per_core = [95.0] + [0.0] * 127
+        monkeypatch.setattr(net_mod.psutil, "cpu_percent", lambda interval=None, percpu=False: per_core if percpu else 0.74)
+
+    for _ in range(6):
+        detector.record_step(data_time=0.50, compute_time=0.02)
+
+    assert detector.current_status == BottleneckStatus.CPU_BOUND
+
+
+def test_bottleneck_detector_acute_stall(monkeypatch):
+    """Acute stall (> 5.0s) should trigger immediately on step 1 without waiting for window_size."""
+    logger = logging.getLogger("test_acute_stall")
+    class MockMonitor:
+        def get_speed_mbps(self):
+            return 25.0
+        def get_speed_str(self):
+            return "25.0 MB/s"
+
+    detector = BottleneckDetector(
+        network_monitor=MockMonitor(),
+        logger=logger,
+        check_interval=30.0,  # normally would wait 30s
+        window_size=20,       # normally would wait for 5 samples
+        cooldown=0.0,
+        acute_stall_threshold=5.0,
+    )
+
+    import sid_unet.utils.network as net_mod
+    monkeypatch.setattr(net_mod, "get_gpu_utilization", lambda: 0.0)
+    if net_mod.psutil is not None:
+        monkeypatch.setattr(net_mod.psutil, "cpu_percent", lambda interval=None, percpu=False: [20.0] * 4 if percpu else 20.0)
+
+    # First step experiences a 12.0s acute stall
+    status = detector.record_step(data_time=12.0, compute_time=1.0)
+    assert status == BottleneckStatus.INTERNET_BOUND
+    assert detector.current_status == BottleneckStatus.INTERNET_BOUND
+
+
+def test_bottleneck_detector_prevents_false_gpu_bound(monkeypatch):
+    """Momentary GPU spikes during brief compute phase must not mask data starvation."""
+    logger = logging.getLogger("test_gpu_burst_filter")
+    class MockMonitor:
+        def get_speed_mbps(self):
+            return 10.0
+        def get_speed_str(self):
+            return "10.0 MB/s"
+
+    detector = BottleneckDetector(
+        network_monitor=MockMonitor(),
+        logger=logger,
+        check_interval=0.0,
+        window_size=5,
+        cooldown=0.0,
+    )
+
+    import sid_unet.utils.network as net_mod
+    # GPU utilization query reports 99% because it was sampled during the 0.05s compute slice
+    monkeypatch.setattr(net_mod, "get_gpu_utilization", lambda: 99.0)
+    if net_mod.psutil is not None:
+        monkeypatch.setattr(net_mod.psutil, "cpu_percent", lambda interval=None, percpu=False: [20.0] * 4 if percpu else 20.0)
+
+    for _ in range(6):
+        # 10s data wait vs 0.05s compute -> GPU is starved 99.5% of the time!
+        detector.record_step(data_time=10.0, compute_time=0.05)
+
+    assert detector.current_status == BottleneckStatus.INTERNET_BOUND
+
+
+def test_bottleneck_detector_step_interval():
+    """Verify step_interval triggers evaluation on step boundaries."""
+    logger = logging.getLogger("test_step_interval")
+    detector = BottleneckDetector(
+        network_monitor=None,
+        logger=logger,
+        check_interval=3600.0,  # large time interval so only step_interval triggers
+        step_interval=3,
+        window_size=5,
+        cooldown=0.0,
+    )
+
+    # Steps 1 and 2: no check
+    s1 = detector.record_step(data_time=0.01, compute_time=0.20)
+    assert s1 is None
+    s2 = detector.record_step(data_time=0.01, compute_time=0.20)
+    assert s2 is None
+
+    # Step 3: step_interval=3 met, but len(data_times)=3 < min(5, 5), so no check yet
+    s3 = detector.record_step(data_time=0.01, compute_time=0.20)
+    assert s3 is None
+
+    # Step 4, 5
+    s4 = detector.record_step(data_time=0.01, compute_time=0.20)
+    s5 = detector.record_step(data_time=0.01, compute_time=0.20)
+
+    # Step 6: step_interval=3 met and len >= 5 -> triggers check!
+    s6 = detector.record_step(data_time=0.01, compute_time=0.20)
+    assert s6 == BottleneckStatus.GPU_BOUND
+
