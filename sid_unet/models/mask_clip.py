@@ -551,17 +551,6 @@ class MaskDecoder(nn.Module):
         self.dropout = nn.Dropout(0.1)
         self.predict = nn.Conv2d(decoder_dim, out_channels, kernel_size=1)
 
-        # Multi-scale prediction heads for FPN deep supervision
-        self.multiscale_heads = nn.ModuleList([
-            nn.Conv2d(decoder_dim, out_channels, kernel_size=1)
-            for _ in scale_factors
-        ])
-        for head in self.multiscale_heads:
-            nn.init.kaiming_normal_(head.weight, mode="fan_out", nonlinearity="linear")
-            if head.bias is not None:
-                nn.init.zeros_(head.bias)
-        self.last_multiscale_logits: Optional[List[torch.Tensor]] = None
-
     def cross_attention(self, x: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         x_flat = x.flatten(2).transpose(1, 2)  # [B, HW, C]
@@ -583,18 +572,8 @@ class MaskDecoder(nn.Module):
 
         return out.reshape(B, C, 1, 1).expand(B, C, H, W)
 
-    def forward(
-        self,
-        query: torch.Tensor,
-        x: torch.Tensor,
-        return_multiscale: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+    def forward(self, query: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         features = [stage(x) for stage in self.stages]
-        multiscale_logits = [
-            head(feat) for head, feat in zip(self.multiscale_heads, features)
-        ]
-        self.last_multiscale_logits = multiscale_logits
-
         _, _, h, w = features[0].shape
         aligned_features = [
             F.interpolate(feat, size=(h, w), mode="bilinear", align_corners=False)
@@ -607,10 +586,8 @@ class MaskDecoder(nn.Module):
 
         x = self.norm(x)
         x = self.dropout(x)
-        logits = self.predict(x)
-        if return_multiscale:
-            return logits, multiscale_logits
-        return logits
+        x = self.predict(x)
+        return x
 
 
 class _SideCLIPMLP(nn.Module):
@@ -837,18 +814,12 @@ class SideAdapterNetwork(nn.Module):
         clip_features: List[torch.Tensor],
         block_hook: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
         decoder_hook: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        return_multiscale: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+    ) -> torch.Tensor:
         image_features = self.forward_features(image, clip_features, block_hook=block_hook)
         if decoder_hook is not None:
             image_features = decoder_hook(image_features)
         # Select the fake class text token [:, 1, :]
         projected_text = self.text_projection(text_features.expand(image_features.shape[0], -1, -1))[:, 1, :]
-        if return_multiscale and hasattr(self.mask_decoder, "forward"):
-            try:
-                return self.mask_decoder(projected_text, image_features, return_multiscale=True)
-            except TypeError:
-                pass
         return self.mask_decoder(projected_text, image_features)
 
     def forward_features(
@@ -1218,8 +1189,6 @@ class MaskCLIP(nn.Module):
         freeze_mae: bool = False,
         enable_clip_cache: bool = False,
         clip_cache_size: int = 10000,
-        multiscale: bool = False,
-        multiscale_weight: float = 0.0,
         lora_r: int = 0,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
@@ -1283,8 +1252,6 @@ class MaskCLIP(nn.Module):
         self.edge_lambda = float(edge_lambda)
         self.edge_mask_width = int(edge_mask_width)
         self.input_normalize = bool(input_normalize)
-        self.multiscale = bool(multiscale)
-        self.multiscale_weight = float(multiscale_weight)
 
         # Register CLIP normalization buffers
         self.register_buffer(
@@ -1625,10 +1592,9 @@ class MaskCLIP(nn.Module):
         x: torch.Tensor,
         cached_clip_features: Optional[Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]] = None,
         return_dict: bool = False,
-        return_multiscale: Optional[bool] = None,
         *args: Any,
         **kwargs: Any,
-    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
         """
         Standard `sid_unet` forward pass.
 
@@ -1681,23 +1647,13 @@ class MaskCLIP(nn.Module):
                 feat = fn(feat)
             return feat
 
-        if return_multiscale is None:
-            return_multiscale = self.multiscale
-        need_multiscale = return_multiscale or return_dict
-        agg_out = self.aggregator(
+        mask_logits = self.aggregator(
             mae_input,
             text_features_mean,
             patch_features,
             block_hook=_block_hook if self._surgery_hooks["mae_block_post_fusion"] else None,
             decoder_hook=_decoder_hook if self._surgery_hooks["decoder_features"] else None,
-            return_multiscale=need_multiscale,
         )
-        if isinstance(agg_out, tuple):
-            mask_logits, multiscale_logits = agg_out
-        else:
-            mask_logits = agg_out
-            multiscale_logits = getattr(getattr(self.aggregator, "mask_decoder", None), "last_multiscale_logits", None)
-
         if mask_logits.shape[2:] != (orig_h, orig_w):
             mask_logits = F.interpolate(mask_logits, size=(orig_h, orig_w), mode="bilinear", align_corners=True)
 
@@ -1712,7 +1668,7 @@ class MaskCLIP(nn.Module):
             class_logits = binary_class_logits
 
         if return_dict:
-            res: Dict[str, Any] = {
+            return {
                 "mask_logits": mask_logits,
                 "class_logits": class_logits,
                 "binary_class_logits": binary_class_logits,
@@ -1721,15 +1677,6 @@ class MaskCLIP(nn.Module):
                 "text_features": text_features_mean,
                 "cls_features": agg_cls,
             }
-            if multiscale_logits is not None:
-                res["multiscale_logits"] = multiscale_logits
-                res["multiscale_pred_masks"] = [torch.sigmoid(m) for m in multiscale_logits]
-            return res
-
-        if return_multiscale:
-            if self.aux_classifier:
-                return mask_logits, class_logits, multiscale_logits
-            return mask_logits, multiscale_logits
 
         if self.aux_classifier:
             return mask_logits, class_logits
@@ -1754,20 +1701,14 @@ class MaskCLIP(nn.Module):
         binary_logits = out["binary_class_logits"]
         mask_prob = torch.sigmoid(mask_logits)
         pred_label = torch.argmax(binary_logits, dim=1)
-        multiscale_logits = out.get("multiscale_logits", None)
-        multiscale_pred_masks = out.get("multiscale_pred_masks", None)
 
         if mask is None:
-            res: Dict[str, Any] = {
+            return {
                 "pred_mask": mask_prob,
                 "pred_label": pred_label,
                 "mask_logits": mask_logits,
                 "class_logits": binary_logits,
             }
-            if multiscale_logits is not None:
-                res["multiscale_logits"] = multiscale_logits
-                res["multiscale_pred_masks"] = multiscale_pred_masks
-            return res
 
         target_mask = mask.float().to(mask_logits.device)
         if target_mask.ndim == 3:
@@ -1799,38 +1740,22 @@ class MaskCLIP(nn.Module):
         else:
             ce_loss = torch.zeros((), device=mask_logits.device, dtype=torch.float32)
 
-        multiscale_loss = torch.zeros((), device=mask_logits.device, dtype=torch.float32)
-        if multiscale_logits is not None and self.multiscale_weight > 0:
-            for s_logit in multiscale_logits:
-                s_pred = F.interpolate(s_logit, size=target_mask.shape[2:], mode="bilinear", align_corners=True)
-                s_bce = F.binary_cross_entropy_with_logits(s_pred.float().view(-1), target_mask.float().view(-1))
-                multiscale_loss = multiscale_loss + s_bce
-            multiscale_loss = multiscale_loss * (self.multiscale_weight / max(len(multiscale_logits), 1))
+        loss = ce_loss + bce_loss + edge_loss
 
-        loss = ce_loss + bce_loss + edge_loss + multiscale_loss
-
-        visual_loss_dict: Dict[str, Any] = {
-            "loss_ce": ce_loss,
-            "loss_bce": bce_loss,
-            "loss_edge": edge_loss,
-            "combined_loss": loss,
-        }
-        if self.multiscale_weight > 0:
-            visual_loss_dict["loss_multiscale"] = multiscale_loss
-
-        res_dict: Dict[str, Any] = {
+        return {
             "backward_loss": loss,
             "pred_mask": mask_prob,
             "pred_label": pred_label,
-            "visual_loss": visual_loss_dict,
+            "visual_loss": {
+                "loss_ce": ce_loss,
+                "loss_bce": bce_loss,
+                "loss_edge": edge_loss,
+                "combined_loss": loss,
+            },
             "visual_image": {
                 "pred_mask": mask_prob,
             },
         }
-        if multiscale_logits is not None:
-            res_dict["multiscale_logits"] = multiscale_logits
-            res_dict["multiscale_pred_masks"] = multiscale_pred_masks
-        return res_dict
 
     @torch.no_grad()
     def predict_mask(self, x: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:

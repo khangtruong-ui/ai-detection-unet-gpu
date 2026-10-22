@@ -50,12 +50,6 @@ from sid_unet.models.diffusion_diff_v2 import (
     TrainableLatentDecoderV2,
 )
 from sid_unet.models.diffusion_diff_minimized import DiffusionDiffMinimizedModel
-from sid_unet.models.mask_clip import (
-    MaskDecoder,
-    SideAdapterNetwork,
-    MaskCLIP,
-    EdgeMaskGenerator,
-)
 from sid_unet.losses.auxiliary import SIDTotalLoss, build_loss
 from sid_unet.utils.config import load_config, ConfigDict
 from sid_unet.models.unet import build_model
@@ -400,59 +394,7 @@ def test_diffusion_diff_minimized_with_fpn():
 
 
 # ============================================================================
-# 5. MaskDecoder & MaskCLIP Multiscale Tests
-# ============================================================================
-
-
-def test_mask_decoder_multiscale_heads():
-    """Verify MaskDecoder multiscale heads generate 4 scales matching (4.0, 2.0, 1.0, 0.5)."""
-    decoder = MaskDecoder(in_channels=768, decoder_dim=256, num_heads=8, out_channels=1)
-    query = torch.randn(2, 256)
-    x = torch.randn(2, 768, 32, 32)
-
-    # 1. Standard call returns fused 4x upsampled prediction
-    out = decoder(query, x, return_multiscale=False)
-    assert out.shape == (2, 1, 128, 128)
-
-    # 2. Call with return_multiscale=True returns tuple of (fused, [s0, s1, s2, s3])
-    fused, ms_logits = decoder(query, x, return_multiscale=True)
-    assert fused.shape == (2, 1, 128, 128)
-    assert len(ms_logits) == 4
-    # Scales: 4.0 (128x128), 2.0 (64x64), 1.0 (32x32), 0.5 (16x16)
-    assert ms_logits[0].shape == (2, 1, 128, 128)
-    assert ms_logits[1].shape == (2, 1, 64, 64)
-    assert ms_logits[2].shape == (2, 1, 32, 32)
-    assert ms_logits[3].shape == (2, 1, 16, 16)
-
-
-def test_mask_clip_forward_opensdi_multiscale_loss():
-    """Verify MaskCLIP forward_opensdi calculates multiscale loss when multiscale_weight > 0."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MaskCLIP(
-        pretrained=True,
-        pretrained_mode="opensdi",
-        num_classes=2,
-        multiscale=True,
-        multiscale_weight=0.3,
-        device=device,
-    )
-
-    x = torch.randn(2, 3, 224, 224, device=device)
-    mask = torch.zeros(2, 1, 224, 224, device=device)
-    label = torch.ones(2, dtype=torch.long, device=device)
-
-    out = model.forward_opensdi(x, mask=mask, label=label)
-
-    assert "backward_loss" in out
-    assert "visual_loss" in out
-    assert "loss_multiscale" in out["visual_loss"]
-    assert out["visual_loss"]["loss_multiscale"].item() >= 0.0
-    assert "multiscale_logits" in out
-    assert len(out["multiscale_logits"]) == 4
-
-
-# ============================================================================
-# 6. SIDTotalLoss Multiscale Deep Supervision Tests
+# 5. SIDTotalLoss Multiscale Deep Supervision Tests
 # ============================================================================
 
 
@@ -509,7 +451,7 @@ def test_sid_total_loss_with_multiscale_supervision():
 
 
 # ============================================================================
-# 7. Experiment Configs Validation
+# 6. Experiment Configs Validation
 # ============================================================================
 
 
@@ -519,7 +461,6 @@ def test_multiscale_yaml_experiment_configs():
         "configs/experiments/diffusion_diff/diffusion_diff_fpn_multiscale.yaml",
         "configs/experiments/diffusion_diff_v2/diffusion_diff_v2_fpn_multiscale.yaml",
         "configs/experiments/diffusion_diff_minimized/diffusion_diff_minimized_fpn_multiscale.yaml",
-        "configs/experiments/mask_clip/mask_clip_fpn_multiscale.yaml",
     ]
 
     for rel_path in yaml_paths:
