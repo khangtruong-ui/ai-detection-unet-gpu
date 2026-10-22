@@ -1,0 +1,103 @@
+project:
+  name: "diffusion_diff_minimized_fpn_multiscale"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/diffusion_diff_minimized_fpn_multiscale"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 48
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.25
+
+model:
+  name: "diffusion_diff_minimized"
+  pretrained_model_name_or_path: "segmind/tiny-sd"
+  vae_subfolder: "vae"
+  unet_subfolder: "unet"
+  diffuser_fp16: true
+  device_map: "cuda"
+  freeze_encoder: true
+  use_encoder_skips: false
+  use_perpendicular_skips: true
+  timesteps: [250]
+  timestep_embed_dim: 32
+  sigma_embed_dim: 32
+  include_noisy_latents: true
+  include_added_noise: true
+  include_predicted_noise: true
+  include_noise_diff: true
+  include_z0: true
+  scaling_factor: 0.18215
+  decoder:
+    channels: [256, 128, 64, 32]
+    upsample_mode: "bilinear"
+    norm_layer: "batchnorm"
+    z_norm: "groupnorm"
+    activation: "silu"
+    dropout: 0.1
+    num_res_blocks: 1
+    use_fpn: true
+    fpn_channels: 128
+    fpn_fusion_mode: "concat"
+    multiscale: true
+  aux_classifier: true
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+  input_rescale: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  focal_weight: 0.5
+  focal_gamma: 2.0
+  focal_alpha: 0.75
+  pos_weight: 1.0
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+  multiscale_weight: 0.3
+
+training:
+  epochs: 10
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 4
+  save_best: true
+  save_latest: true
+  checkpoint_period: 1
+  early_stopping_patience: 4
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+  use_hard_mining: true
+
+hard_mining:
+  enabled: true
+  metric: "median"
+  reset_epochs: 5
+
+logging:
+  log_interval: 20
+  log_memory: true

@@ -227,7 +227,8 @@ class TrainableLatentDecoder(nn.Module):
     """
     Configurable trainable decoder that maps the high-dimensional latent representation Z
     at latent resolution (H/8, W/8) back to full binary image space (H, W), with optional
-    UNet-style skip connections from the encoder.
+    UNet-style skip connections from the encoder, and optional Feature Pyramid Network (FPN)
+    multi-scale prediction.
 
     This module is entirely defined by config files and is the ONLY component with
     trainable parameters in the DiffusionDiffModel architecture.
@@ -245,6 +246,10 @@ class TrainableLatentDecoder(nn.Module):
         num_res_blocks: int = 1,
         use_skip_connections: bool = True,
         skip_channels: Optional[List[int]] = None,
+        use_fpn: bool = True,
+        fpn_channels: int = 128,
+        fpn_fusion_mode: str = "concat",
+        multiscale_prediction: bool = True,
     ):
         super().__init__()
         if channels is None:
@@ -252,6 +257,8 @@ class TrainableLatentDecoder(nn.Module):
         self.channels = [int(c) for c in channels]
         self.out_channels = out_channels
         self.use_skip_connections = bool(use_skip_connections)
+        self.use_fpn = bool(use_fpn)
+        self.last_multiscale_logits: Optional[List[torch.Tensor]] = None
 
         # Initial projection to first channel dimension
         self.init_conv = nn.Sequential(
@@ -313,22 +320,58 @@ class TrainableLatentDecoder(nn.Module):
                 )
             )
 
-        # Final projection to binary mask logits
-        self.out_conv = nn.Conv2d(curr_ch, out_channels, kernel_size=3, padding=1)
-        nn.init.kaiming_normal_(self.out_conv.weight, mode="fan_out", nonlinearity="linear")
-        if self.out_conv.bias is not None:
-            nn.init.zeros_(self.out_conv.bias)
+        if self.use_fpn:
+            from sid_unet.models.fpn import FeaturePyramidNetwork
 
-    def forward(self, z: torch.Tensor, skips: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
-        feat = self.init_conv(z)
+            self.fpn = FeaturePyramidNetwork(
+                in_channels_list=self.channels,
+                fpn_channels=fpn_channels,
+                out_channels=out_channels,
+                norm_layer=norm_layer,
+                activation=activation,
+                dropout=dropout,
+                fusion_mode=fpn_fusion_mode,
+                include_heads=multiscale_prediction,
+            )
+            self.out_conv = self.fpn.out_conv
+        else:
+            self.fpn = None
+            # Final projection to binary mask logits
+            self.out_conv = nn.Conv2d(curr_ch, out_channels, kernel_size=3, padding=1)
+            nn.init.kaiming_normal_(self.out_conv.weight, mode="fan_out", nonlinearity="linear")
+            if self.out_conv.bias is not None:
+                nn.init.zeros_(self.out_conv.bias)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        skips: Optional[List[torch.Tensor]] = None,
+        return_multiscale: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+        feat0 = self.init_conv(z)
+        stage_features = [feat0]
+        feat = feat0
         for i, stage in enumerate(self.stages):
             feat = stage(feat)
             if skips is not None and self.use_skip_connections and i < len(self.skip_fusions):
                 if i < len(skips) and skips[i] is not None:
                     feat = self.skip_fusions[i](feat, skips[i])
+            stage_features.append(feat)
         for extra in self.extra_stages:
             feat = extra(feat)
+            stage_features[-1] = feat
+
+        if self.use_fpn and self.fpn is not None:
+            fused_logits, multiscale_logits = self.fpn(stage_features, return_multiscale=True)
+            self.last_multiscale_logits = multiscale_logits
+            if return_multiscale:
+                return fused_logits, multiscale_logits
+            return fused_logits
+
         logits = self.out_conv(feat)
+        self.last_multiscale_logits = [logits]
+        if return_multiscale:
+            return logits, [logits]
         return logits
 
 
@@ -439,6 +482,10 @@ class DiffusionDiffModel(nn.Module):
         dec_act = dec_cfg.get("activation", "silu")
         dec_dropout = float(dec_cfg.get("dropout", 0.0))
         dec_res_blocks = int(dec_cfg.get("num_res_blocks", 1))
+        dec_use_fpn = bool(dec_cfg.get("use_fpn", dec_cfg.get("fpn", True)))
+        dec_fpn_channels = int(dec_cfg.get("fpn_channels", 128))
+        dec_fpn_fusion = dec_cfg.get("fpn_fusion_mode", dec_cfg.get("fusion_mode", "concat"))
+        dec_multiscale = bool(dec_cfg.get("multiscale", dec_cfg.get("multiscale_prediction", True)))
 
         # Normalization layer for concatenated high-dimensional Z representation
         z_norm_type = dec_cfg.get("z_norm", dec_cfg.get("norm_layer", "groupnorm"))
@@ -464,6 +511,10 @@ class DiffusionDiffModel(nn.Module):
             num_res_blocks=dec_res_blocks,
             use_skip_connections=self.use_skip_connections,
             skip_channels=skip_channels,
+            use_fpn=dec_use_fpn,
+            fpn_channels=dec_fpn_channels,
+            fpn_fusion_mode=dec_fpn_fusion,
+            multiscale_prediction=dec_multiscale,
         )
 
         # 6. Auxiliary classifier head on Z representation
@@ -741,16 +792,25 @@ class DiffusionDiffModel(nn.Module):
         return x, orig_h, orig_w
 
     def forward(
-        self, x: torch.Tensor
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self,
+        x: torch.Tensor,
+        return_dict: bool = False,
+        return_multiscale: bool = False,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
         """
         Forward pass.
         Runs frozen VAE encoder, multi-step noise perturbation, frozen diffuser prediction,
-        sinusoidal embeddings, concatenation to Z, and trainable decoder.
+        sinusoidal embeddings, concatenation to Z, and trainable decoder with optional FPN.
         """
         # Automatically route pre-computed cached tensor Z through fast forward_cached path
         if x.dim() == 4 and x.shape[1] == self.total_z_channels:
-            return self.forward_cached(x)
+            return self.forward_cached(
+                x,
+                return_dict=return_dict,
+                return_multiscale=return_multiscale,
+            )
 
         device = x.device
         dtype = x.dtype
@@ -866,10 +926,21 @@ class DiffusionDiffModel(nn.Module):
 
         # 5. Trainable Decoder decodes Z back to binary mask space (fusing encoder skips if enabled)
         dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
-        mask_logits = self.decoder(
+        skips_input = [s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in enc_skips] if enc_skips else None
+
+        need_multiscale = return_multiscale or return_dict
+        dec_out = self.decoder(
             z_high_dim.to(device=dec_device, dtype=dec_dtype),
-            skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in enc_skips] if enc_skips else None
-        ).to(device=device, dtype=dtype)
+            skips=skips_input,
+            return_multiscale=need_multiscale,
+        )
+        if need_multiscale:
+            mask_logits, multiscale_logits = dec_out
+        else:
+            mask_logits = dec_out
+            multiscale_logits = getattr(self.decoder, "last_multiscale_logits", None)
+
+        mask_logits = mask_logits.to(device=device, dtype=dtype)
 
         # Crop back to original dimensions if padded and ensure contiguous layout
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
@@ -877,7 +948,36 @@ class DiffusionDiffModel(nn.Module):
         else:
             mask_logits = mask_logits.contiguous()
 
-        if self.aux_classifier:
+        if multiscale_logits is not None:
+            cropped_ms: List[torch.Tensor] = []
+            for m in multiscale_logits:
+                m_dev = m.to(device=device, dtype=dtype)
+                if x_proc.shape[2] != orig_h or x_proc.shape[3] != orig_w:
+                    crop_h = max(1, int(orig_h * m.shape[2] / x_proc.shape[2]))
+                    crop_w = max(1, int(orig_w * m.shape[3] / x_proc.shape[3]))
+                    m_dev = m_dev[:, :, :crop_h, :crop_w].contiguous()
+                cropped_ms.append(m_dev)
+            multiscale_logits = cropped_ms
+
+        if return_dict:
+            res: Dict[str, Any] = {
+                "mask_logits": mask_logits,
+                "pred_mask": torch.sigmoid(mask_logits),
+            }
+            if class_logits is not None:
+                res["class_logits"] = class_logits
+                res["pred_label"] = torch.argmax(class_logits, dim=-1)
+            if multiscale_logits is not None:
+                res["multiscale_logits"] = multiscale_logits
+                res["multiscale_pred_masks"] = [torch.sigmoid(m) for m in multiscale_logits]
+            return res
+
+        if return_multiscale:
+            if self.aux_classifier and class_logits is not None:
+                return mask_logits, class_logits, multiscale_logits
+            return mask_logits, multiscale_logits
+
+        if self.aux_classifier and class_logits is not None:
             return mask_logits, class_logits
         return mask_logits
 
@@ -886,7 +986,9 @@ class DiffusionDiffModel(nn.Module):
         z_high_dim: torch.Tensor,
         target_h: Optional[int] = None,
         target_w: Optional[int] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_dict: bool = False,
+        return_multiscale: bool = False,
+    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
         """
         Fast forward pass directly from pre-computed high-dimensional representation Z.
         Bypasses VAE encoder and Diffuser UNet, running trainable decoder and auxiliary classifier.
@@ -906,24 +1008,52 @@ class DiffusionDiffModel(nn.Module):
             class_logits = self.classifier_head(z_normed.to(device=cls_device, dtype=cls_dtype)).to(device=device, dtype=dtype)
 
         dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
-        mask_logits = self.decoder(
+        need_multiscale = return_multiscale or return_dict
+        dec_out = self.decoder(
             z_normed.to(device=dec_device, dtype=dec_dtype),
             skips=None,
-        ).to(device=device, dtype=dtype)
+            return_multiscale=need_multiscale,
+        )
+        if need_multiscale:
+            mask_logits, multiscale_logits = dec_out
+        else:
+            mask_logits = dec_out
+            multiscale_logits = getattr(self.decoder, "last_multiscale_logits", None)
+
+        mask_logits = mask_logits.to(device=device, dtype=dtype)
 
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
             mask_logits = mask_logits[:, :, :orig_h, :orig_w].contiguous()
         else:
             mask_logits = mask_logits.contiguous()
 
-        if mask_logits.device != device or mask_logits.dtype != dtype:
-            mask_logits = mask_logits.to(device=device, dtype=dtype)
+        if multiscale_logits is not None:
+            multiscale_logits = [m.to(device=device, dtype=dtype) for m in multiscale_logits]
+
         if class_logits is not None and (
             class_logits.device != device or class_logits.dtype != dtype
         ):
             class_logits = class_logits.to(device=device, dtype=dtype)
 
-        if self.aux_classifier:
+        if return_dict:
+            res: Dict[str, Any] = {
+                "mask_logits": mask_logits,
+                "pred_mask": torch.sigmoid(mask_logits),
+            }
+            if class_logits is not None:
+                res["class_logits"] = class_logits
+                res["pred_label"] = torch.argmax(class_logits, dim=-1)
+            if multiscale_logits is not None:
+                res["multiscale_logits"] = multiscale_logits
+                res["multiscale_pred_masks"] = [torch.sigmoid(m) for m in multiscale_logits]
+            return res
+
+        if return_multiscale:
+            if self.aux_classifier and class_logits is not None:
+                return mask_logits, class_logits, multiscale_logits
+            return mask_logits, multiscale_logits
+
+        if self.aux_classifier and class_logits is not None:
             return mask_logits, class_logits
         return mask_logits
 

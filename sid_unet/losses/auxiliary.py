@@ -33,6 +33,7 @@ class SIDTotalLoss(nn.Module):
         artifact_weight: float = 1.0,
         edge_weight: float = 0.0,
         edge_mask_width: int = 7,
+        multiscale_weight: float = 0.0,
     ):
         super().__init__()
         self.mask_loss_fn = CombinedMaskLoss(
@@ -50,6 +51,7 @@ class SIDTotalLoss(nn.Module):
         self.artifact_weight = artifact_weight
         self.edge_weight = float(edge_weight)
         self.edge_mask_width = int(edge_mask_width)
+        self.multiscale_weight = float(multiscale_weight)
         self._edge_generator: Optional[nn.Module] = None
         if self.edge_weight > 0.0:
             from sid_unet.models.mask_clip import EdgeMaskGenerator
@@ -62,36 +64,46 @@ class SIDTotalLoss(nn.Module):
         target_labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        model_output: mask_logits or (mask_logits, class_logits) or (mask_logits, class_logits, artifact_loss)
+        model_output: mask_logits or (mask_logits, class_logits) or (mask_logits, class_logits, multiscale_logits)
         target_masks: (B, 1, H, W)
         target_labels: (B,)
         """
         art_loss = None
+        multiscale_logits = None
         if isinstance(model_output, (tuple, list)):
             mask_logits = model_output[0]
             if len(model_output) >= 3:
-                class_logits = model_output[1]
-                art_loss = model_output[2]
+                third_item = model_output[2]
+                if isinstance(third_item, (list, tuple)) and all(torch.is_tensor(t) for t in third_item):
+                    class_logits = model_output[1]
+                    multiscale_logits = third_item
+                    art_loss = model_output[3] if len(model_output) >= 4 else None
+                else:
+                    class_logits = model_output[1]
+                    art_loss = third_item
             elif len(model_output) == 2:
                 second_item = model_output[1]
-                # Determine if second_item is scalar artifact_loss or multi-element classification logits
-                is_scalar = (
-                    second_item is not None
-                    and (
-                        (torch.is_tensor(second_item) and (second_item.ndim == 0 or second_item.numel() == 1))
-                        or isinstance(second_item, (int, float))
-                    )
-                )
-                if is_scalar:
+                if isinstance(second_item, (list, tuple)) and all(torch.is_tensor(t) for t in second_item):
                     class_logits = None
-                    art_loss = second_item
-                elif self.aux_classifier and second_item is not None:
-                    class_logits = second_item
+                    multiscale_logits = second_item
                     art_loss = None
                 else:
-                    # Model returned classification logits but loss aux_classifier is disabled
-                    class_logits = None
-                    art_loss = None
+                    is_scalar = (
+                        second_item is not None
+                        and (
+                            (torch.is_tensor(second_item) and (second_item.ndim == 0 or second_item.numel() == 1))
+                            or isinstance(second_item, (int, float))
+                        )
+                    )
+                    if is_scalar:
+                        class_logits = None
+                        art_loss = second_item
+                    elif self.aux_classifier and second_item is not None:
+                        class_logits = second_item
+                        art_loss = None
+                    else:
+                        class_logits = None
+                        art_loss = None
             else:
                 class_logits = None
                 art_loss = None
@@ -99,12 +111,24 @@ class SIDTotalLoss(nn.Module):
             mask_logits = model_output.get("mask_logits")
             class_logits = model_output.get("class_logits")
             art_loss = model_output.get("artifact_loss")
+            multiscale_logits = model_output.get("multiscale_logits")
         else:
             mask_logits = model_output
             class_logits = None
 
         mask_loss, loss_metrics = self.mask_loss_fn(mask_logits, target_masks)
         total_loss = mask_loss
+
+        if multiscale_logits is not None and self.multiscale_weight > 0.0:
+            scale_losses = []
+            for s_idx, m_scale in enumerate(multiscale_logits):
+                t_scale = F.interpolate(target_masks.float(), size=m_scale.shape[2:], mode="nearest")
+                s_l, _ = self.mask_loss_fn(m_scale, t_scale)
+                scale_losses.append(s_l)
+            if scale_losses:
+                ms_loss = torch.stack(scale_losses).mean()
+                total_loss = total_loss + self.multiscale_weight * ms_loss
+                loss_metrics["multiscale_loss"] = float(ms_loss.item())
 
         if self.edge_weight > 0.0 and self._edge_generator is not None and mask_logits is not None:
             t_mask = target_masks.float()
@@ -160,4 +184,5 @@ def build_loss(config: Any) -> SIDTotalLoss:
         artifact_weight=float(loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", 1.0))),
         edge_weight=float(loss_cfg.get("edge_weight", loss_cfg.get("edge_lambda", 0.0))),
         edge_mask_width=int(loss_cfg.get("edge_mask_width", model_cfg.get("edge_mask_width", 7))),
+        multiscale_weight=float(loss_cfg.get("multiscale_weight", loss_cfg.get("multiscale_loss_weight", 0.0))),
     )

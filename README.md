@@ -26,6 +26,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [8. Diffusion-Diff Minimized (Diffusion-Diff-Minimized)](#8-diffusion-diff-minimized-diffusion-diff-minimized)
   - [9. GAP-SAM: Global Artifact Prior with Distilled SAM3](#9-gap-sam-global-artifact-prior-with-distilled-sam3)
   - [10. OpenSDI MaskCLIP: Synergizing Pretrained Models (CLIP + MAE)](#10-opensdi-maskclip-synergizing-pretrained-models-clip--mae)
+  - [11. Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem](#11-feature-pyramid-network-fpn--multi-scale-prediction-subsystem)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -69,6 +70,8 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)**: State-of-the-art dual-decoder generative perturbation architecture with **frozen VAE encoder by default**, **eliminated encoder-to-decoder skips by default**, and a **parallel pretrained, frozen VAE decoder** providing rich generative decoding priors through **perpendicular skip connections** directly into the trainable decoder.
   - **Diffusion-Diff Minimized (Diffusion-Diff-Minimized)**: Ultra-fast generative forensic architecture designed to dramatically reduce diffusion-diff compute time. Replaces the heavy SD 1.5 backbone with **Segmind Tiny-SD (`segmind/tiny-sd`)** loaded via `DiffusionPipeline.from_pretrained("segmind/tiny-sd", dtype=torch.float16, device_map="cuda")`, and slashes computation down to strictly **2 lines of computation** (1 real latent, 1 chosen noisy latent from the diffusion model vs 4 in v2), reducing representation $Z$ from 244 channels to 84 channels, cutting UNet forward passes from 3 to 1, and cutting UNet parameters from ~860M to ~400M while preserving perpendicular skip connections.
   - **GAP-SAM (Global Artifact Prior SAM with `sam-distil`)**: Implementation of *GAP-SAM* (Yan et al., arXiv:2608.20929) adapted with lightweight **`sam-distil`** foundation backbones (`tinyvit`, `efficientvit`, `repvit`). Combines a frozen VAE reconstruction branch ($x_r$), dual-branch feature encoding with shared base weights and PEFT LoRA, Global Average Pooling (GAP) artifact interaction MLP ($\mathbf{t}_{\text{art}}$), zero-gated FiLM feature modulation ($\alpha_f = 0$ initialization), and an auxiliary real-vs-synthetic artifact classification loss ($\mathcal{L}_{\text{art}}$) to achieve generalizable AI image manipulation localization. Features vectorized batched grounding decoding and persistent workers to achieve >90% GPU saturation.
+  - **OpenSDI MaskCLIP (Synergizing Pretrained Models: CLIP + MAE)**: Online pretrained foundation framework fusing continuous prompt-conditioned CLIP visual representations into MAE spatial blocks with multi-scale deep supervision and morphological boundary loss.
+  - **Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem**: Seamless semantic FPN aggregation (`FeaturePyramidNetwork`) with lateral $1\times 1$ convs, top-down feature interpolation and fusion, $3\times 3$ anti-aliasing smoothing convs, deep supervision prediction heads across multi-scale pyramid levels, and flexible `"concat"` / `"sum"` fusion modes. Natively supported across the entire `diffusion-diff` family (`DiffusionDiffModel`, `DiffusionDiffV2Model`, `DiffusionDiffMinimizedModel`) and `MaskCLIP`.
 - **Continuous Master Reports & Automatic Checkpoint Continuation**:
   - **Automatic Repository Checkpoint Discovery**: Automatically scans repository and output directories (`outputs/RUN/...`, `checkpoints/`, etc.) for existing checkpoints (`checkpoint_latest.pt`, `checkpoint_periodic.pt`, `checkpoint_best.pt`) and displays a highlighted on-screen notification with detailed resume metadata (epoch, global step, metric score).
   - **Hugging Face Model Repository Resumption**: Download and resume training or evaluation directly from Hugging Face Hub repositories (`--resume-repo <owner/repo>` or `--resume hf://<owner/repo>`).
@@ -778,6 +781,97 @@ Input Image [B, 3, H, W]
 - **Morphological Edge Mask & Loss**: Morphological dilation/erosion edge detector with $\lambda_{\text{edge}} = 20.0$.
 - **Model Surgery Readiness**: Clean modular hooks for spatial backbone replacement (e.g. SAM / DINOv2 / ConvNeXt), semantic backbone swapping (SigLIP / MobileCLIP), PEFT LoRA/DoRA injection, forward activation steering hooks, and Task Arithmetic / WiSE-FT weight-space model merging.
 - **Hardware Profile (RTX 3060 12GB)**: Model occupies ~2.1 GB static VRAM; inference latency is ~395 ms/img (peak 3.2 GB VRAM); full SPM training fits at $B=2$ (6.2 GB) or $B=4$ (9.8 GB).
+
+---
+
+### 11. Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem
+
+To address subtle manipulations spanning diverse spatial granularities (from tiny inpainting boundary feathering to large generative object insertions), SID-UNet provides a dedicated **Feature Pyramid Network (FPN)** and **Multi-Scale Prediction Subsystem** (`sid_unet.models.fpn.FeaturePyramidNetwork`).
+
+```
+                              Bottom-Up Decoder Features
+             [Stage 0: C_0, H/8, W/8]  [Stage 1: C_1, H/4, W/4]  [Stage 2: C_2, H/2, W/2]  [Stage 3: C_3, H, W]
+                        │                         │                         │                      │
+               1x1 Conv │                1x1 Conv │                1x1 Conv │             1x1 Conv │
+                        ▼                         ▼                         ▼                      ▼
+                    Laterals[0]               Laterals[1]               Laterals[2]            Laterals[3]
+                        │                         │                         │                      │
+                        │ 2x Upsample             │ 2x Upsample             │ 2x Upsample          │
+                        └───►(+)──────────────────┴───►(+)──────────────────┴───►(+)───────────────┘
+                              │                         │                         │
+                              ▼                         ▼                         ▼
+                          Pyramid[0]                Pyramid[1]                Pyramid[2]               Pyramid[3]
+                              │                         │                         │                        │
+                      3x3 Conv│                 3x3 Conv│                 3x3 Conv│                3x3 Conv│
+                              ▼                         ▼                         ▼                        ▼
+                          Smoothed[0]               Smoothed[1]               Smoothed[2]              Smoothed[3]
+                              │                         │                         │                        │
+                   ┌──────────┼─────────────────────────┼─────────────────────────┼────────────────────────┘
+                   │          │                         │                         │                        │
+                   ▼          ▼                         ▼                         ▼                        ▼
+              Deep Superv:  Head 0 [H/8]              Head 1 [H/4]              Head 2 [H/2]             Head 3 [H]
+                                                          │
+                                                          ▼ (Bilinear Upsample all to H, W)
+                                           ┌─────────────────────────────┐
+                                           │ Multi-Scale Feature Fusion  │
+                                           │ ("concat" or "sum" mode)    │
+                                           └──────────────┬──────────────┘
+                                                          ▼
+                                             Fuse Conv (3x3) + Out Conv (1x1)
+                                                          ▼
+                                              Final Mask Logits [B, 1, H, W]
+```
+
+#### Mathematical Formulation
+
+Given $L$ feature stages $\mathbf{F}_0, \mathbf{F}_1, \dots, \mathbf{F}_{L-1}$ ordered from coarsest resolution ($H_0, W_0$) to finest resolution ($H_{L-1}, W_{L-1}$):
+
+1. **Lateral Projections**:
+   Each stage is projected to uniform pyramid channel dimension $D_{\mathrm{fpn}}$ via $1\times 1$ convolution:
+   $$\mathbf{L}_i = \mathrm{Act}\left(\mathrm{Norm}\left(\mathrm{Conv}_{1\times 1}^{(i)}(\mathbf{F}_i)\right)\right), \quad i \in \{0, \dots, L-1\}$$
+
+2. **Top-Down Feature Merging**:
+   High-level semantic guidance is progressively upsampled and merged elementwise with finer feature representations:
+   $$\mathbf{P}_0 = \mathbf{L}_0, \qquad \mathbf{P}_i = \mathbf{L}_i + \mathrm{Interpolate}_{H_i \times W_i}(\mathbf{P}_{i-1}), \quad i \in \{1, \dots, L-1\}$$
+
+3. **Anti-Aliasing Smoothing**:
+   To counteract interpolation checkerboard artifacts, each merged level is smoothed with a $3\times 3$ convolution:
+   $$\mathbf{S}_i = \mathrm{Act}\left(\mathrm{Norm}\left(\mathrm{Conv}_{3\times 3}^{(i)}(\mathbf{P}_i)\right)\right)$$
+
+4. **Multi-Scale Deep Supervision Heads**:
+   Per-scale prediction heads generate mask logits directly at intermediate pyramid resolutions:
+   $$\hat{\mathbf{M}}_i = \mathrm{Head}_i(\mathbf{S}_i) \in \mathbb{R}^{B \times 1 \times H_i \times W_i}$$
+
+5. **Multi-Scale Feature Fusion**:
+   All smoothed representations $\mathbf{S}_i$ are spatially aligned to finest resolution $(H_{L-1}, W_{L-1})$ and fused via concatenation or elementwise summation:
+   $$\mathbf{S}_{\mathrm{fused}} = \begin{cases} \mathrm{Conv}_{\mathrm{fuse}}\left(\left[\mathrm{Interpolate}(\mathbf{S}_0), \dots, \mathbf{S}_{L-1}\right]\right) & \text{if mode} = \text{"concat"} \\ \mathrm{Conv}_{\mathrm{fuse}}\left(\sum_{i=0}^{L-1} \mathrm{Interpolate}(\mathbf{S}_i)\right) & \text{if mode} = \text{"sum"} \end{cases}$$
+   $$\hat{\mathbf{M}}_{\mathrm{final}} = \mathrm{Conv}_{\mathrm{out}}(\mathbf{S}_{\mathrm{fused}}) \in \mathbb{R}^{B \times 1 \times H_{L-1} \times W_{L-1}}$$
+
+6. **Deep Supervision Auxiliary Loss**:
+   When training with `multiscale_weight > 0.0`, `SIDTotalLoss` computes deep supervision loss over intermediate pyramid logits:
+   $$\mathcal{L}_{\mathrm{Total}} = \mathcal{L}_{\mathrm{Mask}}(\hat{\mathbf{M}}_{\mathrm{final}}, \mathbf{M}_{\mathrm{gt}}) + \lambda_{\mathrm{aux}} \mathcal{L}_{\mathrm{cls}} + \lambda_{\mathrm{ms}} \cdot \frac{1}{L} \sum_{i=0}^{L-1} \mathcal{L}_{\mathrm{Mask}}\left(\mathrm{Interpolate}(\hat{\mathbf{M}}_i), \mathbf{M}_{\mathrm{gt}}\right)$$
+
+#### Model Family Integration
+
+- **`DiffusionDiffModel`**: Integrated into `TrainableLatentDecoder` (`use_fpn: true` by default). Decodes high-dimensional $Z$ across 4 pyramid scales with multi-scale deep supervision.
+- **`DiffusionDiffV2Model`**: Integrated into `TrainableLatentDecoderV2`, seamlessly combining perpendicular skip connections from the parallel frozen decoder with FPN multi-scale refinement.
+- **`DiffusionDiffMinimizedModel`**: Pairs the fast Segmind Tiny-SD 2-line computation (84 channels) with FPN multi-scale prediction for lightweight, high-fidelity boundary localization.
+- **`MaskCLIP`**: SideAdapterNetwork's `MaskDecoder` provides 4 scale prediction heads at scale factors $(4.0, 2.0, 1.0, 0.5)$ matching OpenSDI spatial dimensions with multi-scale deep supervision loss.
+
+#### Configuration Example
+
+```yaml
+model:
+  decoder:
+    channels: [256, 128, 64, 32]
+    use_fpn: true                   # Enable Feature Pyramid Network
+    fpn_channels: 128               # Uniform channel dimension in pyramid
+    fpn_fusion_mode: "concat"       # "concat" or "sum"
+    multiscale: true                # Enable per-scale deep supervision heads
+
+loss:
+  multiscale_weight: 0.3            # Deep supervision loss weight (0.0 to disable)
+```
 
 ---
 

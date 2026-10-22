@@ -259,6 +259,11 @@ class DiffusionDiffMinimizedModel(nn.Module):
         else:
             encoder_skip_channels = None
 
+        dec_use_fpn = bool(dec_cfg.get("use_fpn", dec_cfg.get("fpn", True)))
+        dec_fpn_channels = int(dec_cfg.get("fpn_channels", 128))
+        dec_fpn_fusion = dec_cfg.get("fpn_fusion_mode", dec_cfg.get("fusion_mode", "concat"))
+        dec_multiscale = bool(dec_cfg.get("multiscale", dec_cfg.get("multiscale_prediction", True)))
+
         # 5. Initialize Trainable Latent Decoder
         self.decoder = TrainableLatentDecoderV2(
             in_channels=self.total_z_channels,
@@ -273,6 +278,10 @@ class DiffusionDiffMinimizedModel(nn.Module):
             perpendicular_skip_channels=perp_skip_channels,
             use_encoder_skips=self.use_encoder_skips,
             encoder_skip_channels=encoder_skip_channels,
+            use_fpn=dec_use_fpn,
+            fpn_channels=dec_fpn_channels,
+            fpn_fusion_mode=dec_fpn_fusion,
+            multiscale_prediction=dec_multiscale,
         )
 
         # 6. Auxiliary classifier head on Z representation
@@ -681,8 +690,13 @@ class DiffusionDiffMinimizedModel(nn.Module):
         return x, orig_h, orig_w
 
     def forward(
-        self, x: torch.Tensor
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self,
+        x: torch.Tensor,
+        return_dict: bool = False,
+        return_multiscale: bool = False,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
         """
         Forward pass for Diffusion-Diff-Minimized.
 
@@ -695,11 +709,15 @@ class DiffusionDiffMinimizedModel(nn.Module):
              Frozen diffuser UNet predicts noise eps_hat.
              Noise difference and sinusoidal embeddings (t, sigma) are computed.
           3. High-dimensional representation Z is formed and decoded by TrainableLatentDecoderV2
-             with perpendicular skip connection injection.
+             with perpendicular skip connection injection and optional FPN multi-scale prediction.
         """
         # Automatically route pre-computed cached tensor Z through fast forward_cached path
         if x.dim() == 4 and x.shape[1] == self.total_z_channels:
-            return self.forward_cached(x)
+            return self.forward_cached(
+                x,
+                return_dict=return_dict,
+                return_multiscale=return_multiscale,
+            )
 
         device = x.device
         dtype = x.dtype
@@ -842,11 +860,21 @@ class DiffusionDiffMinimizedModel(nn.Module):
             class_logits = self.classifier_head(z_high_dim.to(device=cls_device, dtype=cls_dtype)).to(device=device, dtype=dtype)
 
         dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
-        mask_logits = self.decoder(
+        perp_input = [s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in perp_skips] if perp_skips else None
+        enc_input = [s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in enc_skips] if enc_skips else None
+
+        need_multiscale = return_multiscale or return_dict
+        dec_out = self.decoder(
             z_high_dim.to(device=dec_device, dtype=dec_dtype),
-            perp_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in perp_skips] if perp_skips else None,
-            encoder_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in enc_skips] if enc_skips else None,
-        ).to(device=device, dtype=dtype)
+            perp_skips=perp_input,
+            encoder_skips=enc_input,
+            return_multiscale=need_multiscale,
+        )
+        if need_multiscale:
+            mask_logits, multiscale_logits = dec_out
+        else:
+            mask_logits = dec_out
+            multiscale_logits = getattr(self.decoder, "last_multiscale_logits", None)
 
         # Crop back to original dimensions if padded and ensure contiguous layout
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
@@ -862,7 +890,36 @@ class DiffusionDiffMinimizedModel(nn.Module):
         ):
             class_logits = class_logits.to(device=device, dtype=dtype)
 
-        if self.aux_classifier:
+        if multiscale_logits is not None:
+            cropped_ms: List[torch.Tensor] = []
+            for m in multiscale_logits:
+                m_dev = m.to(device=device, dtype=dtype)
+                if x_proc.shape[2] != orig_h or x_proc.shape[3] != orig_w:
+                    crop_h = max(1, int(orig_h * m.shape[2] / x_proc.shape[2]))
+                    crop_w = max(1, int(orig_w * m.shape[3] / x_proc.shape[3]))
+                    m_dev = m_dev[:, :, :crop_h, :crop_w].contiguous()
+                cropped_ms.append(m_dev)
+            multiscale_logits = cropped_ms
+
+        if return_dict:
+            res: Dict[str, Any] = {
+                "mask_logits": mask_logits,
+                "pred_mask": torch.sigmoid(mask_logits),
+            }
+            if class_logits is not None:
+                res["class_logits"] = class_logits
+                res["pred_label"] = torch.argmax(class_logits, dim=-1)
+            if multiscale_logits is not None:
+                res["multiscale_logits"] = multiscale_logits
+                res["multiscale_pred_masks"] = [torch.sigmoid(m) for m in multiscale_logits]
+            return res
+
+        if return_multiscale:
+            if self.aux_classifier and class_logits is not None:
+                return mask_logits, class_logits, multiscale_logits
+            return mask_logits, multiscale_logits
+
+        if self.aux_classifier and class_logits is not None:
             return mask_logits, class_logits
         return mask_logits
 
@@ -871,7 +928,9 @@ class DiffusionDiffMinimizedModel(nn.Module):
         z_high_dim: torch.Tensor,
         target_h: Optional[int] = None,
         target_w: Optional[int] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_dict: bool = False,
+        return_multiscale: bool = False,
+    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
         """
         Fast forward pass directly from pre-computed high-dimensional representation Z.
         Bypasses VAE encoder and Diffuser UNet, computing perpendicular skip features
@@ -906,11 +965,18 @@ class DiffusionDiffMinimizedModel(nn.Module):
             class_logits = self.classifier_head(z_normed.to(device=cls_device, dtype=cls_dtype)).to(device=device, dtype=dtype)
 
         dec_device, dec_dtype = get_submodule_device_dtype(self.decoder, device, dtype)
-        mask_logits = self.decoder(
+        need_multiscale = return_multiscale or return_dict
+        dec_out = self.decoder(
             z_normed.to(device=dec_device, dtype=dec_dtype),
             perp_skips=[s.to(device=dec_device, dtype=dec_dtype) if s is not None else None for s in perp_skips] if perp_skips else None,
             encoder_skips=None,
-        ).to(device=device, dtype=dtype)
+            return_multiscale=need_multiscale,
+        )
+        if need_multiscale:
+            mask_logits, multiscale_logits = dec_out
+        else:
+            mask_logits = dec_out
+            multiscale_logits = getattr(self.decoder, "last_multiscale_logits", None)
 
         if mask_logits.shape[2] != orig_h or mask_logits.shape[3] != orig_w:
             mask_logits = mask_logits[:, :, :orig_h, :orig_w].contiguous()
@@ -924,7 +990,28 @@ class DiffusionDiffMinimizedModel(nn.Module):
         ):
             class_logits = class_logits.to(device=device, dtype=dtype)
 
-        if self.aux_classifier:
+        if multiscale_logits is not None:
+            multiscale_logits = [m.to(device=device, dtype=dtype) for m in multiscale_logits]
+
+        if return_dict:
+            res: Dict[str, Any] = {
+                "mask_logits": mask_logits,
+                "pred_mask": torch.sigmoid(mask_logits),
+            }
+            if class_logits is not None:
+                res["class_logits"] = class_logits
+                res["pred_label"] = torch.argmax(class_logits, dim=-1)
+            if multiscale_logits is not None:
+                res["multiscale_logits"] = multiscale_logits
+                res["multiscale_pred_masks"] = [torch.sigmoid(m) for m in multiscale_logits]
+            return res
+
+        if return_multiscale:
+            if self.aux_classifier and class_logits is not None:
+                return mask_logits, class_logits, multiscale_logits
+            return mask_logits, multiscale_logits
+
+        if self.aux_classifier and class_logits is not None:
             return mask_logits, class_logits
         return mask_logits
 
