@@ -25,6 +25,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [7. Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)](#7-diffusion-multi-noise-latent-feature-decoder-v2-diffusion-diff-v2)
   - [8. Diffusion-Diff Minimized (Diffusion-Diff-Minimized)](#8-diffusion-diff-minimized-diffusion-diff-minimized)
   - [9. GAP-SAM: Global Artifact Prior with Distilled SAM3](#9-gap-sam-global-artifact-prior-with-distilled-sam3)
+  - [10. OpenSDI MaskCLIP: Synergizing Pretrained Models (CLIP + MAE)](#10-opensdi-maskclip-synergizing-pretrained-models-clip--mae)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -740,6 +741,43 @@ Based on the research paper [*"GAP-SAM: A Global Artifact Prior for Generalizabl
   - **cuDNN Benchmark Autotuning**: Trainer automatically enables `torch.backends.cudnn.benchmark = True` on CUDA devices for optimized fixed-resolution convolutions.
   - **Benchmarked Impact**: Grounding forward+backward latency dropped from **2,751 ms** to **589 ms** (**4.67x speedup**), end-to-end training throughput rose from **0.91 it/s** to **1.57 it/s** (**+72.5%**), and GPU utilization increased from **49.6%** to **90.3%** (peaking at 100%).
 
+---
+
+### 10. OpenSDI MaskCLIP: Synergizing Pretrained Models (CLIP + MAE)
+
+Based on the CVPR 2025 paper [*"OpenSDI: Spotting Diffusion-Generated Images in the Open World"* (Wang et al., arXiv:2503.19653v3)](https://arxiv.org/html/2503.19653v3), **MaskCLIP** implements the **Synergizing Pretrained Models (SPM)** framework. It unifies high-level semantic generalization (OpenAI CLIP `ViT-L/14`) with fine-grained spatial representation (Windowed MAE `ViT-B/16`) to spot open-world diffusion manipulations across models like SD1.5, SD2.1, SDXL, SD3, and Flux.1.
+
+```
+Input Image [B, 3, H, W]
+   │
+   ├───> [Bilinear 224x224] ───> Frozen OpenAI CLIP ViT-L/14 (Semantic Stream)
+   │                               │
+   │                               ├──> ln_2 hooks at layers [2, 4, 8, 12, 16, 20, 23]
+   │                               │     ├──> CLS tokens [B, 7, 1024] ──> VSA (CLSAttentionAggregator) ──> Dot-Product ──> Image Logits [B, 2]
+   │                               │     └──> Patch tokens [B, 7, 1024, 16, 16]
+   │                               │                   │ (Bilinear to 32x32, 1x1 Conv + LN to 768)
+   │                               │                   ▼
+   ├───> [512x512] ────────────> Windowed MAE ViT-B/16 (Dense Spatial Stream)
+   │                               │   x = x + VCA(x, clip_patch) at blocks {1..7}
+   │                               ▼
+   │                             FPN Multi-Scale Stages (4.0x, 2.0x, 1.0x, 0.5x)
+   │                               │ (ConvTranspose2d / MaxPool2d + 1x1/3x3 Conv + LN to 256)
+   │                               ▼
+   │                             TVCA (Textual-Visual Cross-Attention)
+   │                               ▲ Query: Projected Fake Text Embedding [B, 256] from PromptLearner
+   │                               │
+   │                               ▼
+   └───────────────────────────> 1x1 Conv + Sigmoid ──> Tampering Mask [B, 1, H, W]
+```
+
+#### Key Architectural Features:
+- **Hardcoded Pretrained Weights (Strictly Zero Random Initialization)**: Pretrained checkpoints are downloaded automatically online and cached locally (`nebula/MaskCLIP-weights` -> `MaskCLIP_sd15_20241108_09_14_22.pth`, OpenAI CLIP `ViT-L-14.pt`, and Facebook MAE `mae_pretrain_vit_base.pth`). `allow_random_init = False` by default.
+- **Visual Cross-Attention (VCA / `AttentionFusion`)**: Injects intermediate multi-scale CLIP representations into MAE blocks $\{1, 2, 3, 4, 5, 6, 7\}$ via 8-head cross-attention.
+- **Hierarchical FPN + TVCA (`MaskDecoder`)**: Combines 4 feature pyramid scales ($4\times, 2\times, 1\times, 0.5\times$) conditioned on learned fake prompt vectors.
+- **Visual Self-Attention (VSA / `CLSAttentionAggregator`)**: Aggregates intermediate CLIP `[CLS]` tokens for image-level real/fake classification.
+- **Morphological Edge Mask & Loss**: Morphological dilation/erosion edge detector with $\lambda_{\text{edge}} = 20.0$.
+- **Model Surgery Readiness**: Clean modular hooks for spatial backbone replacement (e.g. SAM / DINOv2 / ConvNeXt), semantic backbone swapping (SigLIP / MobileCLIP), PEFT LoRA/DoRA injection, forward activation steering hooks, and Task Arithmetic / WiSE-FT weight-space model merging.
+- **Hardware Profile (RTX 3060 12GB)**: Model occupies ~2.1 GB static VRAM; inference latency is ~395 ms/img (peak 3.2 GB VRAM); full SPM training fits at $B=2$ (6.2 GB) or $B=4$ (9.8 GB).
 
 ---
 

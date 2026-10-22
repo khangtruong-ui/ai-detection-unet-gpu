@@ -202,6 +202,40 @@ class GAPSAMCacheExtractor(BaseCacheExtractor):
         return meta
 
 
+class MaskCLIPCacheExtractor(BaseCacheExtractor):
+    """Cache extractor for OpenSDI MaskCLIP models (frozen CLIP multi-layer patch & CLS features)."""
+
+    @property
+    def model_name(self) -> str:
+        return "mask_clip"
+
+    @property
+    def total_channels(self) -> int:
+        return getattr(self.model, "total_z_channels", 14336)
+
+    @torch.no_grad()
+    def extract_batch(self, images: torch.Tensor) -> torch.Tensor:
+        self.model.eval()
+        if hasattr(self.model, "extract_cache_tensors"):
+            z = self.model.extract_cache_tensors(images)
+        else:
+            raise NotImplementedError("MaskCLIP model does not implement extract_cache_tensors")
+
+        if self.fp16 and z.dtype != torch.float16:
+            z = z.half()
+        return z
+
+    def get_metadata(self) -> Dict[str, Any]:
+        meta = super().get_metadata()
+        meta.update({
+            "model_setting_name": getattr(self.model, "model_setting_name", "ViTL"),
+            "selected_layers": list(getattr(self.model, "selected_layers", [2, 4, 8, 12, 16, 20, 23])),
+            "resolution": getattr(self.model, "resolution", 512),
+            "pretrained_sources": getattr(self.model, "loaded_pretrained_sources", {}),
+        })
+        return meta
+
+
 # Registry of model extractors
 _EXTRACTOR_REGISTRY: Dict[str, Type[BaseCacheExtractor]] = {
     "diffusion_diff_minimized": DiffusionDiffMinimizedExtractor,
@@ -216,6 +250,11 @@ _EXTRACTOR_REGISTRY: Dict[str, Type[BaseCacheExtractor]] = {
     "gap_sam": GAPSAMCacheExtractor,
     "gap-sam": GAPSAMCacheExtractor,
     "gapsam": GAPSAMCacheExtractor,
+    "mask_clip": MaskCLIPCacheExtractor,
+    "mask-clip": MaskCLIPCacheExtractor,
+    "maskclip": MaskCLIPCacheExtractor,
+    "opensdi": MaskCLIPCacheExtractor,
+    "open_sdi": MaskCLIPCacheExtractor,
 }
 
 

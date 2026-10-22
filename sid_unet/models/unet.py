@@ -265,7 +265,13 @@ class UNet(nn.Module):
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
             saved_cfg = ckpt.get("config", {})
-        elif isinstance(ckpt, dict) and any(k.startswith(("inc.", "downs.", "bottleneck.", "stage1.", "linear.", "stage5.")) for k in ckpt.keys()):
+        elif isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+            state_dict = ckpt["model"]
+            saved_cfg = ckpt.get("config", {})
+        elif isinstance(ckpt, dict) and any(
+            k.startswith(("inc.", "downs.", "bottleneck.", "stage1.", "linear.", "stage5.", "aggregator.", "prompt_learner.", "cls_aggregator."))
+            for k in ckpt.keys()
+        ):
             state_dict = ckpt
             saved_cfg = {}
         else:
@@ -281,7 +287,7 @@ class UNet(nn.Module):
 
         merged = deep_merge(DEFAULT_CONFIG, saved_cfg_dict)
         if isinstance(state_dict, dict):
-            has_aux = any(k.startswith("classifier_head.") for k in state_dict.keys())
+            has_aux = any(k.startswith(("classifier_head.", "cls_aggregator.", "prompt_learner.")) for k in state_dict.keys())
             if not saved_cfg_dict or "aux_classifier" not in saved_cfg_dict.get("model", {}):
                 merged["model"]["aux_classifier"] = has_aux
             saved_model_name = saved_cfg_dict.get("model", {}).get("name")
@@ -289,6 +295,10 @@ class UNet(nn.Module):
                 merged["model"]["name"] = saved_model_name
                 if saved_model_name == "efficientnet":
                     merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
+            elif any(k.startswith(("aggregator.vit_model.", "prompt_learner.", "cls_aggregator.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "mask_clip"
+                if "num_classes" not in saved_cfg_dict.get("model", {}):
+                    merged["model"]["num_classes"] = 3 if any(k.startswith("class_head.") for k in state_dict.keys()) else 2
             elif any(k.startswith(("stage1.", "linear.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "efficientnet"
                 merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
@@ -350,6 +360,67 @@ def build_model(config: Any) -> nn.Module:
 
     model_name = str(model_cfg.get("name", "unet")).lower()
     backbone = str(model_cfg.get("backbone", "")).lower()
+
+    if any(k in model_name for k in ["mask_clip", "mask-clip", "maskclip", "opensdi", "open_sdi", "sideclip"]) or any(
+        k in backbone for k in ["mask_clip", "mask-clip", "maskclip", "opensdi"]
+    ):
+        from sid_unet.models.mask_clip import (
+            MaskCLIP,
+            DEFAULT_MASKCLIP_HF_REPO,
+            DEFAULT_MASKCLIP_HF_FILENAME,
+            DEFAULT_MAE_PRETRAIN_URL,
+        )
+        dev_cfg = (
+            config.get("project", {}).get("device", "auto")
+            if hasattr(config, "get") and hasattr(config.get("project", {}), "get")
+            else "auto"
+        )
+        raw_fusion_map = model_cfg.get("fusion_map", None)
+        parsed_fusion_map = (
+            {int(k): int(v) for k, v in raw_fusion_map.items()}
+            if isinstance(raw_fusion_map, dict)
+            else None
+        )
+        return MaskCLIP(
+            model_setting_name=str(model_cfg.get("model_setting_name", "ViTL")),
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            pretrained_mode=str(model_cfg.get("pretrained_mode", "opensdi")),
+            pretrained_model_name_or_path=str(
+                model_cfg.get(
+                    "pretrained_model_name_or_path",
+                    model_cfg.get("checkpoint_path", DEFAULT_MASKCLIP_HF_REPO),
+                )
+            ),
+            checkpoint_filename=model_cfg.get("checkpoint_filename", DEFAULT_MASKCLIP_HF_FILENAME),
+            mae_pretrained_url=str(model_cfg.get("mae_pretrained_url", DEFAULT_MAE_PRETRAIN_URL)),
+            clip_model_name=model_cfg.get("clip_model_name", None),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
+            resolution=int(model_cfg["resolution"]) if "resolution" in model_cfg and model_cfg["resolution"] is not None else None,
+            selected_layers=model_cfg.get("selected_layers", None),
+            fusion_map=parsed_fusion_map,
+            language_ctx=int(model_cfg["language_ctx"]) if "language_ctx" in model_cfg and model_cfg["language_ctx"] is not None else None,
+            language_depth=int(model_cfg["language_depth"]) if "language_depth" in model_cfg and model_cfg["language_depth"] is not None else None,
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 2)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            edge_lambda=float(model_cfg.get("edge_lambda", 20.0)),
+            edge_mask_width=int(model_cfg.get("edge_mask_width", 7)),
+            input_normalize=bool(model_cfg.get("input_normalize", True)),
+            freeze_clip=bool(model_cfg.get("freeze_clip", True)),
+            freeze_mae=bool(model_cfg.get("freeze_mae", False)),
+            enable_clip_cache=bool(model_cfg.get("enable_clip_cache", False)),
+            clip_cache_size=int(model_cfg.get("clip_cache_size", 10000)),
+            lora_r=int(model_cfg.get("lora_r", 0)),
+            lora_alpha=float(model_cfg.get("lora_alpha", 16.0)),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
+            lora_target=str(model_cfg.get("lora_target", "mae")),
+            use_dora=bool(model_cfg.get("use_dora", False)),
+            cache_dir=model_cfg.get("cache_dir", None),
+            token=model_cfg.get("token", None),
+            force_download=bool(model_cfg.get("force_download", False)),
+            device=dev_cfg,
+        )
 
     if any(k in model_name for k in ["gap_sam", "gap-sam", "gapsam"]) or (
         ("gap" in model_name or "gap" in backbone) and any(b in backbone for b in ["tinyvit", "efficientvit", "repvit", "sam"])

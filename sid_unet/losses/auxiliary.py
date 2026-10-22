@@ -31,6 +31,8 @@ class SIDTotalLoss(nn.Module):
         aux_loss_type: str = "cross_entropy",
         aux_weight: float = 0.2,
         artifact_weight: float = 1.0,
+        edge_weight: float = 0.0,
+        edge_mask_width: int = 7,
     ):
         super().__init__()
         self.mask_loss_fn = CombinedMaskLoss(
@@ -46,6 +48,12 @@ class SIDTotalLoss(nn.Module):
         self.aux_loss_type = aux_loss_type
         self.aux_weight = aux_weight
         self.artifact_weight = artifact_weight
+        self.edge_weight = float(edge_weight)
+        self.edge_mask_width = int(edge_mask_width)
+        self._edge_generator: Optional[nn.Module] = None
+        if self.edge_weight > 0.0:
+            from sid_unet.models.mask_clip import EdgeMaskGenerator
+            self._edge_generator = EdgeMaskGenerator(kernel_size=self.edge_mask_width)
 
     def forward(
         self,
@@ -98,13 +106,29 @@ class SIDTotalLoss(nn.Module):
         mask_loss, loss_metrics = self.mask_loss_fn(mask_logits, target_masks)
         total_loss = mask_loss
 
+        if self.edge_weight > 0.0 and self._edge_generator is not None and mask_logits is not None:
+            t_mask = target_masks.float()
+            if t_mask.ndim == 3:
+                t_mask = t_mask.unsqueeze(1)
+            edge_mask = self._edge_generator(t_mask)
+            edge_loss = F.binary_cross_entropy_with_logits(
+                input=mask_logits.float(),
+                target=t_mask,
+                weight=edge_mask,
+            )
+            total_loss = total_loss + self.edge_weight * edge_loss
+            loss_metrics["edge_loss"] = float(edge_loss.item())
+
         if (
             self.aux_classifier
             and class_logits is not None
             and target_labels is not None
             and self.aux_weight > 0
         ):
-            aux_loss = F.cross_entropy(class_logits, target_labels)
+            eff_labels = target_labels
+            if class_logits.size(-1) == 2 and eff_labels.max() >= 2:
+                eff_labels = (eff_labels > 0).long()
+            aux_loss = F.cross_entropy(class_logits, eff_labels)
             total_loss = total_loss + self.aux_weight * aux_loss
             loss_metrics["aux_loss"] = aux_loss.item()
 
@@ -134,4 +158,6 @@ def build_loss(config: Any) -> SIDTotalLoss:
         aux_loss_type=loss_cfg.get("aux_loss_type", "cross_entropy"),
         aux_weight=float(loss_cfg.get("aux_weight", 0.2)),
         artifact_weight=float(loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", 1.0))),
+        edge_weight=float(loss_cfg.get("edge_weight", loss_cfg.get("edge_lambda", 0.0))),
+        edge_mask_width=int(loss_cfg.get("edge_mask_width", model_cfg.get("edge_mask_width", 7))),
     )

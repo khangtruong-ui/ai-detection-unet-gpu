@@ -12,6 +12,7 @@ Directory Layout:
 - **`diffusion_diff/`**: Diffusion multi-noise feature decoder combining multi-step perturbations, frozen diffuser noise predictions, and sinusoidal embeddings with a configurable trainable decoder.
 - **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
 - **`diffusion_diff_minimized/`**: Minimized ultra-fast diffusion-diff architecture using Segmind Tiny-SD (`segmind/tiny-sd`) in FP16 on CUDA with only 2 lines of computation (1 real latent, 1 chosen noisy latent from the diffusion model).
+- **`mask_clip/`**: OpenSDI MaskCLIP (Synergizing Pretrained Models: CLIP ViT-L/14 + MAE ViT-B/16) with VCA cross-attention, FPN + TVCA mask decoder, VSA CLS aggregator, PromptLearner, edge-weighted loss, and Model Surgery hooks.
 
 
 ---
@@ -112,6 +113,16 @@ Directory Layout:
 
 ---
 
+## 10. OpenSDI MaskCLIP (Synergizing Pretrained Models) (`configs/experiments/mask_clip/`)
+
+| Configuration File | Model & Pretraining | Resolution | Batch Size | Loss | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/mask_clip/default.yaml) | MaskCLIP (`nebula/MaskCLIP-weights`) | $512 \times 512$ | 2 (accum 8) | BCE + Edge ($\lambda=20$) + CE | Official 20-epoch CVPR 2025 OpenSDI checkpoint loaded online with zero random initialization. |
+| [`mask_clip_clip_mae_backbones.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/mask_clip/mask_clip_clip_mae_backbones.yaml) | MaskCLIP (`ViT-L/14` + `MAE-B/16`) | $512 \times 512$ | 2 (accum 8) | BCE + Edge ($\lambda=20$) + CE | SPM training from foundation backbones without random initialization. |
+| [`mask_clip_dora_surgery.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/mask_clip/mask_clip_dora_surgery.yaml) | MaskCLIP + DoRA Surgery ($r=8, \alpha=16$) | $512 \times 512$ | 4 (accum 4) | BCE + Edge ($\lambda=20$) + CE | Parameter-efficient DoRA adaptation (6.3% trainable parameters) for high-speed single-GPU fine-tuning. |
+| [`mask_clip_sideclip_1024.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/mask_clip/mask_clip_sideclip_1024.yaml) | SideCLIP 1024 Variant | $1024 \times 1024$ | 1 (accum 16) | BCE + Edge ($\lambda=20$) + CE | High-resolution $1024 \times 1024$ SideCLIP variant for large image inpainting boundary detection. |
+
+---
 
 ## How to Run
 
@@ -160,13 +171,18 @@ sid-train --config configs/experiments/diffusion_diff_v2/default.yaml
 sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml
 ```
 
-### 10. Multi-Experiment Comparative Suite
+### 10. Training with OpenSDI MaskCLIP
+```bash
+sid-train --config configs/experiments/mask_clip/default.yaml
+```
+
+### 11. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \
   configs/experiments/efficientnet/efficientnet_b0_unet.yaml \
   configs/experiments/gap_sam/default.yaml \
   configs/experiments/sam3_distil/default.yaml \
-  configs/experiments/diffusion_diff_minimized/default.yaml
+  configs/experiments/mask_clip/default.yaml
 ```
 

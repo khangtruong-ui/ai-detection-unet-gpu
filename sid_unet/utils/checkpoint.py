@@ -23,6 +23,10 @@ HF_CHECKPOINT_CANDIDATES = [
     "checkpoints/checkpoint_periodic.pt",
     "outputs/RUN/default/checkpoints/checkpoint_latest.pt",
     "outputs/RUN/default/checkpoints/checkpoint_best.pt",
+    "MaskCLIP_sd15_20241108_09_14_22.pth",
+    "MaskCLIP_sd15_20241109_08_53_19.pth",
+    "MaskCLIP_sd15_20241103_17_45_16.pth",
+    "MaskCLIP_sd15_20241103_17_45_19.pth",
     "pytorch_model.bin",
     "model.pt",
     "checkpoints/model.pt",
@@ -158,12 +162,17 @@ def download_hf_checkpoint(
                 "outputs/RUN/default/checkpoints/checkpoint_best.pt",
                 "checkpoints/checkpoint_periodic.pt",
                 "checkpoint_periodic.pt",
+                "MaskCLIP_sd15_20241108_09_14_22.pth",
+                "MaskCLIP_sd15_20241109_08_53_19.pth",
+                "MaskCLIP_sd15_20241103_17_45_16.pth",
             ]:
                 if pat in repo_files and pat not in dynamic_cands:
                     dynamic_cands.append(pat)
-            # Check for any *.pt under checkpoints/ or outputs/
+            # Check for any *.pt or *.pth under checkpoints/ or outputs/ or root
             for rf in repo_files:
-                if rf.endswith(".pt") and ("checkpoint" in rf.lower() or "model" in rf.lower()) and rf not in dynamic_cands:
+                if rf.endswith((".pt", ".pth")) and (
+                    "checkpoint" in rf.lower() or "model" in rf.lower() or "maskclip" in rf.lower()
+                ) and rf not in dynamic_cands:
                     dynamic_cands.append(rf)
             if dynamic_cands:
                 filenames_to_try = dynamic_cands + [f for f in filenames_to_try if f not in dynamic_cands]

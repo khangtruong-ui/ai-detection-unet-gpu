@@ -1,0 +1,91 @@
+# Configuration: OpenSDI MaskCLIP (High-Resolution 1024x1024 SideCLIP Variant)
+# Loads the official 1024-resolution checkpoint (`MaskCLIP_sd15_20241103_17_45_16.pth`)
+# from `nebula/MaskCLIP-weights` with 4-level feature projection and refiner mask decoder.
+
+project:
+  name: "mask_clip_sideclip_1024"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/mask_clip/sideclip_1024"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  image_size: [1024, 1024]
+  batch_size: 1
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 16
+  shuffle_buffer_size: 16
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.25
+
+model:
+  name: "mask_clip"
+  model_setting_name: "ViTL_1024_SideCLIP"
+  pretrained: true
+  pretrained_mode: "opensdi"
+  pretrained_model_name_or_path: "nebula/MaskCLIP-weights"
+  checkpoint_filename: "MaskCLIP_sd15_20241103_17_45_16.pth"
+  clip_model_name: "ViT-L/14"
+  allow_random_init: false
+  resolution: 1024
+  selected_layers: [5, 11, 17, 23]
+  fusion_map:
+    0: 0
+    3: 1
+    6: 2
+    9: 3
+  language_ctx: 10
+  language_depth: 5
+  aux_classifier: true
+  num_classes: 2
+  in_channels: 3
+  out_channels: 1
+  edge_lambda: 20.0
+  edge_mask_width: 7
+  input_normalize: true
+  freeze_clip: true
+  freeze_mae: false
+  lora_r: 0
+
+loss:
+  mask_loss_type: "bce"
+  bce_weight: 1.0
+  dice_weight: 0.0
+  focal_weight: 0.0
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 1.0
+  edge_weight: 20.0
+  edge_mask_width: 7
+
+training:
+  epochs: 20
+  learning_rate: 0.00005
+  weight_decay: 0.05
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 16
+  save_best: true
+  save_latest: true
+  checkpoint_period: 1
+  early_stopping_patience: 5
+  early_stopping_metric: "val_loss"
+  early_stopping_mode: "min"
+
+logging:
+  log_interval: 20
+  log_memory: true

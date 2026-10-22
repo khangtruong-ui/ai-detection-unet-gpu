@@ -1,0 +1,104 @@
+# Configuration: OpenSDI MaskCLIP with DoRA / LoRA Model Surgery
+# Freezes both CLIP (ViT-L/14) and MAE (ViT-B/16) backbones, injecting Weight-Decomposed
+# Low-Rank Adaptation (DoRA / LoRA r=8, alpha=16) into MAE linear projections, training only
+# the adapter matrices and the SPM fusion/decoder modules (~6.3% of total parameters).
+#
+# Reference:
+#   - "DoRA: Weight-Decomposed Low-Rank Adaptation" (Liu et al., ICML 2024, arXiv:2402.09353)
+#   - "OpenSDI: Spotting Diffusion-Generated Images in the Open World" (CVPR 2025)
+
+project:
+  name: "mask_clip_dora_surgery"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/mask_clip/dora_surgery"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  image_size: [512, 512]
+  batch_size: 4
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 32
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.5
+    random_rotate90: 0.5
+
+model:
+  name: "mask_clip"
+  model_setting_name: "ViTL"
+  pretrained: true
+  pretrained_mode: "opensdi"
+  pretrained_model_name_or_path: "nebula/MaskCLIP-weights"
+  checkpoint_filename: "MaskCLIP_sd15_20241108_09_14_22.pth"
+  mae_pretrained_url: "https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_base.pth"
+  clip_model_name: "ViT-L/14"
+  allow_random_init: false
+  resolution: 512
+  selected_layers: [2, 4, 8, 12, 16, 20, 23]
+  fusion_map:
+    1: 0
+    2: 1
+    3: 2
+    4: 3
+    5: 4
+    6: 5
+    7: 6
+  language_ctx: 10
+  language_depth: 5
+  aux_classifier: true
+  num_classes: 2
+  in_channels: 3
+  out_channels: 1
+  edge_lambda: 20.0
+  edge_mask_width: 7
+  input_normalize: true
+  freeze_clip: true
+  freeze_mae: true
+  lora_r: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_target: "mae"
+  use_dora: true
+
+loss:
+  mask_loss_type: "bce"
+  bce_weight: 1.0
+  dice_weight: 0.0
+  focal_weight: 0.0
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 1.0
+  edge_weight: 20.0
+  edge_mask_width: 7
+
+training:
+  epochs: 20
+  learning_rate: 0.0002
+  weight_decay: 0.05
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 4
+  save_best: true
+  save_latest: true
+  checkpoint_period: 1
+  early_stopping_patience: 5
+  early_stopping_metric: "val_loss"
+  early_stopping_mode: "min"
+
+logging:
+  log_interval: 20
+  log_memory: true

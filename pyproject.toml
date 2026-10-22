@@ -68,6 +68,22 @@ sam3-distil = [
     "einops>=0.7.0",
     "pycocotools>=2.0.7",
 ]
+mask-clip = [
+    "clip @ git+https://github.com/openai/CLIP.git",
+    "timm>=1.0.15",
+    "ftfy>=6.1.1",
+    "regex",
+    "huggingface-hub>=0.20.0",
+    "peft>=0.7.0",
+]
+opensdi = [
+    "clip @ git+https://github.com/openai/CLIP.git",
+    "timm>=1.0.15",
+    "ftfy>=6.1.1",
+    "regex",
+    "huggingface-hub>=0.20.0",
+    "peft>=0.7.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -86,6 +102,7 @@ all = [
     "pytest-xdist>=3.0.0",
     "nn-toolbox @ git+https://github.com/khangtruong-ui/nn-toolbox.git",
     "sam3-distil @ git+https://github.com/khangtruong-ui/sam3-distil.git",
+    "clip @ git+https://github.com/openai/CLIP.git",
     "timm>=1.0.17",
     "omegaconf>=2.3.0",
     "ftfy>=6.1.1",
@@ -118,7 +135,28 @@ include = ["sid_unet*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+timeout = 240
 addopts = "-v --tb=short --timeout=240"
+
+[tool.sid_unet.mask_clip]
+paper_title = "OpenSDI: Spotting Diffusion-Generated Images in the Open World (CVPR 2025)"
+paper_arxiv = "https://arxiv.org/html/2503.19653v3"
+hf_repo_id = "nebula/MaskCLIP-weights"
+default_checkpoint = "MaskCLIP_sd15_20241108_09_14_22.pth"
+available_checkpoints = [
+    "MaskCLIP_sd15_20241108_09_14_22.pth",
+    "MaskCLIP_sd15_20241109_08_53_19.pth",
+    "MaskCLIP_sd15_20241103_17_45_16.pth",
+    "MaskCLIP_sd15_20241103_17_45_19.pth",
+]
+mae_pretrained_url = "https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_base.pth"
+clip_vit_l14_url = "https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt"
+clip_model_name = "ViT-L/14"
+allow_random_init = false
+default_resolution = 512
+selected_layers = [2, 4, 8, 12, 16, 20, 23]
+edge_lambda = 20.0
+edge_mask_width = 7
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
@@ -126,6 +164,7 @@ torchvision = [{ index = "pytorch-cu128" }]
 nn-toolbox = { git = "https://github.com/khangtruong-ui/nn-toolbox.git" }
 sam3-distil = { git = "https://github.com/khangtruong-ui/sam3-distil.git" }
 parquet-dataset-loader = { git = "https://github.com/khangtruong-ui/parquet-dataset-loader.git" }
+clip = { git = "https://github.com/openai/CLIP.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
