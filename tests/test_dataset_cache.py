@@ -1001,6 +1001,23 @@ def test_prefetched_batch_loader_strict_ordering_and_speed():
     assert assembled_ids == expected_ids
 
 
+def test_cache_manager_sys_imports():
+    """Verify sys import is present in cache manager and _ExceptionWrapper captures exc_info."""
+    import sys
+    import sid_unet.cache.manager as cm
+
+    assert hasattr(cm, "sys")
+    assert cm.sys is sys
+
+    try:
+        raise ValueError("test exception for wrapper")
+    except ValueError as e:
+        wrapper = cm._ExceptionWrapper(e)
+        assert wrapper.exc_info is not None
+        assert wrapper.exc_info[0] is ValueError
+
+
+
 
 
 
