@@ -15,19 +15,37 @@ Existing AI image manipulation localizers fine-tune semantic segmentation founda
    - **Frozen Branch:** Encodes reconstructed image $\mathbf{x}_{\text{rec}}$ through a frozen configuration of the EfficientSAM3 backbone, yielding $\mathbf{F}_r^L$.
 3. **Paired Artifact Encoder:**
    - Computes Global Average Pooling (GAP) and branch-specific LayerNorms:
-     $$\mathbf{h}_o = \text{LayerNorm}_o(\text{GAP}(\mathbf{F}_o^L)), \quad \mathbf{h}_r = \text{LayerNorm}_r(\text{GAP}(\mathbf{F}_r^L))$$
+
+$$
+\mathbf{h}_o = \mathrm{LN}_o(\mathrm{GAP}(\mathbf{F}_o^L)), \quad \mathbf{h}_r = \mathrm{LN}_r(\mathrm{GAP}(\mathbf{F}_r^L))
+$$
+
    - Concatenates the pooled descriptors and applies a 2-layer interaction MLP with GELU and intermediate LayerNorm:
-     $$\mathbf{t}_{\text{art}} = \mathbf{W}_2 \, \text{LayerNorm}(\text{GELU}(\mathbf{W}_1 [\mathbf{h}_o ; \mathbf{h}_r] + \mathbf{b}_1)) + \mathbf{b}_2$$
-     producing a 256-dimensional Global Artifact Prior Token $\mathbf{t}_{\text{art}}$.
+
+$$
+\mathbf{t}_{\mathrm{art}} = \mathbf{W}_2 \, \mathrm{LN}\left(\mathrm{GELU}\left(\mathbf{W}_1 [\mathbf{h}_o \,\|\, \mathbf{h}_r] + \mathbf{b}_1\right)\right) + \mathbf{b}_2
+$$
+
+     producing a 256-dimensional Global Artifact Prior Token $\mathbf{t}_{\mathrm{art}}$.
 4. **Zero-Gated FiLM Conditioning:**
    - Modulates each level $l$ of the FPN multiscale feature pyramid before mask decoding:
-     $$\gamma^l, \beta^l = \text{split}(\mathbf{W}_f^{\text{FPN}} \mathbf{t}_{\text{art}} + \mathbf{b}_f^{\text{FPN}})$$
-     $$\tilde{\mathbf{F}}_o^l = \mathbf{F}_o^l + \alpha_f \cdot (\gamma^l \odot \mathbf{F}_o^l + \beta^l)$$
+
+$$
+\boldsymbol{\gamma}^l, \; \boldsymbol{\beta}^l = \mathrm{split}\left(\mathbf{W}_f^{\mathrm{FPN}} \mathbf{t}_{\mathrm{art}} + \mathbf{b}_f^{\mathrm{FPN}}\right)
+$$
+
+$$
+\tilde{\mathbf{F}}_o^l = \mathbf{F}_o^l + \alpha_f \cdot \left(\boldsymbol{\gamma}^l \odot \mathbf{F}_o^l + \boldsymbol{\beta}^l\right)
+$$
+
    - The shared scalar gate $\alpha_f$ is initialized to zero, ensuring exact identity mapping at initialization and smoothly learning to inject forensic prior context without inserting spatial boundary shortcuts.
 5. **Artifact Classifier:**
    - Attaches a linear classifier $c(\mathbf{h}) = \sigma(\mathbf{W}_c \mathbf{h} + b_c)$ to pooled descriptors $\mathbf{h}_o$ and $\mathbf{h}_r$.
-   - Enforces a binary cross-entropy loss $\mathcal{L}_{\text{art}}$ anchoring the paired latent space along the real-versus-synthetic forensic axis:
-     $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{loc}} + \lambda_{\text{art}} \mathcal{L}_{\text{art}}, \quad (\lambda_{\text{art}} = 1.0)$$
+   - Enforces a binary cross-entropy loss $\mathcal{L}_{\mathrm{art}}$ anchoring the paired latent space along the real-versus-synthetic forensic axis:
+
+$$
+\mathcal{L}_{\mathrm{total}} = \mathcal{L}_{\mathrm{loc}} + \lambda_{\mathrm{art}} \mathcal{L}_{\mathrm{art}}, \quad (\lambda_{\mathrm{art}} = 1.0)
+$$
 
 ---
 

@@ -69,7 +69,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)**: Advanced latent perturbation forensics extracting $z_0$, adding noise across multiple diffusion timesteps, computing frozen diffuser predicted noise and sinusoidal schedule embeddings ($t, \sigma$), concatenated into high-dimensional $Z$ decoded by a fully configurable trainable decoder.
   - **Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)**: State-of-the-art dual-decoder generative perturbation architecture with **frozen VAE encoder by default**, **eliminated encoder-to-decoder skips by default**, and a **parallel pretrained, frozen VAE decoder** providing rich generative decoding priors through **perpendicular skip connections** directly into the trainable decoder.
   - **Diffusion-Diff Minimized (Diffusion-Diff-Minimized)**: Ultra-fast generative forensic architecture designed to dramatically reduce diffusion-diff compute time. Replaces the heavy SD 1.5 backbone with **Segmind Tiny-SD (`segmind/tiny-sd`)** loaded via `DiffusionPipeline.from_pretrained("segmind/tiny-sd", dtype=torch.float16, device_map="cuda")`, and slashes computation down to strictly **2 lines of computation** (1 real latent, 1 chosen noisy latent from the diffusion model vs 4 in v2), reducing representation $Z$ from 244 channels to 84 channels, cutting UNet forward passes from 3 to 1, and cutting UNet parameters from ~860M to ~400M while preserving perpendicular skip connections.
-  - **GAP-SAM (Global Artifact Prior SAM with `sam-distil`)**: Implementation of *GAP-SAM* (Yan et al., arXiv:2608.20929) adapted with lightweight **`sam-distil`** foundation backbones (`tinyvit`, `efficientvit`, `repvit`). Combines a frozen VAE reconstruction branch ($x_r$), dual-branch feature encoding with shared base weights and PEFT LoRA, Global Average Pooling (GAP) artifact interaction MLP ($\mathbf{t}_{\text{art}}$), zero-gated FiLM feature modulation ($\alpha_f = 0$ initialization), and an auxiliary real-vs-synthetic artifact classification loss ($\mathcal{L}_{\text{art}}$) to achieve generalizable AI image manipulation localization. Features vectorized batched grounding decoding and persistent workers to achieve >90% GPU saturation.
+  - **GAP-SAM (Global Artifact Prior SAM with `sam-distil`)**: Implementation of *GAP-SAM* (Yan et al., arXiv:2608.20929) adapted with lightweight **`sam-distil`** foundation backbones (`tinyvit`, `efficientvit`, `repvit`). Combines a frozen VAE reconstruction branch ($x_{\mathrm{rec}}$), dual-branch feature encoding with shared base weights and PEFT LoRA, Global Average Pooling (GAP) artifact interaction MLP ($\mathbf{t}_{\mathrm{art}}$), zero-gated FiLM feature modulation (with $\alpha_f = 0$ initialization), and an auxiliary real-vs-synthetic artifact classification loss ($\mathcal{L}_{\mathrm{art}}$) to achieve generalizable AI image manipulation localization. Features vectorized batched grounding decoding and persistent workers to achieve >90% GPU saturation.
   - **OpenSDI MaskCLIP (Synergizing Pretrained Models: CLIP + MAE)**: Online pretrained foundation framework fusing continuous prompt-conditioned CLIP visual representations into MAE spatial blocks with multi-scale deep supervision and morphological boundary loss.
   - **Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem**: Seamless semantic FPN aggregation (`FeaturePyramidNetwork`) with lateral $1\times 1$ convs, top-down feature interpolation and fusion, $3\times 3$ anti-aliasing smoothing convs, deep supervision prediction heads across multi-scale pyramid levels, and flexible `"concat"` / `"sum"` fusion modes. Natively supported across the entire `diffusion-diff` family (`DiffusionDiffModel`, `DiffusionDiffV2Model`, `DiffusionDiffMinimizedModel`).
 - **Continuous Master Reports & Automatic Checkpoint Continuation**:
@@ -401,13 +401,18 @@ A state-of-the-art forensic architecture analyzing how images respond to generat
                 │                          │        │
         ┌───────▼──────────────┐   ┌───────▼────────┼──────────────────────────────────┐
         │ Auxiliary Classifier │   │        Trainable Latent Decoder (UNet-style)      │
-        │ AdaptivePool -> MLP  │   │  Stage 1: H/8 -> H/4 ◄── Skip 1: (H/4, W/4)       │
-        └───────┬──────────────┘   │  Stage 2: H/4 -> H/2 ◄── Skip 2: (H/2, W/2)       │
-                ▼                  │  Stage 3: H/2 -> H   ◄── Skip 3: (H, W)           │
-       Class Logits (B, 3)         │  Final 1x1 ConvOut                                │
+        │ AdaptivePool -> MLP  │   │  Bottleneck: H/8 -> Representation Z              │
+        └───────┬──────────────┘   │  Stage 0: H/8 -> H/4 ◄── Skip 1: (H/4, W/4)       │
+                ▼                  │  Stage 1: H/4 -> H/2 ◄── Skip 2: (H/2, W/2)       │
+       Class Logits (B, 3)         │  Stage 2: H/2 -> H   ◄── Skip 3: (H, W)           │
+                                   │                                                   │
+                                   │  Feature Pyramid Network (FPN) & Deep Superv.     │
+                                   │  - Lateral 1x1 Convs + Top-Down Fusion + 3x3 Conv │
+                                   │  - Multi-Scale Heads: P0 (H/8), P1, P2, P3 (H)    │
+                                   │  - Multi-Scale Fusion ("concat" / "sum")          │
                                    └────────────────┬──────────────────────────────────┘
                                                     ▼
-                                       Binary Mask Logits (B, 1, H, W)
+                                    Multi-Scale Predictions + Final Mask (B, 1, H, W)
 ```
 
 #### Mathematical & Architectural Principles
@@ -484,27 +489,26 @@ Diffusion-Diff-V2 advances the generative latent perturbation paradigm by decoup
                │                         │                                                 │
        ┌───────▼──────────────┐  ┌───────▼────────────────────────────────────────┐        │
        │ Auxiliary Classifier │  │        Trainable Latent Decoder V2             │        │
-       │ AdaptivePool -> MLP  │  │                                                │        │
+       │ AdaptivePool -> MLP  │  │  Bottleneck (H/8): Representation Z            │        │
        └───────┬──────────────┘  │  Stage 0 (H/8 -> H/4) ◄─────────────────────────────────┘
                ▼                 │    feat = PerpSkipFusion_0(feat, Frozen_H4)    │
       Class Logits (B, 3)        │                                                │
-                                 │                                                │
                                  │  Parallel Frozen UpBlock 1 (H/2) ──────────────┼────────┐
                                  │                                                │        │ (Perpendicular Skip 2)
                                  │  Stage 1 (H/4 -> H/2) ◄────────────────────────┴────────┘
                                  │    feat = PerpSkipFusion_1(feat, Frozen_H2)    │
-                                 │                                                │
                                  │                                                │
                                  │  Parallel Frozen UpBlock 2 (H) ────────────────┼────────┐
                                  │                                                │        │ (Perpendicular Skip 3)
                                  │  Stage 2 (H/2 -> H)   ◄────────────────────────┴────────┘
                                  │    feat = PerpSkipFusion_2(feat, Frozen_H)     │
                                  │                                                │
-                                 │  Final 1x1 ConvOut                             │
+                                 │  Feature Pyramid Network (FPN) & Deep Superv.  │
+                                 │  - Multi-Scale Heads: P0 (H/8), P1, P2, P3 (H) │
+                                 │  - Multi-Scale Fusion ("concat" / "sum")       │
                                  └───────────────────────┬────────────────────────┘
                                                          ▼
-                                          Binary Mask Logits (B, 1, H, W)
-```
+                                           Multi-Scale Mask Logits + Fused Mask (B, 1, H, W)
 
 #### Mathematical & Architectural Principles
 
@@ -544,7 +548,19 @@ $$
 h_j^{\text{fused}} = \sigma\left( \mathrm{Norm}\left( \mathrm{Conv}_{3\times3}\left( \left[ h_j, \; F_j^{\text{frozen}} \right] \right) \right) \right)
 $$
 
-- **5. Generative Perturbation & Diffuser Anomaly Cues**: Concurrently, $z_0$ undergoes multi-timestep forward diffusion perturbations $z_{t_k} = \sqrt{\bar{\alpha}_{t_k}} z_0 + \sqrt{1 - \bar{\alpha}_{t_k}} \epsilon_k$. The frozen diffuser UNet predicts $\hat{\epsilon}_k$, and residual anomalies $(\hat{\epsilon}_k - \epsilon_k)$ alongside harmonic schedule embeddings $(e_{t_k}, e_{\sigma_k})$ are concatenated to construct high-dimensional representation $Z$:
+- **5. Generative Perturbation & Diffuser Anomaly Cues**: Concurrently, the clean latent $z_0$ undergoes multi-timestep forward diffusion perturbations:
+
+$$
+z_{t_k} = \sqrt{\bar{\alpha}_{t_k}} z_0 + \sqrt{1 - \bar{\alpha}_{t_k}} \, \epsilon_k
+$$
+
+The frozen diffuser UNet predicts the injected noise $\hat{\epsilon}_k$. Residual anomalies and harmonic schedule embeddings are computed:
+
+$$
+\Delta\epsilon_k = \hat{\epsilon}_k - \epsilon_k, \qquad \mathbf{e}_k = \left( e_{t_k}, \; e_{\sigma_k} \right)
+$$
+
+All perturbation components are concatenated with clean latent $z_0$ to construct the high-dimensional representation $Z$:
 
 $$
 Z = \left[ z_0, \; z_{t_1}, \; \epsilon_1, \; \hat{\epsilon}_1, \; (\hat{\epsilon}_1 - \epsilon_1), \; e_{t_1}, \; e_{\sigma_1}, \; \dots, \; z_{t_K}, \; \epsilon_K, \; \hat{\epsilon}_K, \; (\hat{\epsilon}_K - \epsilon_K), \; e_{t_K}, \; e_{\sigma_K} \right]
@@ -614,7 +630,11 @@ $$
                                       │                       │
                          + Perpendicular Skips F0,F1,F2   3-Class Logits
                                       │
-                         Binary Mask Logits (B, 1, H, W)
+                        Feature Pyramid Network (FPN)
+                        Multi-Scale Deep Supervision
+                        [P0: H/8, P1: H/4, P2: H/2, P3: H]
+                                      │
+                     Multi-Scale Predictions + Final Mask (B, 1, H, W)
 ```
 
 #### Comparative Architectural Specifications:
@@ -707,27 +727,57 @@ Based on the research paper [*"GAP-SAM: A Global Artifact Prior for Generalizabl
 
 - **1. Paired Artifact Feature Extraction & Reconstruction Branch**:
   Given an input image $\mathbf{x}_o \in \mathbb{R}^{B \times 3 \times H \times W}$, a frozen Variational Autoencoder ($\mathrm{VAE}_{\mathrm{enc}}, \mathrm{VAE}_{\mathrm{dec}}$ from Stable Diffusion) reconstructs the image:
-  $$\mathbf{x}_r = \mathrm{VAE}_{\mathrm{dec}}\left(\mathrm{VAE}_{\mathrm{enc}}(\mathbf{x}_o)\right)$$
-  The generative reconstruction suppresses localized manipulation traces while retaining overall scene structure. The original image $\mathbf{x}_o$ is processed by the trainable LoRA-adapted backbone, and $\mathbf{x}_r$ is processed by the frozen base backbone (`peft_model.disable_adapter()`, eliminating parameter memory duplication) to extract paired feature representations $\mathbf{F}_o^l, \mathbf{F}_r^l \in \mathbb{R}^{B \times 256 \times H_l \times W_l}$ across FPN pyramid levels $l \in \{0, 1, 2\}$.
+
+$$
+\mathbf{x}_r = \mathrm{VAE}_{\mathrm{dec}}\left(\mathrm{VAE}_{\mathrm{enc}}(\mathbf{x}_o)\right)
+$$
+
+  The generative reconstruction suppresses localized manipulation traces while retaining overall scene structure. The original image $\mathbf{x}_o$ is processed by the trainable LoRA-adapted backbone, and reconstructed image $\mathbf{x}_r$ is processed by the frozen base backbone (`peft_model.disable_adapter()`, eliminating parameter memory duplication) to extract paired feature representations across FPN pyramid levels $l \in \{0, 1, 2\}$:
+
+$$
+\mathbf{F}_o^l, \; \mathbf{F}_r^l \in \mathbb{R}^{B \times 256 \times H_l \times W_l}
+$$
 
 - **2. Global Average Pooling (GAP) & Artifact Interaction MLP**:
   Global spatial average pooling collapses the final layer feature maps ($l=L$):
-  $$\mathbf{h}_o = \mathrm{GAP}(\mathbf{F}_o^L), \qquad \mathbf{h}_r = \mathrm{GAP}(\mathbf{F}_r^L) \quad \in \mathbb{R}^{B \times 256}$$
+
+$$
+\mathbf{h}_o = \mathrm{GAP}(\mathbf{F}_o^L), \qquad \mathbf{h}_r = \mathrm{GAP}(\mathbf{F}_r^L) \quad \in \mathbb{R}^{B \times 256}
+$$
+
   Branch-specific LayerNorms stabilize distribution differences:
-  $$\hat{\mathbf{h}}_o = \mathrm{LN}_o(\mathbf{h}_o), \qquad \hat{\mathbf{h}}_r = \mathrm{LN}_r(\mathbf{h}_r)$$
-  A 2-layer interaction Multi-Layer Perceptron ($512 \to 512 \to 256$) with GELU and output LayerNorm computes the global artifact token $\mathbf{t}_{\text{art}}$:
-  $$\mathbf{t}_{\text{art}} = \mathrm{LN}\left(\mathbf{W}_2 \, \mathrm{GELU}\left(\mathbf{W}_1 \, [\hat{\mathbf{h}}_o \,\|\, \hat{\mathbf{h}}_r] + \mathbf{b}_1\right) + \mathbf{b}_2\right) \quad \in \mathbb{R}^{B \times 256}$$
+
+$$
+\hat{\mathbf{h}}_o = \mathrm{LN}_o(\mathbf{h}_o), \qquad \hat{\mathbf{h}}_r = \mathrm{LN}_r(\mathbf{h}_r)
+$$
+
+  A 2-layer interaction Multi-Layer Perceptron ($512 \to 512 \to 256$) with GELU and output LayerNorm computes the global artifact token $\mathbf{t}_{\mathrm{art}}$:
+
+$$
+\mathbf{t}_{\mathrm{art}} = \mathrm{LN}\left(\mathbf{W}_2 \, \mathrm{GELU}\left(\mathbf{W}_1 \, [\hat{\mathbf{h}}_o \,\|\, \hat{\mathbf{h}}_r] + \mathbf{b}_1\right) + \mathbf{b}_2\right) \quad \in \mathbb{R}^{B \times 256}
+$$
 
 - **3. Zero-Gated FiLM Conditioning on FPN Feature Pyramid**:
-  Rather than standard cross-attention which can perturb fine spatial details, Feature-wise Linear Modulation (FiLM) modulates each feature pyramid level $l$ using affine parameters $\boldsymbol{\gamma}^l, \boldsymbol{\beta}^l \in \mathbb{R}^{256}$ projected from $\mathbf{t}_{\text{art}}$. To ensure training stability and preserve pretrained SAM3 representations at initialization, a scalar gate $\alpha_f$ is initialized strictly to zero ($\alpha_f = 0$):
-  $$\tilde{\mathbf{F}}_o^l = \mathbf{F}_o^l + \alpha_f \cdot \left(\boldsymbol{\gamma}^l \odot \mathbf{F}_o^l + \boldsymbol{\beta}^l\right)$$
+  Rather than standard cross-attention which can perturb fine spatial details, Feature-wise Linear Modulation (FiLM) modulates each feature pyramid level $l$ using affine parameters $\boldsymbol{\gamma}^l, \boldsymbol{\beta}^l \in \mathbb{R}^{256}$ projected from $\mathbf{t}_{\mathrm{art}}$. To ensure training stability and preserve pretrained SAM3 representations at initialization, a scalar gate $\alpha_f$ is initialized strictly to zero ($\alpha_f = 0$):
+
+$$
+\tilde{\mathbf{F}}_o^l = \mathbf{F}_o^l + \alpha_f \cdot \left(\boldsymbol{\gamma}^l \odot \mathbf{F}_o^l + \boldsymbol{\beta}^l\right)
+$$
+
   At the beginning of training, $\tilde{\mathbf{F}}_o^l \equiv \mathbf{F}_o^l$, creating an exact identity mapping and preventing optimization shocks.
 
 - **4. Forensic Latent Anchoring via Artifact Classifier Loss**:
-  To anchor the pooled representations $\mathbf{h}_o, \mathbf{h}_r$ to the forensic real-versus-synthetic axis, a lightweight linear classifier $c(\mathbf{h}) \in \mathbb{R}^2$ predicts whether an embedding originates from authentic natural content or synthetic manipulation:
-  $$\mathcal{L}_{\text{art}} = \mathcal{L}_{\text{CE}}(c(\mathbf{h}_o), y_{\text{binary}}) + \mathcal{L}_{\text{CE}}(c(\mathbf{h}_r), 0)$$
-  where ground-truth label $y_{\text{binary}} = 1$ if the image contains synthetic content (labels 1 or 2) and $0$ for pristine authentic images. The total loss combines dense mask localization with artifact supervision ($\lambda_{\text{art}} = 1.0$):
-  $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{loc}}(\hat{\mathbf{M}}, \mathbf{M}_{\text{gt}}) + \lambda_{\text{art}} \, \mathcal{L}_{\text{art}}$$
+  To anchor pooled representations $\mathbf{h}_o, \mathbf{h}_r$ to the forensic real-versus-synthetic axis, a lightweight linear classifier $c(\mathbf{h}) \in \mathbb{R}^2$ predicts whether an embedding originates from authentic natural content or synthetic manipulation:
+
+$$
+\mathcal{L}_{\mathrm{art}} = \mathcal{L}_{\mathrm{CE}}(c(\mathbf{h}_o), y_{\mathrm{binary}}) + \mathcal{L}_{\mathrm{CE}}(c(\mathbf{h}_r), 0)
+$$
+
+  where ground-truth label $y_{\mathrm{binary}} = 1$ if the image contains synthetic content (labels 1 or 2) and $0$ for pristine authentic images. The total loss combines dense mask localization with artifact supervision ($\lambda_{\mathrm{art}} = 1.0$):
+
+$$
+\mathcal{L}_{\mathrm{total}} = \mathcal{L}_{\mathrm{loc}}(\hat{\mathbf{M}}, \mathbf{M}_{\mathrm{gt}}) + \lambda_{\mathrm{art}} \, \mathcal{L}_{\mathrm{art}}
+$$
 
 - **5. Lightweight Foundation Backbones via `sam-distil`**:
   Instead of Meta's heavy SAM3 ViT backbones, `GAP-SAM` integrates distilled models from the `sam-distil` module:
@@ -824,32 +874,57 @@ To address subtle manipulations spanning diverse spatial granularities (from tin
 
 #### Mathematical Formulation
 
-Given $L$ feature stages $\mathbf{F}_0, \mathbf{F}_1, \dots, \mathbf{F}_{L-1}$ ordered from coarsest resolution ($H_0, W_0$) to finest resolution ($H_{L-1}, W_{L-1}$):
+Given $L$ feature stages ordered from coarsest resolution ($H_0, W_0$) to finest resolution ($H_{L-1}, W_{L-1}$):
+
+$$
+\mathbf{F}_0, \; \mathbf{F}_1, \; \dots, \; \mathbf{F}_{L-1}
+$$
 
 1. **Lateral Projections**:
    Each stage is projected to uniform pyramid channel dimension $D_{\mathrm{fpn}}$ via $1\times 1$ convolution:
-   $$\mathbf{L}_i = \mathrm{Act}\left(\mathrm{Norm}\left(\mathrm{Conv}_{1\times 1}^{(i)}(\mathbf{F}_i)\right)\right), \quad i \in \{0, \dots, L-1\}$$
+
+$$
+\mathbf{L}_i = \mathrm{Act}\left(\mathrm{Norm}\left(\mathrm{Conv}_{1\times 1}^{(i)}(\mathbf{F}_i)\right)\right), \quad i \in \{0, \dots, L-1\}
+$$
 
 2. **Top-Down Feature Merging**:
    High-level semantic guidance is progressively upsampled and merged elementwise with finer feature representations:
-   $$\mathbf{P}_0 = \mathbf{L}_0, \qquad \mathbf{P}_i = \mathbf{L}_i + \mathrm{Interpolate}_{H_i \times W_i}(\mathbf{P}_{i-1}), \quad i \in \{1, \dots, L-1\}$$
+
+$$
+\mathbf{P}_0 = \mathbf{L}_0, \qquad \mathbf{P}_i = \mathbf{L}_i + \mathrm{Interpolate}_{H_i \times W_i}(\mathbf{P}_{i-1}), \quad i \in \{1, \dots, L-1\}
+$$
 
 3. **Anti-Aliasing Smoothing**:
    To counteract interpolation checkerboard artifacts, each merged level is smoothed with a $3\times 3$ convolution:
-   $$\mathbf{S}_i = \mathrm{Act}\left(\mathrm{Norm}\left(\mathrm{Conv}_{3\times 3}^{(i)}(\mathbf{P}_i)\right)\right)$$
+
+$$
+\mathbf{S}_i = \mathrm{Act}\left(\mathrm{Norm}\left(\mathrm{Conv}_{3\times 3}^{(i)}(\mathbf{P}_i)\right)\right)
+$$
 
 4. **Multi-Scale Deep Supervision Heads**:
    Per-scale prediction heads generate mask logits directly at intermediate pyramid resolutions:
-   $$\hat{\mathbf{M}}_i = \mathrm{Head}_i(\mathbf{S}_i) \in \mathbb{R}^{B \times 1 \times H_i \times W_i}$$
+
+$$
+\hat{\mathbf{M}}_i = \mathrm{Head}_i(\mathbf{S}_i) \in \mathbb{R}^{B \times 1 \times H_i \times W_i}
+$$
 
 5. **Multi-Scale Feature Fusion**:
    All smoothed representations $\mathbf{S}_i$ are spatially aligned to finest resolution $(H_{L-1}, W_{L-1})$ and fused via concatenation or elementwise summation:
-   $$\mathbf{S}_{\mathrm{fused}} = \begin{cases} \mathrm{Conv}_{\mathrm{fuse}}\left(\left[\mathrm{Interpolate}(\mathbf{S}_0), \dots, \mathbf{S}_{L-1}\right]\right) & \text{if mode} = \text{"concat"} \\ \mathrm{Conv}_{\mathrm{fuse}}\left(\sum_{i=0}^{L-1} \mathrm{Interpolate}(\mathbf{S}_i)\right) & \text{if mode} = \text{"sum"} \end{cases}$$
-   $$\hat{\mathbf{M}}_{\mathrm{final}} = \mathrm{Conv}_{\mathrm{out}}(\mathbf{S}_{\mathrm{fused}}) \in \mathbb{R}^{B \times 1 \times H_{L-1} \times W_{L-1}}$$
+
+$$
+\mathbf{S}_{\mathrm{fused}} = \begin{cases} \mathrm{Conv}_{\mathrm{fuse}}\left(\left[\mathrm{Interpolate}(\mathbf{S}_0), \dots, \mathbf{S}_{L-1}\right]\right) & \text{if mode} = \text{concat} \\ \mathrm{Conv}_{\mathrm{fuse}}\left(\sum_{i=0}^{L-1} \mathrm{Interpolate}(\mathbf{S}_i)\right) & \text{if mode} = \text{sum} \end{cases}
+$$
+
+$$
+\hat{\mathbf{M}}_{\mathrm{final}} = \mathrm{Conv}_{\mathrm{out}}(\mathbf{S}_{\mathrm{fused}}) \in \mathbb{R}^{B \times 1 \times H_{L-1} \times W_{L-1}}
+$$
 
 6. **Deep Supervision Auxiliary Loss**:
    When training with `multiscale_weight > 0.0`, `SIDTotalLoss` computes deep supervision loss over intermediate pyramid logits:
-   $$\mathcal{L}_{\mathrm{Total}} = \mathcal{L}_{\mathrm{Mask}}(\hat{\mathbf{M}}_{\mathrm{final}}, \mathbf{M}_{\mathrm{gt}}) + \lambda_{\mathrm{aux}} \mathcal{L}_{\mathrm{cls}} + \lambda_{\mathrm{ms}} \cdot \frac{1}{L} \sum_{i=0}^{L-1} \mathcal{L}_{\mathrm{Mask}}\left(\mathrm{Interpolate}(\hat{\mathbf{M}}_i), \mathbf{M}_{\mathrm{gt}}\right)$$
+
+$$
+\mathcal{L}_{\mathrm{Total}} = \mathcal{L}_{\mathrm{Mask}}(\hat{\mathbf{M}}_{\mathrm{final}}, \mathbf{M}_{\mathrm{gt}}) + \lambda_{\mathrm{aux}} \mathcal{L}_{\mathrm{cls}} + \lambda_{\mathrm{ms}} \cdot \frac{1}{L} \sum_{i=0}^{L-1} \mathcal{L}_{\mathrm{Mask}}\left(\mathrm{Interpolate}(\hat{\mathbf{M}}_i), \mathbf{M}_{\mathrm{gt}}\right)
+$$
 
 #### Model Family Integration
 
@@ -1123,9 +1198,16 @@ When initializing complex models (such as `DiffusionDiff`, `DiffusionDiffV2`, or
 3. **Subset Kickstart Training**: Trains the active core stream on a small sample subset (e.g. 512, 1024, or 2048 examples) for multiple epochs (`bootstrap_epochs`) until performing an acceptable fit and reaching a target score.
 4. **Diagnostic Verification via `nn-toolbox`**: Integrates with `nn-toolbox` to inspect:
    - *Parameter & Channel Isolation*: Guarantees that frozen parameters and channel streams received zero gradient leakage:
-     $$\nabla_{\theta_{\mathrm{frozen}}} \mathcal{L} = 0$$
+
+$$
+\nabla_{\theta_{\mathrm{frozen}}} \mathcal{L} = 0
+$$
+
    - *Loss Trajectory & Fit Verification*: Quantifies initial loss $\mathcal{L}(0)$ vs. final loss $\mathcal{L}(T)$ on the kickstart subset:
-     $$\Delta \mathcal{L} = \frac{\mathcal{L}(0) - \mathcal{L}(T)}{\mathcal{L}(0)} \ge 0.15$$
+
+$$
+\Delta \mathcal{L} = \frac{\mathcal{L}(0) - \mathcal{L}(T)}{\mathcal{L}(0)} \ge 0.15
+$$
      confirming acceptable fit (relative loss drop $\ge$ 15% or score $\ge$ `target_score`).
    - *Divergence Safety*: Detects explosive activation or loss dynamics before committing to full training.
 5. **Early Parameter Release**: Once the kickstart phase achieves an acceptable fit, all frozen tail channels and parameters are cleanly restored to their configured training state (`requires_grad = True` where appropriate), the optimizer is re-initialized for the full model, and normal full-scale training commences from a calibrated, well-conditioned state.

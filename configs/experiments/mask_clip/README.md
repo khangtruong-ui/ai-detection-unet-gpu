@@ -115,7 +115,11 @@ The `MaskCLIP` implementation provides a first-class Model Surgery interface (`s
 
 ### 5. Weight-Space Model Merging & Task Arithmetic (`task_arithmetic_merge`)
 - **Method**: Linearly interpolates or merges model weights across fine-tuned checkpoints:
-  $$\mathbf{W}_{\text{merged}} = (1 - \alpha) \mathbf{W}_{\text{zero-shot}} + \alpha \mathbf{W}_{\text{fine-tuned}}$$
+
+$$
+\mathbf{W}_{\mathrm{merged}} = (1 - \alpha) \mathbf{W}_{\mathrm{zero-shot}} + \alpha \mathbf{W}_{\mathrm{fine-tuned}}
+$$
+
   Prevents catastrophic forgetting on open-world generators when adapting to new generators (e.g. Flux.1, SD3, SDXL).
 - **Literature**:
   - *Ilharco et al., "Editing Models with Task Arithmetic" (ICLR 2023, arXiv:2212.04089)*.
