@@ -509,6 +509,7 @@ Diffusion-Diff-V2 advances the generative latent perturbation paradigm by decoup
                                  └───────────────────────┬────────────────────────┘
                                                          ▼
                                            Multi-Scale Mask Logits + Fused Mask (B, 1, H, W)
+```
 
 #### Mathematical & Architectural Principles
 
