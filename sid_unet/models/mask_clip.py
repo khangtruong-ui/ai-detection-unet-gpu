@@ -95,6 +95,18 @@ MASKCLIP_SETTINGS: Dict[str, Dict[str, Any]] = {
         "pretrain_img_size": 224,
         "pretrain_use_cls_token": True,
     },
+    "ViTB": {
+        "model_name": "ViT-B/16",
+        "resolution": 512,
+        "language_ctx": 10,
+        "language_depth": 5,
+        "adapter_length": 5,
+        "selected_layers": [1, 3, 5, 7, 9, 11],
+        "fusion_map": {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5},
+        "decoder_variant": "spm_fpn_tvca",
+        "pretrain_img_size": 224,
+        "pretrain_use_cls_token": True,
+    },
     "ViTL_1024_SideCLIP": {
         "model_name": DEFAULT_CLIP_MODEL_NAME,
         "resolution": 1024,
@@ -1224,6 +1236,14 @@ class MaskCLIP(nn.Module):
                     effective_setting_name = "ViTL_1024_SideCLIP"
                 break
 
+        # Auto-detect ViTB profile if user specifies a ViT-B model while keeping default ViTL setting
+        if (
+            clip_model_name is not None
+            and "vit-b" in clip_model_name.lower()
+            and effective_setting_name == "ViTL"
+        ):
+            effective_setting_name = "ViTB"
+
         if effective_setting_name not in MASKCLIP_SETTINGS:
             effective_setting_name = "ViTL"
         self.model_setting_name = effective_setting_name
@@ -1438,6 +1458,14 @@ class MaskCLIP(nn.Module):
             _OPENSDI_STATE_DICT_CACHE[cache_key] = cleaned
 
         # Filter out any shape-mismatched keys only if output channels/resolution were customized
+        if self.visemb_dim != 1024:
+            logger.warning(
+                f"Loading OpenSDI checkpoint into model with visemb_dim={self.visemb_dim} "
+                f"({self.model_setting_name}). Official OpenSDI checkpoints were trained "
+                f"with ViT-L/14 (visemb_dim=1024, align_dim=768). Cross-attention adapter "
+                f"layers and prompt learner have mismatched dimensions and will not transfer without fine-tuning."
+            )
+
         model_sd = self.state_dict()
         compatible_sd: Dict[str, torch.Tensor] = {}
         for k, v in cleaned.items():

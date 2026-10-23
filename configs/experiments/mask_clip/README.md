@@ -138,6 +138,7 @@ $$
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | [`default.yaml`](default.yaml) | Full OpenSDI (`nebula/MaskCLIP-weights`) | $512 \times 512$ | 2 (accum 8) | BCE + Edge ($\lambda=20$) + CE | Official 20-epoch CVPR 2025 MaskCLIP baseline. |
 | [`mask_clip_clip_mae_backbones.yaml`](mask_clip_clip_mae_backbones.yaml) | Online Foundation Backbones (`ViT-L/14` + `MAE-B/16`) | $512 \times 512$ | 2 (accum 8) | BCE + Edge ($\lambda=20$) + CE | Training SPM from scratch using pretrained backbones. |
+| [`mask_clip_vitb_backbones.yaml`](mask_clip_vitb_backbones.yaml) | Online Foundation Backbones (`ViT-B/16` + `MAE-B/16`) | $512 \times 512$ | 4 (accum 4) | BCE + Edge ($\lambda=20$) + CE | Lightweight ViT-B configuration for training SPM from scratch. |
 | [`mask_clip_dora_surgery.yaml`](mask_clip_dora_surgery.yaml) | DoRA Surgery ($r=8, \alpha=16$) | $512 \times 512$ | 4 (accum 4) | BCE + Edge ($\lambda=20$) + CE | Parameter-efficient DoRA adaptation (6.3% trainable params). |
 | [`mask_clip_sideclip_1024.yaml`](mask_clip_sideclip_1024.yaml) | 1024-Res SideCLIP (`MaskCLIP_sd15_20241103_17_45_16.pth`) | $1024 \times 1024$ | 1 (accum 16) | BCE + Edge ($\lambda=20$) + CE | High-resolution 1024x1024 SideCLIP configuration. |
 
@@ -183,3 +184,11 @@ mask_logits, class_logits = model(x)              # mask: [1, 1, 512, 512], clas
 surgery_meta = model.inject_peft_lora(target="mae", r=8, alpha=16, use_dora=True)
 print(f"Adapted {surgery_meta['num_adapted_layers']} layers, {surgery_meta['trainable_pct']}% params trainable")
 ```
+
+---
+
+## 7. Architectural Investigations & Feasibility Reports
+
+For deep technical investigations on alternative architectures, see:
+* [**`INVESTIGATION_BACKBONE_ABLATION.md`**](INVESTIGATION_BACKBONE_ABLATION.md): Detailed investigation of switching from ViT-L to ViT-B, omitting backbones, empirical benchmarks, and 4 promising alternative directions (frozen CLIP caching, VCA tap pruning, quantization, and forensic U-Net distillation).
+
