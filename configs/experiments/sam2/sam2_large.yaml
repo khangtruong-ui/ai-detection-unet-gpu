@@ -48,6 +48,8 @@ model:
   out_channels: 1
   target_size: [1024, 1024]
   use_mask_adapter: true
+  freeze_decoder: false             # Unfreeze mask decoder parameters to resolve 0.03 IoU bottleneck
+  reinit_decoder: false             # If true, re-initializes mask decoder weights to break salient object bias
 
 loss:
   mask_loss_type: "combined"

@@ -567,6 +567,8 @@ def build_model(config: Any) -> nn.Module:
             out_channels=int(model_cfg.get("out_channels", 1)),
             target_size=tuple(model_cfg.get("target_size", [1024, 1024])),
             use_mask_adapter=bool(model_cfg.get("use_mask_adapter", True)),
+            freeze_decoder=bool(model_cfg.get("freeze_decoder", False)),
+            reinit_decoder=bool(model_cfg.get("reinit_decoder", False)),
             device=dev_cfg,
         )
 

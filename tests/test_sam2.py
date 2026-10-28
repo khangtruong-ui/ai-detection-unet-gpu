@@ -178,3 +178,121 @@ def test_pull_sam2_weights_both_variants():
 
     large_repo = pull_sam2_weights(variant="large")
     assert large_repo == DEFAULT_SAM2_LARGE_CHECKPOINT
+
+
+def test_sam2_decoder_unfrozen_trainable():
+    """Verify that freeze_decoder=False sets mask_decoder parameters to requires_grad=True and receives gradients."""
+    model = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=False,
+        lora_r=4,
+        lora_alpha=8,
+        freeze_decoder=False,
+        device="cpu",
+    )
+    dec = model.get_mask_decoder()
+    assert dec is not None
+    dec_params = [p for p in dec.parameters()]
+    assert len(dec_params) > 0
+    assert all(p.requires_grad for p in dec_params)
+
+    # Forward + backward pass to ensure gradients flow into mask_decoder
+    model.train()
+    x = torch.randn(1, 3, 64, 64)
+    out = model(x)
+    loss = out.mean()
+    loss.backward()
+
+    dec_grads = [p.grad for p in dec_params if p.grad is not None]
+    assert len(dec_grads) > 0, "Active mask_decoder parameters should receive gradients"
+
+
+def test_sam2_decoder_frozen_flag():
+    """Verify that freeze_decoder=True keeps all mask_decoder parameters frozen."""
+    model = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=False,
+        lora_r=4,
+        lora_alpha=8,
+        freeze_decoder=True,
+        device="cpu",
+    )
+    dec = model.get_mask_decoder()
+    assert dec is not None
+    dec_params = [p for p in dec.parameters()]
+    assert len(dec_params) > 0
+    assert all(not p.requires_grad for p in dec_params)
+
+
+def test_sam2_decoder_reinitialization():
+    """Verify that reinit_decoder=True re-initializes mask_decoder weights."""
+    model_pretrained = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=False,
+        lora_r=4,
+        reinit_decoder=False,
+        device="cpu",
+    )
+    model_reinit = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=False,
+        lora_r=4,
+        reinit_decoder=True,
+        device="cpu",
+    )
+    dec_pre = model_pretrained.get_mask_decoder()
+    dec_re = model_reinit.get_mask_decoder()
+    assert dec_pre is not None and dec_re is not None
+
+    # Compare iou_token or mask_tokens weights
+    pre_iou = dec_pre.iou_token.weight.detach().cpu()
+    re_iou = dec_re.iou_token.weight.detach().cpu()
+    assert not torch.allclose(pre_iou, re_iou), "Reinitialized weights should differ from pretrained"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU for 4-bit QLoRA")
+def test_sam2_qlora_4bit_unfrozen_decoder_gpu():
+    """Verify QLoRA 4-bit with unfrozen decoder executes backward pass without bitsandbytes dtype crash."""
+    model = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=True,
+        lora_r=4,
+        lora_alpha=8,
+        freeze_decoder=False,
+        device="cuda",
+    )
+    dec = model.get_mask_decoder()
+    assert dec is not None
+    # Mask decoder must NOT be quantized to 4-bit; must be float
+    for p in dec.parameters():
+        assert p.is_floating_point()
+        assert p.requires_grad
+
+    x = torch.randn(1, 3, 64, 64, device="cuda")
+    model.train()
+    out = model(x)
+    loss = out.mean()
+    loss.backward()
+
+    grads = [p.grad for p in dec.parameters() if p.grad is not None]
+    assert len(grads) > 0, "Decoder parameters should receive gradients in 4-bit QLoRA mode"
+
+
+def test_sam2_mask_adapter_balanced_init():
+    """Verify that mask_adapter is initialized with balanced zero bias and Xavier weights to avoid 0.0000 IoU trap."""
+    model = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=False,
+        lora_r=4,
+        lora_alpha=8,
+        use_mask_adapter=True,
+        device="cpu",
+    )
+    assert model.mask_adapter is not None
+    last_conv = model.mask_adapter[-1]
+    assert isinstance(last_conv, torch.nn.Conv2d)
+    assert last_conv.bias is not None
+    # Bias must be initialized to 0.0, avoiding the -2.0 bias trap
+    assert torch.allclose(last_conv.bias, torch.zeros_like(last_conv.bias), atol=1e-5)
+    # Weights must have normal/Xavier variance, not all zero
+    assert last_conv.weight.std().item() > 0.01

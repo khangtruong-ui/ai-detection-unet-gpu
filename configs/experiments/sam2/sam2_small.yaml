@@ -16,7 +16,7 @@ data:
   background_download: true
   columns: ["image", "mask"]
   image_size: [256, 256]
-  batch_size: 4                     # Tuned for 12GB VRAM budget (~9.6 GB peak reserved)
+  batch_size: 2                     # Tuned for stable 12-15GB VRAM budget (~6.5 GB peak reserved)
   num_workers: -1
   pin_memory: true
   prefetch_batches: 48
@@ -52,6 +52,8 @@ model:
   out_channels: 1
   target_size: [1024, 1024]
   use_mask_adapter: true
+  freeze_decoder: false             # Unfreeze 4.2M mask decoder parameters to resolve 0.03 IoU bottleneck
+  reinit_decoder: false             # If true, re-initializes mask decoder weights to break salient object bias
 
 loss:
   mask_loss_type: "combined"
@@ -60,9 +62,9 @@ loss:
 
 training:
   epochs: 10
-  learning_rate: 1.0e-4
+  learning_rate: 2.0e-4
   weight_decay: 1.0e-4
-  gradient_accumulation_steps: 4   # 4 micro-batches * bs 4 = effective batch size 16
+  gradient_accumulation_steps: 8   # 8 micro-batches * bs 2 = effective batch size 16
   mixed_precision: "bf16"
   clip_grad_norm: 1.0
   lr_scheduler: "cosine"

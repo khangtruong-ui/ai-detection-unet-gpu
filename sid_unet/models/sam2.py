@@ -136,6 +136,8 @@ class SAM2Segmenter(nn.Module):
         out_channels: int = 1,
         target_size: Tuple[int, int] = (1024, 1024),
         use_mask_adapter: bool = True,
+        freeze_decoder: bool = False,
+        reinit_decoder: bool = False,
         device: Optional[Union[str, torch.device]] = "auto",
         **kwargs: Any,
     ):
@@ -153,6 +155,13 @@ class SAM2Segmenter(nn.Module):
         self.out_channels = out_channels
         self.target_size = tuple(target_size)
         self.use_mask_adapter = use_mask_adapter
+
+        # Decoder training and weight re-initialization options
+        if "train_decoder" in kwargs:
+            self.freeze_decoder = not bool(kwargs.pop("train_decoder"))
+        else:
+            self.freeze_decoder = bool(freeze_decoder)
+        self.reinit_decoder = bool(reinit_decoder)
 
         # Resolve device
         if device == "auto" or device is None:
@@ -172,10 +181,17 @@ class SAM2Segmenter(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(16, 1, kernel_size=1),
             )
-            # Initialize with small negative bias to reflect tampering sparsity (~5-10% positive)
-            # and avoid saturation at 1.0 (all foreground)
-            nn.init.constant_(self.mask_adapter[-1].bias, -2.0)
-            nn.init.normal_(self.mask_adapter[-1].weight, std=0.02)
+            # Initialize with Xavier uniform and zero bias so predicted logits start centered
+            # at the decision boundary (0.0). Avoids negative bias saturation (e.g. -2.0)
+            # which forces all predicted masks to 0 and traps training IoU at 0.0000.
+            for m in self.mask_adapter.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
         else:
             self.mask_adapter = None
 
@@ -204,6 +220,9 @@ class SAM2Segmenter(nn.Module):
         bnb_config = None
         fallback_to_gpu_16bit = False
 
+        # If decoder is unfrozen, skip quantizing mask_decoder modules so its parameters remain float and trainable
+        skip_modules = ["mask_decoder"] if not self.freeze_decoder else None
+
         if self.load_in_4bit and is_cuda:
             compute_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
             bnb_config = BitsAndBytesConfig(
@@ -211,6 +230,7 @@ class SAM2Segmenter(nn.Module):
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=True,
+                llm_int8_skip_modules=skip_modules,
             )
             device_map = "auto"
         elif self.load_in_8bit and is_cuda:
@@ -219,7 +239,10 @@ class SAM2Segmenter(nn.Module):
                 is_ok, details = check_8bit_compatibility(device=self._target_device)
                 if not is_ok:
                     raise RuntimeError(details.get("message", "8-bit environment incompatible"))
-                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+                bnb_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_skip_modules=skip_modules,
+                )
                 device_map = "auto"
             except Exception as e:
                 logger.warning(
@@ -258,6 +281,21 @@ class SAM2Segmenter(nn.Module):
         else:
             self.model = base_model
 
+        # 6. Configure mask decoder parameter training and weight initialization
+        decoder_mod = self.get_mask_decoder()
+        if decoder_mod is not None:
+            if self.reinit_decoder:
+                self._reinit_decoder_weights(decoder_mod)
+                logger.info("Re-initialized SAM2 mask_decoder weights from scratch.")
+            if not self.freeze_decoder:
+                for p in decoder_mod.parameters():
+                    p.requires_grad = True
+                logger.info("Unfroze SAM2 mask_decoder parameters for active training.")
+            else:
+                for p in decoder_mod.parameters():
+                    p.requires_grad = False
+                logger.info("Frozen SAM2 mask_decoder parameters.")
+
         # Pre-compute default full-image bounding box coordinates [0, 0, W, H]
         h_t, w_t = self.target_size
         default_box = torch.tensor([[[0.0, 0.0, float(w_t), float(h_t)]]], dtype=torch.float32)
@@ -265,8 +303,39 @@ class SAM2Segmenter(nn.Module):
 
         logger.info(
             f"Initialized SAM2Segmenter with base='{self.pretrained_model_name_or_path}', "
-            f"4bit={self.load_in_4bit}, 8bit={self.load_in_8bit}, r={self.lora_r}, alpha={self.lora_alpha}"
+            f"4bit={self.load_in_4bit}, 8bit={self.load_in_8bit}, r={self.lora_r}, alpha={self.lora_alpha}, "
+            f"freeze_decoder={self.freeze_decoder}, reinit_decoder={self.reinit_decoder}"
         )
+
+    def get_mask_decoder(self) -> Optional[nn.Module]:
+        """
+        Retrieve mask decoder submodule safely whether wrapped with PEFT or base model.
+        """
+        curr = getattr(self, "model", None)
+        if curr is None:
+            return None
+        if hasattr(curr, "base_model") and hasattr(curr.base_model, "model"):
+            curr = curr.base_model.model
+        elif hasattr(curr, "model"):
+            curr = curr.model
+        return getattr(curr, "mask_decoder", None)
+
+    def _reinit_decoder_weights(self, module: nn.Module) -> None:
+        """
+        Re-initialize mask decoder weights to eliminate salient-object segmentation inductive bias.
+        """
+        for m in module.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+            elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def _load_processor(self):
         """Attempt to load processor with fallback handling."""
