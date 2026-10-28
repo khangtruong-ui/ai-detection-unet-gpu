@@ -481,7 +481,7 @@ def resolve_sample_limit(
     return default_samples
 
 
-def safe_dataloader_len(loader: Optional[DataLoader]) -> Optional[int]:
+def safe_dataloader_len(loader: Optional[Any]) -> Optional[int]:
     """
     Safely return DataLoader length, or None if dataset has no length (e.g. IterableDataset).
     Avoids TypeError when DataLoader wraps an IterableDataset without __len__.
@@ -490,7 +490,20 @@ def safe_dataloader_len(loader: Optional[DataLoader]) -> Optional[int]:
         return None
     try:
         return len(loader)
-    except (TypeError, NotImplementedError):
+    except (TypeError, NotImplementedError, AttributeError):
+        return None
+
+
+def safe_dataset_len(dataset: Optional[Any]) -> Optional[int]:
+    """
+    Safely return Dataset length, or None if dataset has no length (e.g. IterableDataset).
+    Avoids TypeError when Dataset is an IterableDataset without len.
+    """
+    if dataset is None:
+        return None
+    try:
+        return len(dataset)
+    except (TypeError, NotImplementedError, AttributeError):
         return None
 
 

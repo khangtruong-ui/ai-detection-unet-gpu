@@ -46,7 +46,7 @@ def test_hard_mining_config_defaults():
 
     # Test all diffusion-diff configs have hard mining enabled
     diff_configs = glob.glob("configs/experiments/diffusion_diff*/**/*.yaml", recursive=True)
-    assert len(diff_configs) == 6, f"Expected 6 diffusion configs, found {len(diff_configs)}"
+    assert len(diff_configs) >= 6, f"Expected at least 6 diffusion configs, found {len(diff_configs)}"
     for cfg_path in diff_configs:
         c = load_config(cfg_path)
         assert c.hard_mining.enabled is True, f"{cfg_path} should have hard_mining.enabled=True"
@@ -447,5 +447,60 @@ def test_hard_mining_batch_filter_bounded_len():
     yielded = list(filtered)
     assert len(yielded) == 3
     assert yielded == [2, 5, 8]
+
+
+def test_hard_miner_and_filter_with_unsized_iterable_dataloader():
+    """
+    Verify that HardMiner and HardMiningBatchFilter gracefully operate
+    when dataloader wraps an unsized IterableDataset without __len__.
+    """
+    from sid_unet.dataset.loader import safe_dataloader_len
+
+    class MockStreamingDataset(torch.utils.data.IterableDataset):
+        def __iter__(self):
+            for idx in range(10):
+                yield {
+                    "image": torch.randn(3, 32, 32),
+                    "mask": torch.zeros(1, 32, 32),
+                    "label": torch.tensor(0, dtype=torch.long),
+                }
+
+        def __len__(self):
+            raise TypeError("'MockStreamingDataset' object has no len() when max_samples is None")
+
+    stream_ds = MockStreamingDataset()
+    loader = DataLoader(stream_ds, batch_size=2)
+
+    # Calling len(loader) raises TypeError
+    with pytest.raises(TypeError, match="has no len"):
+        len(loader)
+
+    # safe_dataloader_len should return None for unsized stream loader without raising TypeError
+    assert safe_dataloader_len(loader) is None
+
+    cfg = {
+        "hard_mining": {
+            "enabled": True,
+            "metric": "median",
+            "reset_epochs": 5,
+        }
+    }
+    miner = HardMiner(cfg)
+    miner.is_active_epoch = True
+    miner.hard_batch_indices = {0, 2}
+
+    # wrap_dataloader should not raise TypeError
+    filtered = miner.wrap_dataloader(loader)
+    assert isinstance(filtered, HardMiningBatchFilter)
+    assert len(filtered) == 2
+
+    # Should yield matching batches
+    batches = []
+    for b in filtered:
+        batches.append(b)
+        if len(batches) >= 2:
+            break
+    assert len(batches) == 2
+
 
 

@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 
+from sid_unet.dataset.loader import safe_dataloader_len, safe_dataset_len
+
 logger = logging.getLogger("sid_unet.bootstrapping")
 
 
@@ -592,7 +594,8 @@ def run_bootstrapping_phase(
     logger.info(f"📦 [BOOTSTRAPPING v1.0] Assembling kickstart sample pool ({num_samples} examples)...")
     try:
         boot_loader = create_bootstrap_loader(train_loader, num_samples=num_samples, batch_size=batch_size)
-        actual_samples = len(boot_loader.dataset) if hasattr(boot_loader, "dataset") and hasattr(boot_loader.dataset, "__len__") else num_samples
+        ds_len = safe_dataset_len(getattr(boot_loader, "dataset", None))
+        actual_samples = ds_len if ds_len is not None else num_samples
         logger.info(f"✅ [BOOTSTRAPPING v1.0] Kickstart sample pool ready with {actual_samples} samples.")
     except Exception as e:
         logger.warning(f"⚠️ [BOOTSTRAPPING v1.0] Failed to build subset loader: {e}; falling back to standard loader")
@@ -606,6 +609,8 @@ def run_bootstrapping_phase(
     model.eval()
     init_loss_accum = 0.0
     init_steps = 0
+    bl_len = safe_dataloader_len(boot_loader)
+    max_init_steps = min(4, bl_len) if bl_len is not None else 4
     with torch.no_grad():
         for init_b in boot_loader:
             if isinstance(init_b, dict):
@@ -636,7 +641,7 @@ def run_bootstrapping_phase(
                 b_l = b_l[0]
             init_loss_accum += float(b_l.item())
             init_steps += 1
-            if init_steps >= min(4, len(boot_loader) if hasattr(boot_loader, "__len__") else 4):
+            if init_steps >= max_init_steps:
                 break
     initial_loss = (init_loss_accum / max(1, init_steps)) if init_steps > 0 else None
     model.train()

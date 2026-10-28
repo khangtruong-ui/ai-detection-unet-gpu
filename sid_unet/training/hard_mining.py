@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from sid_unet.dataset.loader import safe_dataloader_len
+
 logger = logging.getLogger("sid_unet.training.hard_mining")
 
 
@@ -41,7 +43,7 @@ class HardMiningBatchFilter:
         if self.anchor_seed is not None:
             torch.manual_seed(self.anchor_seed)
 
-        loader_len = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
+        loader_len = safe_dataloader_len(self.dataloader)
         if loader_len is not None:
             target = sum(1 for idx in self.hard_batch_indices if idx < loader_len)
         else:
@@ -59,12 +61,9 @@ class HardMiningBatchFilter:
                     break
 
     def __len__(self) -> int:
-        if hasattr(self.dataloader, "__len__"):
-            try:
-                loader_len = len(self.dataloader)
-                return sum(1 for idx in self.hard_batch_indices if idx < loader_len)
-            except Exception:
-                pass
+        loader_len = safe_dataloader_len(self.dataloader)
+        if loader_len is not None:
+            return sum(1 for idx in self.hard_batch_indices if idx < loader_len)
         return len(self.hard_batch_indices)
 
     @property
@@ -265,8 +264,8 @@ class HardMiner:
         multi-GPU topology mismatches.
         """
         if self.enabled and self.is_active_epoch and self.hard_batch_indices:
-            if hasattr(dataloader, "__len__"):
-                actual_loader_len = len(dataloader)
+            actual_loader_len = safe_dataloader_len(dataloader)
+            if actual_loader_len is not None:
                 # If dataloader length does not match total batches recorded during full epoch
                 if self.total_batches_in_full_epoch > 0 and actual_loader_len != self.total_batches_in_full_epoch:
                     logger.warning(

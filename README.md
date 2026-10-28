@@ -1387,6 +1387,9 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
 14. **Periodic Cache & Allocator Flushes (`clear_memory_cache()`) & Intra-Epoch Validation Schedule**:
    - In `DatasetCacheManager`, `clear_memory_cache(self.device)` is executed at every shard boundary (`commit_shard()`), releasing PyTorch caching allocator pools and running garbage collection to prevent DMA page table exhaustion and host/device allocator fragmentation across long caching runs.
    - In `Trainer`, periodic memory cache clearing (`empty_cache_steps`) and optional intra-epoch validation (`val_check_interval` / `val_check_steps`) ensure regular stream flushes and memory cleanup during long multi-thousand-step training epochs.
+15. **Unsized Streaming & IterableDataset DataLoader Resilience**:
+   - `safe_dataloader_len()` and `safe_dataset_len()` provide robust exception-guarded length discovery across DataLoaders, IterableDatasets, and `BackgroundPrefetcher` pipelines.
+   - Prevents `TypeError: 'SIDStreamingDataset' object has no len() when max_samples is None` during automatic checkpoint resumption (`resume_from_checkpoint()`), hard example mining batch filtering (`HardMiner.wrap_dataloader()`), bootstrapping kickstart pool construction, and background dataset prefetching.
 
 ---
 
@@ -2038,7 +2041,7 @@ outputs/RUN/
 ```
 
 #### C. Automatic Resumption & Hugging Face Hub Resumption
-By default, `sid-train` automatically discovers existing checkpoints in the repository and output directories (`outputs/RUN/<stem>/checkpoints/`, `outputs/checkpoints/`, etc.), displaying an on-screen notification before seamlessly resuming training:
+By default, `sid-train` automatically discovers existing checkpoints in the repository and output directories (`outputs/RUN/<stem>/checkpoints/`, `outputs/checkpoints/`, etc.), displaying an on-screen notification before seamlessly resuming training. Auto-resume fully supports both Map-style and remote Streaming datasets (`data.streaming: true` without explicit `max_samples`), gracefully restoring global optimizer step, learning rate schedule, and hard example mining states without requiring dataset sizing.
 
 ```bash
 # 1. Automatic checkpoint discovery (enabled by default)
