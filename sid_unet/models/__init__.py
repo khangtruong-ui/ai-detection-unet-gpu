@@ -1,4 +1,11 @@
 from sid_unet.models.unet import UNet, build_model
+from sid_unet.models.detective_sam import (
+    DetectiveSAM,
+    ImagePerturbation,
+    FeatureAdapter,
+    MaskAdapter,
+    DetectiveSAMLoss,
+)
 from sid_unet.models.iml_maskformer import (
     IMLMaskformer,
     RefactorMaskformer,
@@ -127,6 +134,11 @@ __all__ = [
     "RefectorMaskformer",
     "RefactorMaskformerLoss",
     "HungarianMatcher",
+    "DetectiveSAM",
+    "ImagePerturbation",
+    "FeatureAdapter",
+    "MaskAdapter",
+    "DetectiveSAMLoss",
 ]
 
 
