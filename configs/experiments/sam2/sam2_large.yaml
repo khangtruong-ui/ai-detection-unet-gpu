@@ -12,7 +12,7 @@ data:
   dataset_name: "KhangTruong/COCO-inpainted"
   streaming: true
   image_size: [256, 256]
-  batch_size: 1
+  batch_size: 1                     # Maximum batch size for 12GB VRAM budget (~7.7 GB peak reserved; bs=2 exceeds 14GB)
   num_workers: -1
   pin_memory: true
   prefetch_batches: 48

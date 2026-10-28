@@ -1961,10 +1961,26 @@ data:
 
 ### 1. Training
 
+> [!NOTE]
+> **Detached Execution by Default**: `sid-train` defaults to detaching from the terminal session (`--detach`, default `true`), spawning the training process in the background and redirecting all standard output and error in real-time into `.logs.txt`.
+> - **Live Monitoring**: Inspect training logs with `tail -f .logs.txt`.
+> - **Process Termination**: Terminate running or background tasks anytime via `sid-kill`.
+> - **Foreground Execution**: To run attached to the terminal instead, pass `--no-detach`, `--foreground`, or `-f`.
+> - **Custom Log File**: Pass `--log-file <path>` to log to an alternate file instead of `.logs.txt`.
+
 #### A. Single Experiment Training
 ```bash
-# Train SAM3 + QLoRA on BeyondTheBrush (streaming mode)
-sid-train --config configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
+# Train in background (detached by default; outputs to .logs.txt)
+sid-train --config configs/experiments/sam2/sam2_small.yaml
+
+# Train SAM2 Large in background
+sid-train --config configs/experiments/sam2/sam2_large.yaml
+
+# Train in foreground (attached to terminal)
+sid-train --config configs/experiments/sam2/sam2_small.yaml --no-detach
+
+# Train SAM3 + QLoRA with learnable prompt tuning on BeyondTheBrush
+sid-train --config configs/experiments/sam3-qlora/sam3_qlora_learnable_prompt.yaml
 
 # Train standard UNet
 sid-train --config configs/default.yaml
@@ -2371,6 +2387,7 @@ pytest
 pytest -v
 
 # Run specific test modules
+pytest tests/test_detach.py -v
 pytest tests/test_sam2.py -v
 pytest tests/test_sam3_qlora.py -k "not gpu_memory_fit" -v
 pytest tests/test_tqdm_multi_device.py -v
