@@ -18,6 +18,7 @@ from sid_unet.dataset.loader import (
     safe_dataloader_len,
     safe_dataset_len,
     BackgroundPrefetcher,
+    PDLDataLoader,
 )
 
 __all__ = [
@@ -42,5 +43,6 @@ __all__ = [
     "safe_dataloader_len",
     "safe_dataset_len",
     "BackgroundPrefetcher",
+    "PDLDataLoader",
 ]
 

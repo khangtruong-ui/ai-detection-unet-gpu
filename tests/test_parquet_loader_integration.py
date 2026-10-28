@@ -225,3 +225,44 @@ def test_create_dataloaders_with_parquet_config(temp_parquet_dataset):
     eval_l = create_eval_dataloader(cfg, split="train", max_samples=4)
     b_eval = next(iter(eval_l))
     assert b_eval["image"].shape == (4, 3, 64, 64)
+
+
+def test_pdl_dataloader_exact_max_len_and_multi_epoch_resilience(temp_parquet_dataset):
+    """
+    Test that PDLDataLoader exposes exact batch length (eliminating 'no max len')
+    and cleanly supports multi-epoch iteration even when close() is invoked intra-epoch.
+    """
+    from sid_unet.dataset.loader import PDLDataLoader
+
+    cfg = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=true",
+        "data.batch_size=4",
+        "data.train_samples_per_epoch=12",
+        "data.val_samples_per_epoch=8",
+        "data.image_size=[64, 64]",
+        "data.num_workers=0",
+        "data.use_parquet_loader=true",
+    ])
+
+    train_l, val_l = create_dataloaders(cfg, include_test=False)
+
+    # 1. Verify exact length is immediately available
+    assert isinstance(train_l, PDLDataLoader)
+    assert isinstance(train_l, DataLoader)
+    assert len(train_l) == 3   # 12 samples // batch_size 4
+    assert len(val_l) == 2     # 8 samples // batch_size 4
+
+    # 2. Iterate Epoch 1
+    epoch_1_batches = list(train_l)
+    assert len(epoch_1_batches) == 3
+
+    # 3. Simulate intra-epoch close() call
+    train_l.close()
+
+    # 4. Iterate Epoch 2 without RuntimeError: Cannot iterate over a closed DataLoader.
+    epoch_2_batches = list(train_l)
+    assert len(epoch_2_batches) == 3
+

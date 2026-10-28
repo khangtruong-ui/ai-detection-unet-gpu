@@ -35,7 +35,7 @@ from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.training.callbacks import CheckpointManager, EarlyStopping
-from sid_unet.training.hard_mining import HardMiner
+from sid_unet.training.hard_mining import HardMiner, HardMiningBatchFilter
 from sid_unet.utils.logger import MetricLogger, setup_logger
 from sid_unet.utils.memory import (
     auto_scale_batch_size_and_grad_accum,
@@ -1312,11 +1312,22 @@ class Trainer:
         finally:
             pbar.close()
             del pbar
-            if hasattr(effective_loader, "close") and callable(effective_loader.close):
+            # Only close per-epoch iterator wrappers (like BackgroundPrefetcher),
+            # never permanently close persistent loaders (like pdl.DataLoader) across epochs
+            if effective_loader is not self.train_loader and not isinstance(effective_loader, HardMiningBatchFilter):
+                if hasattr(effective_loader, "close") and callable(effective_loader.close):
+                    if not hasattr(effective_loader, "_is_closed"):
+                        try:
+                            effective_loader.close()
+                        except Exception:
+                            pass
+            elif type(effective_loader).__name__ == "BackgroundPrefetcher":
                 try:
                     effective_loader.close()
                 except Exception:
                     pass
+            if hasattr(self.train_loader, "_is_closed"):
+                self.train_loader._is_closed = False
             self._active_train_loader = None
             self.hard_miner.end_epoch(epoch)
             if self.empty_cache_per_epoch:

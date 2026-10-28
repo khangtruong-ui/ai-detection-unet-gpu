@@ -75,7 +75,7 @@ class HardMiningBatchFilter:
         return getattr(self.dataloader, "batch_size", None)
 
     def close(self) -> None:
-        if hasattr(self.dataloader, "close") and callable(self.dataloader.close):
+        if type(self.dataloader).__name__ == "BackgroundPrefetcher":
             try:
                 self.dataloader.close()
             except Exception:

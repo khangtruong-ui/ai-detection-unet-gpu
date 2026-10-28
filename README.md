@@ -1099,17 +1099,19 @@ To solve this, `sid_unet` natively integrates [**`parquet-dataset-loader`**](htt
 #### Key Capabilities:
 1. **Instant, Non-Blocking Initialization (~0.4s)**:
    Uses HTTP Range requests to read Parquet footers and builds an index in ~0.4s without downloading full files. Training starts immediately.
-2. **True Map-Style Random Access with $O(\log M)$ Seek (`SIDMapDataset`)**:
-   Standard indexable PyTorch `Dataset` (`streaming: false`) wraps `IndexedParquetDataset`. Random access (`ds[idx]`) seeks directly to the target row group via binary search and downloads only that chunk, cached in an in-memory thread-safe LRU cache.
-3. **PyTorch Multi-Worker DataLoader Compatibility**:
-   Supports `num_workers > 0` with `multiprocessing_context="spawn"`. Dataset components are fully picklable with clean serialization guards (`__getstate__` / `__setstate__`), so worker processes instantiate their own connection handles without deadlocks or thread lock pickling errors.
-4. **Progressive Disk Persistence (`save_to_disk: true` or path)**:
+2. **Native `parquet-dataset-loader` DataLoader Integration (`PDLDataLoader`)**:
+   Replaces custom SID loader prefetchers with `parquet_dataset_loader.dataloader.DataLoader`. Exposes exact batch counts (`len(loader) == len(dataset) // batch_size`) immediately during both streaming and map-style execution, resolving tqdm progress uncertainty (`total_batches` is always known). Implements thread-safe bounded prefetching, worker health monitoring, DDP rank sharding, and full multi-epoch lifecycle resilience.
+3. **True Map-Style Random Access with $O(\log M)$ Seek (`SIDMapDataset`)**:
+   Standard indexable PyTorch `Dataset` (`streaming: false` or streaming with parquet loader) wraps `IndexedParquetDataset`. Random access (`ds[idx]`) seeks directly to the target row group via binary search and downloads only that chunk, cached in an in-memory thread-safe LRU cache.
+4. **PyTorch Multi-Worker DataLoader Compatibility**:
+   Supports `num_workers > 0` with `multiprocessing_context="spawn"` or threaded prefetching. Dataset components are fully picklable with clean serialization guards (`__getstate__` / `__setstate__`), so worker processes instantiate their own connection handles without deadlocks or thread lock pickling errors.
+5. **Progressive Disk Persistence (`save_to_disk: true` or path)**:
    Streams unblocked while saving fetched row groups to local disk in the background. Subsequent runs reload locally with zero network I/O.
-5. **Background Downloader (`background_download: true`)**:
+6. **Background Downloader (`background_download: true`)**:
    Spawns an asynchronous background worker thread to pre-fetch remaining row groups to disk ahead of foreground iteration.
-6. **Column Projection (`columns: ["image", "mask"]`)**:
+7. **Column Projection (`columns: ["image", "mask"]`)**:
    Transfers only the requested columns over HTTP, cutting network payload from ~98 MB down to ~250 KB per row group.
-7. **Transparent Fallback**:
+8. **Transparent Fallback**:
    If the target dataset is not a Parquet repository or if `use_parquet_loader: false`, the loader automatically falls back to standard Hugging Face `load_dataset` without raising errors.
 
 #### Dynamic Label & Mask Synthesis Logic
