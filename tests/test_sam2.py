@@ -276,3 +276,23 @@ def test_sam2_qlora_4bit_unfrozen_decoder_gpu():
 
     grads = [p.grad for p in dec.parameters() if p.grad is not None]
     assert len(grads) > 0, "Decoder parameters should receive gradients in 4-bit QLoRA mode"
+
+
+def test_sam2_mask_adapter_balanced_init():
+    """Verify that mask_adapter is initialized with balanced zero bias and Xavier weights to avoid 0.0000 IoU trap."""
+    model = SAM2Segmenter(
+        pretrained_model_name_or_path=DEFAULT_SAM2_SMALL_CHECKPOINT,
+        load_in_4bit=False,
+        lora_r=4,
+        lora_alpha=8,
+        use_mask_adapter=True,
+        device="cpu",
+    )
+    assert model.mask_adapter is not None
+    last_conv = model.mask_adapter[-1]
+    assert isinstance(last_conv, torch.nn.Conv2d)
+    assert last_conv.bias is not None
+    # Bias must be initialized to 0.0, avoiding the -2.0 bias trap
+    assert torch.allclose(last_conv.bias, torch.zeros_like(last_conv.bias), atol=1e-5)
+    # Weights must have normal/Xavier variance, not all zero
+    assert last_conv.weight.std().item() > 0.01

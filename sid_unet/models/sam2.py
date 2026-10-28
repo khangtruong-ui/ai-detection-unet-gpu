@@ -181,10 +181,17 @@ class SAM2Segmenter(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(16, 1, kernel_size=1),
             )
-            # Initialize with small negative bias to reflect tampering sparsity (~5-10% positive)
-            # and avoid saturation at 1.0 (all foreground)
-            nn.init.constant_(self.mask_adapter[-1].bias, -2.0)
-            nn.init.normal_(self.mask_adapter[-1].weight, std=0.02)
+            # Initialize with Xavier uniform and zero bias so predicted logits start centered
+            # at the decision boundary (0.0). Avoids negative bias saturation (e.g. -2.0)
+            # which forces all predicted masks to 0 and traps training IoU at 0.0000.
+            for m in self.mask_adapter.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
         else:
             self.mask_adapter = None
 
