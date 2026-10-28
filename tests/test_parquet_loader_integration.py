@@ -225,3 +225,84 @@ def test_create_dataloaders_with_parquet_config(temp_parquet_dataset):
     eval_l = create_eval_dataloader(cfg, split="train", max_samples=4)
     b_eval = next(iter(eval_l))
     assert b_eval["image"].shape == (4, 3, 64, 64)
+
+
+def test_pdl_dataloader_exact_max_len_and_multi_epoch_resilience(temp_parquet_dataset):
+    """
+    Test that PDLDataLoader exposes exact batch length (eliminating 'no max len')
+    and cleanly supports multi-epoch iteration even when close() is invoked intra-epoch.
+    """
+    from sid_unet.dataset.loader import PDLDataLoader
+
+    cfg = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=true",
+        "data.batch_size=4",
+        "data.train_samples_per_epoch=12",
+        "data.val_samples_per_epoch=8",
+        "data.image_size=[64, 64]",
+        "data.num_workers=0",
+        "data.use_parquet_loader=true",
+    ])
+
+    train_l, val_l = create_dataloaders(cfg, include_test=False)
+
+    # 1. Verify exact length is immediately available
+    assert isinstance(train_l, PDLDataLoader)
+    assert isinstance(train_l, DataLoader)
+    assert len(train_l) == 3   # 12 samples // batch_size 4
+    assert len(val_l) == 2     # 8 samples // batch_size 4
+
+    # 2. Iterate Epoch 1
+    epoch_1_batches = list(train_l)
+    assert len(epoch_1_batches) == 3
+
+    # 3. Simulate intra-epoch close() call
+    train_l.close()
+
+    # 4. Iterate Epoch 2 without RuntimeError: Cannot iterate over a closed DataLoader.
+    epoch_2_batches = list(train_l)
+    assert len(epoch_2_batches) == 3
+
+
+def test_sid_map_dataset_row_group_locality_and_block_shuffled_sampler(temp_parquet_dataset):
+    """
+    Verify SIDMapDataset delegates get_row_group_indices and get_row_group_file_indices,
+    and PDLDataLoader automatically selects BlockShuffledSampler (avoiding RandomSampler cache thrashing).
+    """
+    from sid_unet.dataset.loader import PDLDataLoader, SIDMapDataset
+    from parquet_dataset_loader.dataset import BlockShuffledSampler
+
+    map_ds = SIDMapDataset(
+        dataset_name=temp_parquet_dataset,
+        split="train",
+        target_image_size=(64, 64),
+        use_parquet_loader=True,
+        save_to_disk=True,
+    )
+
+    assert hasattr(map_ds, "get_row_group_indices")
+    groups = map_ds.get_row_group_indices()
+    assert isinstance(groups, list)
+    assert len(groups) > 0
+
+    assert hasattr(map_ds, "get_row_group_file_indices")
+    f_indices = map_ds.get_row_group_file_indices()
+    assert f_indices is not None
+
+    loader = PDLDataLoader(
+        dataset=map_ds,
+        batch_size=4,
+        shuffle=True,
+        seed=42,
+        num_workers=0,
+    )
+
+    assert isinstance(loader.sampler, BlockShuffledSampler)
+    batches = list(loader)
+    assert len(batches) == 10  # 40 samples // 4
+    map_ds.close()
+
+

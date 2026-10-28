@@ -11,6 +11,10 @@ project:
 data:
   dataset_name: "KhangTruong/COCO-inpainted"
   streaming: true
+  use_parquet_loader: true
+  save_to_disk: true
+  background_download: true
+  columns: ["image", "mask"]
   image_size: [256, 256]
   batch_size: 4                     # Tuned for 12GB VRAM budget (~9.6 GB peak reserved)
   num_workers: -1
