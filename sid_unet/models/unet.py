@@ -514,6 +514,27 @@ def build_model(config: Any) -> nn.Module:
             force_download=bool(model_cfg.get("force_download", False)),
         )
 
+    if any(k in model_name for k in ["iml", "refactor_maskformer", "refectormaskformer", "maskformer"]) or any(k in backbone for k in ["iml", "refactor_maskformer", "refectormaskformer", "maskformer"]):
+        from sid_unet.models.iml_maskformer import IMLMaskformer
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        return IMLMaskformer(
+            variant=str(model_cfg.get("variant", model_cfg.get("model_variant", "large"))),
+            sam2_repo=model_cfg.get("sam2_repo", None),
+            config_path=model_cfg.get("config_path", None),
+            checkpoint_path=model_cfg.get("checkpoint_path", model_cfg.get("pretrained_model_name_or_path", None)),
+            embed_dim=int(model_cfg.get("embed_dim", 256)),
+            num_queries=int(model_cfg.get("num_queries", 100)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            pixel_num_layers=int(model_cfg.get("pixel_num_layers", 6)),
+            decoder_num_layers=int(model_cfg.get("decoder_num_layers", 9)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            target_size=tuple(model_cfg.get("target_size", [384, 384])),
+            use_dummy=bool(model_cfg.get("use_dummy", False)),
+            device=dev_cfg,
+        )
+
     if "sam2" in model_name or "sam2" in backbone:
         from sid_unet.models.sam2 import (
             SAM2Segmenter,
@@ -545,6 +566,7 @@ def build_model(config: Any) -> nn.Module:
             in_channels=int(model_cfg.get("in_channels", 3)),
             out_channels=int(model_cfg.get("out_channels", 1)),
             target_size=tuple(model_cfg.get("target_size", [1024, 1024])),
+            use_mask_adapter=bool(model_cfg.get("use_mask_adapter", True)),
             device=dev_cfg,
         )
 
