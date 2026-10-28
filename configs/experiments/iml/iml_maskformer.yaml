@@ -1,0 +1,70 @@
+# Configuration: IML MaskFormer (RefactorMaskformer)
+# Image Manipulation Localization via SAM 2.1 Hiera Vision Backbone + Deformable Attention Pixel Decoder
+# + Dual-Query Interactive MaskFormer Transformer Decoder.
+
+project:
+  name: "sid_iml_maskformer"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/iml_maskformer"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  use_parquet_loader: true
+  save_to_disk: true
+  background_download: true
+  columns: ["image", "mask"]
+  image_size: [384, 384]
+  batch_size: 2                     # Tuned for 15GB VRAM Tesla T4
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 32
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  evaluate_on_test: true
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    color_jitter: 0.0
+
+model:
+  name: "iml"
+  variant: "large"
+  sam2_repo: "/content/sam2"
+  checkpoint_path: "/content/sam2/checkpoints/sam2.1_hiera_large.pt"
+  embed_dim: 256
+  num_queries: 100
+  num_classes: 3
+  pixel_num_layers: 6
+  decoder_num_layers: 9
+  aux_classifier: false
+  in_channels: 3
+  out_channels: 1
+  target_size: [384, 384]
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  gradient_accumulation_steps: 4   # 4 micro-batches * bs 2 = effective batch size 8
+  mixed_precision: "bf16"
+  clip_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+  save_best: true
+  eval_every: 1

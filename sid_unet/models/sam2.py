@@ -135,6 +135,7 @@ class SAM2Segmenter(nn.Module):
         in_channels: int = 3,
         out_channels: int = 1,
         target_size: Tuple[int, int] = (1024, 1024),
+        use_mask_adapter: bool = True,
         device: Optional[Union[str, torch.device]] = "auto",
         **kwargs: Any,
     ):
@@ -151,6 +152,7 @@ class SAM2Segmenter(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.target_size = tuple(target_size)
+        self.use_mask_adapter = use_mask_adapter
 
         # Resolve device
         if device == "auto" or device is None:
@@ -161,6 +163,21 @@ class SAM2Segmenter(nn.Module):
             self._target_device = device
 
         self._init_processor_and_model()
+
+        # Trainable mask combination/adaptation head over the 3 candidate masks
+        if self.use_mask_adapter:
+            self.mask_adapter = nn.Sequential(
+                nn.Conv2d(3, 16, kernel_size=3, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 1, kernel_size=1),
+            )
+            # Initialize with small negative bias to reflect tampering sparsity (~5-10% positive)
+            # and avoid saturation at 1.0 (all foreground)
+            nn.init.constant_(self.mask_adapter[-1].bias, -2.0)
+            nn.init.normal_(self.mask_adapter[-1].weight, std=0.02)
+        else:
+            self.mask_adapter = None
 
         # Auxiliary classification head
         if self.aux_classifier:
@@ -339,16 +356,21 @@ class SAM2Segmenter(nn.Module):
         # outputs.pred_masks is [B, 1, num_masks, H_m, W_m]
         pred_masks = outputs.pred_masks
         if pred_masks.ndim == 5:
-            # Multi-mask output: aggregate using predicted IoU scores if available
-            if hasattr(outputs, "iou_scores") and outputs.iou_scores is not None:
-                weights = torch.softmax(outputs.iou_scores, dim=-1).unsqueeze(-1).unsqueeze(-1)
-                mask_logits_raw = (pred_masks * weights).sum(dim=2)  # [B, 1, H_m, W_m]
-            else:
-                mask_logits_raw = pred_masks.mean(dim=2)  # [B, 1, H_m, W_m]
+            pred_masks_squeezed = pred_masks.squeeze(1)  # [B, num_masks, H_m, W_m]
         elif pred_masks.ndim == 4:
-            mask_logits_raw = pred_masks
+            pred_masks_squeezed = pred_masks
         else:
             raise RuntimeError(f"Unexpected pred_masks shape from SAM2: {pred_masks.shape}")
+
+        if self.use_mask_adapter and self.mask_adapter is not None:
+            # Route candidate masks through trainable adapter to produce dense forgery logits
+            adapter_dev, adapter_dtype = get_submodule_device_dtype(self.mask_adapter, x.device, torch.float32)
+            mask_logits_raw = self.mask_adapter(pred_masks_squeezed.to(device=adapter_dev, dtype=adapter_dtype))
+        elif hasattr(outputs, "iou_scores") and outputs.iou_scores is not None:
+            weights = torch.softmax(outputs.iou_scores, dim=-1).unsqueeze(-1).unsqueeze(-1)
+            mask_logits_raw = (pred_masks * weights).sum(dim=2)  # [B, 1, H_m, W_m]
+        else:
+            mask_logits_raw = pred_masks_squeezed.mean(dim=1, keepdim=True)
 
         # Interpolate mask logits back to original image dimensions [B, 1, orig_h, orig_w]
         mask_logits = F.interpolate(
