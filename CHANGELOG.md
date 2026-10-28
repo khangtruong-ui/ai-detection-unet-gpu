@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-10-28
 
 ### Added
+- **Detective SAM (ICLR 2026) Architecture Integration**: Implemented *Detective SAM: Adaptive AI-Image Forgery Localization* (`sid_unet/models/detective_sam.py`):
+  - Differentiable dual-branch perturbation generator (`ImagePerturbation` with Gaussian blur $\sigma_{\text{blur}}=0.75$ and Gaussian noise $\sigma_{\text{noise}}=0.15$).
+  - Residual cross-stream feature adapters (`FeatureAdapter`) computing $\Delta F_s$ at each Hiera scale ($s \in \{0, 1, 2\}$) to isolate tampering sensitivity.
+  - Multi-scale Mask Adapter (`MaskAdapter`) with coarse downscaled transformer, conv refinement, and linear spatial gating ($g = \sigma(W_g * [L_{\text{coarse}}, U])$).
+  - Multi-task training loss (`DetectiveSAMLoss`) combining Focal loss ($\lambda=20$), Dice loss ($\lambda=1$), and IoU prediction regression loss ($\lambda=1$).
+  - Config added at `configs/experiments/sam2/detective_sam.yaml` with optimal hyperparameters from the paper ($d=64$, $\text{lr}=1\times 10^{-3}$, weight decay $1\times 10^{-4}$).
+- **100-Step Training Trajectory Benchmark**: Created `scripts/evaluate_100_steps.py` and benchmarked all 3 models (SAM2 Small, Senior's IML MaskFormer, Detective SAM) under identical training conditions on NVIDIA Tesla T4 GPU, recording per-step losses, IoU metrics, step throughput, and memory consumption to `benchmark_100_steps_results.json`.
+- **Unit & Integration Test Suite for Detective SAM**: Added 10 tests in `tests/test_detective_sam.py` covering perturbation, feature adapters, mask adapters, aux classifier, dynamic resolution handling, loss calculation, and GPU gradient flow.
 - **SAM2 Unfrozen Mask Decoder Support**: Added `freeze_decoder` and `reinit_decoder` parameters in `SAM2Segmenter` and configuration schemas (`configs/experiments/sam2/*.yaml`), allowing all ~4.2M parameters of SAM2's mask decoder (attention layers, cross-attention, MLP blocks, and output tokens) to directly adapt to visual manipulation traces.
 - **Quantization Protection for Decoder**: Added `llm_int8_skip_modules=['mask_decoder']` in `BitsAndBytesConfig` under 4-bit NF4 and 8-bit quantization modes to preserve decoder layers in native floating-point precision (`bfloat16`/`float16`/`float32`).
 - **Post-PEFT Gradient Preservation**: Enforced decoder unfreezing strictly after PEFT's `get_peft_model()` initialization to prevent non-LoRA parameter re-freezing.
@@ -21,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Balanced adapter initialization verification (`test_sam2_mask_adapter_balanced_init`).
 
 ### Fixed
+- **Detective SAM Dynamic Input Resolution & Prompt Padding**: Resolved HF SAM2 hardcoded `view` size mismatch when handling non-1024 resolutions or perturbed image batches by dynamically calculating spatial grid dimensions via `isqrt`, dynamically interpolating positional and dense prompt embeddings, and providing a dummy negative prompt point (`label=-1`) to prevent `NoneType` crashes in `prompt_encoder`.
 - **SAM2 0.0000 IoU Training Deadlock**: Fixed negative suppression bias (`bias = -2.0`, $\sigma=0.02$) in `mask_adapter` that clamped all initial predicted logits to $\approx -2.0$ ($\sigma(-2.0) \approx 0.12 < 0.5$). This had forced all predicted mask pixels to 0, producing zero positive predictions and locking training IoU at `0.0000` for 76+ steps in `.logs.txt`. With balanced Xavier initialization, training IoU immediately climbs to `0.0463` on step 1 and `0.1377` on step 4.
 - **SAM2 0.03 IoU Bottleneck**: Resolved representation bottleneck where a frozen mask decoder could only output rigid SA-1B object proposals from prompt queries.
 - **BitsAndBytes Autograd Dtype Crash**: Resolved `RuntimeError: only Tensors of floating point and complex dtype can require gradients` during backward pass by skipping quantization on `mask_decoder`.

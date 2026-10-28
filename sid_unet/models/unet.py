@@ -306,6 +306,8 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "gap_sam"
             elif any(k.startswith(("base_model.backbone.vision_backbone", "peft_model.base_model", "model.backbone.vision_backbone")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_distil"
+            elif any(k.startswith(("feature_adapters.", "mask_adapter.refine_conv", "perturbation.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "detective_sam"
             elif any("vision_encoder.backbone.blocks." in k for k in state_dict.keys()) or any("base_box" in k for k in state_dict.keys()):
                 merged["model"]["name"] = "sam2"
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
@@ -531,6 +533,30 @@ def build_model(config: Any) -> nn.Module:
             in_channels=int(model_cfg.get("in_channels", 3)),
             out_channels=int(model_cfg.get("out_channels", 1)),
             target_size=tuple(model_cfg.get("target_size", [384, 384])),
+            use_dummy=bool(model_cfg.get("use_dummy", False)),
+            device=dev_cfg,
+        )
+
+    if any(k in model_name for k in ["detective_sam", "detective-sam", "detectivesam"]) or any(k in backbone for k in ["detective_sam", "detective-sam", "detectivesam"]):
+        from sid_unet.models.detective_sam import DetectiveSAM
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        return DetectiveSAM(
+            pretrained_model_name_or_path=model_cfg.get("pretrained_model_name_or_path", model_cfg.get("checkpoint_path", None)),
+            variant=str(model_cfg.get("variant", model_cfg.get("model_variant", "small"))).lower(),
+            layer_width=int(model_cfg.get("layer_width", 64)),
+            noise_intensity=float(model_cfg.get("noise_intensity", 0.75)),
+            perturbation_type=str(model_cfg.get("perturbation_type", "blur_noise")),
+            transformer_downscaling=int(model_cfg.get("transformer_downscaling", 16)),
+            transformer_layers=int(model_cfg.get("transformer_layers", 1)),
+            dropout=float(model_cfg.get("dropout", 0.15)),
+            target_size=tuple(model_cfg.get("target_size", [1024, 1024])),
+            freeze_sam2=bool(model_cfg.get("freeze_sam2", True)),
+            freeze_decoder=bool(model_cfg.get("freeze_decoder", True)),
+            multimask_output=bool(model_cfg.get("multimask_output", False)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
             use_dummy=bool(model_cfg.get("use_dummy", False)),
             device=dev_cfg,
         )
