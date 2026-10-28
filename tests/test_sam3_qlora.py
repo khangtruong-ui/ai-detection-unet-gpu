@@ -130,6 +130,52 @@ def test_sam3_qlora_build_model_and_checkpoint():
         assert out.shape == (1, 1, 64, 64)
 
 
+def test_sam3_qlora_learnable_prompt_gradient_update():
+    """Verify that learnable prompt parameters receive gradients and update via optimizer."""
+    model = SAM3QLoRA(
+        pretrained_model_name_or_path="yujiepan/sam3-tiny-random",
+        load_in_4bit=False,
+        lora_r=4,
+        lora_alpha=8,
+        use_learnable_prompt=True,
+        device="cpu",
+    )
+    assert model.prompt_embeddings is not None
+    assert model.prompt_embeddings.requires_grad is True
+
+    orig_weights = model.prompt_embeddings.clone().detach()
+    optimizer = torch.optim.SGD([model.prompt_embeddings], lr=0.1)
+
+    x = torch.randn(1, 3, 64, 64)
+    mask_logits = model(x)
+    loss = mask_logits.mean()
+    loss.backward()
+
+    assert model.prompt_embeddings.grad is not None
+    assert model.prompt_embeddings.grad.norm().item() > 0
+
+    optimizer.step()
+    # Ensure parameter values updated
+    assert not torch.allclose(model.prompt_embeddings, orig_weights)
+
+
+def test_sam3_qlora_fixed_text_prompt_fallback():
+    """Verify backward compatibility when use_learnable_prompt=False."""
+    model = SAM3QLoRA(
+        pretrained_model_name_or_path="yujiepan/sam3-tiny-random",
+        load_in_4bit=False,
+        lora_r=4,
+        lora_alpha=8,
+        use_learnable_prompt=False,
+        device="cpu",
+    )
+    assert model.prompt_embeddings is None
+
+    x = torch.randn(1, 3, 64, 64)
+    out = model(x)
+    assert out.shape == (1, 1, 64, 64)
+
+
 @pytest.mark.timeout(240)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required for memory fit benchmark")
 def test_sam3_qlora_gpu_memory_fit():

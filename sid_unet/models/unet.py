@@ -306,6 +306,8 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "gap_sam"
             elif any(k.startswith(("base_model.backbone.vision_backbone", "peft_model.base_model", "model.backbone.vision_backbone")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_distil"
+            elif any("vision_encoder.backbone.blocks." in k for k in state_dict.keys()) or any("base_box" in k for k in state_dict.keys()):
+                merged["model"]["name"] = "sam2"
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_qlora"
             elif any(k.startswith("decoder.perp_fusions.") for k in state_dict.keys()):
@@ -512,6 +514,40 @@ def build_model(config: Any) -> nn.Module:
             force_download=bool(model_cfg.get("force_download", False)),
         )
 
+    if "sam2" in model_name or "sam2" in backbone:
+        from sid_unet.models.sam2 import (
+            SAM2Segmenter,
+            DEFAULT_SAM2_SMALL_CHECKPOINT,
+            DEFAULT_SAM2_LARGE_CHECKPOINT,
+        )
+        variant = str(model_cfg.get("variant", model_cfg.get("model_variant", "small"))).lower()
+        default_ckpt = (
+            DEFAULT_SAM2_LARGE_CHECKPOINT
+            if "large" in variant or "large" in model_name
+            else DEFAULT_SAM2_SMALL_CHECKPOINT
+        )
+        ckpt_name = model_cfg.get(
+            "pretrained_model_name_or_path",
+            model_cfg.get("checkpoint_path", model_cfg.get("model_name", default_ckpt)),
+        )
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        return SAM2Segmenter(
+            pretrained_model_name_or_path=str(ckpt_name),
+            variant=str(variant) if variant else None,
+            load_in_4bit=bool(model_cfg.get("load_in_4bit", False)),
+            load_in_8bit=bool(model_cfg.get("load_in_8bit", False)),
+            lora_r=int(model_cfg.get("lora_r", 8)),
+            lora_alpha=int(model_cfg.get("lora_alpha", 16)),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
+            lora_target_modules=model_cfg.get("lora_target_modules", None),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            target_size=tuple(model_cfg.get("target_size", [1024, 1024])),
+            device=dev_cfg,
+        )
+
     if "sam3" in model_name or "sam3" in backbone:
         from sid_unet.models.sam3_qlora import SAM3QLoRA, DEFAULT_SAM3_CHECKPOINT
         ckpt_name = model_cfg.get("pretrained_model_name_or_path", model_cfg.get("model_name", DEFAULT_SAM3_CHECKPOINT))
@@ -525,6 +561,8 @@ def build_model(config: Any) -> nn.Module:
             lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
             lora_target_modules=model_cfg.get("lora_target_modules", None),
             prompt_text=str(model_cfg.get("prompt_text", "tampered region")),
+            use_learnable_prompt=bool(model_cfg.get("use_learnable_prompt", True)),
+            num_learnable_tokens=int(model_cfg.get("num_learnable_tokens", 32)),
             aux_classifier=bool(model_cfg.get("aux_classifier", False)),
             num_classes=int(model_cfg.get("num_classes", 3)),
             in_channels=int(model_cfg.get("in_channels", 3)),
