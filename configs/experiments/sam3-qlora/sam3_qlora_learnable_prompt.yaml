@@ -1,0 +1,71 @@
+# Configuration: SAM3 + QLoRA with Learnable Prompt Tuning on COCO-inpainted
+# Meta SAM3 foundation model with 4-bit NF4 NormalFloat quantization via bitsandbytes
+# and Low-Rank Adaptation (LoRA r=8, alpha=16) via PEFT.
+# Redesigned transformer conditioning: Replaces fixed "tampered region" text input with
+# learnable prompt embeddings (prompt tuning) optimized end-to-end via gradient descent.
+
+project:
+  name: "sid_sam3_qlora_learnable_prompt"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/sam3_qlora_learnable_prompt"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 1                     # Maximum batch size for 12GB VRAM budget (interpolates to 1008x1008; ~6.5-7.5 GB peak reserved)
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 48
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  evaluate_on_test: true
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    color_jitter: 0.0
+
+model:
+  name: "sam3_qlora"
+  pretrained_model_name_or_path: "jetjodh/sam3"
+  load_in_4bit: true
+  load_in_8bit: false
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "v_proj"]
+  use_learnable_prompt: true
+  num_learnable_tokens: 32
+  prompt_text: "tampered region"
+  aux_classifier: false
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+  target_size: [1008, 1008]
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  gradient_accumulation_steps: 16
+  mixed_precision: "bf16"
+  clip_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+  save_best: true
+  eval_every: 1

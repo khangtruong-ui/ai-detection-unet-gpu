@@ -533,7 +533,7 @@ class Trainer:
 
         # Restore hard mining state if present
         if "hard_mining" in ckpt_meta and ckpt_meta["hard_mining"] and hasattr(self, "hard_miner"):
-            cur_iters = len(self.train_loader) if hasattr(self.train_loader, "__len__") else None
+            cur_iters = safe_dataloader_len(self.train_loader)
             self.hard_miner.load_state_dict(ckpt_meta["hard_mining"], current_iterations=cur_iters)
             if self.hard_miner.is_active_epoch:
                 self.logger.info(

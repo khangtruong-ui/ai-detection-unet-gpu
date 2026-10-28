@@ -27,7 +27,7 @@ import pyarrow.parquet as pq
 
 from sid_unet.cache.extractor import BaseCacheExtractor, get_extractor_for_model
 from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask
-from sid_unet.dataset.loader import load_parquet_or_hf_dataset
+from sid_unet.dataset.loader import load_parquet_or_hf_dataset, safe_dataset_len
 from sid_unet.utils.memory import clear_memory_cache
 
 logger = logging.getLogger(__name__)
@@ -264,7 +264,7 @@ class BackgroundRowGroupPrefetcher:
 
     def _worker_loop(self) -> None:
         ds = self.target_ds
-        total_len = len(ds) if hasattr(ds, "__len__") else None
+        total_len = safe_dataset_len(ds)
 
         while not self.stop_event.is_set():
             with self.lock:
@@ -1065,7 +1065,7 @@ class DatasetCacheManager:
                 streaming=True,
             )
 
-        total_dataset_len = len(ds) if hasattr(ds, "__len__") else None
+        total_dataset_len = safe_dataset_len(ds)
 
         existing_shards = self._detect_existing_shards(split) if should_resume else []
         already_cached_shards = len(existing_shards)

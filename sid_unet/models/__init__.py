@@ -3,6 +3,16 @@ from sid_unet.models.fpn import FeaturePyramidNetwork, FPNBlock
 from sid_unet.models.blocks import DoubleConv, Down, Up, OutConv, AuxiliaryClassifier
 from sid_unet.models.efficientnet import EfficientNetSegmentation
 from sid_unet.models.sam3_qlora import SAM3QLoRA
+from sid_unet.models.sam2 import (
+    SAM2Segmenter,
+    SAM2QLoRA,
+    DEFAULT_SAM2_SMALL_CHECKPOINT,
+    DEFAULT_SAM2_LARGE_CHECKPOINT,
+    FALLBACK_SAM2_CHECKPOINT,
+    SAM2_CHECKPOINTS,
+    pull_sam2_weights,
+    resolve_sam2_checkpoint,
+)
 from sid_unet.models.sam3_distil import SAM3DistilLoRA, SAM3Distil
 from sid_unet.models.sam3_refiner import SAMRefiner, get_sam_refiner
 from sid_unet.models.vae_finetune import DiffusionVAEFinetune, VAEFinetune, SDVAEFinetune
@@ -54,6 +64,14 @@ __all__ = [
     "FPNBlock",
     "EfficientNetSegmentation",
     "SAM3QLoRA",
+    "SAM2Segmenter",
+    "SAM2QLoRA",
+    "DEFAULT_SAM2_SMALL_CHECKPOINT",
+    "DEFAULT_SAM2_LARGE_CHECKPOINT",
+    "FALLBACK_SAM2_CHECKPOINT",
+    "SAM2_CHECKPOINTS",
+    "pull_sam2_weights",
+    "resolve_sam2_checkpoint",
     "SAM3DistilLoRA",
     "SAM3Distil",
     "GAPSAM",

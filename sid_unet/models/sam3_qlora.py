@@ -50,6 +50,9 @@ class SAM3QLoRA(nn.Module):
         lora_dropout (float): Dropout probability for LoRA layers (default: 0.05).
         lora_target_modules (List[str]): Module names to attach LoRA adapters to.
         prompt_text (str): Conditioning text prompt for SAM3 (default: 'tampered region').
+        use_learnable_prompt (bool): If True, replaces fixed text input with learnable parameters
+            (prompt tuning) trained end-to-end via gradient descent (default: True).
+        num_learnable_tokens (int): Number of learnable prompt tokens if initializing randomly (default: 32).
         aux_classifier (bool): Whether to enable auxiliary classification head (default: False).
         num_classes (int): Number of target classes for auxiliary head (default: 3).
         in_channels (int): Input image channels (default: 3).
@@ -68,6 +71,8 @@ class SAM3QLoRA(nn.Module):
         lora_dropout: float = 0.05,
         lora_target_modules: Optional[List[str]] = None,
         prompt_text: str = "tampered region",
+        use_learnable_prompt: bool = True,
+        num_learnable_tokens: int = 32,
         aux_classifier: bool = False,
         num_classes: int = 3,
         in_channels: int = 3,
@@ -85,6 +90,8 @@ class SAM3QLoRA(nn.Module):
         self.lora_dropout = lora_dropout
         self.lora_target_modules = lora_target_modules or ["q_proj", "v_proj"]
         self.prompt_text = prompt_text
+        self.use_learnable_prompt = use_learnable_prompt
+        self.num_learnable_tokens = num_learnable_tokens
         self.aux_classifier = aux_classifier
         self.num_classes = num_classes
         self.in_channels = in_channels
@@ -181,9 +188,36 @@ class SAM3QLoRA(nn.Module):
             bias="none",
         )
         self.model = get_peft_model(base_model, lora_cfg)
+
+        # 6. Initialize learnable prompt parameters (replacing fixed text input "tampered region")
+        if self.use_learnable_prompt:
+            with torch.no_grad():
+                try:
+                    init_text_out = base_model.get_text_features(
+                        input_ids=self.base_input_ids.to(base_model.device if hasattr(base_model, "device") else "cpu"),
+                        attention_mask=self.base_attention_mask.to(base_model.device if hasattr(base_model, "device") else "cpu"),
+                        return_dict=True,
+                    )
+                    init_embeds = init_text_out.pooler_output.to(dtype=torch.float32, device="cpu")
+                except Exception as exc:
+                    logger.warning(f"Could not initialize learnable prompt from base text features ({exc}). Initializing randomly.")
+                    hidden_size = getattr(
+                        getattr(base_model.config, "detr_encoder_config", None),
+                        "hidden_size",
+                        getattr(getattr(base_model.config, "text_config", None), "projection_dim", 256),
+                    )
+                    init_embeds = torch.randn(1, self.num_learnable_tokens, hidden_size) * 0.02
+
+            self.prompt_embeddings = nn.Parameter(init_embeds.clone().detach(), requires_grad=True)
+            logger.info(
+                f"Enabled learnable prompt embeddings for SAM3 with shape {list(self.prompt_embeddings.shape)}"
+            )
+        else:
+            self.prompt_embeddings = None
+
         logger.info(
             f"Initialized SAM3-QLoRA with base='{self.pretrained_model_name_or_path}', "
-            f"4bit={self.load_in_4bit}, r={self.lora_r}, alpha={self.lora_alpha}"
+            f"4bit={self.load_in_4bit}, r={self.lora_r}, alpha={self.lora_alpha}, learnable_prompt={self.use_learnable_prompt}"
         )
 
     def _load_processor(self):
@@ -258,16 +292,26 @@ class SAM3QLoRA(nn.Module):
         else:
             x_proc = x_proc.to(device=model_device)
 
-        # Prepare batched prompt tokens
-        batch_input_ids = self.base_input_ids.repeat(b_sz, 1).to(model_device)
-        batch_attention_mask = self.base_attention_mask.repeat(b_sz, 1).to(model_device)
-
-        # Forward pass through PEFT SAM3 model
-        outputs = self.model(
-            pixel_values=x_proc,
-            input_ids=batch_input_ids,
-            attention_mask=batch_attention_mask,
-        )
+        # Forward pass through PEFT SAM3 model (using learnable prompt embeddings or fixed text tokenization)
+        if self.use_learnable_prompt and self.prompt_embeddings is not None:
+            from transformers.modeling_outputs import BaseModelOutputWithPooling
+            prompt_dtype = param_dtype if param_dtype in (torch.float16, torch.bfloat16) else torch.float32
+            prompt_tensor = self.prompt_embeddings.to(device=model_device, dtype=prompt_dtype)
+            batch_prompt = prompt_tensor.repeat(b_sz, 1, 1)
+            text_embeds = BaseModelOutputWithPooling(pooler_output=batch_prompt)
+            outputs = self.model(
+                pixel_values=x_proc,
+                text_embeds=text_embeds,
+            )
+        else:
+            # Prepare batched prompt tokens
+            batch_input_ids = self.base_input_ids.repeat(b_sz, 1).to(model_device)
+            batch_attention_mask = self.base_attention_mask.repeat(b_sz, 1).to(model_device)
+            outputs = self.model(
+                pixel_values=x_proc,
+                input_ids=batch_input_ids,
+                attention_mask=batch_attention_mask,
+            )
 
         # outputs.semantic_seg is shape [B, 1, H_fpn, W_fpn]
         semantic_seg = outputs.semantic_seg

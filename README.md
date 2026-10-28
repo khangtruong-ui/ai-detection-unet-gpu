@@ -19,7 +19,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [1. Standard UNet](#1-standard-unet)
   - [2. Pretrained EfficientNet Backbone (Default UNet Multi-Scale Decoder)](#2-pretrained-efficientnet-backbone-default-unet-multi-scale-decoder)
   - [3. EfficientNet 'Sacrifice of Pixel' Architecture](#3-efficientnet-sacrifice-of-pixel-architecture)
-  - [4. SAM3 + QLoRA Architecture](#4-sam3--qlora-architecture)
+  - [4. SAM3 + QLoRA Architecture with Learnable Prompt Tuning](#4-sam3--qlora-architecture-with-learnable-prompt-tuning)
   - [5. Finetuned Diffusion VAE (SD1.5 AutoencoderKL)](#5-finetuned-diffusion-vae-sd15-autoencoderkl)
   - [6. Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)](#6-diffusion-multi-noise-feature-decoder-diffusion-diff)
   - [7. Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)](#7-diffusion-multi-noise-latent-feature-decoder-v2-diffusion-diff-v2)
@@ -27,6 +27,7 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [9. GAP-SAM: Global Artifact Prior with Distilled SAM3](#9-gap-sam-global-artifact-prior-with-distilled-sam3)
   - [10. OpenSDI MaskCLIP: Synergizing Pretrained Models (CLIP + MAE)](#10-opensdi-maskclip-synergizing-pretrained-models-clip--mae)
   - [11. Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem](#11-feature-pyramid-network-fpn--multi-scale-prediction-subsystem)
+  - [12. SAM2 Segmenter & QLoRA Architecture (Small & Large Models)](#12-sam2-segmenter--qlora-architecture-small--large-models)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -65,6 +66,8 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - **Standard UNet**: Modular depth, configurable channel dimensions, bilinear or transposed convolutions.
   - **Pretrained EfficientNet-UNet**: Leverage ImageNet pretrained CNN representations with multi-scale skip connections ($/2, /4, /8, /16, /32$) feeding into a progressive decoder.
   - **Sacrifice of Pixel Mode**: Uses **only the final bottleneck feature map** ($8 \times 8$ or $7 \times 7$), routes through a single Linear layer, and zooms out to match full image resolution.
+  - **SAM3 + QLoRA with Learnable Prompt Tuning**: Redesigned Segment Anything Model 3 with parameter-efficient fine-tuning (4-bit NF4 quantization + LoRA). Replaces fixed static text prompts (`"tampered region"`) with end-to-end learnable soft prompt parameter embeddings trained directly into DETR cross-attention queries.
+  - **SAM2 Segmenter & QLoRA (Hiera Small & Large)**: Segment Anything Model 2 foundation backbones leveraging multi-scale Hiera vision transformers with 4-bit/8-bit quantization and LoRA. Natively supports both **`facebook/sam2-hiera-small`** (~184 MB) and **`facebook/sam2-hiera-large`** (~898 MB) with automatic weight caching, IoU-weighted multi-mask prediction, and bounding box spatial refinement.
   - **Finetuned Diffusion VAE (SD1.5 AutoencoderKL)**: Adapts pretrained latent diffusion VAE to decode compressed latent representations directly into binary tampering mask space with end-to-end or decoder-only fine-tuning.
   - **Diffusion Multi-Noise Feature Decoder (Diffusion-Diff)**: Advanced latent perturbation forensics extracting $z_0$, adding noise across multiple diffusion timesteps, computing frozen diffuser predicted noise and sinusoidal schedule embeddings ($t, \sigma$), concatenated into high-dimensional $Z$ decoded by a fully configurable trainable decoder.
   - **Diffusion Multi-Noise Latent Feature Decoder V2 (Diffusion-Diff-V2)**: State-of-the-art dual-decoder generative perturbation architecture with **frozen VAE encoder by default**, **eliminated encoder-to-decoder skips by default**, and a **parallel pretrained, frozen VAE decoder** providing rich generative decoding priors through **perpendicular skip connections** directly into the trainable decoder.
@@ -270,22 +273,31 @@ In this specialized mode (`sacrifice_of_pixel: true`), intermediate feature skip
 
 ---
 
-### 4. SAM3 + QLoRA Architecture
+### 4. SAM3 + QLoRA Architecture with Learnable Prompt Tuning
 
-Meta's **Segment Anything Model 3 (SAM3)** integrated with **Quantized Low-Rank Adaptation (QLoRA)** allows fine-tuning foundation vision-language segmentation models directly on consumer GPUs (e.g. 12GB RTX 3060):
+Meta's **Segment Anything Model 3 (SAM3)** integrated with **Quantized Low-Rank Adaptation (QLoRA)** allows fine-tuning foundation vision-language segmentation models directly on consumer GPUs (e.g. 12GB RTX 3060).
+
+#### Architectural Redesign: Learnable Parameter Prompt Tuning
+Previously, SAM3 transformer conditioning was fixed to a static text string (`"tampered region"`). While functional for referring segmentation, this fixed text condition was a major representational bottleneck for forensic manipulation localization because frozen language embeddings cannot adapt to visual tampering artifacts.
+
+The model architecture has been redesigned to replace the fixed text transformer input with **trainable soft prompt parameters** (`use_learnable_prompt: true`, `num_learnable_tokens: 32`):
+- **Continuous Parameter Formulation**: A learnable parameter tensor $\mathbf{P} \in \mathbb{R}^{1 \times K \times D_{\text{hidden}}}$ is trained end-to-end via gradient descent.
+- **Warm-Start or Random Initialization**: Initialized by extracting pooler embeddings from base text features or sampled randomly from $\mathcal{N}(0, 0.02)$.
+- **Direct Transformer Conditioning Injection**: Formatted as a `BaseModelOutputWithPooling` and passed directly as `text_embeds` into `self.model(...)`, directly driving cross-attention in the DETR encoder, DETR decoder queries, and multi-scale mask decoders without invoking frozen tokenizers during forward training passes.
+- **Backward Compatibility**: Setting `use_learnable_prompt: false` seamlessly restores tokenizer-based text conditioning using `prompt_text` (e.g. `"tampered region"`).
 
 ```
-                      Input Image (3, H, W)             Text Prompt: "tampered region"
-                               │                                       │
-                               ▼                                       ▼
-                     Bilinear Resize (1008x1008)               CLIP Text Tokenizer
-                               │                                       │
-                               ▼                                       ▼
-                    ┌─────────────────────────────────────────────────────┐
+                      Input Image (3, H, W)             Learnable Prompt Embeddings (1, K, D)
+                                │                                       │
+                                ▼                                       ▼
+                     Bilinear Resize (1008x1008)                Soft Prompt Tuning
+                                │                               (Trained via Backprop)
+                                ▼                                       │
+                    ┌───────────────────────────────────────────────────┴─┐
                     │               SAM3 Foundation Backbone              │
                     │   - ViT Vision Encoder (4-bit NF4 Quantized)        │
                     │   - LoRA Adapters (r=8..16 on q_proj, v_proj)       │
-                    │   - Text Encoder & Cross-Attention                  │
+                    │   - Learnable Prompt Conditioning (prompt_embeds)   │
                     │   - DETR Encoder & Decoder with Object Queries      │
                     │   - Multiscale Mask Decoder & FPN Pixel Head        │
                     └──────────────────────────┬──────────────────────────┘
@@ -301,10 +313,11 @@ Meta's **Segment Anything Model 3 (SAM3)** integrated with **Quantized Low-Rank 
 ```
 
 Key features:
+- **Learnable Prompt Tuning**: End-to-end prompt embeddings $\mathbf{P}$ receive direct gradients alongside LoRA adapters, learning optimal tampering representations without frozen language vocabulary constraints.
 - **4-Bit NormalFloat (NF4) Quantization**: Reduces the 3.4GB FP32/BF16 base model footprint to only **~660 MB** of VRAM.
 - **PEFT LoRA Adapters**: Injects low-rank decomposition matrices ($r=8, \alpha=16$) into self-attention projection layers (`q_proj`, `v_proj`). Less than **0.5%** of total parameters are trainable.
 - **Hardware Compatibility**: Verified to fit and train on **12GB VRAM GPUs** (such as NVIDIA RTX 3060) with batch size 1 and gradient accumulation (e.g. 16 steps).
-- **Prompt Conditioning**: Defaults to text prompt `"tampered region"` to focus the DETR queries and mask decoder cross-attention on manipulated or inpainted artifacts.
+- **Flexible Conditioning Fallback**: Supports both learnable prompt parameters (`use_learnable_prompt: true`) and legacy text conditioning (`prompt_text: "tampered region"`).
 
 ---
 
@@ -950,6 +963,51 @@ loss:
 
 ---
 
+### 12. SAM2 Segmenter & QLoRA Architecture (Small & Large Models)
+
+Meta's **Segment Anything Model 2 (SAM2)** introduces a unified **Hiera** hierarchical vision transformer backbone that processes multi-scale visual tokens natively with superior throughput and memory efficiency. SID-UNet provides complete integration of both the **Large** and **Small** SAM2 models with QLoRA fine-tuning, automated weight pulling and caching, auxiliary classification, and integration into the SAM refinement pipeline.
+
+```
+                      Input Image (3, H, W)
+                                │
+                                ▼
+                     Bilinear Resize (1024x1024)
+                                │
+                                ▼
+                    ┌─────────────────────────────────────────────────────┐
+                    │          SAM2 Foundation Backbone (Hiera)           │
+                    │   - Multi-Scale Hiera Vision Transformer            │
+                    │   - 4-Bit NF4 / 8-Bit Quantization via bitsandbytes │
+                    │   - LoRA Adapters (r=8..16 on qkv, proj)            │
+                    │   - High-Resolution Memory & Mask Decoder           │
+                    └──────────────────────────┬──────────────────────────┘
+                                               │
+                                ┌──────────────┴──────────────┐
+                                │                             │
+                                ▼                             ▼
+                    Multi-Mask Output (B, 3, H, W)   Auxiliary Classifier (Optional)
+                     Weighted by IoU Scores               AdaptivePool -> MLP
+                                │                             │
+                                ▼                             ▼
+                     Aggregated Mask Logits (B, 1, H, W)   Class Logits (B, 3)
+```
+
+Key features:
+- **Small & Large Model Variants**:
+  - **SAM2 Small (`facebook/sam2-hiera-small`)**: ~184 MB checkpoint. Lightweight and fast, ideal for rapid prototyping and resource-constrained inference.
+  - **SAM2 Large (`facebook/sam2-hiera-large`)**: ~898 MB checkpoint. Full-scale Hiera vision transformer providing state-of-the-art segmentation fidelity and crisp boundary localization.
+- **Automated Weight Management (`pull_sam2_weights`)**:
+  - Automatically downloads and verifies weights from Hugging Face Hub, storing them in standard Hugging Face cache (`~/.cache/huggingface/hub/models--facebook--sam2-hiera-*`).
+  - Supports offline checkpoint loading via local paths or custom checkpoints.
+- **LoRA Parameter Efficiency**:
+  - Attaches low-rank adapters ($r=8, \alpha=16$) to Hiera multi-head attention projection layers (`target_modules=["qkv", "proj"]`), training under 1% of total parameters while keeping backbone weights frozen and quantized.
+- **IoU-Score Mask Aggregation**:
+  - SAM2 decodes multiple mask proposals per object query along with estimated IoU scores (`iou_scores`). The segmenter computes a softmax-weighted aggregation across candidate masks to produce calibrated forensic probability maps.
+- **Unified `SAMRefiner` Support**:
+  - `SAMRefiner` (and aliases `SAM2Refiner`, `get_sam2_refiner`) natively supports SAM2 backbones alongside SAM3. Given candidate bounding boxes from preliminary detectors (UNet, Diffusion-Diff, etc.), SAM2 generates boundary-refined spatial masks.
+
+---
+
 ## Mechanisms & Architectural Principles
 
 ### 1. Problem Formulation & Task Definition
@@ -1088,11 +1146,11 @@ $$
 
 ---
 
-### 6. SAM3 Spatial Join & Boundary Contrast Refinement
+### 6. SAM2 / SAM3 Spatial Join & Boundary Contrast Refinement
 
-The hybrid integration (`sid_unet.models.sam3_refiner.SAMRefiner`) executes a **Spatial Join**:
+The hybrid integration (`sid_unet.models.sam3_refiner.SAMRefiner`, with aliases `SAM2Refiner` and `get_sam2_refiner`) executes a **Spatial Join** using either **SAM2** (small or large) or **SAM3**:
 1. Bounding boxes are derived from connected components of the model tampering mask.
-2. The bounding boxes are supplied to SAM as prompt coordinates.
+2. The bounding boxes are supplied to SAM2 or SAM3 as prompt coordinates.
 3. A segment is joined into the output tampering mask if its intersection exceeds the overlap threshold:
 
 $$
@@ -1329,6 +1387,9 @@ Crucially, running inside `tmux` or `nohup` was historically insufficient when P
 14. **Periodic Cache & Allocator Flushes (`clear_memory_cache()`) & Intra-Epoch Validation Schedule**:
    - In `DatasetCacheManager`, `clear_memory_cache(self.device)` is executed at every shard boundary (`commit_shard()`), releasing PyTorch caching allocator pools and running garbage collection to prevent DMA page table exhaustion and host/device allocator fragmentation across long caching runs.
    - In `Trainer`, periodic memory cache clearing (`empty_cache_steps`) and optional intra-epoch validation (`val_check_interval` / `val_check_steps`) ensure regular stream flushes and memory cleanup during long multi-thousand-step training epochs.
+15. **Unsized Streaming & IterableDataset DataLoader Resilience**:
+   - `safe_dataloader_len()` and `safe_dataset_len()` provide robust exception-guarded length discovery across DataLoaders, IterableDatasets, and `BackgroundPrefetcher` pipelines.
+   - Prevents `TypeError: 'SIDStreamingDataset' object has no len() when max_samples is None` during automatic checkpoint resumption (`resume_from_checkpoint()`), hard example mining batch filtering (`HardMiner.wrap_dataloader()`), bootstrapping kickstart pool construction, and background dataset prefetching.
 
 ---
 
@@ -1372,6 +1433,8 @@ The package uses standard [PEP 508](https://peps.python.org/pep-0508/) direct UR
 | Extra Target | Install Command | Included Dependencies & Sources |
 |---|---|---|
 | **Base** | `uv pip install -e .` | PyTorch, torchvision, pyarrow, datasets, `parquet-dataset-loader @ git+https://github.com/khangtruong-ui/parquet-dataset-loader.git` |
+| **`sam2`** | `uv pip install -e ".[sam2]"` | `transformers>=5.0.0`, `peft>=0.7.0`, `bitsandbytes>=0.41.0`, `accelerate>=0.25.0`, `torchao>=0.16.0` (for SAM2 Hiera models) |
+| **`sam3`** | `uv pip install -e ".[sam3]"` | `transformers>=5.0.0`, `peft>=0.7.0`, `bitsandbytes>=0.41.0`, `accelerate>=0.25.0`, `torchao>=0.16.0` (for SAM3 QLoRA models) |
 | **`diffusion-diff`** | `uv pip install -e ".[diffusion-diff]"` | `diffusers>=0.25.0`, `accelerate>=0.25.0` (for `diffusion_diff`, `diffusion_diff_v2`, `diffusion_diff_minimized`) |
 | **`sam3-distil`** | `uv pip install -e ".[sam3-distil]"` | `sam3-distil @ git+https://github.com/khangtruong-ui/sam3-distil.git`, `timm>=1.0.17`, `peft>=0.7.0`, `bitsandbytes>=0.41.0` |
 | **`debug`** | `uv pip install -e ".[debug]"` | `nn-toolbox @ git+https://github.com/khangtruong-ui/nn-toolbox.git` (runtime learnability diagnostics) |
@@ -1404,7 +1467,11 @@ python -m sid_unet.train --check-8bit
 │   │   ├── diffseg30k.yaml
 │   │   └── open-sdid.yaml
 │   └── experiments/
+│       ├── sam2/                     # SAM2 experiment configs (Hiera small & large)
+│       │   ├── sam2_small.yaml
+│       │   └── sam2_large.yaml
 │       ├── sam3-qlora/               # SAM3 + QLoRA (4-bit NF4) configs on BeyondTheBrush
+│       │   ├── sam3_qlora_learnable_prompt.yaml
 │       │   ├── sam3_qlora_beyondthebrush_b1.yaml
 │       │   ├── sam3_qlora_beyondthebrush_r16.yaml
 │       │   ├── sam3_qlora_beyondthebrush_focal.yaml
@@ -1427,10 +1494,11 @@ python -m sid_unet.train --check-8bit
 │   ├── dataset/
 │   ├── models/
 │   │   ├── blocks.py
-│   │   ├── unet.py                   # UNet architecture
+│   │   ├── unet.py                   # UNet architecture & factory builder
 │   │   ├── efficientnet.py           # EfficientNet UNet & Sacrifice of Pixel
-│   │   ├── sam3_qlora.py             # SAM3 foundation model with 4-bit QLoRA
-│   │   └── sam3_refiner.py           # SAM3 spatial join refinement
+│   │   ├── sam2.py                   # SAM2 Segmenter & QLoRA (Hiera small/large)
+│   │   ├── sam3_qlora.py             # SAM3 with learnable prompt tuning & 4-bit QLoRA
+│   │   └── sam3_refiner.py           # SAM2 / SAM3 spatial join refinement
 │   ├── losses/
 │   ├── metrics/
 │   ├── training/
@@ -1525,15 +1593,18 @@ The configuration file is divided into modular top-level sections:
 | `backbone` | `str` | `"efficientnet_b0"` | Pretrained CNN backbone for EfficientNet (`"efficientnet_b0"` to `"b7"`). |
 | `pretrained` | `bool` | `true` | Loads ImageNet pretrained weights for EfficientNet backbones. |
 | `sacrifice_of_pixel` | `bool` | `false` | When `true`, uses only bottleneck features routed to a linear layer and zoomed directly. |
-| `pretrained_model_name_or_path` | `str` | `"jetjodh/sam3"` | Base Hugging Face model repository or local path for SAM3 foundation models. |
-| `load_in_4bit` | `bool` | `true` | Applies 4-bit NormalFloat (NF4) quantization via bitsandbytes for SAM3. |
-| `load_in_8bit` | `bool` | `false` | Applies 8-bit quantization via bitsandbytes for SAM3. |
+| `pretrained_model_name_or_path` | `str` | `"jetjodh/sam3"` / `"facebook/sam2-hiera-small"` | Base Hugging Face model repository or local path for SAM3 or SAM2 foundation models. |
+| `variant` | `str` | `"small"` | For SAM2: `"small"` (`facebook/sam2-hiera-small`) or `"large"` (`facebook/sam2-hiera-large`). |
+| `use_learnable_prompt` | `bool` | `true` | For SAM3: replaces fixed text input with learnable parameters trained via gradient descent. |
+| `num_learnable_tokens` | `int` | `32` | For SAM3: number of learnable prompt tokens if initialized randomly. |
+| `load_in_4bit` | `bool` | `true` | Applies 4-bit NormalFloat (NF4) quantization via bitsandbytes for SAM models. |
+| `load_in_8bit` | `bool` | `false` | Applies 8-bit quantization via bitsandbytes for SAM models. |
 | `lora_r` | `int` | `8` | Low-Rank Adaptation (LoRA) rank dimension for PEFT parameter adapters. |
 | `lora_alpha` | `int` | `16` | LoRA alpha scaling hyperparameter. |
 | `lora_dropout` | `float` | `0.05` | Dropout probability for LoRA adapter layers. |
-| `lora_target_modules` | `list[str]` | `["q_proj", "v_proj"]`| Target attention projection layers to attach LoRA adapters to. |
-| `prompt_text` | `str` | `"tampered region"` | Natural language conditioning prompt guiding SAM3 attention queries. |
-| `target_size` | `[H, W]` | `[1008, 1008]` | Native ViT patch grid resolution for SAM3 input processing. |
+| `lora_target_modules` | `list[str]` | `["q_proj", "v_proj"]` (SAM3) / `["qkv", "proj"]` (SAM2) | Target attention projection layers to attach LoRA adapters to. |
+| `prompt_text` | `str` | `"tampered region"` | Natural language conditioning prompt guiding SAM3 attention queries (when `use_learnable_prompt=false`). |
+| `target_size` | `[H, W]` | `[1008, 1008]` (SAM3) / `[1024, 1024]` (SAM2) | Native ViT patch grid resolution for SAM input processing. |
 
 #### `loss`
 | Field | Type | Default | Description |
@@ -1893,10 +1964,26 @@ data:
 
 ### 1. Training
 
+> [!NOTE]
+> **Detached Execution by Default**: `sid-train` defaults to detaching from the terminal session (`--detach`, default `true`), spawning the training process in the background and redirecting all standard output and error in real-time into `.logs.txt`.
+> - **Live Monitoring**: Inspect training logs with `tail -f .logs.txt`.
+> - **Process Termination**: Terminate running or background tasks anytime via `sid-kill`.
+> - **Foreground Execution**: To run attached to the terminal instead, pass `--no-detach`, `--foreground`, or `-f`.
+> - **Custom Log File**: Pass `--log-file <path>` to log to an alternate file instead of `.logs.txt`.
+
 #### A. Single Experiment Training
 ```bash
-# Train SAM3 + QLoRA on BeyondTheBrush (streaming mode)
-sid-train --config configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml
+# Train in background (detached by default; outputs to .logs.txt)
+sid-train --config configs/experiments/sam2/sam2_small.yaml
+
+# Train SAM2 Large in background
+sid-train --config configs/experiments/sam2/sam2_large.yaml
+
+# Train in foreground (attached to terminal)
+sid-train --config configs/experiments/sam2/sam2_small.yaml --no-detach
+
+# Train SAM3 + QLoRA with learnable prompt tuning on BeyondTheBrush
+sid-train --config configs/experiments/sam3-qlora/sam3_qlora_learnable_prompt.yaml
 
 # Train standard UNet
 sid-train --config configs/default.yaml
@@ -1954,7 +2041,7 @@ outputs/RUN/
 ```
 
 #### C. Automatic Resumption & Hugging Face Hub Resumption
-By default, `sid-train` automatically discovers existing checkpoints in the repository and output directories (`outputs/RUN/<stem>/checkpoints/`, `outputs/checkpoints/`, etc.), displaying an on-screen notification before seamlessly resuming training:
+By default, `sid-train` automatically discovers existing checkpoints in the repository and output directories (`outputs/RUN/<stem>/checkpoints/`, `outputs/checkpoints/`, etc.), displaying an on-screen notification before seamlessly resuming training. Auto-resume fully supports both Map-style and remote Streaming datasets (`data.streaming: true` without explicit `max_samples`), gracefully restoring global optimizer step, learning rate schedule, and hard example mining states without requiring dataset sizing.
 
 ```bash
 # 1. Automatic checkpoint discovery (enabled by default)
@@ -2303,6 +2390,9 @@ pytest
 pytest -v
 
 # Run specific test modules
+pytest tests/test_detach.py -v
+pytest tests/test_sam2.py -v
+pytest tests/test_sam3_qlora.py -k "not gpu_memory_fit" -v
 pytest tests/test_tqdm_multi_device.py -v
 pytest tests/test_kill.py -v
 pytest tests/test_signals.py -v

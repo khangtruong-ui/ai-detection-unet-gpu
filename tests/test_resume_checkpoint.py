@@ -1017,6 +1017,98 @@ def test_checkpoint_manager_save_metric_alias_val_loss():
         assert mgr.best_epoch == 1
 
 
+def test_resume_from_checkpoint_with_streaming_dataset_and_hard_mining():
+    """
+    Verify that resuming a checkpoint containing hard_mining state on a Trainer
+    with a streaming dataset (IterableDataset without __len__) succeeds without
+    TypeError: 'SIDStreamingDataset' object has no len() when max_samples is None.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Build mock checkpoint with hard mining state and -inf best score (matching real bug scenario)
+        ckpt_path = os.path.join(tmpdir, "checkpoint_latest.pt")
+        model = torch.nn.Conv2d(3, 1, 3, padding=1)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        hard_mining_state = {
+            "version": 2,
+            "enabled": True,
+            "metric": "median",
+            "reset_epochs": 5,
+            "current_epoch": 1,
+            "cycle_epoch": 1,
+            "is_active_epoch": False,
+            "previous_median": None,
+            "threshold": None,
+            "hard_batch_indices": [],
+            "total_batches_in_full_epoch": 0,
+            "cycle_anchor_epoch": 1,
+            "world_size": 1,
+            "num_gpus": 1,
+            "per_device_batch_size": 1,
+            "iterations_per_epoch": 0,
+        }
+
+        torch.save(
+            {
+                "epoch": 1,
+                "step": 32,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "scheduler_state_dict": None,
+                "scaler_state_dict": None,
+                "metrics": {"step": 32},
+                "best_score": float("-inf"),
+                "best_epoch": 1,
+                "history": [],
+                "config": {},
+                "hard_mining": hard_mining_state,
+            },
+            ckpt_path,
+        )
+
+        cfg = load_config("configs/test_smoke.yaml")
+        cfg.project.output_dir = tmpdir
+        cfg.data.batch_size = 2
+        cfg.data.streaming = True
+        cfg.training.epochs = 2
+        cfg.hard_mining = {"enabled": True, "metric": "median", "reset_epochs": 5}
+        cfg.training.use_hard_mining = True
+
+        # Streaming dataset with max_samples=None
+        class MockStreamingDataset(torch.utils.data.IterableDataset):
+            def __iter__(self):
+                for idx in range(10):
+                    yield {
+                        "image": torch.randn(3, 32, 32),
+                        "mask": torch.zeros(1, 32, 32),
+                        "label": torch.tensor(0, dtype=torch.long),
+                    }
+
+            def __len__(self):
+                raise TypeError("'MockStreamingDataset' object has no len() when max_samples is None")
+
+        train_ds = MockStreamingDataset()
+        val_ds = MockStreamingDataset()
+
+        train_loader = DataLoader(train_ds, batch_size=2)
+        val_loader = DataLoader(val_ds, batch_size=2)
+
+        trainer = Trainer(
+            config=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+        )
+
+        # Resuming should succeed cleanly and not raise TypeError
+        res = trainer.resume_from_checkpoint(ckpt_path)
+        assert res["epoch"] == 1
+        assert res["step"] == 32
+        assert trainer.global_step == 32
+        assert trainer.start_epoch == 1
+        assert trainer.hard_miner.enabled is True
+
+
+
 
 
 

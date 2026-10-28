@@ -16,6 +16,7 @@ from sid_unet.dataset.loader import (
     load_parquet_or_hf_dataset,
     process_raw_sample,
     safe_dataloader_len,
+    safe_dataset_len,
     BackgroundPrefetcher,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     "load_parquet_or_hf_dataset",
     "process_raw_sample",
     "safe_dataloader_len",
+    "safe_dataset_len",
     "BackgroundPrefetcher",
 ]
 

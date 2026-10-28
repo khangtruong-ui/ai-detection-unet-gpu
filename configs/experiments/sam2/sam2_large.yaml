@@ -1,0 +1,67 @@
+# Configuration: SAM2 Large (Hiera) + QLoRA on COCO-inpainted
+# Meta SAM2 large foundation model (facebook/sam2-hiera-large)
+# with 4-bit NF4 NormalFloat quantization via bitsandbytes and Low-Rank Adaptation (LoRA r=8, alpha=16) via PEFT.
+
+project:
+  name: "sid_sam2_large"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/sam2_large"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  image_size: [256, 256]
+  batch_size: 1                     # Maximum batch size for 12GB VRAM budget (~7.7 GB peak reserved; bs=2 exceeds 14GB)
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 48
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  evaluate_on_test: true
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    color_jitter: 0.0
+
+model:
+  name: "sam2"
+  variant: "large"
+  pretrained_model_name_or_path: "facebook/sam2-hiera-large"
+  load_in_4bit: true
+  load_in_8bit: false
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules: ["qkv", "proj"]
+  aux_classifier: false
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+  target_size: [1024, 1024]
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  gradient_accumulation_steps: 16
+  mixed_precision: "bf16"
+  clip_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+  save_best: true
+  eval_every: 1

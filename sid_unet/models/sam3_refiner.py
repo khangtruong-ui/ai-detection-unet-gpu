@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from scipy.ndimage import label, find_objects
 
@@ -122,24 +123,44 @@ class SAMRefiner:
         self._load_model()
 
     def _load_model(self):
-        """Load SAM3 processor and model."""
-        try:
-            from transformers import Sam3Model, Sam3Processor
-        except ImportError as exc:
-            raise ImportError(
-                "SAM3 mask refinement requires transformers. "
-                "Please install it via `pip install 'sid-unet[sam]'`."
-            ) from exc
+        """Load SAM2 or SAM3 processor and model."""
+        self.is_sam2 = "sam2" in str(self.model_name).lower()
+        if self.is_sam2:
+            try:
+                from transformers import Sam2Model, Sam2Processor
+            except ImportError as exc:
+                raise ImportError(
+                    "SAM2 mask refinement requires transformers. "
+                    "Please install it via `pip install 'sid-unet[sam]'`."
+                ) from exc
 
-        try:
-            self.processor = Sam3Processor.from_pretrained(self.model_name)
-            self.model = Sam3Model.from_pretrained(self.model_name)
-            self.model.to(self.device)
-            self.model.eval()
-            logger.info(f"Successfully loaded {self.model_name} onto {self.device}")
-        except Exception as exc:
-            logger.error(f"Failed to load SAM3 model '{self.model_name}': {exc}")
-            raise exc
+            try:
+                self.processor = Sam2Processor.from_pretrained(self.model_name)
+                self.model = Sam2Model.from_pretrained(self.model_name)
+                self.model.to(self.device)
+                self.model.eval()
+                logger.info(f"Successfully loaded SAM2 model {self.model_name} onto {self.device}")
+            except Exception as exc:
+                logger.error(f"Failed to load SAM2 model '{self.model_name}': {exc}")
+                raise exc
+        else:
+            try:
+                from transformers import Sam3Model, Sam3Processor
+            except ImportError as exc:
+                raise ImportError(
+                    "SAM3 mask refinement requires transformers. "
+                    "Please install it via `pip install 'sid-unet[sam]'`."
+                ) from exc
+
+            try:
+                self.processor = Sam3Processor.from_pretrained(self.model_name)
+                self.model = Sam3Model.from_pretrained(self.model_name)
+                self.model.to(self.device)
+                self.model.eval()
+                logger.info(f"Successfully loaded {self.model_name} onto {self.device}")
+            except Exception as exc:
+                logger.error(f"Failed to load SAM3 model '{self.model_name}': {exc}")
+                raise exc
 
     def refine_single_sample(
         self,
@@ -207,7 +228,7 @@ class SAMRefiner:
                 "num_joined_segments": 0,
             }
 
-        # Run SAM3 with box prompts
+        # Run SAM2 / SAM3 with box prompts
         try:
             inputs = self.processor(
                 images=pil_img,
@@ -222,16 +243,31 @@ class SAMRefiner:
             with torch.no_grad():
                 outputs = self.model(**inputs)
 
-            results = self.processor.post_process_instance_segmentation(
-                outputs,
-                threshold=self.score_threshold,
-                target_sizes=[(h, w)],
-            )
-
-            sam_masks = results[0]["masks"].detach().cpu().float().numpy()
-            scores = results[0]["scores"].detach().cpu().float().numpy()
+            if getattr(self, "is_sam2", False):
+                raw_masks = outputs.pred_masks[0]  # [num_boxes, 3, H_m, W_m]
+                raw_ious = outputs.iou_scores[0]  # [num_boxes, 3]
+                sam_masks_list = []
+                scores_list = []
+                for b_idx in range(len(boxes)):
+                    best_m_idx = int(raw_ious[b_idx].argmax().item())
+                    score = float(raw_ious[b_idx, best_m_idx].item())
+                    m_tensor = raw_masks[b_idx, best_m_idx:best_m_idx + 1].unsqueeze(0).float()
+                    m_interp = F.interpolate(m_tensor, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
+                    bin_mask = (torch.sigmoid(m_interp) >= self.threshold).detach().cpu().numpy().astype(np.float32)
+                    sam_masks_list.append(bin_mask)
+                    scores_list.append(score)
+                sam_masks = np.array(sam_masks_list, dtype=np.float32) if sam_masks_list else np.zeros((0, h, w), dtype=np.float32)
+                scores = np.array(scores_list, dtype=np.float32) if scores_list else np.zeros((0,), dtype=np.float32)
+            else:
+                results = self.processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=self.score_threshold,
+                    target_sizes=[(h, w)],
+                )
+                sam_masks = results[0]["masks"].detach().cpu().float().numpy()
+                scores = results[0]["scores"].detach().cpu().float().numpy()
         except Exception as exc:
-            logger.warning(f"SAM3 inference encountered error ({exc}), falling back to UNet mask.")
+            logger.warning(f"SAM inference encountered error ({exc}), falling back to UNet mask.")
             return orig_binary_mask, {
                 "pixels_changed": 0,
                 "pixel_change_ratio": 0.0,
@@ -354,3 +390,9 @@ def get_sam_refiner(
     refiner = SAMRefiner(model_name=model_name, device=device, threshold=threshold)
     _GLOBAL_REFINER_CACHE[cache_key] = refiner
     return refiner
+
+
+# Convenient alias for SAM2 refinement
+SAM2Refiner = SAMRefiner
+get_sam2_refiner = get_sam_refiner
+

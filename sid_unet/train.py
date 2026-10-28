@@ -87,6 +87,31 @@ def parse_args():
         help="Directory to save experiment outputs/checkpoints/reports",
     )
     parser.add_argument(
+        "--detach",
+        dest="detach",
+        action="store_true",
+        default=True,
+        help="Detach from terminal and run training in background logging to .logs.txt (default: True)",
+    )
+    parser.add_argument(
+        "--no-detach",
+        "--no_detach",
+        "--foreground",
+        "-f",
+        dest="detach",
+        action="store_false",
+        help="Run training in foreground attached to terminal (do not detach)",
+    )
+    parser.add_argument(
+        "--log-file",
+        "--logfile",
+        "--logs-file",
+        dest="log_file",
+        type=str,
+        default=".logs.txt",
+        help="File path to redirect standard output and error when detached (default: .logs.txt)",
+    )
+    parser.add_argument(
         "--batch_size",
         "--batch-size",
         type=int,
@@ -724,6 +749,62 @@ def main():
         _, details = check_8bit_compatibility(verbose=False)
         print("\n" + format_compatibility_table(details) + "\n")
         return
+
+    # Check if we should detach from controlling terminal and run in background logging to .logs.txt
+    in_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ) or is_dist_avail_and_initialized()
+    in_pytest = ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
+    already_detached = bool(os.environ.get("SID_UNET_DETACHED", False))
+    no_detach_env = bool(os.environ.get("SID_UNET_NO_DETACH", False)) or bool(os.environ.get("SID_UNET_FOREGROUND", False))
+
+    if bool(getattr(args, "detach", True)) and not in_dist and not in_pytest and not already_detached and not no_detach_env:
+        import subprocess
+        from datetime import datetime
+
+        log_path = os.path.abspath(getattr(args, "log_file", None) or ".logs.txt")
+        log_dir = os.path.dirname(log_path)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        log_fp = open(log_path, "a", encoding="utf-8")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_fp.write(
+            f"\n{'='*70}\n"
+            f"🚀 [sid-train detached session started at {now_str}]\n"
+            f"Command: {' '.join(sys.argv)}\n"
+            f"{'='*70}\n\n"
+        )
+        log_fp.flush()
+
+        child_env = os.environ.copy()
+        child_env["SID_UNET_DETACHED"] = "1"
+        child_env["PYTHONUNBUFFERED"] = "1"
+
+        # Build child command: preserve all arguments except --detach, adding --no-detach
+        child_argv = [a for a in sys.argv[1:] if a != "--detach"]
+        if not any(a in ("--no-detach", "--no_detach", "--foreground", "-f") for a in child_argv):
+            child_argv.insert(0, "--no-detach")
+
+        cmd = [sys.executable, "-m", "sid_unet.train"] + child_argv
+
+        sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            **sub_kwargs,
+        )
+        log_fp.close()
+
+        print("\n" + "=" * 70)
+        print(f"🚀 [DETACHED] sid-train running in background (PID: {proc.pid})")
+        print(f"📄 Logging output to: {log_path}")
+        print(f"🔍 To monitor logs live: tail -f {getattr(args, 'log_file', '.logs.txt')}")
+        print("🛑 To stop training: sid-kill")
+        print("=" * 70 + "\n")
+        sys.stdout.flush()
+        return {"status": "detached", "pid": proc.pid, "log_file": log_path}
 
     config_paths = args.config if isinstance(args.config, list) else [args.config]
 
