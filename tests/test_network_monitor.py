@@ -240,3 +240,35 @@ def test_bottleneck_detector_step_interval():
     s6 = detector.record_step(data_time=0.01, compute_time=0.20)
     assert s6 == BottleneckStatus.GPU_BOUND
 
+
+def test_bottleneck_detector_high_speed_diagnosed_data_bound(monkeypatch):
+    """When download speed is very high (e.g. 77 MB/s) but data wait stalls, diagnose DATA_BOUND."""
+    logger = logging.getLogger("test_high_speed_data_bound")
+
+    class MockHighSpeedMonitor:
+        def get_speed_mbps(self):
+            return 77.03
+
+        def get_speed_str(self):
+            return "77.03 MB/s"
+
+    detector = BottleneckDetector(
+        network_monitor=MockHighSpeedMonitor(),
+        logger=logger,
+        check_interval=0.0,
+        window_size=5,
+        cooldown=0.0,
+        acute_stall_threshold=5.0,
+    )
+
+    import sid_unet.utils.network as net_mod
+    monkeypatch.setattr(net_mod, "get_gpu_utilization", lambda: 0.0)
+    if net_mod.psutil is not None:
+        monkeypatch.setattr(net_mod.psutil, "cpu_percent", lambda interval=None, percpu=False: [25.0] * 4 if percpu else 25.0)
+
+    # 17s stall despite 77 MB/s download speed -> data-bound / cache-thrashing
+    status = detector.record_step(data_time=17.85, compute_time=2.64)
+    assert status == BottleneckStatus.DATA_BOUND
+    assert detector.current_status == BottleneckStatus.DATA_BOUND
+
+

@@ -249,6 +249,7 @@ class BottleneckStatus(str, Enum):
     GPU_BOUND = "GPU_BOUND"
     CPU_BOUND = "CPU_BOUND"
     INTERNET_BOUND = "INTERNET_BOUND"
+    DATA_BOUND = "DATA_BOUND"
     BALANCED = "BALANCED"
 
 
@@ -267,6 +268,7 @@ class BottleneckDetector:
         window_size: int = 20,
         cooldown: float = 30.0,
         acute_stall_threshold: float = 5.0,
+        fast_network_threshold: float = 35.0,
     ):
         self.network_monitor = network_monitor
         self.logger = logger or logging.getLogger(__name__)
@@ -275,6 +277,7 @@ class BottleneckDetector:
         self.window_size = window_size
         self.cooldown = cooldown
         self.acute_stall_threshold = acute_stall_threshold
+        self.fast_network_threshold = fast_network_threshold
 
         self._data_times: List[float] = []
         self._compute_times: List[float] = []
@@ -362,6 +365,19 @@ class BottleneckDetector:
                         f"Tip: Increase num_workers, enable pin_memory, or simplify augmentations."
                     )
                 return self._last_status
+            elif net_speed_mbps >= self.fast_network_threshold:
+                self._last_status = BottleneckStatus.DATA_BOUND
+                if now - self._last_warn_time >= self.cooldown:
+                    self._last_warn_time = now
+                    stall_prefix = f"Acute DataLoader stall ({latest_data:.2f}s)! " if is_acute else ""
+                    self.logger.warning(
+                        f"⚠️ Bottleneck Warning: Training is DATA-BOUND (Cache thrashing / I/O)! {stall_prefix}"
+                        f"DataLoader wait time ({avg_data:.2f}s) dominates GPU compute ({avg_compute:.2f}s) "
+                        f"despite fast network download speed ({net_str}), CPU: avg {avg_cpu:.1f}% / max {max_cpu:.1f}%. "
+                        f"The data loader is thrashing remote row groups or downloading redundant chunks. "
+                        f"Tip: Use BlockShuffledSampler for row-group cache locality, enable save_to_disk, or cache dataset locally."
+                    )
+                return self._last_status
             elif net_speed_mbps > 0.05 or (self.network_monitor is not None and not is_cpu_saturated):
                 self._last_status = BottleneckStatus.INTERNET_BOUND
                 if now - self._last_warn_time >= self.cooldown:
@@ -376,7 +392,7 @@ class BottleneckDetector:
                     )
                 return self._last_status
             else:
-                self._last_status = BottleneckStatus.CPU_BOUND
+                self._last_status = BottleneckStatus.DATA_BOUND
                 if now - self._last_warn_time >= self.cooldown:
                     self._last_warn_time = now
                     self.logger.warning(

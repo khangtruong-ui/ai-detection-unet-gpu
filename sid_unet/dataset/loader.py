@@ -881,6 +881,10 @@ class SIDStreamingDataset(IterableDataset):
         self.max_cached_row_groups = max_cached_row_groups
         self._current_dataset = None
 
+    @property
+    def pdl_dataset(self) -> Any:
+        return getattr(self, "_current_dataset", None)
+
     def __len__(self) -> int:
         if self.max_samples is not None and self.max_samples > 0:
             return self.max_samples
@@ -1196,6 +1200,24 @@ class SIDMapDataset(Dataset):
         sample_dict["sample_idx"] = idx
         return sample_dict
 
+    @property
+    def pdl_dataset(self) -> Any:
+        return getattr(self, "data", None)
+
+    def get_row_group_indices(self) -> List[List[int]]:
+        """Return row group index groupings for cache-locality preserving sampling."""
+        data = getattr(self, "data", None)
+        if data is not None and hasattr(data, "get_row_group_indices"):
+            return data.get_row_group_indices()
+        return [list(range(len(self)))]
+
+    def get_row_group_file_indices(self) -> Optional[List[int]]:
+        """Return file index mapping for each row group to preserve file locality."""
+        data = getattr(self, "data", None)
+        if data is not None and hasattr(data, "get_row_group_file_indices"):
+            return data.get_row_group_file_indices()
+        return None
+
     def close(self) -> None:
         """Close underlying dataset reader and stop any background download thread."""
         data = getattr(self, "data", None)
@@ -1334,7 +1356,7 @@ def create_eval_dataloader(
 
     use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
     save_to_disk = config.data.get("save_to_disk", False)
-    background_download = bool(config.data.get("background_download", False))
+    background_download = bool(config.data.get("background_download", bool(save_to_disk)))
     columns = config.data.get("columns", None)
     token = config.data.get("token", None)
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
@@ -2008,7 +2030,7 @@ def create_dataloaders(
 
     use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
     save_to_disk = config.data.get("save_to_disk", False)
-    background_download = bool(config.data.get("background_download", False))
+    background_download = bool(config.data.get("background_download", bool(save_to_disk)))
     columns = config.data.get("columns", None)
     token = config.data.get("token", None)
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))

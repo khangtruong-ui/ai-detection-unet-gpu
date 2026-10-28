@@ -266,3 +266,43 @@ def test_pdl_dataloader_exact_max_len_and_multi_epoch_resilience(temp_parquet_da
     epoch_2_batches = list(train_l)
     assert len(epoch_2_batches) == 3
 
+
+def test_sid_map_dataset_row_group_locality_and_block_shuffled_sampler(temp_parquet_dataset):
+    """
+    Verify SIDMapDataset delegates get_row_group_indices and get_row_group_file_indices,
+    and PDLDataLoader automatically selects BlockShuffledSampler (avoiding RandomSampler cache thrashing).
+    """
+    from sid_unet.dataset.loader import PDLDataLoader, SIDMapDataset
+    from parquet_dataset_loader.dataset import BlockShuffledSampler
+
+    map_ds = SIDMapDataset(
+        dataset_name=temp_parquet_dataset,
+        split="train",
+        target_image_size=(64, 64),
+        use_parquet_loader=True,
+        save_to_disk=True,
+    )
+
+    assert hasattr(map_ds, "get_row_group_indices")
+    groups = map_ds.get_row_group_indices()
+    assert isinstance(groups, list)
+    assert len(groups) > 0
+
+    assert hasattr(map_ds, "get_row_group_file_indices")
+    f_indices = map_ds.get_row_group_file_indices()
+    assert f_indices is not None
+
+    loader = PDLDataLoader(
+        dataset=map_ds,
+        batch_size=4,
+        shuffle=True,
+        seed=42,
+        num_workers=0,
+    )
+
+    assert isinstance(loader.sampler, BlockShuffledSampler)
+    batches = list(loader)
+    assert len(batches) == 10  # 40 samples // 4
+    map_ds.close()
+
+
