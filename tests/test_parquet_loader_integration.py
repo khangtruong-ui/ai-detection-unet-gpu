@@ -306,3 +306,29 @@ def test_sid_map_dataset_row_group_locality_and_block_shuffled_sampler(temp_parq
     map_ds.close()
 
 
+def test_create_dataloaders_with_max_cache_gb_forwarding(temp_parquet_dataset):
+    """Verify max_cache_gb and cache_files config parameters are cleanly forwarded to parquet-dataset-loader."""
+    cfg = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=true",
+        "data.save_to_disk=true",
+        "data.max_cache_gb=2.0",
+        "data.cache_files=true",
+        "data.batch_size=4",
+        "data.train_samples_per_epoch=8",
+        "data.val_samples_per_epoch=4",
+        "data.image_size=[64, 64]",
+        "data.num_workers=0",
+        "data.use_parquet_loader=true",
+        "training.data_parallel=false",
+    ])
+
+    train_l, val_l = create_dataloaders(cfg, include_test=False)
+    b_train = next(iter(train_l))
+    assert b_train["image"].shape == (4, 3, 64, 64)
+    assert b_train["mask"].shape == (4, 1, 64, 64)
+
+
+
