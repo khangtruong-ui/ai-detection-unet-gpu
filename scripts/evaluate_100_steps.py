@@ -194,7 +194,7 @@ def main():
         transformer_downscaling=16,
         transformer_layers=1,
         dropout=0.15,
-        target_size=(1024, 1024),
+        target_size=(512, 512),
         freeze_sam2=True,
         freeze_decoder=True,
         device=device,

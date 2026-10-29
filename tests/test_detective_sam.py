@@ -223,3 +223,48 @@ def test_detective_sam_gpu_gradient_flow():
     assert len(active_grads) > 0, "Trainable adapters must receive gradients"
     for p in frozen:
         assert p.grad is None, "Frozen backbone parameter unexpectedly received gradient"
+
+
+def test_detective_sam_default_target_size():
+    """Verify DetectiveSAM defaults to 512x512 resolution for optimal speed and memory."""
+    model = DetectiveSAM(use_dummy=True, device="cpu")
+    assert model.target_size == (512, 512), f"Expected (512, 512), got {model.target_size}"
+
+    # Verify build_model without target_size defaults to (512, 512)
+    cfg = ConfigDict({
+        "project": {"device": "cpu"},
+        "model": {
+            "name": "detective_sam",
+            "use_dummy": True,
+        }
+    })
+    model_cfg_inst = build_model(cfg)
+    assert model_cfg_inst.target_size == (512, 512), f"Expected build_model to use (512, 512), got {model_cfg_inst.target_size}"
+
+
+def test_sam2_query_slot_parameter_sizes():
+    """Verify learnable parameter sizes in the query slot of SAM2's mask decoder."""
+    from transformers import Sam2Model
+    model = Sam2Model.from_pretrained("facebook/sam2-hiera-tiny")
+    mask_decoder = model.mask_decoder
+
+    # Query tokens in mask decoder:
+    # 1. mask_tokens: [4, 256] = 1,024 params (4 mask proposal query slots)
+    # 2. iou_token: [1, 256] = 256 params (IoU prediction query slot)
+    # 3. obj_score_token: [1, 256] = 256 params (object presence query slot)
+    assert mask_decoder.mask_tokens.weight.shape == (4, 256)
+    assert mask_decoder.mask_tokens.weight.numel() == 1024
+
+    assert mask_decoder.iou_token.weight.shape == (1, 256)
+    assert mask_decoder.iou_token.weight.numel() == 256
+
+    assert mask_decoder.obj_score_token.weight.shape == (1, 256)
+    assert mask_decoder.obj_score_token.weight.numel() == 256
+
+    total_query_params = (
+        mask_decoder.mask_tokens.weight.numel()
+        + mask_decoder.iou_token.weight.numel()
+        + mask_decoder.obj_score_token.weight.numel()
+    )
+    assert total_query_params == 1536
+

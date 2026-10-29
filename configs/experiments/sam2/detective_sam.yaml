@@ -49,7 +49,7 @@ model:
   transformer_downscaling: 16       # 16x downscale for coarse transformer (Table 16)
   transformer_layers: 1             # 1 transformer layer (Table 16)
   dropout: 0.15                     # Dropout rate 0.15 (Table 16)
-  target_size: [1024, 1024]
+  target_size: [512, 512]           # Standard 512x512 resolution for faster throughput & lower VRAM
   freeze_sam2: true                 # SAM2 backbone remains frozen
   freeze_decoder: true              # Frozen decoder per paper Section 3.2
   multimask_output: false
