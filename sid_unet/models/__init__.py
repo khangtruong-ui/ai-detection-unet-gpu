@@ -1,4 +1,8 @@
 from sid_unet.models.unet import UNet, build_model
+from sid_unet.models.forensic_memory import (
+    ForensicVectorMemory,
+    stop_gradient_query_replacement,
+)
 from sid_unet.models.detective_sam import (
     DetectiveSAM,
     ImagePerturbation,

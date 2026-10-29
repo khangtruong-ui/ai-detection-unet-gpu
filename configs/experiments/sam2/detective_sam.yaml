@@ -57,6 +57,17 @@ model:
   num_classes: 3
   in_channels: 3
   out_channels: 1
+  # Learnable Forensic Vector Memory Configuration
+  memory_enabled: false             # Set true to enable forensic vector memory retrieval and collection
+  memory_max_entries: 5000          # Bounded database size
+  memory_key_dim: 64                # Key vector dimension (matches adapter d=64)
+  memory_value_dim: 64              # Stored value vector dimension
+  memory_vectors_per_image: 16      # Max tampered vectors extracted per image
+  memory_retrieval_k: 8             # Number of nearest neighbors retrieved
+  memory_similarity_metric: "cosine"# Similarity metric: cosine, l2, or dot
+  memory_dedup_threshold: 0.95      # Cosine threshold above which candidates are discarded as redundant
+  memory_consolidation_method: "dedup_greedy" # Bounded consolidation: dedup_greedy, reservoir, or fifo
+  memory_seed: 42                   # Deterministic random seed for memory operations
 
 loss:
   mask_loss_type: "combined"
