@@ -296,6 +296,8 @@ class CheckpointManager:
         }
         if hard_mining is not None:
             state["hard_mining"] = hard_mining
+        if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None:
+            state["forensic_memory_state_dict"] = model_to_save.forensic_memory.state_dict()
 
         periodic_path = os.path.join(self.checkpoint_dir, "checkpoint_periodic.pt")
         torch.save(state, periodic_path)
@@ -444,6 +446,8 @@ class CheckpointManager:
         }
         if hard_mining is not None:
             state["hard_mining"] = hard_mining
+        if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None:
+            state["forensic_memory_state_dict"] = model_to_save.forensic_memory.state_dict()
 
         saved_paths = {}
 
@@ -550,6 +554,16 @@ class CheckpointManager:
             strict=strict,
             target_device=map_location,
         )
+
+        # Restore forensic memory state if present
+        raw_m = getattr(model, "module", model)
+        if hasattr(raw_m, "forensic_memory") and raw_m.forensic_memory is not None:
+            if isinstance(checkpoint, dict) and "forensic_memory_state_dict" in checkpoint and checkpoint["forensic_memory_state_dict"] is not None:
+                try:
+                    raw_m.forensic_memory.load_state_dict(checkpoint["forensic_memory_state_dict"])
+                    logger.info("Restored forensic vector memory state from checkpoint.")
+                except Exception as mem_err:
+                    logger.warning(f"Could not restore forensic memory state ({mem_err}).")
 
         if optimizer is not None and isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
             try:

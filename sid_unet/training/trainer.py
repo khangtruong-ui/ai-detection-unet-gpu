@@ -1018,6 +1018,9 @@ class Trainer:
             model_kwargs["f_r"] = batch["gap_r"].to(self.device, non_blocking=True)
         if "img_id" in batch and not (self.is_distributed or self.is_data_parallel):
             model_kwargs["img_ids"] = batch["img_id"]
+        raw_target = getattr(self.model, "module", self.model)
+        if getattr(raw_target, "memory_enabled", False):
+            model_kwargs["gt_masks"] = masks
         model_kwargs = self._filter_model_kwargs(model_kwargs)
 
         with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
@@ -1330,6 +1333,19 @@ class Trainer:
                 self.train_loader._is_closed = False
             self._active_train_loader = None
             self.hard_miner.end_epoch(epoch)
+
+            # Consolidate forensic vector memory at epoch boundary
+            raw_model = getattr(self.model, "module", self.model)
+            if hasattr(raw_model, "consolidate_memory") and getattr(raw_model, "memory_enabled", False):
+                mem_stats = raw_model.consolidate_memory()
+                if self.is_main_process:
+                    self.logger.info(
+                        f"🧠 [FORENSIC MEMORY] Epoch {epoch} consolidation: "
+                        f"Entries: {mem_stats.get('final_entry_count')}/{getattr(raw_model.forensic_memory, 'memory_max_entries', 0)}, "
+                        f"+{mem_stats.get('new_observations')} new, -{mem_stats.get('duplicates_removed')} dedup, "
+                        f"-{mem_stats.get('capacity_pruned')} pruned in {mem_stats.get('consolidation_duration_sec', 0.0):.3f}s"
+                    )
+
             if self.empty_cache_per_epoch:
                 try:
                     clear_memory_cache(self.device)

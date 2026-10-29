@@ -23,6 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sid_unet.models.blocks import get_submodule_device_dtype
+from sid_unet.models.forensic_memory import (
+    ForensicVectorMemory,
+    stop_gradient_query_replacement,
+)
 from sid_unet.models.sam2 import (
     DEFAULT_SAM2_SMALL_CHECKPOINT,
     DEFAULT_SAM2_LARGE_CHECKPOINT,
@@ -233,17 +237,24 @@ class MaskAdapter(nn.Module):
         f_i: List[torch.Tensor],
         f_pert: List[torch.Tensor],
         f_tilde: List[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        forensic_memory: Optional[ForensicVectorMemory] = None,
+        random_retrieval: bool = False,
+        return_features: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
+    ]:
         """
         Inputs:
             f_i: List of unperturbed multi-scale feature tensors
             f_pert: List of perturbed multi-scale feature tensors
             f_tilde: List of adapted multi-scale feature tensors
+            forensic_memory: Optional ForensicVectorMemory for similarity-based query replacement
+            random_retrieval: If True, uses random retrieval for ablation (Baseline C)
+            return_features: If True, also returns f_fuse and retrieval_latency
         Returns:
-            m: Blended heatmap prompt [B, 1, s_hat, s_hat]
-            l_coarse: Coarse logits [B, 1, s_hat, s_hat]
-            l_refine: Refined logits [B, 1, s_hat, s_hat]
-            u: Uncertainty map [B, 1, s_hat, s_hat]
+            Default: (m, l_coarse, l_refine, u)
+            If return_features=True: (m, l_coarse, l_refine, u, f_fuse, retrieval_latency)
         """
         s_hat = f_i[0].shape[-2:]
 
@@ -265,7 +276,35 @@ class MaskAdapter(nn.Module):
         coarse_w = max(2, w // self.downscale_factor)
         f_down = F.adaptive_avg_pool2d(f_fuse, (coarse_h, coarse_w))
         tokens = f_down.flatten(2).transpose(1, 2)  # [B, coarse_h * coarse_w, d]
-        trans_out = self.transformer(tokens)
+
+        # Stop-gradient surrogate query replacement
+        R = tokens  # [B, N_coarse, d]
+        retrieval_latency = 0.0
+        if (
+            forensic_memory is not None
+            and getattr(forensic_memory, "memory_enabled", False)
+            and getattr(forensic_memory, "is_warmed_up", False)
+        ):
+            # Global image-level query representation across coarse tokens
+            q = torch.mean(R, dim=1)  # [B, d]
+            retrieved_vals, _, retrieval_latency = forensic_memory.retrieve(
+                q,
+                k=forensic_memory.memory_retrieval_k,
+                random_retrieval=random_retrieval,
+            )
+            if retrieved_vals is not None:
+                # Shape of retrieved_vals: [B, k, d]
+                # Aggregate top-k retrieved vectors (mean pooling across k neighbors)
+                v_agg = torch.mean(retrieved_vals, dim=1, keepdim=True)  # [B, 1, d]
+                Rt = v_agg.expand_as(R).contiguous()  # [B, N_coarse, d]
+                # Stop-gradient query replacement: Rx = R + (Rt - R).detach()
+                R_x = stop_gradient_query_replacement(R, Rt)
+            else:
+                R_x = R
+        else:
+            R_x = R
+
+        trans_out = self.transformer(R_x)
         coarse_pred = self.coarse_head(trans_out)  # [B, tokens, 2]
         coarse_pred = coarse_pred.transpose(1, 2).view(b, 2, coarse_h, coarse_w)
 
@@ -282,6 +321,8 @@ class MaskAdapter(nn.Module):
         g = torch.sigmoid(self.gate_conv(gate_input))
         m = g * l_refine + (1.0 - g) * l_coarse
 
+        if return_features:
+            return m, l_coarse, l_refine, u, f_fuse, retrieval_latency
         return m, l_coarse, l_refine, u
 
 
@@ -334,6 +375,17 @@ class DetectiveSAM(nn.Module):
         out_channels: int = 1,
         use_dummy: bool = False,
         device: Optional[Union[str, torch.device]] = "auto",
+        memory_enabled: bool = False,
+        memory_max_entries: int = 5000,
+        memory_key_dim: int = 64,
+        memory_value_dim: int = 64,
+        memory_vectors_per_image: int = 16,
+        memory_retrieval_k: int = 8,
+        memory_similarity_metric: str = "cosine",
+        memory_dedup_threshold: float = 0.95,
+        memory_consolidation_method: str = "dedup_greedy",
+        memory_seed: int = 42,
+        memory_path: Optional[str] = None,
         **kwargs: Any,
     ):
         super().__init__()
@@ -354,6 +406,19 @@ class DetectiveSAM(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.use_dummy = use_dummy
+
+        # Memory configuration
+        self.memory_enabled = bool(memory_enabled)
+        self.memory_max_entries = int(memory_max_entries)
+        self.memory_key_dim = int(memory_key_dim)
+        self.memory_value_dim = int(memory_value_dim)
+        self.memory_vectors_per_image = int(memory_vectors_per_image)
+        self.memory_retrieval_k = int(memory_retrieval_k)
+        self.memory_similarity_metric = str(memory_similarity_metric).lower()
+        self.memory_dedup_threshold = float(memory_dedup_threshold)
+        self.memory_consolidation_method = str(memory_consolidation_method).lower()
+        self.memory_seed = int(memory_seed)
+        self.memory_path = memory_path
 
         # Resolve target device
         if device == "auto" or device is None:
@@ -399,10 +464,32 @@ class DetectiveSAM(nn.Module):
         else:
             self.classifier_head = None
 
+        # 6. Forensic Vector Memory (CPU-resident)
+        self.forensic_memory = ForensicVectorMemory(
+            memory_enabled=self.memory_enabled,
+            memory_max_entries=self.memory_max_entries,
+            memory_key_dim=self.memory_key_dim,
+            memory_value_dim=self.memory_value_dim,
+            memory_vectors_per_image=self.memory_vectors_per_image,
+            memory_retrieval_k=self.memory_retrieval_k,
+            memory_similarity_metric=self.memory_similarity_metric,
+            memory_dedup_threshold=self.memory_dedup_threshold,
+            memory_consolidation_method=self.memory_consolidation_method,
+            memory_seed=self.memory_seed,
+        )
+
+        if self.memory_path:
+            if os.path.exists(self.memory_path):
+                self.forensic_memory.load(self.memory_path)
+            elif self.memory_enabled:
+                raise FileNotFoundError(
+                    f"Forensic memory file not found at '{self.memory_path}' while memory_enabled is True."
+                )
+
         logger.info(
             f"Initialized DetectiveSAM (variant='{self.variant}', width={self.layer_width}, "
             f"noise_intensity={self.noise_intensity}, freeze_sam2={self.freeze_sam2}, "
-            f"freeze_decoder={self.freeze_decoder})"
+            f"freeze_decoder={self.freeze_decoder}, memory_enabled={self.memory_enabled})"
         )
 
     def _init_sam2_model(self):
@@ -483,6 +570,8 @@ class DetectiveSAM(nn.Module):
         self,
         images: torch.Tensor,
         return_dict: bool = False,
+        gt_masks: Optional[torch.Tensor] = None,
+        random_retrieval: bool = False,
         **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
         """
@@ -491,12 +580,15 @@ class DetectiveSAM(nn.Module):
         Args:
             images (torch.Tensor): Input images of shape [B, 3, H, W].
             return_dict (bool): Whether to return complete dictionary of intermediate representations.
+            gt_masks (Optional[torch.Tensor]): Ground-truth binary masks [B, 1, H, W] used strictly
+                during training for forensic vector memory collection. Never used during evaluation/inference.
+            random_retrieval (bool): Whether to use randomized retrieval for Baseline C ablation.
 
         Returns:
             - Default: Predicted mask logits of shape [B, 1, H, W]
               (or Tuple[mask_logits, cls_logits] if aux_classifier is True).
             - If return_dict is True: Dict containing 'mask_logits', 'heatmap_prompt',
-              'l_coarse', 'l_refine', 'uncertainty', etc.
+              'l_coarse', 'l_refine', 'uncertainty', 'retrieval_latency', etc.
         """
         b_sz, _, orig_h, orig_w = images.shape
         model_device, param_dtype = get_submodule_device_dtype(
@@ -525,8 +617,20 @@ class DetectiveSAM(nn.Module):
             f_tilde = adapter(feats_i[s_idx], feats_pert[s_idx])
             feats_adapted.append(f_tilde)
 
-        # 5. Mask Adapter: automatic prompting heatmap M
-        m_prompt, l_coarse, l_refine, u_map = self.mask_adapter(feats_i, feats_pert, feats_adapted)
+        # 5. Mask Adapter: automatic prompting heatmap M with stop-gradient memory retrieval
+        mask_adapter_out = self.mask_adapter(
+            feats_i,
+            feats_pert,
+            feats_adapted,
+            forensic_memory=self.forensic_memory if self.memory_enabled else None,
+            random_retrieval=random_retrieval,
+            return_features=True,
+        )
+        m_prompt, l_coarse, l_refine, u_map, f_fuse, retrieval_lat = mask_adapter_out
+
+        # Collect ground-truth tampered features into memory strictly during training
+        if self.training and self.memory_enabled and gt_masks is not None:
+            self._collect_tampered_memory(f_fuse, gt_masks)
 
         # 6. Bilinearly upsample heatmap prompt and adapted features to 256x256 before decoding
         # (As specified in Section 3.2, Page 5: bilinearly upsample M and {~Fs} to 256x256)
@@ -599,6 +703,9 @@ class DetectiveSAM(nn.Module):
                 "l_refine": l_refine,
                 "uncertainty": u_map,
                 "perturbed_images": x_pert,
+                "retrieval_latency": retrieval_lat,
+                "memory_entries": self.forensic_memory.entry_count if self.forensic_memory is not None else 0,
+                "is_warmed_up": self.forensic_memory.is_warmed_up if self.forensic_memory is not None else False,
             }
             if cls_logits is not None:
                 res["cls_logits"] = cls_logits
@@ -609,14 +716,105 @@ class DetectiveSAM(nn.Module):
 
         return mask_logits
 
+    def _collect_tampered_memory(self, f_fuse: torch.Tensor, gt_masks: torch.Tensor) -> int:
+        """
+        Extract features from ground-truth tampered regions and add to epoch collection buffer.
+        Strictly excludes authentic/untampered images from positive forensic memory collection.
+
+        Args:
+            f_fuse (torch.Tensor): Fused feature map [B, d, s_hat, s_hat].
+            gt_masks (torch.Tensor): Ground-truth masks [B, 1, H, W] in {0.0, 1.0}.
+
+        Returns:
+            int: Number of valid tampered vectors extracted and detached to CPU.
+        """
+        if self.forensic_memory is None or not self.memory_enabled:
+            return 0
+        if gt_masks is None or gt_masks.numel() == 0:
+            return 0
+
+        # Downscale ground-truth masks to feature map resolution s_hat using area interpolation
+        s_hat = f_fuse.shape[-2:]
+        if gt_masks.shape[-2:] != s_hat:
+            gt_down = F.interpolate(gt_masks.float(), size=s_hat, mode="area") >= 0.5
+        else:
+            gt_down = (gt_masks >= 0.5)
+
+        total_collected = 0
+        b_sz = f_fuse.shape[0]
+
+        for b in range(b_sz):
+            tampered_mask_b = gt_down[b, 0]  # [s_hat_h, s_hat_w]
+            num_tampered = int(tampered_mask_b.sum().item())
+            if num_tampered == 0:
+                # Authentic image: strictly exclude, do not collect any vectors
+                continue
+
+            # Feature map for image b: [s_hat_h, s_hat_w, d]
+            feat_b = f_fuse[b].permute(1, 2, 0)
+            tampered_vectors = feat_b[tampered_mask_b]  # [num_tampered, d]
+
+            if num_tampered > self.memory_vectors_per_image:
+                # Uniformly subsample across tampered region
+                indices = torch.linspace(
+                    0, num_tampered - 1, steps=self.memory_vectors_per_image, device=tampered_vectors.device
+                ).long()
+                selected_vectors = tampered_vectors[indices]
+            else:
+                selected_vectors = tampered_vectors
+
+            # Add detached observations to CPU memory
+            added = self.forensic_memory.add_observations(selected_vectors)
+            total_collected += added
+
+        return total_collected
+
+    def consolidate_memory(self) -> Dict[str, Any]:
+        """Consolidate accumulated epoch observations into authoritative database."""
+        if self.forensic_memory is None:
+            return {}
+        return self.forensic_memory.consolidate()
+
+    def save_memory(self, filepath: str) -> None:
+        """Save authoritative memory database to disk."""
+        if self.forensic_memory is not None:
+            self.forensic_memory.save(filepath)
+
+    def load_memory(self, filepath: str) -> None:
+        """Load authoritative memory database from disk."""
+        if self.forensic_memory is not None:
+            self.forensic_memory.load(filepath)
+
+    def get_memory_summary(self) -> Dict[str, Any]:
+        """Return memory statistics and resource summary."""
+        if self.forensic_memory is None:
+            return {"memory_enabled": False}
+        return {
+            "memory_enabled": self.memory_enabled,
+            "entry_count": self.forensic_memory.entry_count,
+            "max_entries": self.forensic_memory.memory_max_entries,
+            "is_warmed_up": self.forensic_memory.is_warmed_up,
+            "key_dim": self.forensic_memory.memory_key_dim,
+            "value_dim": self.forensic_memory.memory_value_dim,
+            "memory_bytes": self.forensic_memory.get_memory_bytes(),
+            "memory_mb": self.forensic_memory.get_memory_bytes() / (1024 * 1024),
+            "similarity_metric": self.forensic_memory.memory_similarity_metric,
+            "consolidation_method": self.forensic_memory.memory_consolidation_method,
+        }
+
     @torch.no_grad()
-    def predict_mask(self, images: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    def predict_mask(
+        self,
+        images: torch.Tensor,
+        threshold: float = 0.5,
+        random_retrieval: bool = False,
+    ) -> torch.Tensor:
         """
         Produce binary mask prediction B in {0, 1}^{H x W} given input images.
         Thresholds sigmoid(M_hat) >= 0.5 as defined in Section 3.2.
         """
         self.eval()
-        outputs = self.forward(images)
+        outputs = self.forward(images, random_retrieval=random_retrieval)
         mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
         probs = torch.sigmoid(mask_logits)
         return (probs >= threshold).float()

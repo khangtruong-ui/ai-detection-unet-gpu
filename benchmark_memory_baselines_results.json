@@ -1,0 +1,54 @@
+{
+  "timestamp": "2026-10-29 08:57:40",
+  "device": "cuda",
+  "num_batches": 5,
+  "batch_size": 2,
+  "consolidation_stats": {
+    "new_observations": 640,
+    "duplicates_removed": 0,
+    "capacity_pruned": 0,
+    "final_entry_count": 640,
+    "consolidation_duration_sec": 0.00025529100003041094
+  },
+  "results": [
+    {
+      "condition": "A: Original Detective SAM (No Memory)",
+      "memory_enabled": false,
+      "random_retrieval": false,
+      "iou": 0.083,
+      "f1": 0.143,
+      "latency_ms_per_batch": 144.26,
+      "retrieval_latency_ms": 0.0,
+      "peak_gpu_memory_mb": 557.48,
+      "cpu_memory_mb": 0.3125,
+      "database_entry_count": 640,
+      "memory_consolidation_duration_sec": 0.0
+    },
+    {
+      "condition": "B: Detective SAM with NN Memory Retrieval",
+      "memory_enabled": true,
+      "random_retrieval": false,
+      "iou": 0.0852,
+      "f1": 0.1451,
+      "latency_ms_per_batch": 142.19,
+      "retrieval_latency_ms": 111.806,
+      "peak_gpu_memory_mb": 557.55,
+      "cpu_memory_mb": 0.3125,
+      "database_entry_count": 640,
+      "memory_consolidation_duration_sec": 0.0005
+    },
+    {
+      "condition": "C: Detective SAM with Randomized Retrieval",
+      "memory_enabled": true,
+      "random_retrieval": true,
+      "iou": 0.0765,
+      "f1": 0.1303,
+      "latency_ms_per_batch": 146.07,
+      "retrieval_latency_ms": 102.351,
+      "peak_gpu_memory_mb": 557.55,
+      "cpu_memory_mb": 0.3125,
+      "database_entry_count": 640,
+      "memory_consolidation_duration_sec": 0.0005
+    }
+  ]
+}

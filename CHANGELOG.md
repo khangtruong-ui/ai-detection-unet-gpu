@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-10-29
 
+### Added
+- **Learnable Forensic Vector Memory for Detective SAM**: Implemented a CPU-resident vector database containing forensic representations extracted exclusively from ground-truth tampered image regions:
+  - **Surrogate Stop-Gradient Query Replacement**: Replaced forward values of Detective SAM's coarse transformer query representation with retrieved vectors ($R_x = R + (R_t - R).\text{detach}()$), preserving identity gradients along the original query path ($d R_x / d R = I$) while halting gradients to CPU memory ($d R_x / d R_t = 0$).
+  - **Authentic Region Exclusion**: Area-downsampled ground-truth masks to feature map resolution ($s_{\text{hat}}$) with threshold $\ge 0.5$. Strictly excludes authentic/untampered images from positive memory collection.
+  - **Epoch-End Bounded Memory Consolidation**: Chunked candidate deduplication against existing database, enforcing `memory_max_entries` with deterministic pruning (`memory_seed`), avoiding quadratic $N \times N$ memory allocations.
+  - **Controlled Baseline Evaluation (`scripts/evaluate_memory_baselines.py`)**: Compared Condition A (No Memory, IoU 0.0830), Condition B (NN Retrieval, IoU **0.0852**), and Condition C (Randomized Retrieval, IoU 0.0765) on identical batches from `KhangTruong/COCO-inpainted`.
+  - **Automated 17-Point Test Suite (`tests/test_forensic_memory.py`)**: Full coverage of forward semantics, gradient semantics, CPU residency, key/value pairing, similarity computation, undersized database handling, warm-up bypass, zero-norm safety, bounded capacity, deterministic consolidation, coordinate mapping, authentic region exclusion, inference isolation, checkpoint reload, dimension compatibility, and end-to-end pretrained GPU forward passes.
+  - **Architecture Note**: Documented query tensor selection, tensor shapes, autograd paths, and alignment in `docs/architecture_note.md`.
+  - **Configuration Schema**: Created `configs/experiments/sam2/detective_sam_memory.yaml` and integrated memory parameters into `DetectiveSAM`, `build_model`, `Trainer`, and `CheckpointManager`.
+
 ### Fixed
 - **Official SAM2 Trunk Weight Loading**: Fixed weight loading failure in `IMLMaskformer` (`sid_unet/models/iml_maskformer.py`):
   - Previously logged `Could not load official SAM2 trunk (No module named 'sam2'). Falling back to lightweight dummy trunk`, causing the model to use an uninitialized dummy trunk that produced zero features and numerical instability.

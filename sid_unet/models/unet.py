@@ -559,6 +559,17 @@ def build_model(config: Any) -> nn.Module:
             out_channels=int(model_cfg.get("out_channels", 1)),
             use_dummy=bool(model_cfg.get("use_dummy", False)),
             device=dev_cfg,
+            memory_enabled=bool(model_cfg.get("memory_enabled", False)),
+            memory_max_entries=int(model_cfg.get("memory_max_entries", 5000)),
+            memory_key_dim=int(model_cfg.get("memory_key_dim", 64)),
+            memory_value_dim=int(model_cfg.get("memory_value_dim", 64)),
+            memory_vectors_per_image=int(model_cfg.get("memory_vectors_per_image", 16)),
+            memory_retrieval_k=int(model_cfg.get("memory_retrieval_k", 8)),
+            memory_similarity_metric=str(model_cfg.get("memory_similarity_metric", "cosine")),
+            memory_dedup_threshold=float(model_cfg.get("memory_dedup_threshold", 0.95)),
+            memory_consolidation_method=str(model_cfg.get("memory_consolidation_method", "dedup_greedy")),
+            memory_seed=int(model_cfg.get("memory_seed", 42)),
+            memory_path=model_cfg.get("memory_path", None),
         )
 
     if "sam2" in model_name or "sam2" in backbone:
