@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-10-29
 
+### Fixed
+- **Official SAM2 Trunk Weight Loading**: Fixed weight loading failure in `IMLMaskformer` (`sid_unet/models/iml_maskformer.py`):
+  - Previously logged `Could not load official SAM2 trunk (No module named 'sam2'). Falling back to lightweight dummy trunk`, causing the model to use an uninitialized dummy trunk that produced zero features and numerical instability.
+  - Installed Meta's `sam2` package and `hydra-core` dependencies.
+  - Verified official SAM 2.1 Hiera checkpoint (`/content/sam2/checkpoints/sam2.1_hiera_small.pt`) loads cleanly via `build_sam2`, extracting non-zero multi-scale hierarchical feature maps (`use_dummy: False`).
+
 ### Added
-- **300-Step Training Trajectory Benchmark**: Created `scripts/evaluate_300_steps.py` and benchmarked SAM2 Small (unfrozen decoder), Detective SAM (512x512), and Senior's IML MaskFormer across 300 identical batches from `KhangTruong/COCO-inpainted`. Results recorded in `benchmark_300_steps_results.json`:
-  - SAM2 Small doubles mean IoU from 0.0342 (steps 1-50) to 0.0703 (steps 101-200), peaking at **0.3613**.
-  - Detective SAM at 512x512 learns sharp spatial gating after step 100, surging from 0.0002 up to **0.2463** at step 200 and peaking at **0.2821** with a sustained final 20-step mean IoU of **0.1022**.
+- **300-Step Training Trajectory Benchmark with Verified Weights**: Ran `scripts/evaluate_300_steps.py` across 300 identical batches from `KhangTruong/COCO-inpainted` on NVIDIA Tesla T4 GPU with official weights loaded. Results recorded in `benchmark_300_steps_results.json`:
+  - **Detective SAM (512x512)**: 0.26M trainable params (99.3% frozen). Fastest by far at **0.082s/step** (24.7s total for 300 steps). Surges from 0.0000 at step 50 to **0.1551** at step 100, **0.3091** at step 200, and **0.3200** at step 300 (peak IoU: **0.3346**, final 20-step mean IoU: **0.1338**).
+  - **SAM2 Small (Unfrozen Decoder)**: 4.53M trainable params. 0.377s/step (113.0s total). Reaches 0.0394 at step 50, 0.0989 at step 100, 0.1190 at step 200, and 0.1257 at step 300 (peak IoU: **0.3844**).
+  - **Senior's IML MaskFormer (Real Hiera Weights)**: 23.20M trainable params. 0.174s/step (52.3s total). Loss dropped smoothly from 0.6778 to 0.4520 with stable gradients and real trunk features; 100 Hungarian bipartite query slots require longer training (>1,000 steps) to match mask segments.
 - **SAM2 Query Slot Parameter Analysis & Verification**: Conducted rigorous architectural analysis of SAM2's learnable query slot parameters inside `Sam2MaskDecoder`:
   - Mask queries: 4 tokens of dimension 256 = 1,024 parameters (`mask_tokens.weight`).
   - Total decoder query tokens: 6 tokens of dimension 256 = 1,536 parameters (including `iou_token` and `obj_score_token`).

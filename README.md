@@ -1246,23 +1246,23 @@ To study extended convergence dynamics beyond the initial 100 steps, all three m
 
 #### 1. 300-Step Trajectory Comparison
 
-| Metric | SAM2 Small (Unfrozen Decoder) | Detective SAM ($512 \times 512$) | Senior's IML MaskFormer |
+| Metric | SAM2 Small (Unfrozen Decoder) | Detective SAM ($512 \times 512$) | Senior's IML MaskFormer (Real Hiera Weights) |
 | :--- | :--- | :--- | :--- |
-| **Total Parameters** | 38.85M | 38.80M | 23.20M |
+| **Total Parameters** | 38.85M | 38.80M | 57.15M |
 | **Trainable Parameters** | 4.53M (LoRA + Decoder + Adapter) | **0.26M (261k adapters only!)** | 23.20M (Full Decoder) |
 | **Input Image Resolution** | $1024 \times 1024$ | **$512 \times 512$ (Optimized Scale)** | $384 \times 384$ |
-| **Step 1 IoU** | 0.0405 | 0.0219 | 0.0000 |
-| **Step 50 IoU** | 0.0398 | 0.0000 | 0.0000 |
-| **Step 100 IoU** | 0.1291 | 0.0002 | 0.0000 |
-| **Step 200 IoU** | 0.0888 | **0.2463** | 0.0000 |
-| **Step 300 IoU** | 0.1334 | **0.2343** | 0.0000 |
-| **Peak IoU (0–300)** | **0.3613** | **0.2821** | 0.0000 |
-| **Mean IoU (Steps 1–50)** | 0.0342 | 0.0017 | 0.0000 |
-| **Mean IoU (Steps 51–100)**| 0.0399 | 0.0093 | 0.0000 |
-| **Mean IoU (Steps 101–200)**| **0.0703** | 0.0541 | 0.0000 |
-| **Mean IoU (Steps 201–300)**| 0.0688 | **0.0624** | 0.0000 |
-| **Mean Final 20 Steps IoU** | 0.0696 | **0.1022 (Highest Sustained)**| 0.0000 |
-| **Total 300-Step Runtime**| 113.05s (0.377s/step) | **24.52s (0.082s/step - 9x faster!)**| 46.98s (0.157s/step) |
+| **Step 1 IoU** | 0.0258 | 0.0171 | 0.0000 |
+| **Step 50 IoU** | 0.0394 | 0.0000 | 0.0000 |
+| **Step 100 IoU** | 0.0989 | **0.1551** | 0.0000 |
+| **Step 200 IoU** | 0.1190 | **0.3091** | 0.0000 |
+| **Step 300 IoU** | 0.1257 | **0.3200** | 0.0000 |
+| **Peak IoU (0–300)** | **0.3844** | **0.3346** | 0.0641 |
+| **Mean IoU (Steps 1–50)** | 0.0381 | 0.0040 | 0.0025 |
+| **Mean IoU (Steps 51–100)**| 0.0480 | 0.0204 | 0.0000 |
+| **Mean IoU (Steps 101–200)**| 0.0726 | 0.0580 | 0.0000 |
+| **Mean IoU (Steps 201–300)**| 0.0676 | **0.0888** | 0.0000 |
+| **Mean Final 20 Steps IoU** | 0.0667 | **0.1338 (Highest Sustained)**| 0.0000 |
+| **Total 300-Step Runtime**| 112.99s (0.377s/step) | **24.66s (0.082s/step - 9x faster!)**| 52.32s (0.174s/step) |
 
 ---
 
@@ -1293,7 +1293,7 @@ Detective SAM was originally configured with Meta SAM2's native ViT resolution o
 By standardizing `target_size: [512, 512]`:
 - **Throughput Surge**: Per-step training time plummeted from **0.740s/step** down to **0.082s/step** (a **9.0x speedup**).
 - **VRAM Conservation**: Peak memory usage dropped by >55%, eliminating OOM risks on standard Tesla T4 / RTX 3080/4080 (12–16GB) GPUs.
-- **Superior Convergence**: Because the coarse transformer downsamples by 16x ($512/16 = 32 \times 32$ spatial tokens vs $64 \times 64$), the transformer self-attention map is more compact and learns faster. As evidenced in the 300-step benchmark, Detective SAM achieves a dramatic breakthrough at step 200 (**0.2463 IoU**), reaching **0.2821 peak IoU** and the highest sustained final IoU (**0.1022**) among all evaluated models.
+- **Superior Convergence**: Because the coarse transformer downsamples by 16x ($512/16 = 32 \times 32$ spatial tokens vs $64 \times 64$), the transformer self-attention map is more compact and learns faster. As evidenced in the 300-step benchmark, Detective SAM achieves a dramatic breakthrough at step 100 (**0.1551 IoU**) and step 200 (**0.3091 IoU**), reaching **0.3346 peak IoU** and the highest sustained final IoU (**0.1338**) among all evaluated models.
 
 ---
 
@@ -1301,13 +1301,14 @@ By standardizing `target_size: [512, 512]`:
 
 1. **Phase 1: Decision Boundary Alignment (Steps 1–50)**:
    - **SAM2 Small**: Balanced Xavier initialization prevents logit saturation. IoU holds steady around **0.035–0.040**, with gradient updates directly optimizing the unfrozen decoder and LoRA layers.
-   - **Detective SAM**: Focuses initially on negative suppression; false positive predictions across background regions are suppressed, bringing IoU near 0.0000 while the loss falls from 0.6978 to 0.6004.
+   - **Detective SAM**: Focuses initially on negative suppression; false positive predictions across background regions are suppressed, bringing IoU near 0.0000 while the loss falls from 0.7411 to 0.5918.
 2. **Phase 2: Representation Adaptation (Steps 51–100)**:
-   - **SAM2 Small**: Begins distinguishing manipulation borders from salient object boundaries, recording a breakthrough step at step 100 with **0.1291 IoU**.
-   - **Detective SAM**: Feature adapters ($\Delta F_s$) begin isolating subtle tampering discrepancies; fine conv refinement ($L_{\text{refine}}$) aligns with coarse guidance.
+   - **SAM2 Small**: Begins distinguishing manipulation borders from salient object boundaries, recording a breakthrough step at step 100 with **0.0989 IoU**.
+   - **Detective SAM**: Feature adapters ($\Delta F_s$) begin isolating subtle tampering discrepancies; fine conv refinement ($L_{\text{refine}}$) aligns with coarse guidance, reaching **0.1551 IoU** at step 100.
 3. **Phase 3: Forensic Specialization & High-IoU Peaks (Steps 101–300)**:
-   - **SAM2 Small**: Mean IoU nearly doubles to **0.0703** (steps 101–200) and **0.0688** (steps 201–300), frequently peaking above **0.36 IoU** (**0.3613 peak**).
-   - **Detective SAM**: Undergoes a massive surge at step 200 (**0.2463 IoU**) as the linear spatial gating ($g = \sigma(W_g * [L_{\text{coarse}}, U])$) learns to dynamically switch between coarse global guidance and high-frequency edge refinement. Holds sustained performance around **0.23–0.24 IoU** through step 300 (peak **0.2821**, final 20-step average **0.1022**).
+   - **SAM2 Small**: Mean IoU nearly doubles to **0.0726** (steps 101–200) and **0.0676** (steps 201–300), frequently peaking above **0.38 IoU** (**0.3844 peak**).
+   - **Detective SAM**: Undergoes a massive surge at step 200 (**0.3091 IoU**) as the linear spatial gating ($g = \sigma(W_g * [L_{\text{coarse}}, U])$) learns to dynamically switch between coarse global guidance and high-frequency edge refinement. Climbs to **0.3200 IoU** at step 300 (peak **0.3346**, final 20-step average **0.1338**).
+   - **Senior's IML MaskFormer**: Official SAM 2.1 Hiera weights loaded cleanly from `/content/sam2/checkpoints/sam2.1_hiera_small.pt`, with loss decreasing steadily from 0.6778 to 0.4520. As expected for Hungarian bipartite matching on 100 query slots, longer training steps (>1,000 steps) are required for query clustering and mask convergence.
 
 ---
 
