@@ -19,7 +19,7 @@ data:
   background_download: true
   columns: ["image", "mask"]
   image_size: [256, 256]
-  batch_size: 16                     # Stable micro-batch for Tesla T4 GPU
+  batch_size: 32                     # Stable micro-batch for Tesla T4 GPU
   num_workers: -1
   pin_memory: true
   prefetch_batches: 32
@@ -65,7 +65,7 @@ loss:
 
 training:
   epochs: 10
-  learning_rate: 1.0e-3             # Optimal LR from paper Table 16 (0.001)
+  learning_rate: 1.0e-4             # Optimal LR from paper Table 16 (0.001)
   weight_decay: 1.0e-4              # Adam weight decay from paper Table 16 (0.0001)
   gradient_accumulation_steps: 8   # 8 micro-batches * bs 2 = effective batch size 16
   mixed_precision: "bf16"
