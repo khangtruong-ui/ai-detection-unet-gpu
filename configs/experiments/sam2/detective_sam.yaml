@@ -19,7 +19,7 @@ data:
   background_download: true
   columns: ["image", "mask"]
   image_size: [256, 256]
-  batch_size: 2                     # Stable micro-batch for Tesla T4 GPU
+  batch_size: 16                     # Stable micro-batch for Tesla T4 GPU
   num_workers: -1
   pin_memory: true
   prefetch_batches: 32
