@@ -617,6 +617,9 @@ def load_parquet_dataset(
     token: Optional[Union[bool, str]] = None,
     cache_dir: Optional[str] = None,
     max_cached_row_groups: int = 2,
+    max_cached_files: Optional[int] = None,
+    max_cache_gb: Optional[float] = None,
+    cache_files: Optional[bool] = None,
     **kwargs: Any,
 ) -> Tuple[Any, str]:
     """
@@ -645,6 +648,9 @@ def load_parquet_dataset(
                 token=token,
                 cache_dir=cache_dir,
                 max_cached_row_groups=max_cached_row_groups,
+                max_cached_files=max_cached_files,
+                max_cache_gb=max_cache_gb,
+                cache_files=cache_files,
                 **kwargs,
             )
             return ds, cand
@@ -1617,6 +1623,9 @@ def create_cached_dataloaders(
     background_download = bool(config.data.get("background_download", bool(save_to_disk)))
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
     max_cached_row_groups = int(config.data.get("max_cached_row_groups", 4))
+    cache_files = config.data.get("cache_files", None)
+    max_cache_gb = config.data.get("max_cache_gb", None)
+    max_cached_files = config.data.get("max_cached_files", None)
 
     # 1. High-performance non-blocking path via parquet-dataset-loader
     if use_parquet_loader and _HAS_PARQUET_LOADER and pdl is not None:
@@ -1633,6 +1642,9 @@ def create_cached_dataloaders(
                 token=token,
                 cache_dir=pdl_cache_dir,
                 max_cached_row_groups=max_cached_row_groups,
+                max_cached_files=max_cached_files,
+                max_cache_gb=max_cache_gb,
+                cache_files=cache_files,
             )
             val_pdl, resolved_val_split = load_parquet_dataset(
                 dataset_name=cached_repo,
@@ -1643,6 +1655,9 @@ def create_cached_dataloaders(
                 token=token,
                 cache_dir=pdl_cache_dir,
                 max_cached_row_groups=max_cached_row_groups,
+                max_cached_files=max_cached_files,
+                max_cache_gb=max_cache_gb,
+                cache_files=cache_files,
             )
 
             train_dataset = CachedIndexedDataset(

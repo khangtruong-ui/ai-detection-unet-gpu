@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Configuration Schema**: Created `configs/experiments/sam2/detective_sam_memory.yaml` and integrated memory parameters into `DetectiveSAM`, `build_model`, `Trainer`, and `CheckpointManager`.
 
 ### Fixed
+- **Forwarding of `max_cache_gb`, `cache_files`, and `max_cached_files` in DataLoaders**:
+  - `create_cached_dataloaders` and `load_parquet_dataset` now extract and forward `max_cache_gb`, `cache_files`, and `max_cached_files` from `config.data` to `parquet-dataset-loader`.
+  - Configured `cache_files: true` and `max_cache_gb: 4.0` in `configs/experiments/sam2/detective_sam_memory.yaml` to eliminate HTTP 429 rate limiting and socket flooding, keeping unconsumed cached files bounded while progressively saving the complete dataset to disk (`save_to_disk: true`).
 - **Official SAM2 Trunk Weight Loading**: Fixed weight loading failure in `IMLMaskformer` (`sid_unet/models/iml_maskformer.py`):
   - Previously logged `Could not load official SAM2 trunk (No module named 'sam2'). Falling back to lightweight dummy trunk`, causing the model to use an uninitialized dummy trunk that produced zero features and numerical instability.
   - Installed Meta's `sam2` package and `hydra-core` dependencies.

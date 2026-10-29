@@ -16,6 +16,8 @@ data:
   use_parquet_loader: true
   save_to_disk: true
   background_download: true
+  cache_files: true                  # Cache full files locally to eliminate HTTP socket thrashing and 429 rate limits
+  max_cache_gb: 4.0                  # Bounded cache size waiting for consumption (persisted to disk since save_to_disk=true)
   columns: ["image", "mask"]
   image_size: [256, 256]
   batch_size: 32                     # Stable micro-batch for Tesla T4 GPU
