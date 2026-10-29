@@ -304,7 +304,7 @@ class DetectiveSAM(nn.Module):
         transformer_downscaling (int): Coarse transformer downsampling factor (default: 16).
         transformer_layers (int): Coarse transformer layers (default: 1).
         dropout (float): Dropout probability for mask adapter (default: 0.15).
-        target_size (Tuple[int, int]): Native input resolution for SAM2 Hiera ViT (default: (1024, 1024)).
+        target_size (Tuple[int, int]): Native input resolution for SAM2 Hiera ViT (default: (512, 512)).
         freeze_sam2 (bool): Whether to freeze all base SAM2 parameters (default: True).
         freeze_decoder (bool): Whether to keep the mask decoder frozen (default: True per paper).
         multimask_output (bool): Whether mask decoder outputs candidate multimasks (default: False).
@@ -324,7 +324,7 @@ class DetectiveSAM(nn.Module):
         transformer_downscaling: int = 16,
         transformer_layers: int = 1,
         dropout: float = 0.15,
-        target_size: Tuple[int, int] = (1024, 1024),
+        target_size: Tuple[int, int] = (512, 512),
         freeze_sam2: bool = True,
         freeze_decoder: bool = True,
         multimask_output: bool = False,

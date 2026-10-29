@@ -549,7 +549,7 @@ def build_model(config: Any) -> nn.Module:
             transformer_downscaling=int(model_cfg.get("transformer_downscaling", 16)),
             transformer_layers=int(model_cfg.get("transformer_layers", 1)),
             dropout=float(model_cfg.get("dropout", 0.15)),
-            target_size=tuple(model_cfg.get("target_size", [1024, 1024])),
+            target_size=tuple(model_cfg.get("target_size", [512, 512])),
             freeze_sam2=bool(model_cfg.get("freeze_sam2", True)),
             freeze_decoder=bool(model_cfg.get("freeze_decoder", True)),
             multimask_output=bool(model_cfg.get("multimask_output", False)),
