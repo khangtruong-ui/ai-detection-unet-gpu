@@ -624,16 +624,47 @@ def generate_master_cross_evaluation_report(
     checkpoints_seen: Dict[str, str] = {}  # ckpt_path -> ckpt_name
     configs_seen: Dict[str, str] = {}      # cfg_path -> cfg_name
 
+    raw_ckpts: List[Tuple[str, str]] = []
     for res in cross_results:
         cp = res.get("checkpoint_path", "unknown")
         cn = res.get("checkpoint_name", os.path.splitext(os.path.basename(cp))[0])
+        if (cp, cn) not in raw_ckpts:
+            raw_ckpts.append((cp, cn))
+
+    name_counts: Dict[str, int] = {}
+    for _, cn in raw_ckpts:
+        name_counts[cn] = name_counts.get(cn, 0) + 1
+
+    seen_disambig: Dict[str, int] = {}
+    for cp, cn in raw_ckpts:
+        if name_counts[cn] > 1:
+            idx = seen_disambig.get(cn, 0) + 1
+            seen_disambig[cn] = idx
+            parent_folder = os.path.basename(os.path.dirname(os.path.abspath(cp)))
+            if parent_folder and parent_folder not in ("checkpoints", ".", ""):
+                resolved_cn = f"{parent_folder}_{cn}"
+            else:
+                resolved_cn = f"{cn}_{idx}"
+            checkpoints_seen[cp] = resolved_cn
+        else:
+            checkpoints_seen[cp] = cn
+
+    for res in cross_results:
         kp = res.get("config_path", "unknown")
         kn = res.get("config_name", os.path.splitext(os.path.basename(kp))[0])
-        checkpoints_seen[cp] = cn
         configs_seen[kp] = kn
 
-    unique_ckpt_names = list(checkpoints_seen.values())
-    unique_config_names = list(configs_seen.values())
+    seen_ckpts: List[str] = []
+    for v in checkpoints_seen.values():
+        if v not in seen_ckpts:
+            seen_ckpts.append(v)
+    unique_ckpt_names = seen_ckpts
+
+    seen_cfgs: List[str] = []
+    for v in configs_seen.values():
+        if v not in seen_cfgs:
+            seen_cfgs.append(v)
+    unique_config_names = seen_cfgs
 
     iou_matrix: Dict[Tuple[str, str], float] = {}
     f1_matrix: Dict[Tuple[str, str], float] = {}

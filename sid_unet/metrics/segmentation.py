@@ -194,12 +194,14 @@ class SegmentationMetricTracker:
             "dice": 0.0,
             "f1": 0.0,
             "pixel_f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
         }
         # Per-label accumulator (0: Real, 1: Fully AI, 2: Partially AI, plus dynamic labels)
         self.per_label_stats: Dict[int, Dict[str, Union[float, int]]] = {
-            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0},
-            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0},
-            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0},
+            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
+            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
+            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
         }
 
     def update(
@@ -277,6 +279,10 @@ class SegmentationMetricTracker:
                         "count": 0,
                         "pos_count": 0,
                         "iou_pos_sum": 0.0,
+                        "dice_pos_sum": 0.0,
+                        "f1_pos_sum": 0.0,
+                        "precision_pos_sum": 0.0,
+                        "recall_pos_sum": 0.0,
                     }
                 self.per_label_stats[lbl]["iou_sum"] += m["iou"]
                 self.per_label_stats[lbl]["dice_sum"] += m["dice"]
@@ -290,6 +296,10 @@ class SegmentationMetricTracker:
                 if has_pos:
                     self.per_label_stats[lbl]["pos_count"] += 1
                     self.per_label_stats[lbl]["iou_pos_sum"] += m["iou"]
+                    self.per_label_stats[lbl]["dice_pos_sum"] += m["dice"]
+                    self.per_label_stats[lbl]["f1_pos_sum"] += m["f1"]
+                    self.per_label_stats[lbl]["precision_pos_sum"] += m["precision"]
+                    self.per_label_stats[lbl]["recall_pos_sum"] += m["recall"]
 
     def compute(self) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]]]:
         """
@@ -312,16 +322,22 @@ class SegmentationMetricTracker:
             overall["iou_positive"] = self.positive_metrics_sum["iou"] / self.positive_samples
             overall["dice_positive"] = self.positive_metrics_sum["dice"] / self.positive_samples
             overall["f1_positive"] = self.positive_metrics_sum["f1"] / self.positive_samples
+            overall["precision_positive"] = self.positive_metrics_sum["precision"] / self.positive_samples
+            overall["recall_positive"] = self.positive_metrics_sum["recall"] / self.positive_samples
         else:
             overall["iou_positive"] = overall["iou_all"]
             overall["dice_positive"] = overall["dice_all"]
             overall["f1_positive"] = overall["f1_all"]
+            overall["precision_positive"] = overall.get("precision", 0.0)
+            overall["recall_positive"] = overall.get("recall", 0.0)
 
         if self.filter_zero_positive and self.positive_samples > 0:
             overall["iou"] = overall["iou_positive"]
             overall["dice"] = overall["dice_positive"]
             overall["f1"] = overall["f1_positive"]
             overall["pixel_f1"] = overall["f1_positive"]
+            overall["precision"] = overall["precision_positive"]
+            overall["recall"] = overall["recall_positive"]
 
         per_label = {}
         for lbl, stats in self.per_label_stats.items():
@@ -330,21 +346,37 @@ class SegmentationMetricTracker:
             if cnt > 0:
                 if self.filter_zero_positive and pos_cnt > 0:
                     lbl_iou = stats["iou_pos_sum"] / pos_cnt
+                    lbl_dice = stats.get("dice_pos_sum", stats["dice_sum"]) / pos_cnt
+                    lbl_f1 = stats.get("f1_pos_sum", stats["f1_sum"]) / pos_cnt
+                    lbl_prec = stats.get("precision_pos_sum", stats.get("precision_sum", 0.0)) / pos_cnt
+                    lbl_rec = stats.get("recall_pos_sum", stats.get("recall_sum", 0.0)) / pos_cnt
                 else:
                     lbl_iou = stats["iou_sum"] / cnt
+                    lbl_dice = stats["dice_sum"] / cnt
+                    lbl_f1 = stats["f1_sum"] / cnt
+                    lbl_prec = stats.get("precision_sum", 0.0) / cnt
+                    lbl_rec = stats.get("recall_sum", 0.0) / cnt
 
                 per_label[lbl] = {
                     "iou": lbl_iou,
                     "iou_all": stats["iou_sum"] / cnt,
-                    "iou_positive": stats["iou_pos_sum"] / pos_cnt if pos_cnt > 0 else 0.0,
-                    "dice": stats["dice_sum"] / cnt,
-                    "f1": stats["f1_sum"] / cnt,
-                    "pixel_f1": stats["f1_sum"] / cnt,
+                    "iou_positive": stats["iou_pos_sum"] / pos_cnt if pos_cnt > 0 else (stats["iou_sum"] / cnt),
+                    "dice": lbl_dice,
+                    "dice_all": stats["dice_sum"] / cnt,
+                    "dice_positive": stats.get("dice_pos_sum", stats["dice_sum"]) / pos_cnt if pos_cnt > 0 else (stats["dice_sum"] / cnt),
+                    "f1": lbl_f1,
+                    "f1_all": stats["f1_sum"] / cnt,
+                    "f1_positive": stats.get("f1_pos_sum", stats["f1_sum"]) / pos_cnt if pos_cnt > 0 else (stats["f1_sum"] / cnt),
+                    "pixel_f1": lbl_f1,
                     "auroc": stats["auroc_sum"] / cnt,
                     "pixel_auroc": stats["auroc_sum"] / cnt,
                     "pixel_acc": stats["pixel_acc_sum"] / cnt,
-                    "precision": stats.get("precision_sum", 0.0) / cnt,
-                    "recall": stats.get("recall_sum", 0.0) / cnt,
+                    "precision": lbl_prec,
+                    "precision_all": stats.get("precision_sum", 0.0) / cnt,
+                    "precision_positive": stats.get("precision_pos_sum", stats.get("precision_sum", 0.0)) / pos_cnt if pos_cnt > 0 else (stats.get("precision_sum", 0.0) / cnt),
+                    "recall": lbl_rec,
+                    "recall_all": stats.get("recall_sum", 0.0) / cnt,
+                    "recall_positive": stats.get("recall_pos_sum", stats.get("recall_sum", 0.0)) / pos_cnt if pos_cnt > 0 else (stats.get("recall_sum", 0.0) / cnt),
                     "specificity": stats.get("specificity_sum", 0.0) / cnt,
                     "samples": cnt,
                     "positive_samples": pos_cnt,
@@ -355,13 +387,21 @@ class SegmentationMetricTracker:
                     "iou_all": 0.0,
                     "iou_positive": 0.0,
                     "dice": 0.0,
+                    "dice_all": 0.0,
+                    "dice_positive": 0.0,
                     "f1": 0.0,
+                    "f1_all": 0.0,
+                    "f1_positive": 0.0,
                     "pixel_f1": 0.0,
                     "auroc": 0.0,
                     "pixel_auroc": 0.0,
                     "pixel_acc": 0.0,
                     "precision": 0.0,
+                    "precision_all": 0.0,
+                    "precision_positive": 0.0,
                     "recall": 0.0,
+                    "recall_all": 0.0,
+                    "recall_positive": 0.0,
                     "specificity": 0.0,
                     "samples": 0,
                     "positive_samples": 0,
