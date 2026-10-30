@@ -285,6 +285,11 @@ def find_local_checkpoint_artifacts(
             checkpoints[os.path.basename(checkpoint_name)] = os.path.abspath(checkpoint_name)
         else:
             raise FileNotFoundError(f"Specified checkpoint not found: {checkpoint_name}")
+        # If pushing a specific checkpoint, also include sibling forensic memory database if present
+        for mem_cand in ["forensic_memory.pt", "forensic_memory_best.pt", "forensic_memory_periodic.pt"]:
+            sibling_mem = os.path.join(os.path.dirname(checkpoints[list(checkpoints.keys())[0]]), mem_cand)
+            if os.path.isfile(sibling_mem) and mem_cand not in checkpoints:
+                checkpoints[mem_cand] = sibling_mem
     else:
         for p in ["checkpoint_best.pt", "checkpoint_latest.pt", "checkpoint_periodic.pt"]:
             full_p = os.path.join(ckpt_dir, p)
@@ -294,6 +299,18 @@ def find_local_checkpoint_artifacts(
         if not checkpoints:
             for pt_file in glob.glob(os.path.join(ckpt_dir, "*.pt")):
                 checkpoints[os.path.basename(pt_file)] = pt_file
+
+        # Discover forensic memory vector databases (if present)
+        for mem_p in [
+            "forensic_memory.pt",
+            "forensic_memory_best.pt",
+            "forensic_memory_latest.pt",
+            "forensic_memory_periodic.pt",
+        ]:
+            for search_d in [ckpt_dir, target_dir]:
+                full_mem = os.path.join(search_d, mem_p)
+                if os.path.isfile(full_mem) and mem_p not in checkpoints:
+                    checkpoints[mem_p] = full_mem
 
     if not checkpoints:
         raise FileNotFoundError(f"No checkpoint (.pt) files found in '{ckpt_dir}'.")

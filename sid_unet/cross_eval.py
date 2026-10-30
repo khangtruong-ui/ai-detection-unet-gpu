@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import inspect
 import json
 import logging
 import os
@@ -200,6 +201,21 @@ def parse_args():
         action="store_false",
         help="Disable collision checking and force re-evaluation of all combinations.",
     )
+    # Zero positive mask filtering for justified IoU
+    parser.add_argument(
+        "--filter-zero-positive",
+        "--filter_zero_positive",
+        dest="filter_zero_positive",
+        action="store_true",
+        default=True,
+        help="Filter out zero-positive ground-truth masks when computing average IoU and Dice (default: True).",
+    )
+    parser.add_argument(
+        "--no-filter-zero-positive",
+        dest="filter_zero_positive",
+        action="store_false",
+        help="Include zero-positive ground-truth masks in average IoU.",
+    )
     return parser.parse_args()
 
 
@@ -323,13 +339,34 @@ def eval_single_batch(
     if labels is not None:
         labels = labels.to(device, non_blocking=True)
 
-    outputs = model(images)
+    model_kwargs: Dict[str, Any] = {}
+    if "f_r" in batch and isinstance(batch["f_r"], torch.Tensor):
+        model_kwargs["f_r"] = batch["f_r"].to(device, non_blocking=True)
+    elif "gap_r" in batch and isinstance(batch["gap_r"], torch.Tensor):
+        model_kwargs["f_r"] = batch["gap_r"].to(device, non_blocking=True)
+    if "img_id" in batch:
+        model_kwargs["img_ids"] = batch["img_id"]
+
+    if model_kwargs:
+        try:
+            raw_target = getattr(model, "module", model)
+            sig = inspect.signature(raw_target.forward)
+            accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not accepts_var_kwargs:
+                model_kwargs = {k: v for k, v in model_kwargs.items() if k in sig.parameters}
+        except Exception:
+            pass
+
+    outputs = model(images, **model_kwargs) if model_kwargs else model(images)
     loss, _ = loss_fn(outputs, masks, labels)
 
     b_size = images.size(0)
     if isinstance(outputs, (tuple, list)):
         mask_logits = outputs[0]
         class_logits = outputs[1] if len(outputs) > 1 else None
+    elif isinstance(outputs, dict):
+        mask_logits = outputs.get("mask_logits", outputs.get("pred_masks", outputs.get("masks", outputs.get("logits"))))
+        class_logits = outputs.get("class_logits", outputs.get("pred_logits"))
     else:
         mask_logits, class_logits = outputs, None
 
@@ -429,6 +466,7 @@ def evaluate_checkpoint_on_config(
     save_illustrations: bool = True,
     max_illustrations: int = 6,
     master_output_dir: Optional[str] = None,
+    filter_zero_positive: bool = True,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -475,10 +513,10 @@ def evaluate_checkpoint_on_config(
     resolved_split = getattr(eval_loader.dataset, "resolved_split", split or eval_config.data.get("eval_split", "test"))
     dataset_name = eval_config.data.get("dataset_name", "KhangTruong/IMD2020")
 
-    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold)
-    post_seg_tracker = SegmentationMetricTracker(threshold=threshold) if postprocessor.enabled else None
-    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold) if refiner is not None else None
-    both_seg_tracker = SegmentationMetricTracker(threshold=threshold) if (refiner is not None and postprocessor.enabled) else None
+    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive)
+    post_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if postprocessor.enabled else None
+    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if refiner is not None else None
+    both_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if (refiner is not None and postprocessor.enabled) else None
     cls_tracker = ClassificationMetricTracker(num_classes=ckpt_config.model.get("num_classes", 3))
 
     total_loss_sum = 0.0
@@ -580,26 +618,30 @@ def evaluate_checkpoint_on_config(
     clear_memory_cache(device)
 
     # Compute metrics across variants
-    raw_seg, per_label_seg = raw_seg_tracker.compute()
+    raw_seg, raw_per_label = raw_seg_tracker.compute()
     cls_metrics, confusion_mat = cls_tracker.compute()
 
     ablation_dict: Dict[str, Dict[str, Any]] = {"Baseline (Raw UNet)": raw_seg}
     chosen_seg = raw_seg
+    chosen_per_label = raw_per_label
 
     if post_seg_tracker is not None:
-        post_seg, _ = post_seg_tracker.compute()
+        post_seg, post_per_label = post_seg_tracker.compute()
         ablation_dict["+ Post-Processing"] = post_seg
         chosen_seg = post_seg
+        chosen_per_label = post_per_label
 
     if sam_seg_tracker is not None:
-        sam_seg, _ = sam_seg_tracker.compute()
+        sam_seg, sam_per_label = sam_seg_tracker.compute()
         ablation_dict["+ SAM Refinement"] = sam_seg
         chosen_seg = sam_seg
+        chosen_per_label = sam_per_label
 
     if both_seg_tracker is not None:
-        both_seg, _ = both_seg_tracker.compute()
+        both_seg, both_per_label = both_seg_tracker.compute()
         ablation_dict["+ SAM & Post-Processing"] = both_seg
         chosen_seg = both_seg
+        chosen_per_label = both_per_label
 
     overall_metrics = {
         "eval_split": resolved_split,
@@ -647,6 +689,7 @@ def evaluate_checkpoint_on_config(
         "checkpoint_path": checkpoint_path,
         "checkpoint_name": ckpt_run_name,
         "config_path": config_path,
+        "config_stem": cfg_stem,
         "config_name": cfg_proj_name,
         "dataset_name": dataset_name,
         "eval_split": resolved_split,
@@ -654,7 +697,8 @@ def evaluate_checkpoint_on_config(
         "metrics": overall_metrics,
         "overall_metrics": overall_metrics,
         "ablation_metrics": ablation_dict,
-        "per_label_metrics": per_label_seg,
+        "per_label_metrics": chosen_per_label,
+        "raw_per_label_metrics": raw_per_label,
         "confusion_matrix": confusion_mat,
         "dataset_illustration_path": dataset_illustration_path,
         "checkpoint_config": ckpt_config.to_dict() if hasattr(ckpt_config, "to_dict") else dict(ckpt_config),
@@ -681,6 +725,7 @@ def run_cross_evaluation(
     save_illustrations: bool = True,
     max_illustrations: int = 6,
     skip_collision: bool = True,
+    filter_zero_positive: bool = True,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -733,10 +778,19 @@ def run_cross_evaluation(
         kp_abs = os.path.abspath(r.get("config_path", ""))
         cn = r.get("checkpoint_name") or resolve_checkpoint_name(cp_abs)
         kn = r.get("config_name", os.path.splitext(os.path.basename(kp_abs))[0])
+        ks = r.get("config_stem", os.path.splitext(os.path.basename(kp_abs))[0])
         if cp_abs and kp_abs:
             existing_map[(cp_abs, kp_abs)] = r
-        if cn and kn and cn not in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
-            existing_map[(cn, kn)] = r
+        if cn and cn not in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
+            if kn:
+                existing_map[(cn, kn)] = r
+            if ks:
+                existing_map[(cn, ks)] = r
+        if cp_abs:
+            if kn:
+                existing_map[(cp_abs, kn)] = r
+            if ks:
+                existing_map[(cp_abs, ks)] = r
 
     all_cross_results: List[Dict[str, Any]] = []
     checkpoint_to_results: Dict[str, List[Dict[str, Any]]] = {}
@@ -751,7 +805,8 @@ def run_cross_evaluation(
         for cfg_path in config_paths:
             run_idx += 1
             kp_abs = os.path.abspath(cfg_path)
-            kn = os.path.splitext(os.path.basename(cfg_path))[0]
+            cfg_stem = os.path.splitext(os.path.basename(cfg_path))[0]
+            kn = cfg_stem
 
             # Check for collision
             existing_res = None
@@ -759,32 +814,45 @@ def run_cross_evaluation(
                 if (cp_abs, kp_abs) in existing_map:
                     existing_res = existing_map[(cp_abs, kp_abs)]
                 elif (cn, kn) in existing_map and cn not in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
-                    existing_cp = os.path.abspath(existing_map[(cn, kn)].get("checkpoint_path", ""))
-                    if existing_cp == cp_abs:
-                        existing_res = existing_map[(cn, kn)]
+                    existing_res = existing_map[(cn, kn)]
+                elif (cn, cfg_stem) in existing_map and cn not in ("checkpoint_best", "checkpoint_latest", "checkpoint", "model", "best", "latest"):
+                    existing_res = existing_map[(cn, cfg_stem)]
+                elif (cp_abs, kn) in existing_map:
+                    existing_res = existing_map[(cp_abs, kn)]
+                elif (cp_abs, cfg_stem) in existing_map:
+                    existing_res = existing_map[(cp_abs, cfg_stem)]
                 else:
                     # Check neighbor dir for saved per-config report
                     neighbor_dir = resolve_checkpoint_neighbor_dir(ckpt_path)
-                    neighbor_cfg_json = os.path.join(neighbor_dir, f"eval_{kn}_report.json")
-                    if os.path.exists(neighbor_cfg_json):
-                        try:
-                            with open(neighbor_cfg_json, "r", encoding="utf-8") as f:
-                                rep = json.load(f)
-                                existing_res = {
-                                    "checkpoint_path": ckpt_path,
-                                    "checkpoint_name": cn,
-                                    "config_path": cfg_path,
-                                    "config_name": kn,
-                                    "dataset_name": rep.get("config", {}).get("data", {}).get("dataset_name", kn),
-                                    "eval_split": rep.get("config", {}).get("data", {}).get("val_split", "test"),
-                                    "metrics": rep.get("overall_metrics", {}),
-                                    "ablation_metrics": rep.get("ablation_results", {}),
-                                    "per_label_metrics": rep.get("per_label_metrics", {}),
-                                    "confusion_matrix": rep.get("confusion_matrix", []),
-                                    "eval_config": rep.get("config", {}),
-                                }
-                        except Exception:
-                            pass
+                    candidate_filenames = [
+                        f"eval_{kn}_report.json",
+                        f"eval_{cfg_stem}_report.json",
+                        f"{kn}_report.json",
+                        f"{cfg_stem}_report.json",
+                    ]
+                    for cf in candidate_filenames:
+                        cand_path = os.path.join(neighbor_dir, cf)
+                        if os.path.exists(cand_path):
+                            try:
+                                with open(cand_path, "r", encoding="utf-8") as f:
+                                    rep = json.load(f)
+                                    existing_res = {
+                                        "checkpoint_path": ckpt_path,
+                                        "checkpoint_name": cn,
+                                        "config_path": cfg_path,
+                                        "config_stem": cfg_stem,
+                                        "config_name": kn,
+                                        "dataset_name": rep.get("config", {}).get("data", {}).get("dataset_name", kn),
+                                        "eval_split": rep.get("config", {}).get("data", {}).get("val_split", rep.get("config", {}).get("data", {}).get("test_split", "test")),
+                                        "metrics": rep.get("overall_metrics", {}),
+                                        "ablation_metrics": rep.get("ablation_results", {}),
+                                        "per_label_metrics": rep.get("per_label_metrics", {}),
+                                        "confusion_matrix": rep.get("confusion_matrix", []),
+                                        "eval_config": rep.get("config", {}),
+                                    }
+                                    break
+                            except Exception:
+                                pass
 
             if existing_res is not None:
                 ds_name = existing_res.get("dataset_name", kn)
@@ -815,6 +883,7 @@ def run_cross_evaluation(
                 save_illustrations=save_illustrations,
                 max_illustrations=max_illustrations,
                 master_output_dir=master_output_dir,
+                filter_zero_positive=filter_zero_positive,
             )
 
             all_cross_results.append(res)
@@ -858,7 +927,9 @@ def run_cross_evaluation(
 
         # Also write per-config reports in neighbor dir
         for r in results:
-            cfg_stem = r.get("config_name", "config").replace(" ", "_")
+            raw_cfg = r.get("config_stem") or r.get("config_name", "config")
+            clean_stem = str(raw_cfg).replace(" ", "_")
+            report_stem = clean_stem if clean_stem.startswith("eval_") else f"eval_{clean_stem}"
             r_ill = [r["dataset_illustration_path"]] if r.get("dataset_illustration_path") else None
             generate_evaluation_report(
                 overall_metrics=r["metrics"],
@@ -866,11 +937,32 @@ def run_cross_evaluation(
                 confusion_matrix=r["confusion_matrix"],
                 config=r["eval_config"],
                 output_dir=neighbor_dir,
-                report_name=f"eval_{cfg_stem}_report",
+                report_name=f"{report_stem}_report",
                 ablation_results=r.get("ablation_metrics"),
                 illustration_paths=r_ill,
             )
         logger.info(f"✅ Checkpoint neighbor report saved at: {os.path.join(neighbor_dir, 'cross_evaluation_report.md')}")
+
+    # Merge newly evaluated results with existing master results to ensure continuous accumulation
+    evaluated_keys = set()
+    for r in all_cross_results:
+        cp_a = os.path.abspath(r.get("checkpoint_path", ""))
+        kp_a = os.path.abspath(r.get("config_path", ""))
+        cn_k = r.get("checkpoint_name", "")
+        kn_k = r.get("config_name", "")
+        if cp_a and kp_a:
+            evaluated_keys.add((cp_a, kp_a))
+        if cn_k and kn_k:
+            evaluated_keys.add((cn_k, kn_k))
+
+    consolidated_master_results: List[Dict[str, Any]] = list(all_cross_results)
+    for prev_r in existing_cross_results:
+        cp_a = os.path.abspath(prev_r.get("checkpoint_path", ""))
+        kp_a = os.path.abspath(prev_r.get("config_path", ""))
+        cn_k = prev_r.get("checkpoint_name", "")
+        kn_k = prev_r.get("config_name", "")
+        if (cp_a, kp_a) not in evaluated_keys and (cn_k, kn_k) not in evaluated_keys:
+            consolidated_master_results.append(prev_r)
 
     # 2. Generate Master Heatmaps and Illustrations
     master_illustration_paths: List[str] = []
@@ -878,7 +970,7 @@ def run_cross_evaluation(
         # Extract unique checkpoint & config names
         seen_ckpts = []
         seen_cfgs = []
-        for r in all_cross_results:
+        for r in consolidated_master_results:
             cn = r["checkpoint_name"]
             kn = r["config_name"]
             if cn not in seen_ckpts:
@@ -891,7 +983,7 @@ def run_cross_evaluation(
         pixel_acc_matrix = {}
         auroc_matrix = {}
 
-        for r in all_cross_results:
+        for r in consolidated_master_results:
             cn = r["checkpoint_name"]
             kn = r["config_name"]
             m = r["metrics"]
@@ -920,14 +1012,14 @@ def run_cross_evaluation(
             logger.warning(f"Failed to generate cross-eval heatmaps: {e}")
 
         # Also add sample prediction grids to master illustrations
-        for r in all_cross_results:
+        for r in consolidated_master_results:
             p = r.get("dataset_illustration_path")
             if p and p not in master_illustration_paths:
                 master_illustration_paths.append(p)
 
     # 3. Generate Master Cross-Evaluation Report
     master_report = generate_master_cross_evaluation_report(
-        cross_results=all_cross_results,
+        cross_results=consolidated_master_results,
         output_dir=master_output_dir,
         report_name="master_cross_evaluation_report",
         illustration_paths=master_illustration_paths if master_illustration_paths else None,
@@ -944,7 +1036,8 @@ def run_cross_evaluation(
 
     return {
         "master_report": master_report,
-        "cross_results": all_cross_results,
+        "cross_results": consolidated_master_results,
+        "current_cross_results": all_cross_results,
         "checkpoint_results": checkpoint_to_results,
         "output_dir": master_output_dir,
         "illustration_paths": master_illustration_paths,
@@ -988,6 +1081,7 @@ def main():
         save_illustrations=args.save_illustrations,
         max_illustrations=args.max_illustrations,
         skip_collision=args.skip_collision,
+        filter_zero_positive=args.filter_zero_positive,
     )
     return results
 

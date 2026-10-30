@@ -29,18 +29,34 @@ class ClassificationMetricTracker:
         target_labels: Union[torch.Tensor, np.ndarray, List[int]],
     ):
         """
-        class_logits: (B, num_classes)
+        class_logits: (B, num_classes) or (B, 1) or (B,)
         target_labels: (B,) or (B, 1)
         """
         if isinstance(class_logits, torch.Tensor):
-            probs = torch.softmax(class_logits.float(), dim=1).detach().cpu().numpy()
+            t_logits = class_logits.detach().cpu().float()
+            if t_logits.ndim == 1:
+                t_logits = t_logits.unsqueeze(1)
+            if t_logits.shape[-1] == 1:
+                p1 = torch.sigmoid(t_logits)
+                p0 = 1.0 - p1
+                probs = torch.cat([p0, p1], dim=-1).numpy()
+            else:
+                probs = torch.softmax(t_logits, dim=-1).numpy()
         else:
             arr = np.asarray(class_logits, dtype=np.float64)
-            if (arr < 0.0).any() or (arr > 1.0).any() or not np.allclose(arr.sum(axis=-1), 1.0, atol=1e-3):
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.shape[-1] == 1:
+                p1 = 1.0 / (1.0 + np.exp(-np.clip(arr, -500.0, 500.0)))
+                probs = np.concatenate([1.0 - p1, p1], axis=-1)
+            elif (arr < 0.0).any() or (arr > 1.0).any() or not np.allclose(arr.sum(axis=-1), 1.0, atol=1e-3):
                 exp_arr = np.exp(arr - np.max(arr, axis=-1, keepdims=True))
                 probs = exp_arr / np.sum(exp_arr, axis=-1, keepdims=True)
             else:
                 probs = arr
+
+        if probs.shape[-1] > self.num_classes:
+            self.num_classes = probs.shape[-1]
 
         preds = np.argmax(probs, axis=1).tolist()
 
@@ -65,15 +81,17 @@ class ClassificationMetricTracker:
         acc = float(np.mean(y_true == y_pred))
 
         # Confusion Matrix
-        cm = np.zeros((self.num_classes, self.num_classes), dtype=int)
+        max_label = max(int(np.max(y_true)) if len(y_true) > 0 else 0, int(np.max(y_pred)) if len(y_pred) > 0 else 0, y_probs.shape[1] - 1 if y_probs.ndim > 1 else 0)
+        eff_classes = max(self.num_classes, max_label + 1)
+        cm = np.zeros((eff_classes, eff_classes), dtype=int)
         for t, p in zip(y_true, y_pred):
-            if 0 <= t < self.num_classes and 0 <= p < self.num_classes:
+            if 0 <= t < eff_classes and 0 <= p < eff_classes:
                 cm[t, p] += 1
 
         # Macro F1 (computed across active classes: present in ground truth or predicted)
         f1_scores = []
         active_classes = []
-        for c in range(self.num_classes):
+        for c in range(eff_classes):
             tp = int(cm[c, c])
             fp = int(cm[:, c].sum() - tp)
             fn = int(cm[c, :].sum() - tp)
@@ -94,21 +112,29 @@ class ClassificationMetricTracker:
         else:
             macro_f1 = float(np.mean(f1_scores)) if f1_scores else 0.0
 
-        # Multi-class AUROC
+        # Multi-class and Binary AUROC
         aux_auroc = 0.0
         try:
             unique_classes = np.unique(y_true)
-            if len(unique_classes) > 1 and y_probs.shape[1] == self.num_classes:
-                if len(unique_classes) == self.num_classes:
+            n_prob_classes = y_probs.shape[1] if y_probs.ndim > 1 else 1
+
+            if len(unique_classes) > 1 and n_prob_classes >= 2:
+                if n_prob_classes == 2 and len(unique_classes) == 2:
+                    # Binary classification: y_score must be 1D probability of positive class
+                    pos_cls = unique_classes[1]
+                    bin_true = (y_true == pos_cls).astype(int)
+                    aux_auroc = float(roc_auc_score(bin_true, y_probs[:, 1]))
+                elif n_prob_classes > 2 and len(unique_classes) == n_prob_classes:
                     aux_auroc = float(roc_auc_score(y_true, y_probs, multi_class="ovr", average="macro"))
                 else:
                     # One-vs-rest on present classes
                     present_aurocs = []
                     for c in unique_classes:
-                        bin_true = (y_true == c).astype(int)
-                        if len(np.unique(bin_true)) > 1:
-                            present_aurocs.append(float(roc_auc_score(bin_true, y_probs[:, c])))
-                    aux_auroc = float(np.mean(present_aurocs)) if present_aurocs else 1.0
+                        if c < n_prob_classes:
+                            bin_true = (y_true == c).astype(int)
+                            if len(np.unique(bin_true)) > 1:
+                                present_aurocs.append(float(roc_auc_score(bin_true, y_probs[:, c])))
+                    aux_auroc = float(np.mean(present_aurocs)) if present_aurocs else (1.0 if acc > 0.5 else 0.5)
             else:
                 aux_auroc = 1.0 if acc > 0.5 else 0.5
         except Exception:

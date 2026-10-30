@@ -296,8 +296,19 @@ class CheckpointManager:
         }
         if hard_mining is not None:
             state["hard_mining"] = hard_mining
+        saved: Dict[str, str] = {}
         if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None:
             state["forensic_memory_state_dict"] = model_to_save.forensic_memory.state_dict()
+            if getattr(model_to_save, "memory_enabled", False):
+                try:
+                    mem_path = os.path.join(self.checkpoint_dir, "forensic_memory_periodic.pt")
+                    model_to_save.forensic_memory.save(mem_path)
+                    latest_mem_path = os.path.join(self.checkpoint_dir, "forensic_memory.pt")
+                    model_to_save.forensic_memory.save(latest_mem_path)
+                    saved["memory"] = latest_mem_path
+                    saved["memory_periodic"] = mem_path
+                except Exception as mem_e:
+                    logger.warning(f"Could not save standalone periodic forensic memory ({mem_e}).")
 
         periodic_path = os.path.join(self.checkpoint_dir, "checkpoint_periodic.pt")
         torch.save(state, periodic_path)
@@ -310,7 +321,8 @@ class CheckpointManager:
         latest_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml")
         save_config(cfg_dict, latest_cfg_path)
 
-        saved = {"periodic": periodic_path, "latest": latest_path}
+        saved["periodic"] = periodic_path
+        saved["latest"] = latest_path
 
         if self.push_to_hub and self.hf_repo:
             self.push_to_hf(
@@ -407,25 +419,28 @@ class CheckpointManager:
         self,
         epoch: int,
         model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: Optional[Any],
-        metrics: Dict[str, float],
-        config: Dict[str, Any],
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        scheduler: Optional[Any] = None,
+        metrics: Optional[Dict[str, float]] = None,
+        config: Optional[Dict[str, Any]] = None,
         is_best: bool = False,
         step: Optional[int] = None,
         scaler: Optional[Any] = None,
         history: Optional[List[Dict[str, Any]]] = None,
         hard_mining: Optional[Dict[str, Any]] = None,
+        current_score: Optional[float] = None,
     ) -> Dict[str, str]:
         """Save checkpoints to disk."""
-        current_score = metrics.get(self.metric_name, None)
-        if current_score is None:
-            if self.metric_name in ("val_loss", "loss"):
-                current_score = metrics.get("val_total_loss", metrics.get("val_loss", None))
-            elif self.metric_name == "val_total_loss":
-                current_score = metrics.get("val_loss", None)
-            elif self.metric_name in ("val_iou", "iou"):
-                current_score = metrics.get("val_iou", metrics.get("iou", None))
+        metrics_dict = metrics or {}
+        if current_score is None and metrics_dict:
+            current_score = metrics_dict.get(self.metric_name, None)
+            if current_score is None:
+                if self.metric_name in ("val_loss", "loss"):
+                    current_score = metrics_dict.get("val_total_loss", metrics_dict.get("val_loss", None))
+                elif self.metric_name == "val_total_loss":
+                    current_score = metrics_dict.get("val_loss", None)
+                elif self.metric_name in ("val_iou", "iou"):
+                    current_score = metrics_dict.get("val_iou", metrics_dict.get("iou", None))
         if current_score is not None and self.is_better(current_score):
             self.best_score = current_score
             self.best_epoch = epoch
@@ -438,11 +453,11 @@ class CheckpointManager:
             "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "scaler_state_dict": scaler.state_dict() if (scaler is not None and hasattr(scaler, "state_dict")) else None,
-            "metrics": metrics,
+            "metrics": metrics_dict,
             "best_score": self.best_score,
             "best_epoch": self.best_epoch,
             "history": history or [],
-            "config": config,
+            "config": config or {},
         }
         if hard_mining is not None:
             state["hard_mining"] = hard_mining
@@ -450,6 +465,14 @@ class CheckpointManager:
             state["forensic_memory_state_dict"] = model_to_save.forensic_memory.state_dict()
 
         saved_paths = {}
+
+        if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None and getattr(model_to_save, "memory_enabled", False):
+            try:
+                mem_path = os.path.join(self.checkpoint_dir, "forensic_memory.pt")
+                model_to_save.forensic_memory.save(mem_path)
+                saved_paths["memory"] = mem_path
+            except Exception as mem_e:
+                logger.warning(f"Could not save standalone forensic memory ({mem_e}).")
 
         if self.save_latest:
             latest_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
@@ -465,6 +488,13 @@ class CheckpointManager:
                 best_cfg_path = os.path.join(self.checkpoint_dir, "checkpoint_best_config.yaml")
                 save_config(config, best_cfg_path)
                 saved_paths["best"] = best_path
+                if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None and getattr(model_to_save, "memory_enabled", False):
+                    try:
+                        best_mem_path = os.path.join(self.checkpoint_dir, "forensic_memory_best.pt")
+                        model_to_save.forensic_memory.save(best_mem_path)
+                        saved_paths["memory_best"] = best_mem_path
+                    except Exception as mem_e:
+                        logger.warning(f"Could not save standalone best forensic memory ({mem_e}).")
 
         if self.push_to_hub and self.hf_repo:
             self.push_to_hf(
@@ -475,6 +505,9 @@ class CheckpointManager:
             )
 
         return saved_paths
+
+    save_checkpoint = save
+    periodic_save = save_periodic
 
     def load_latest(
         self,
@@ -558,12 +591,26 @@ class CheckpointManager:
         # Restore forensic memory state if present
         raw_m = getattr(model, "module", model)
         if hasattr(raw_m, "forensic_memory") and raw_m.forensic_memory is not None:
+            loaded_mem = False
             if isinstance(checkpoint, dict) and "forensic_memory_state_dict" in checkpoint and checkpoint["forensic_memory_state_dict"] is not None:
                 try:
                     raw_m.forensic_memory.load_state_dict(checkpoint["forensic_memory_state_dict"])
                     logger.info("Restored forensic vector memory state from checkpoint.")
+                    loaded_mem = True
                 except Exception as mem_err:
                     logger.warning(f"Could not restore forensic memory state ({mem_err}).")
+            if not loaded_mem:
+                ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+                for cand in ["forensic_memory.pt", "forensic_memory_best.pt", "forensic_memory_latest.pt", "forensic_memory_periodic.pt"]:
+                    cand_path = os.path.join(ckpt_dir, cand)
+                    if os.path.isfile(cand_path):
+                        try:
+                            raw_m.forensic_memory.load(cand_path)
+                            logger.info(f"Loaded forensic vector memory ({raw_m.forensic_memory.entry_count} entries) from '{cand_path}'.")
+                            loaded_mem = True
+                            break
+                        except Exception as mem_err:
+                            logger.warning(f"Could not load forensic memory from '{cand_path}': {mem_err}")
 
         if optimizer is not None and isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
             try:

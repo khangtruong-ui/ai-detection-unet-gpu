@@ -1,0 +1,91 @@
+# Configuration: Detective SAM Large (Adaptive AI-Image Forgery Localization)
+# Based on ICLR 2026 paper:
+# "Detective SAM: Adaptive AI-Image Forgery Localization"
+# Integrates frozen SAM2 Large (Hiera Large) backbone (facebook/sam2-hiera-large)
+# with perturbation-driven forensic clues, multi-scale feature adapters (delta correction),
+# and an automatic mask adapter (downscaled coarse transformer + spatial gating).
+
+project:
+  name: "sid_detective_sam_large"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/detective_sam_large"
+
+data:
+  dataset_name: "KhangTruong/COCO-inpainted"
+  streaming: true
+  use_parquet_loader: true
+  save_to_disk: true
+  background_download: true
+  cache_files: true                  # Cache full files locally to eliminate HTTP socket thrashing
+  max_cache_gb: 4.0                  # Bounded cache size waiting for consumption
+  columns: ["image", "mask"]
+  image_size: [256, 256]
+  batch_size: 16                     # Tailored micro-batch for SAM2 Large memory envelope
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 32
+  shuffle_buffer_size: 32
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  evaluate_on_test: true
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    color_jitter: 0.0
+
+model:
+  name: "detective_sam"
+  variant: "large"
+  pretrained_model_name_or_path: "facebook/sam2-hiera-large"
+  layer_width: 64                   # Optimal adapter width d=64 (Table 16)
+  noise_intensity: 0.75             # Optimal perturbation intensity (Table 16 & 17)
+  perturbation_type: "blur_noise"   # Gaussian blur + Gaussian noise (Table 16)
+  transformer_downscaling: 16       # 16x downscale for coarse transformer (Table 16)
+  transformer_layers: 1             # 1 transformer layer (Table 16)
+  dropout: 0.15                     # Dropout rate 0.15 (Table 16)
+  target_size: [512, 512]           # Standard 512x512 resolution for optimal throughput
+  freeze_sam2: true                 # SAM2 Large backbone remains frozen
+  freeze_decoder: true              # Frozen decoder per paper Section 3.2
+  multimask_output: false
+  aux_classifier: false
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+
+  # Learnable Forensic Vector Memory Configuration
+  memory_enabled: false             # Set true to enable forensic vector memory
+  memory_max_entries: 5000          # Bounded database size
+  memory_key_dim: 64                # Key vector dimension (matches adapter d=64)
+  memory_value_dim: 64              # Stored value vector dimension
+  memory_vectors_per_image: 16      # Max tampered vectors extracted per image
+  memory_retrieval_k: 8             # Number of nearest neighbors retrieved
+  memory_similarity_metric: "cosine"# Similarity metric: cosine, l2, or dot
+  memory_dedup_threshold: 0.95      # Cosine threshold above which candidates are discarded
+  memory_consolidation_method: "dedup_greedy" # Bounded consolidation
+  memory_seed: 42                   # Deterministic random seed
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 1.0e-3             # Optimal LR from paper Table 16 (0.001)
+  weight_decay: 1.0e-4              # Adam weight decay from paper Table 16 (0.0001)
+  gradient_accumulation_steps: 16   # Effective batch size scaling for Large backbone
+  mixed_precision: "bf16"
+  clip_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+  save_best: true
+  eval_every: 1

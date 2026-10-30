@@ -5,7 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-10-29
+## [Unreleased] - 2026-10-30
+
+### Fixed
+- **Cross-Evaluation Continuous Master Report Accumulation**:
+  - Fixed master cross-evaluation consolidation logic in `sid_unet/cross_eval.py` where evaluating a new checkpoint would overwrite `master_cross_evaluation_report.json` and discard previously evaluated checkpoints.
+  - Implemented non-destructive accumulation merging prior entries with current evaluation results in both tabular matrices and publication-quality heatmaps.
+- **Cross-Evaluation Collision Detection & Neighbor Report Path Resolution**:
+  - Corrected report file naming in neighbor directories to prevent `eval_eval_...` filename prefix doubling when `config_name` already contained the `eval_` prefix.
+  - Expanded collision lookup map in `sid_unet/cross_eval.py` to match across multiple canonical key representations (`(cp_abs, kp_abs)`, `(cn, kn)`, `(cn, cfg_stem)`, `(cp_abs, kn)`, and `(cp_abs, cfg_stem)`) as well as checking existing neighbor JSON reports (`eval_{kn}_report.json`, `eval_{cfg_stem}_report.json`, and `{kn}_report.json`).
+- **Classification AUROC Calculation for Binary Auxiliary Logits**:
+  - Fixed `ValueError: y should be a 1d array, got an array of shape (N, 2) instead` in `ClassificationMetricTracker` (`sid_unet/metrics/classification.py`) when computing AUROC with 2 classes under `multi_class="ovr"`.
+  - Added support for 1D/2D positive class probability scoring and single-logit binary classification models (`(B, 1)` or `(B,)`), replacing dummy fallback heuristics with genuine AUROC curves.
+- **Ablation & Per-Label Metric Synchronization in Evaluation Engines**:
+  - Fixed bug in `sid_unet/cross_eval.py` and `sid_unet/evaluate.py` where `per_label_metrics` always reported baseline Raw UNet scores even when post-processing or SAM refinement was active, discarding stage-specific per-label performance.
+  - Enhanced `SegmentationMetricTracker` (`sid_unet/metrics/segmentation.py`) to record per-label positive counts and metrics (`iou_pos_sum`, `dice_pos_sum`, `f1_pos_sum`, `precision_pos_sum`, and `recall_pos_sum`), aligning subset breakdowns with filtered evaluation settings.
+- **Model Forward Kwargs and Dictionary Output Support**:
+  - Enabled inspection and forwarding of `model_kwargs` (`f_r`, `img_ids`) to `model(images, **model_kwargs)` in `sid_unet/cross_eval.py` (matching `evaluate.py`), supporting models with external feature caches and forensic vector databases.
+  - Handled model dictionary outputs (`mask_logits`, `class_logits`, `pred_masks`) safely without type errors.
+
+### Added
+- **Base Cross-Evaluation Configuration for KhangTruong/COCO-inpainted**:
+  - Added `configs/cross-eval/base.yaml` and symlinked `configs/base.yaml` targeting `KhangTruong/COCO-inpainted` with standard UNet architectural parameters.
+  - Explicitly configured sample limit to 1024 samples (`val_samples: 1024`, `test_samples: 1024`, `eval_split: "validation"`) to verify cross-evaluation logic with bounded runtime.
+- **Comprehensive Unit & Integration Tests**:
+  - Added tests in `tests/test_metrics.py` covering binary AUROC computation, single-logit binary classification, and per-label positive metric filtering.
+  - Added tests in `tests/test_cross_eval.py` covering `base.yaml` configuration resolution, neighbor report naming without double prefixing, continuous multi-checkpoint master report retention, and dict-output forward handling.
+
+### Added
+- **Detective SAM Large Variant Support**:
+  - Implemented full configuration and instantiation support for `DetectiveSAM` using Meta's `facebook/sam2-hiera-large` ViT backbone.
+  - Verified architectural compatibility: SAM2 Large outputs identical hierarchical FPN channel dimensions `[32, 64, 256]` across scales, allowing seamless coupling with Detective SAM's multi-scale `FeatureAdapter` layers and `MaskAdapter`.
+  - Added pre-configured experiment recipes:
+    - `configs/experiments/sam2/detective_sam_large.yaml`: base Detective SAM with large ViT backbone, effective batch size 16 (1 sample/GPU with gradient accumulation steps 16), and target resolution 512x512.
+    - `configs/experiments/sam2/detective_sam_large_memory.yaml`: Detective SAM Large integrated with Learnable Forensic Vector Memory.
+  - Added unit and config regression tests in `tests/test_detective_sam.py` (`test_detective_sam_large_variant_init_and_forward` and `test_detective_sam_large_configs`).
+- **Forensic Memory Database Persistence, Checkpointing, and Hub Synchronization**:
+  - Checkpointed standalone database files alongside model checkpoints: `forensic_memory.pt`, `forensic_memory_best.pt`, and `forensic_memory_periodic.pt` in `sid_unet/training/callbacks.py`.
+  - Added resilient multi-stage loading in `UNet.from_checkpoint`: restores from embedded `forensic_memory_state_dict`, searches sibling files in the checkpoint directory, or falls back to explicit `memory_path`.
+  - Integrated database artifact discovery into `find_local_checkpoint_artifacts` in `sid_unet/checkpoint_sync.py` and opportunistic downloads in `sid_unet/utils/checkpoint.py`, ensuring `sid-push` automatically uploads the forensic memory database to Hugging Face Hub repositories.
+  - Added 3 automated tests in `tests/test_forensic_memory.py` covering manager persistence, sibling loading, and synchronization artifact discovery.
+
+## [0.1.2] - 2026-10-29
 
 ### Added
 - **Learnable Forensic Vector Memory for Detective SAM**: Implemented a CPU-resident vector database containing forensic representations extracted exclusively from ground-truth tampered image regions:

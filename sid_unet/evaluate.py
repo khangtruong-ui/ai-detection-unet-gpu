@@ -189,6 +189,21 @@ def parse_args():
         action="store_false",
         help="Disable collision checking and force re-evaluation of all checkpoints.",
     )
+    # Zero positive mask filtering for justified IoU
+    parser.add_argument(
+        "--filter-zero-positive",
+        "--filter_zero_positive",
+        dest="filter_zero_positive",
+        action="store_true",
+        default=True,
+        help="Filter out zero-positive ground-truth masks when computing average IoU and Dice (default: True).",
+    )
+    parser.add_argument(
+        "--no-filter-zero-positive",
+        dest="filter_zero_positive",
+        action="store_false",
+        help="Include zero-positive ground-truth masks in average IoU.",
+    )
     return parser.parse_args()
 
 
@@ -371,6 +386,7 @@ def evaluate_single_checkpoint(
     max_illustrations: int = 8,
     multi_run: bool = False,
     skip_collision: bool = True,
+    filter_zero_positive: bool = True,
 ) -> Dict[str, Any]:
     """Run full evaluation on a single checkpoint with ablation tracking and illustration generation."""
     if not os.path.exists(checkpoint_path):
@@ -502,10 +518,10 @@ def evaluate_single_checkpoint(
     logger.info(f"Evaluating dataset '{config.data.get('dataset_name')}' on split: '{resolved_split}' (requested: '{requested_split}')")
 
     # Set up multi-stage segmentation trackers
-    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold)
-    post_seg_tracker = SegmentationMetricTracker(threshold=threshold) if postprocessor.enabled else None
-    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold) if refiner is not None else None
-    both_seg_tracker = SegmentationMetricTracker(threshold=threshold) if (refiner is not None and postprocessor.enabled) else None
+    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive)
+    post_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if postprocessor.enabled else None
+    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if refiner is not None else None
+    both_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if (refiner is not None and postprocessor.enabled) else None
     cls_tracker = ClassificationMetricTracker(num_classes=config.model.get("num_classes", 3))
 
     total_loss_sum = 0.0
@@ -602,26 +618,30 @@ def evaluate_single_checkpoint(
     clear_memory_cache(device)
 
     # Compute metrics across all pipeline stages
-    raw_seg, per_label_seg = raw_seg_tracker.compute()
+    raw_seg, raw_per_label = raw_seg_tracker.compute()
     cls_metrics, confusion_mat = cls_tracker.compute()
 
     ablation_dict: Dict[str, Dict[str, Any]] = {"Baseline (Raw UNet)": raw_seg}
     chosen_seg = raw_seg
+    chosen_per_label = raw_per_label
 
     if post_seg_tracker is not None:
-        post_seg, _ = post_seg_tracker.compute()
+        post_seg, post_per_label = post_seg_tracker.compute()
         ablation_dict["+ Post-Processing"] = post_seg
         chosen_seg = post_seg
+        chosen_per_label = post_per_label
 
     if sam_seg_tracker is not None:
-        sam_seg, _ = sam_seg_tracker.compute()
+        sam_seg, sam_per_label = sam_seg_tracker.compute()
         ablation_dict["+ SAM Refinement"] = sam_seg
         chosen_seg = sam_seg
+        chosen_per_label = sam_per_label
 
     if both_seg_tracker is not None:
-        both_seg, _ = both_seg_tracker.compute()
+        both_seg, both_per_label = both_seg_tracker.compute()
         ablation_dict["+ SAM & Post-Processing"] = both_seg
         chosen_seg = both_seg
+        chosen_per_label = both_per_label
 
     overall_metrics = {
         "eval_split": resolved_split,
@@ -681,7 +701,7 @@ def evaluate_single_checkpoint(
     # Generate and override the report in the target output directory
     report_result = generate_evaluation_report(
         overall_metrics=overall_metrics,
-        per_label_metrics=per_label_seg,
+        per_label_metrics=chosen_per_label,
         confusion_matrix=confusion_mat,
         config=config.to_dict() if hasattr(config, "to_dict") else dict(config),
         output_dir=resolved_out_dir,
@@ -705,7 +725,7 @@ def evaluate_single_checkpoint(
 
         generate_evaluation_report(
             overall_metrics=overall_metrics,
-            per_label_metrics=per_label_seg,
+            per_label_metrics=chosen_per_label,
             confusion_matrix=confusion_mat,
             config=config.to_dict() if hasattr(config, "to_dict") else dict(config),
             output_dir=local_out_dir,
@@ -724,7 +744,8 @@ def evaluate_single_checkpoint(
         "overall_metrics": overall_metrics,
         "final_metrics": overall_metrics,
         "ablation_metrics": ablation_dict,
-        "per_label_metrics": per_label_seg,
+        "per_label_metrics": chosen_per_label,
+        "raw_per_label_metrics": raw_per_label,
         "confusion_matrix": confusion_mat,
         "illustration_paths": illustration_paths,
         "report_path": os.path.join(resolved_out_dir, "evaluation_report.md"),
@@ -805,6 +826,7 @@ def main():
             max_illustrations=args.max_illustrations,
             multi_run=False,
             skip_collision=args.skip_collision,
+            filter_zero_positive=args.filter_zero_positive,
         )
         return res["report_result"]
 
@@ -836,6 +858,7 @@ def main():
             max_illustrations=args.max_illustrations,
             multi_run=True,
             skip_collision=args.skip_collision,
+            filter_zero_positive=args.filter_zero_positive,
         )
         all_results.append(res)
 

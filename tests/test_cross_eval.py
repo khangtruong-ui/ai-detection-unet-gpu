@@ -391,3 +391,207 @@ def test_cross_eval_num_workers_cli_and_cap(monkeypatch):
     args = parse_args()
     assert args.num_workers == 4
 
+
+def test_base_coco_inpainted_config_spec():
+    """Verify that configs/cross-eval/base.yaml correctly targets KhangTruong/COCO-inpainted with 1024 samples."""
+    from sid_unet.utils.config import load_config
+    cfg = load_config("configs/cross-eval/base.yaml")
+    assert cfg.data.dataset_name == "KhangTruong/COCO-inpainted"
+    assert cfg.data.test_samples == 1024
+    assert cfg.data.val_samples == 1024
+    assert cfg.data.eval_split in ("validation", "test")
+    assert os.path.exists("configs/base.yaml")
+
+
+def test_cross_eval_neighbor_report_naming_and_collision(monkeypatch):
+    """Verify that neighbor reports are saved without 'eval_eval_' prefix doubling and collision detection works."""
+    from PIL import ImageDraw
+    class MockDataset:
+        def __init__(self, count=4):
+            self.samples = [
+                {
+                    "image": Image.new("RGB", (32, 32), color=(i * 30, 80, 80)),
+                    "label": 2,
+                    "mask": Image.new("L", (32, 32), color=255),
+                    "img_id": f"mock_{i}",
+                }
+                for i in range(count)
+            ]
+        def __iter__(self):
+            return iter(self.samples)
+        def __len__(self):
+            return len(self.samples)
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockDataset(4))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        train_dir = os.path.join(tmpdir, "train_runs")
+        ckpt_dir = os.path.join(train_dir, "RUN", "dummy_run", "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(ckpt_dir, "checkpoint_best.pt")
+
+        from sid_unet.models.unet import UNet
+        model = UNet(in_channels=3, out_channels=1, features=[8, 16], aux_classifier=False)
+        cfg = {
+            "project": {"name": "dummy_run", "device": "cpu"},
+            "model": {"name": "unet", "features": [8, 16], "aux_classifier": False},
+        }
+        torch.save({"model_state_dict": model.state_dict(), "config": cfg}, ckpt_path)
+
+        master_dir = os.path.join(tmpdir, "master_out")
+        res1 = run_cross_evaluation(
+            checkpoint_paths=[ckpt_path],
+            config_paths=["configs/cross-eval/cocoglide.yaml"],
+            split="test",
+            samples=2,
+            batch_size=2,
+            output_dir=master_dir,
+            overrides=["data.num_workers=0", "project.device=cpu"],
+            skip_collision=True,
+            save_illustrations=False,
+        )
+        assert len(res1["cross_results"]) == 1
+
+        neighbor_dir = os.path.join(train_dir, "RUN", "dummy_run", "cross_eval_reports")
+        # Ensure no eval_eval_ doubling occurred
+        assert not os.path.exists(os.path.join(neighbor_dir, "eval_eval_cocoglide_report.json"))
+        # Ensure standard report exists
+        assert os.path.exists(os.path.join(neighbor_dir, "eval_cocoglide_report.json"))
+
+        # Re-run: collision should skip seamlessly via neighbor or master report
+        res2 = run_cross_evaluation(
+            checkpoint_paths=[ckpt_path],
+            config_paths=["configs/cross-eval/cocoglide.yaml"],
+            split="test",
+            samples=2,
+            batch_size=2,
+            output_dir=master_dir,
+            overrides=["data.num_workers=0", "project.device=cpu"],
+            skip_collision=True,
+            save_illustrations=False,
+        )
+        assert len(res2["cross_results"]) == 1
+
+
+def test_cross_eval_continuous_master_report_accumulation_preserves_prior_checkpoints(monkeypatch):
+    """Verify that running cross evaluation on Checkpoint B does not purge Checkpoint A from the continuous master report."""
+    class MockDataset:
+        def __init__(self, count=4):
+            self.samples = [
+                {
+                    "image": Image.new("RGB", (32, 32), color=(i * 30, 80, 80)),
+                    "label": 2,
+                    "mask": Image.new("L", (32, 32), color=255),
+                    "img_id": f"mock_{i}",
+                }
+                for i in range(count)
+            ]
+        def __iter__(self):
+            return iter(self.samples)
+        def __len__(self):
+            return len(self.samples)
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockDataset(4))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt1_dir = os.path.join(tmpdir, "model1", "checkpoints")
+        ckpt2_dir = os.path.join(tmpdir, "model2", "checkpoints")
+        os.makedirs(ckpt1_dir, exist_ok=True)
+        os.makedirs(ckpt2_dir, exist_ok=True)
+        ckpt1_path = os.path.join(ckpt1_dir, "checkpoint_best.pt")
+        ckpt2_path = os.path.join(ckpt2_dir, "checkpoint_best.pt")
+
+        from sid_unet.models.unet import UNet
+        m1 = UNet(in_channels=3, out_channels=1, features=[8, 16], aux_classifier=False)
+        m2 = UNet(in_channels=3, out_channels=1, features=[8, 16], aux_classifier=False)
+        cfg1 = {"project": {"name": "model_alpha", "device": "cpu"}, "model": {"name": "unet", "features": [8, 16], "aux_classifier": False}}
+        cfg2 = {"project": {"name": "model_beta", "device": "cpu"}, "model": {"name": "unet", "features": [8, 16], "aux_classifier": False}}
+        torch.save({"model_state_dict": m1.state_dict(), "config": cfg1}, ckpt1_path)
+        torch.save({"model_state_dict": m2.state_dict(), "config": cfg2}, ckpt2_path)
+
+        master_dir = os.path.join(tmpdir, "master_continuous")
+
+        # Run 1: Evaluate ONLY ckpt1
+        res1 = run_cross_evaluation(
+            checkpoint_paths=[ckpt1_path],
+            config_paths=["configs/cross-eval/cocoglide.yaml"],
+            split="test",
+            samples=2,
+            batch_size=2,
+            output_dir=master_dir,
+            overrides=["data.num_workers=0", "project.device=cpu"],
+            skip_collision=True,
+            save_illustrations=False,
+        )
+        assert len(res1["cross_results"]) == 1
+        assert res1["cross_results"][0]["checkpoint_name"] == "model_alpha"
+
+        # Run 2: Evaluate ONLY ckpt2 (ckpt1 is NOT passed!)
+        res2 = run_cross_evaluation(
+            checkpoint_paths=[ckpt2_path],
+            config_paths=["configs/cross-eval/cocoglide.yaml"],
+            split="test",
+            samples=2,
+            batch_size=2,
+            output_dir=master_dir,
+            overrides=["data.num_workers=0", "project.device=cpu"],
+            skip_collision=True,
+            save_illustrations=False,
+        )
+        # Continuous master report MUST now contain BOTH model_alpha and model_beta!
+        assert len(res2["cross_results"]) == 2
+        ckpt_names = {r["checkpoint_name"] for r in res2["cross_results"]}
+        assert "model_alpha" in ckpt_names
+        assert "model_beta" in ckpt_names
+
+
+def test_cross_eval_eval_single_batch_dict_output_and_kwargs():
+    """Verify that eval_single_batch correctly accepts dict model outputs and forwards model_kwargs."""
+    from sid_unet.cross_eval import eval_single_batch
+    from sid_unet.metrics.segmentation import SegmentationMetricTracker
+    from sid_unet.metrics.classification import ClassificationMetricTracker
+    from sid_unet.losses.auxiliary import build_loss
+    from sid_unet.utils.config import load_config
+    import torch.nn as nn
+
+    class DictOutputModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(32 * 32 * 3, 32 * 32)
+        def forward(self, images, f_r=None, img_ids=None):
+            b = images.size(0)
+            logits = images[:, :1, :, :].clone()
+            return {"mask_logits": logits}
+
+    cfg = load_config("configs/test_smoke.yaml", overrides=["project.device=cpu"])
+    loss_fn = build_loss(cfg)
+
+    batch_sample = {
+        "image": torch.randn(2, 3, 32, 32),
+        "mask": torch.zeros(2, 1, 32, 32),
+        "label": torch.tensor([0, 0]),
+        "f_r": torch.randn(2, 16),
+        "img_id": ["id1", "id2"],
+    }
+    model = DictOutputModel()
+    raw_tracker = SegmentationMetricTracker(threshold=0.5)
+    cls_tracker = ClassificationMetricTracker(3)
+
+    loss_val, count, _ = eval_single_batch(
+        batch_sample,
+        model,
+        loss_fn,
+        torch.device("cpu"),
+        raw_tracker,
+        cls_tracker,
+    )
+    assert count == 2
+    assert loss_val >= 0.0
+    seg_m, _ = raw_tracker.compute()
+    assert "iou" in seg_m
+
+

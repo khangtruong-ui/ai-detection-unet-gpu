@@ -230,3 +230,119 @@ def test_compute_binary_metrics_low_precision_dtypes(dtype):
     metrics = compute_binary_metrics(pred, target)
     assert metrics["iou"] == 1.0
     assert metrics["pixel_acc"] == 1.0
+
+
+def test_filter_zero_positive_masks():
+    # Sample 0: Authentic image (all zero ground-truth). Model has 1 spurious false positive pixel.
+    # IoU for Sample 0 is 0.0 because tp=0, fp=1, fn=0 -> 0/1 = 0.
+    # Sample 1: Tampered image with genuine positive region. Model predicts it perfectly (IoU = 1.0).
+    targets = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    targets[1, 0, :8, :] = 1.0  # 128 positive pixels
+
+    preds = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    preds[0, 0, 0, 0] = 1.0     # 1 false positive pixel
+    preds[1, 0, :8, :] = 1.0    # Perfect prediction on positive sample
+
+    # 1. Unfiltered tracker (legacy behavior): Sample 0 pulls the metric down to 0.5
+    tracker_unfiltered = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=False)
+    tracker_unfiltered.update(preds, targets)
+    overall_unfiltered, _ = tracker_unfiltered.compute()
+    assert overall_unfiltered["iou"] == pytest.approx(0.5, abs=1e-4)
+    assert overall_unfiltered["positive_samples"] == 1
+    assert overall_unfiltered["zero_positive_samples"] == 1
+
+    # 2. Filtered tracker (justified behavior): filters out zero-positive mask (Sample 0)
+    tracker_filtered = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=True)
+    tracker_filtered.update(preds, targets)
+    overall_filtered, _ = tracker_filtered.compute()
+    assert overall_filtered["iou"] == pytest.approx(1.0, abs=1e-4)
+    assert overall_filtered["iou_all"] == pytest.approx(0.5, abs=1e-4)
+    assert overall_filtered["iou_positive"] == pytest.approx(1.0, abs=1e-4)
+    assert overall_filtered["positive_samples"] == 1
+    assert overall_filtered["zero_positive_samples"] == 1
+
+
+def test_filter_zero_positive_all_zero_fallback():
+    # When all samples in evaluation have 0 positive pixels
+    targets = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    preds = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+
+    tracker = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=True)
+    tracker.update(preds, targets)
+    overall, per_label = tracker.compute()
+    assert overall["positive_samples"] == 0
+    assert overall["zero_positive_samples"] == 2
+    assert overall["iou"] == 1.0  # clean fallback
+
+
+def test_classification_tracker_binary_auroc_two_classes():
+    # Verify that binary AUROC calculation doesn't throw ValueError or fall back to dummy accuracy
+    tracker = ClassificationMetricTracker(num_classes=2)
+    # 4 samples: 2 negatives, 2 positives with distinct calibrated probabilities
+    logits = torch.tensor([
+        [2.0, -2.0],  # sample 0: true 0, pred prob class 1 is small (~0.018)
+        [1.0, -1.0],  # sample 1: true 0, pred prob class 1 is small (~0.119)
+        [-1.0, 1.0],  # sample 2: true 1, pred prob class 1 is high (~0.881)
+        [-2.0, 2.0],  # sample 3: true 1, pred prob class 1 is high (~0.982)
+    ])
+    targets = torch.tensor([0, 0, 1, 1])
+
+    tracker.update(logits, targets)
+    metrics, cm = tracker.compute()
+
+    assert metrics["aux_accuracy"] == 1.0
+    assert metrics["aux_auroc"] == 1.0
+    assert len(cm) == 2
+
+
+def test_classification_tracker_single_logit_binary():
+    # Models outputting single logit (B, 1) or (B,) for binary classification
+    tracker = ClassificationMetricTracker(num_classes=2)
+    logits = torch.tensor([[-3.0], [-1.0], [1.0], [3.0]])
+    targets = torch.tensor([0, 0, 1, 1])
+
+    tracker.update(logits, targets)
+    metrics, cm = tracker.compute()
+
+    assert metrics["aux_accuracy"] == 1.0
+    assert metrics["aux_auroc"] == 1.0
+    assert cm[0][0] == 2
+    assert cm[1][1] == 2
+
+
+def test_segmentation_tracker_per_label_with_filter_zero_positive():
+    tracker = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=True)
+
+    # 3 samples:
+    # Sample 0: Label 0 (Real) -> all-zero target, 1 false positive pixel -> iou_sample = 0.0
+    # Sample 1: Label 2 (Tampered) -> positive target, perfect prediction -> iou_sample = 1.0
+    # Sample 2: Label 2 (Tampered) -> positive target, perfect prediction -> iou_sample = 1.0
+    targets = torch.zeros((3, 1, 16, 16), dtype=torch.float32)
+    targets[1, 0, :8, :] = 1.0
+    targets[2, 0, :8, :] = 1.0
+
+    preds = torch.zeros((3, 1, 16, 16), dtype=torch.float32)
+    preds[0, 0, 0, 0] = 1.0  # 1 FP pixel
+    preds[1, 0, :8, :] = 1.0
+    preds[2, 0, :8, :] = 1.0
+
+    labels = torch.tensor([0, 2, 2])
+
+    tracker.update(preds, targets, labels)
+    overall, per_label = tracker.compute()
+
+    # Filtered overall IoU should only include positive samples (samples 1 & 2 -> 1.0)
+    assert overall["iou"] == pytest.approx(1.0, abs=1e-4)
+    assert overall["positive_samples"] == 2
+    assert overall["zero_positive_samples"] == 1
+
+    # Per-label 2 (tampered, positive)
+    assert per_label[2]["iou"] == pytest.approx(1.0, abs=1e-4)
+    assert per_label[2]["dice"] == pytest.approx(1.0, abs=1e-4)
+    assert per_label[2]["positive_samples"] == 2
+
+    # Per-label 0 (real, zero positive pixels) should maintain valid stats
+    assert per_label[0]["samples"] == 1
+    assert per_label[0]["positive_samples"] == 0
+
+

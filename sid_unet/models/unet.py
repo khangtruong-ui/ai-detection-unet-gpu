@@ -4,11 +4,14 @@ UNet architecture with optional 3-class auxiliary classification head for AI ima
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
 from sid_unet.models.blocks import AuxiliaryClassifier, DoubleConv, Down, OutConv, Up
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_checkpoint(func, *args):
@@ -327,6 +330,50 @@ class UNet(nn.Module):
         model = build_model(config)
         from sid_unet.training.callbacks import load_state_dict_compatible
         load_state_dict_compatible(model, state_dict, strict=strict, target_device=target_map)
+
+        # Restore forensic vector memory if supported by the model architecture
+        raw_model = getattr(model, "module", model)
+        if hasattr(raw_model, "forensic_memory") and raw_model.forensic_memory is not None:
+            loaded_mem = False
+            # 1. From embedded checkpoint dictionary
+            if isinstance(ckpt, dict) and "forensic_memory_state_dict" in ckpt and ckpt["forensic_memory_state_dict"] is not None:
+                try:
+                    raw_model.forensic_memory.load_state_dict(ckpt["forensic_memory_state_dict"])
+                    logger.info(
+                        f"Restored forensic vector memory ({raw_model.forensic_memory.entry_count} entries) "
+                        f"from checkpoint dictionary."
+                    )
+                    loaded_mem = True
+                except Exception as mem_err:
+                    logger.warning(f"Could not restore forensic memory state dict from checkpoint ({mem_err}).")
+            # 2. Or from sibling memory file in checkpoint directory
+            if not loaded_mem:
+                ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+                for cand in ["forensic_memory.pt", "forensic_memory_best.pt", "forensic_memory_latest.pt", "forensic_memory_periodic.pt"]:
+                    cand_path = os.path.join(ckpt_dir, cand)
+                    if os.path.isfile(cand_path):
+                        try:
+                            raw_model.forensic_memory.load(cand_path)
+                            logger.info(
+                                f"Loaded forensic vector memory ({raw_model.forensic_memory.entry_count} entries) "
+                                f"from sibling file '{cand_path}'."
+                            )
+                            loaded_mem = True
+                            break
+                        except Exception as mem_err:
+                            logger.warning(f"Could not load forensic memory from sibling file '{cand_path}': {mem_err}")
+            # 3. Or from explicit configured memory_path
+            if not loaded_mem and hasattr(raw_model, "memory_path") and raw_model.memory_path and os.path.isfile(raw_model.memory_path):
+                try:
+                    raw_model.forensic_memory.load(raw_model.memory_path)
+                    logger.info(
+                        f"Loaded forensic vector memory ({raw_model.forensic_memory.entry_count} entries) "
+                        f"from memory_path '{raw_model.memory_path}'."
+                    )
+                    loaded_mem = True
+                except Exception as mem_err:
+                    logger.warning(f"Could not load forensic memory from memory_path '{raw_model.memory_path}': {mem_err}")
+
         model.eval()
 
         if device is not None:
