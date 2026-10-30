@@ -85,7 +85,7 @@ def test_all_experiment_configs_validity():
         assert cfg.data.train_samples_per_epoch == -1
         assert cfg.data.val_samples == -1
 
-        cfg.project.device = "cpu"
+        cfg.project.device = "cuda" if torch.cuda.is_available() else "cpu"
         # Use fast tiny model for sam3 / gap-sam config loop testing
         if "gap_sam" in str(cfg.model.name).lower() or "gap-sam" in str(cfg.model.name).lower():
             cfg.model.checkpoint_path = None
@@ -97,8 +97,12 @@ def test_all_experiment_configs_validity():
         elif "sam3" in str(cfg.model.name).lower():
             cfg.model.pretrained_model_name_or_path = "yujiepan/sam3-tiny-random"
             cfg.model.load_in_4bit = False
-        elif "diffusion" in str(cfg.model.name).lower() or "vae" in str(cfg.model.name).lower():
+        elif "diffusion" in str(cfg.model.name).lower() or "vae" in str(cfg.model.name).lower() or "iml" in str(cfg.model.name).lower() or "maskformer" in str(cfg.model.name).lower():
             cfg.model.use_dummy = True
+        elif "mask_clip" in str(cfg.model.name).lower() or "maskclip" in str(cfg.model.name).lower():
+            cfg.model.pretrained = False
+            cfg.model.allow_random_init = True
+            cfg.model.checkpoint_filename = None
 
         # Verify model and loss build cleanly
         try:

@@ -516,6 +516,67 @@ class SinusoidPositionEmbeddings2D(nn.Module):
         return pe.to(device=x.device, dtype=x.dtype)
 
 
+def _ensure_sam2_available(repo_dir: Path) -> None:
+    """
+    Ensure Meta's official SAM 2 repository/package is importable.
+    Searches installed packages, local repo paths, or clones if missing.
+    """
+    try:
+        import sam2  # noqa: F401
+        from sam2.build_sam import build_sam2  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import sys
+
+    # 1. Check if repo_dir has sam2 package
+    if repo_dir.exists() and (repo_dir / "sam2").is_dir():
+        if str(repo_dir) not in sys.path:
+            sys.path.insert(0, str(repo_dir))
+        try:
+            import sam2  # noqa: F401
+            from sam2.build_sam import build_sam2  # noqa: F401
+            return
+        except ImportError:
+            pass
+
+    # 2. Check candidate directories
+    for cand in DEFAULT_SAM2_REPO_CANDIDATES:
+        if cand.exists() and (cand / "sam2").is_dir():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            try:
+                import sam2  # noqa: F401
+                from sam2.build_sam import build_sam2  # noqa: F401
+                return
+            except ImportError:
+                pass
+
+    # 3. Clone repository if missing
+    import shutil
+    import subprocess
+    logger.info(f"Cloning official SAM2 repository to {repo_dir}...")
+    tmp_clone = Path("/tmp/sam2_clone")
+    if not (tmp_clone / "sam2").is_dir():
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/facebookresearch/sam2.git", str(tmp_clone)],
+            check=True,
+            capture_output=True,
+        )
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    for item in tmp_clone.iterdir():
+        dest = repo_dir / item.name
+        if not dest.exists():
+            if item.is_dir():
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+
+    if str(repo_dir) not in sys.path:
+        sys.path.insert(0, str(repo_dir))
+
+
 class SAM2ImageEncoder(nn.Module):
     """
     Frozen SAM 2.1 Hiera Vision Backbone for multi-scale feature extraction.
@@ -529,12 +590,16 @@ class SAM2ImageEncoder(nn.Module):
         config_path: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
         variant: str = "large",
-        device: str = "auto",
+        device: Optional[Union[str, torch.device]] = "auto",
         use_dummy: bool = False,
     ):
         super().__init__()
         self.variant = variant.lower()
         self.use_dummy = use_dummy
+        self.sam2_repo = sam2_repo
+        self.config_path = config_path
+        self.checkpoint_path = checkpoint_path
+        self.device = str(device) if device is not None else "auto"
         self.backbone_dims = BACKBONE_DIMS.get(self.variant, BACKBONE_DIMS["large"])
 
         if use_dummy:
@@ -542,13 +607,15 @@ class SAM2ImageEncoder(nn.Module):
             self.image_encoder = None
             return
 
-        resolved_device = "cuda" if (device == "cuda" or (device == "auto" and torch.cuda.is_available())) else "cpu"
+        resolved_device = "cuda" if (self.device == "cuda" or (self.device == "auto" and torch.cuda.is_available())) else "cpu"
         repo_dir = self._find_sam2_repo(sam2_repo)
         cfg_file = config_path or SAM2_CONFIGS.get(self.variant, SAM2_CONFIGS["large"])
 
         # Resolve checkpoint file
         if checkpoint_path and Path(checkpoint_path).exists():
             ckpt_file = str(checkpoint_path)
+        elif checkpoint_path:
+            ckpt_file = self._download_checkpoint(Path(checkpoint_path), self.variant)
         else:
             ckpt_name = f"sam2.1_hiera_{self.variant}.pt"
             candidate_ckpt = repo_dir / "checkpoints" / ckpt_name
@@ -556,6 +623,8 @@ class SAM2ImageEncoder(nn.Module):
                 ckpt_file = str(candidate_ckpt)
             else:
                 ckpt_file = self._download_checkpoint(candidate_ckpt, self.variant)
+
+        _ensure_sam2_available(repo_dir)
 
         try:
             from sam2.build_sam import build_sam2
@@ -565,9 +634,11 @@ class SAM2ImageEncoder(nn.Module):
                 p.requires_grad = False
             logger.info(f"Loaded SAM2 Hiera trunk ({self.variant}) from '{ckpt_file}'.")
         except Exception as exc:
-            logger.warning(f"Could not load official SAM2 trunk ({exc}). Falling back to lightweight dummy trunk.")
-            self.use_dummy = True
-            self.image_encoder = None
+            logger.error(f"Failed to load official SAM2 trunk ({exc}) from '{ckpt_file}'.")
+            raise RuntimeError(
+                f"Failed to load official SAM2 trunk ({exc}) from '{ckpt_file}'. "
+                f"Dummy weights fallback is strictly disabled when use_dummy=False."
+            ) from exc
 
     def _find_sam2_repo(self, explicit_repo: Optional[Union[str, Path]]) -> Path:
         if explicit_repo and Path(explicit_repo).exists():
@@ -575,7 +646,7 @@ class SAM2ImageEncoder(nn.Module):
         for cand in DEFAULT_SAM2_REPO_CANDIDATES:
             if cand.exists():
                 return cand
-        return Path("/content/sam2")
+        return Path(explicit_repo or "/content/sam2")
 
     def _download_checkpoint(self, target_path: Path, variant: str) -> str:
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -598,6 +669,9 @@ class SAM2ImageEncoder(nn.Module):
                 torch.zeros(b, c2, 24, 24, device=dev),
                 torch.zeros(b, c3, 12, 12, device=dev),
             ]
+        first_param = next(self.image_encoder.parameters(), None)
+        if first_param is not None and images.device != first_param.device:
+            images = images.to(device=first_param.device)
         return self.image_encoder(images)
 
 
@@ -607,9 +681,25 @@ class PixelEncoder(nn.Module):
     and constructs multi-scale DeformableFeatures.
     """
 
-    def __init__(self, embed_dim: int = 256, variant: str = "large", use_dummy: bool = False):
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        variant: str = "large",
+        sam2_repo: Optional[Union[str, Path]] = None,
+        config_path: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        device: Optional[Union[str, torch.device]] = "auto",
+        use_dummy: bool = False,
+    ):
         super().__init__()
-        self.sam_backbone = SAM2ImageEncoder(variant=variant, use_dummy=use_dummy)
+        self.sam_backbone = SAM2ImageEncoder(
+            sam2_repo=sam2_repo,
+            config_path=config_path,
+            checkpoint_path=checkpoint_path,
+            variant=variant,
+            device=device,
+            use_dummy=use_dummy,
+        )
         backbone_dims = BACKBONE_DIMS.get(variant, BACKBONE_DIMS["large"])
         self.embed_dim = embed_dim
 
@@ -1029,9 +1119,33 @@ class TransformerDecoder(nn.Module):
 
 
 class PixelModule(nn.Module):
-    def __init__(self, num_layers: int = 6, embed_dim: int = 256, ffn_hid_dim: int = 1024, num_heads: int = 8, num_levels: int = 3, num_points: int = 4, variant: str = "large", use_dummy: bool = False, attn_drop: float = 0.0, ffn_drop: float = 0.0):
+    def __init__(
+        self,
+        num_layers: int = 6,
+        embed_dim: int = 256,
+        ffn_hid_dim: int = 1024,
+        num_heads: int = 8,
+        num_levels: int = 3,
+        num_points: int = 4,
+        variant: str = "large",
+        sam2_repo: Optional[Union[str, Path]] = None,
+        config_path: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        device: Optional[Union[str, torch.device]] = "auto",
+        use_dummy: bool = False,
+        attn_drop: float = 0.0,
+        ffn_drop: float = 0.0,
+    ):
         super().__init__()
-        self.pixel_encoder = PixelEncoder(embed_dim=embed_dim, variant=variant, use_dummy=use_dummy)
+        self.pixel_encoder = PixelEncoder(
+            embed_dim=embed_dim,
+            variant=variant,
+            sam2_repo=sam2_repo,
+            config_path=config_path,
+            checkpoint_path=checkpoint_path,
+            device=device,
+            use_dummy=use_dummy,
+        )
         f4_dim = BACKBONE_DIMS.get(variant, BACKBONE_DIMS["large"])[0]
         self.pixel_decoder = PixelDecoder(
             num_layers=num_layers,
@@ -1107,6 +1221,10 @@ class IMLMaskformer(nn.Module):
             num_levels=3,
             num_points=4,
             variant=self.variant,
+            sam2_repo=sam2_repo,
+            config_path=config_path,
+            checkpoint_path=checkpoint_path,
+            device=device,
             use_dummy=use_dummy,
         )
 

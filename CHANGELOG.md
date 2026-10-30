@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-10-30
 
 ### Fixed
+- **IML MaskFormer Official SAM 2.1 Hiera Vision Backbone Integration**:
+  - Resolved silent fallback to dummy weights (`Could not load official SAM2 trunk. Falling back to lightweight dummy trunk`) in `sid_unet/models/iml_maskformer.py`.
+  - Implemented `_ensure_sam2_available(repo_dir)` to automatically detect Meta's SAM 2 repository/package or clone it into target directories without colliding with pre-existing checkpoint files.
+  - Enforced strict loading when `use_dummy=False`: silent dummy fallback is completely forbidden, raising an explicit `RuntimeError` if official weights cannot be instantiated.
+  - Forwarded `sam2_repo`, `config_path`, `checkpoint_path`, and `device` parameters from `IMLMaskformer` through `PixelModule` and `PixelEncoder` down to `SAM2ImageEncoder`.
+  - Added input device alignment in `SAM2ImageEncoder.forward` to ensure incoming image tensors match vision trunk parameters across mixed-precision and distributed settings.
+  - Added `hydra-core>=1.3.2`, `omegaconf>=2.3.0`, and `iopath>=0.1.10` to `pyproject.toml` base dependencies, `iml` optional dependency group, and `all`.
+  - Added unit and regression tests in `tests/test_iml.py` covering real trunk instantiation, parameter forwarding, and strict dummy fallback prevention.
+  - Added technical architecture and integration note in `docs/iml_maskformer_integration.md`.
 - **Cross-Evaluation Continuous Master Report Accumulation**:
   - Fixed master cross-evaluation consolidation logic in `sid_unet/cross_eval.py` where evaluating a new checkpoint would overwrite `master_cross_evaluation_report.json` and discard previously evaluated checkpoints.
   - Implemented non-destructive accumulation merging prior entries with current evaluation results in both tabular matrices and publication-quality heatmaps.
