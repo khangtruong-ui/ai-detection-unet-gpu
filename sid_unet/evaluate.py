@@ -189,6 +189,21 @@ def parse_args():
         action="store_false",
         help="Disable collision checking and force re-evaluation of all checkpoints.",
     )
+    # Zero positive mask filtering for justified IoU
+    parser.add_argument(
+        "--filter-zero-positive",
+        "--filter_zero_positive",
+        dest="filter_zero_positive",
+        action="store_true",
+        default=True,
+        help="Filter out zero-positive ground-truth masks when computing average IoU and Dice (default: True).",
+    )
+    parser.add_argument(
+        "--no-filter-zero-positive",
+        dest="filter_zero_positive",
+        action="store_false",
+        help="Include zero-positive ground-truth masks in average IoU.",
+    )
     return parser.parse_args()
 
 
@@ -371,6 +386,7 @@ def evaluate_single_checkpoint(
     max_illustrations: int = 8,
     multi_run: bool = False,
     skip_collision: bool = True,
+    filter_zero_positive: bool = True,
 ) -> Dict[str, Any]:
     """Run full evaluation on a single checkpoint with ablation tracking and illustration generation."""
     if not os.path.exists(checkpoint_path):
@@ -502,10 +518,10 @@ def evaluate_single_checkpoint(
     logger.info(f"Evaluating dataset '{config.data.get('dataset_name')}' on split: '{resolved_split}' (requested: '{requested_split}')")
 
     # Set up multi-stage segmentation trackers
-    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold)
-    post_seg_tracker = SegmentationMetricTracker(threshold=threshold) if postprocessor.enabled else None
-    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold) if refiner is not None else None
-    both_seg_tracker = SegmentationMetricTracker(threshold=threshold) if (refiner is not None and postprocessor.enabled) else None
+    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive)
+    post_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if postprocessor.enabled else None
+    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if refiner is not None else None
+    both_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if (refiner is not None and postprocessor.enabled) else None
     cls_tracker = ClassificationMetricTracker(num_classes=config.model.get("num_classes", 3))
 
     total_loss_sum = 0.0
@@ -805,6 +821,7 @@ def main():
             max_illustrations=args.max_illustrations,
             multi_run=False,
             skip_collision=args.skip_collision,
+            filter_zero_positive=args.filter_zero_positive,
         )
         return res["report_result"]
 
@@ -836,6 +853,7 @@ def main():
             max_illustrations=args.max_illustrations,
             multi_run=True,
             skip_collision=args.skip_collision,
+            filter_zero_positive=args.filter_zero_positive,
         )
         all_results.append(res)
 

@@ -268,3 +268,44 @@ def test_sam2_query_slot_parameter_sizes():
     )
     assert total_query_params == 1536
 
+
+def test_detective_sam_large_variant_init_and_forward():
+    """Verify DetectiveSAM correctly instantiates and executes with the SAM2 Large variant."""
+    model = DetectiveSAM(
+        variant="large",
+        use_dummy=True,
+        device="cpu",
+    )
+    assert model.variant == "large"
+    assert model.pretrained_model_name_or_path == "facebook/sam2-hiera-large"
+
+    x = torch.randn(2, 3, 512, 512)
+    out = model(x)
+    assert out.shape == (2, 1, 512, 512)
+    assert torch.isfinite(out).all()
+
+
+def test_detective_sam_large_configs():
+    """Verify both standard and memory-enabled SAM2 Large configuration files load and build correctly."""
+    from sid_unet.utils.config import load_config
+    
+    # Standard Large
+    cfg_large = load_config("configs/experiments/sam2/detective_sam_large.yaml")
+    assert cfg_large.model.variant == "large"
+    assert cfg_large.model.pretrained_model_name_or_path == "facebook/sam2-hiera-large"
+    cfg_large.model.use_dummy = True
+    model_large = build_model(cfg_large)
+    assert model_large.variant == "large"
+    assert not model_large.memory_enabled
+
+    # Memory Large
+    cfg_large_mem = load_config("configs/experiments/sam2/detective_sam_large_memory.yaml")
+    assert cfg_large_mem.model.variant == "large"
+    assert cfg_large_mem.model.memory_enabled is True
+    cfg_large_mem.model.use_dummy = True
+    model_large_mem = build_model(cfg_large_mem)
+    assert model_large_mem.variant == "large"
+    assert model_large_mem.memory_enabled is True
+    assert model_large_mem.forensic_memory is not None
+
+

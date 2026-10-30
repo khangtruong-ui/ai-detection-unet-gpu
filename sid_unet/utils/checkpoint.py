@@ -21,6 +21,10 @@ HF_CHECKPOINT_CANDIDATES = [
     "checkpoints/checkpoint_best.pt",
     "checkpoint_periodic.pt",
     "checkpoints/checkpoint_periodic.pt",
+    "forensic_memory.pt",
+    "checkpoints/forensic_memory.pt",
+    "forensic_memory_best.pt",
+    "checkpoints/forensic_memory_best.pt",
     "outputs/RUN/default/checkpoints/checkpoint_latest.pt",
     "outputs/RUN/default/checkpoints/checkpoint_best.pt",
     "MaskCLIP_sd15_20241108_09_14_22.pth",
@@ -161,6 +165,10 @@ def download_hf_checkpoint(
                 "checkpoint_best.pt",
                 "outputs/RUN/default/checkpoints/checkpoint_best.pt",
                 "checkpoints/checkpoint_periodic.pt",
+    "forensic_memory.pt",
+    "checkpoints/forensic_memory.pt",
+    "forensic_memory_best.pt",
+    "checkpoints/forensic_memory_best.pt",
                 "checkpoint_periodic.pt",
                 "MaskCLIP_sd15_20241108_09_14_22.pth",
                 "MaskCLIP_sd15_20241109_08_53_19.pth",
@@ -193,6 +201,19 @@ def download_hf_checkpoint(
                 token=token,
                 force_download=force_download,
             )
+            # If a model checkpoint was downloaded, also opportunistically download forensic memory if present in repo
+            if not fname.startswith("forensic_memory"):
+                for mem_cand in ["forensic_memory.pt", "checkpoints/forensic_memory.pt", "forensic_memory_best.pt"]:
+                    try:
+                        hf_hub_download(
+                            repo_id=repo_id,
+                            filename=mem_cand,
+                            cache_dir=effective_cache,
+                            token=token,
+                            force_download=force_download,
+                        )
+                    except Exception:
+                        pass
             return {
                 "checkpoint_path": downloaded_path,
                 "repo_id": repo_id,

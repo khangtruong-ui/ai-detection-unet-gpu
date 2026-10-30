@@ -200,6 +200,21 @@ def parse_args():
         action="store_false",
         help="Disable collision checking and force re-evaluation of all combinations.",
     )
+    # Zero positive mask filtering for justified IoU
+    parser.add_argument(
+        "--filter-zero-positive",
+        "--filter_zero_positive",
+        dest="filter_zero_positive",
+        action="store_true",
+        default=True,
+        help="Filter out zero-positive ground-truth masks when computing average IoU and Dice (default: True).",
+    )
+    parser.add_argument(
+        "--no-filter-zero-positive",
+        dest="filter_zero_positive",
+        action="store_false",
+        help="Include zero-positive ground-truth masks in average IoU.",
+    )
     return parser.parse_args()
 
 
@@ -429,6 +444,7 @@ def evaluate_checkpoint_on_config(
     save_illustrations: bool = True,
     max_illustrations: int = 6,
     master_output_dir: Optional[str] = None,
+    filter_zero_positive: bool = True,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -475,10 +491,10 @@ def evaluate_checkpoint_on_config(
     resolved_split = getattr(eval_loader.dataset, "resolved_split", split or eval_config.data.get("eval_split", "test"))
     dataset_name = eval_config.data.get("dataset_name", "KhangTruong/IMD2020")
 
-    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold)
-    post_seg_tracker = SegmentationMetricTracker(threshold=threshold) if postprocessor.enabled else None
-    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold) if refiner is not None else None
-    both_seg_tracker = SegmentationMetricTracker(threshold=threshold) if (refiner is not None and postprocessor.enabled) else None
+    raw_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive)
+    post_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if postprocessor.enabled else None
+    sam_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if refiner is not None else None
+    both_seg_tracker = SegmentationMetricTracker(threshold=threshold, filter_zero_positive=filter_zero_positive) if (refiner is not None and postprocessor.enabled) else None
     cls_tracker = ClassificationMetricTracker(num_classes=ckpt_config.model.get("num_classes", 3))
 
     total_loss_sum = 0.0
@@ -681,6 +697,7 @@ def run_cross_evaluation(
     save_illustrations: bool = True,
     max_illustrations: int = 6,
     skip_collision: bool = True,
+    filter_zero_positive: bool = True,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -815,6 +832,7 @@ def run_cross_evaluation(
                 save_illustrations=save_illustrations,
                 max_illustrations=max_illustrations,
                 master_output_dir=master_output_dir,
+                filter_zero_positive=filter_zero_positive,
             )
 
             all_cross_results.append(res)
@@ -988,6 +1006,7 @@ def main():
         save_illustrations=args.save_illustrations,
         max_illustrations=args.max_illustrations,
         skip_collision=args.skip_collision,
+        filter_zero_positive=args.filter_zero_positive,
     )
     return results
 

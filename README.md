@@ -1105,7 +1105,7 @@ Key Architectural Components:
 
 4. **Prediction Heads & Dense Semantics**:
    - `ClsPredictionHead`: Projects queries to 3 forensic classes (Authentic, Forged, No-Object).
-   - `MaskPredictionHead`: 3-layer MLP predicting dynamic mask embedding vectors $\mathbf{w}_i \in \mathbb{R}^{256}$. Inner product $\mathbf{w}_i \cdot \mathbf{M}_{\mathrm{high\_res}}$ yields candidate spatial masks $[B, 100, H/4, W/4]$.
+   - `MaskPredictionHead`: 3-layer MLP predicting dynamic mask embedding vectors $\mathbf{w}_i \in \mathbb{R}^{256}$. Inner product $\mathbf{w}_i \cdot \mathbf{M}_{\text{high-res}}$ yields candidate spatial masks $[B, 100, H/4, W/4]$.
    - Dense Forgery Logit Assembly:
      $$S_{c, x, y} = \sum_{i=1}^{N} P_i(c) \cdot \sigma(M_{i, x, y})$$
      $$\text{Logit}(x, y) = S_{\text{forged}, x, y} - S_{\text{authentic}, x, y}$$
@@ -1197,7 +1197,11 @@ Key Architectural Innovations & Integration Analysis:
      $$M = g \odot L_{\text{refine}} + (1 - g) \odot L_{\text{coarse}}$$
 4. **SAM2 Mask Decoder Execution**:
    - Both the heatmap prompt $M$ and adapted features $\{\tilde{F}_s\}$ are fed into SAM2's frozen prompt encoder and mask decoder, predicting crisp, calibrated forgery logits $\hat{M}$.
-5. **Practical Integration Subtleties & Input Mismatches Identified**:
+5. **Backbone Scalability: SAM2 Small & SAM2 Large Variants**:
+   - Detective SAM natively supports both Meta SAM2 Hiera Small (`facebook/sam2-hiera-small`) and SAM2 Large (`facebook/sam2-hiera-large`).
+   - Because SAM2's FPN feature hierarchy outputs identical channel dimensions across scales ($C_0 = 32, C_1 = 64, C_2 = 256$), the multi-scale `FeatureAdapter` layers and `MaskAdapter` seamlessly couple to the Large backbone without architectural modification.
+   - Dedicated recipes are available at [`configs/experiments/sam2/detective_sam_large.yaml`](file:///content/ai-detection-unet-gpu/configs/experiments/sam2/detective_sam_large.yaml) and [`configs/experiments/sam2/detective_sam_large_memory.yaml`](file:///content/ai-detection-unet-gpu/configs/experiments/sam2/detective_sam_large_memory.yaml) configured with gradient accumulation (16 steps) for 16GB GPUs.
+6. **Practical Integration Subtleties & Input Mismatches Identified**:
    - *Spatial Resolution & Stride Alignment*: Transformers SAM2 defaults to $1024 \times 1024$ image input. When operating on non-standard resolutions (e.g. $512 \times 512$), positional embeddings (`get_image_wide_positional_embeddings()`) and dense prompt embeddings must be dynamically interpolated to match the spatial dimensions of the coarsest feature map ($F_2$).
    - *PromptEncoder Batch Interface*: When no manual point/box prompts are provided, SAM2's prompt encoder expects a dummy padding point with label `-1` to ensure correct sparse embedding dimensions `[B, 0, 256]`, alongside the dense mask embedding from $M$.
    - *Parameter Efficiency*: Only 261,094 parameters (~0.67% of the model) are trained, allowing ultra-fast training and adaptation without catastrophic forgetting.
@@ -1280,7 +1284,7 @@ Inside Meta's SAM2 mask decoder (`Sam2MaskDecoder`), the query slots driving tra
    - Concatenated shape: $[6, 256]$ = $\mathbf{1{,}536}$ parameters.
 
 **Why the Existing Query Slot Size (1,024 / 1,536 Parameters) is Structurally Optimal and Should Not Be Modified**:
-- **Architectural Symmetry**: The 256 channel dimension matches the Hiera ViT feature projection dimension ($C_{\text{dec}} = 256$) and the two-way multi-head cross-attention layers ($8 \text{ heads} \times 32 \text{ head\_dim} = 256$).
+- **Architectural Symmetry**: The 256 channel dimension matches the Hiera ViT feature projection dimension ($C_{\text{dec}} = 256$) and the two-way multi-head cross-attention layers ($8 \text{ heads} \times 32 \text{ head dimensions} = 256$).
 - **Downstream Hypernetwork Binding**: The 4 mask query slots correspond 1-to-1 with the 4 hypernetwork MLP heads (`output_hypernetworks_mlps[0..3]`), which project each transformed query token into dynamic convolution weights ($\mathbb{R}^{32}$) to take dot-products against upscaled spatial feature maps. Altering the slot count breaks this 1-to-1 downstream binding.
 - **Extreme Efficiency**: At only 1,024 parameters, the query slots represent **<0.025%** of the 4.2M-parameter mask decoder and **<0.003%** of the entire model. They provide enough expressive capacity for prompt-conditioned localization without risk of overfitting or memory bloat.
 
@@ -1403,11 +1407,20 @@ Using `scripts/evaluate_memory_baselines.py`, we evaluated Detective SAM on iden
 
 #### 4. Automated Test Suite
 
-A comprehensive 17-point test suite is implemented in [`tests/test_forensic_memory.py`](file:///content/ai-detection-unet-gpu/tests/test_forensic_memory.py):
+A comprehensive 20-point test suite is implemented in [`tests/test_forensic_memory.py`](file:///content/ai-detection-unet-gpu/tests/test_forensic_memory.py):
 ```bash
 pytest tests/test_forensic_memory.py tests/test_detective_sam.py
 ```
-Validates query replacement forward/gradient semantics, CPU residency, key/value pairing, cosine/L2/dot similarity, undersized database handling, warm-up bypass, zero-norm safety, bounded capacity, deterministic consolidation, coordinate mapping, authentic region exclusion, inference isolation, checkpoint reload, dimension compatibility, and end-to-end pretrained GPU forward passes.
+Validates query replacement forward/gradient semantics, CPU residency, key/value pairing, cosine/L2/dot similarity, undersized database handling, warm-up bypass, zero-norm safety, bounded capacity, deterministic consolidation, coordinate mapping, authentic region exclusion, inference isolation, checkpoint reload, dimension compatibility, pretrained GPU forward passes, standalone database persistence, sibling fallback loading, and Hugging Face Hub synchronization discovery.
+
+#### 5. Database Checkpointing, Resilient Loading & Hub Synchronization
+
+- **Standalone Checkpointing**: `CheckpointManager` (`sid_unet/training/callbacks.py`) saves standalone database files alongside model weights (`forensic_memory.pt`, `forensic_memory_best.pt`, and `forensic_memory_periodic.pt`) in addition to embedding `forensic_memory_state_dict` in the main checkpoint dictionary.
+- **Resilient Multi-Stage Loading**: When restoring a model via `UNet.from_checkpoint()` or `CheckpointManager.load_checkpoint()`:
+  1. Primary: Reads embedded `forensic_memory_state_dict` from the checkpoint dictionary.
+  2. Sibling File Fallback: If absent, searches for `forensic_memory.pt` or `forensic_memory_best.pt` in the checkpoint's local directory.
+  3. Pre-Trained Fallback: If configured, loads from external `memory_path`.
+- **Hugging Face Hub Push & Pull**: `find_local_checkpoint_artifacts` (`sid_unet/checkpoint_sync.py`) discovers `forensic_memory*.pt` files and schedules them for asynchronous upload via `sid-push` / `push_to_hf`. Hub checkpoint loaders (`sid_unet/utils/checkpoint.py`) opportunistically download sibling memory files for seamless remote deployment.
 
 ---
 
@@ -2121,7 +2134,7 @@ training:
 
 #### B. Checkpoint Files & State Persistence
 During training, up to three checkpoints are managed in `outputs/RUN/<stem>/checkpoints/`:
-- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time $\ge$ checkpoint\_period or step interval is reached. Contains model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, metrics, and history.
+- **`checkpoint_periodic.pt`**: Written whenever elapsed wall-clock time $\ge$ `checkpoint_period` or step interval is reached. Contains model weights, optimizer state, LR scheduler state, `GradScaler` state, `epoch`, `global_step`, metrics, and history.
 - **`checkpoint_latest.pt`**: Continuously synchronized on periodic saves and written at every epoch boundary. Prioritized first for auto-resumption.
 - **`checkpoint_best.pt`**: Updated whenever validation metric improves on `eval_interval` epochs (governed by `early_stopping_metric` and `save_best: true`).
 
@@ -2573,8 +2586,12 @@ sid-eval --checkpoints \
 sid-cross-eval \
   --cross-configs configs/cross-eval/*.yaml \
   --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
-  --split test
+  --split test \
+  --filter-zero-positive
 ```
+
+> [!NOTE]
+> **Justified IoU Metric on Authentic Images (`--filter-zero-positive`)**: When an authentic/unaltered image has zero positive pixels in its ground-truth mask, any single false positive pixel yields $\text{IoU} = \frac{0}{\text{FP}} = 0.0$, which drastically pulls down the dataset-wide mean IoU. Both `sid-cross-eval` and `sid-eval` enable `--filter-zero-positive` by default, computing `iou_positive` exclusively on masks containing actual positive ground-truth regions while tracking all-mask metrics (`iou_all`) and sample counts in reports. To include zero-positive masks, pass `--no-filter-zero-positive`.
 
 ---
 

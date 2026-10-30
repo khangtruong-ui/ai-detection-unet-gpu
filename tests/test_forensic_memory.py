@@ -541,3 +541,146 @@ def test_end_to_end_forward_pass_genuine_pretrained():
     assert res["is_warmed_up"] is True
     assert res["retrieval_latency"] >= 0.0
     assert torch.isfinite(res["mask_logits"]).all()
+
+
+# =============================================================================
+# 18. Database Checkpointing, Sibling Loading, and Hub Artifact Discovery
+# =============================================================================
+
+def test_checkpoint_manager_saves_and_restores_database(tmp_path):
+    """Verify CheckpointManager saves standalone forensic_memory.pt and restores it cleanly."""
+    from sid_unet.training.callbacks import CheckpointManager
+
+    ckpt_dir = tmp_path / "checkpoints"
+    ckpt_dir.mkdir(parents=True)
+    mgr = CheckpointManager(
+        checkpoint_dir=str(ckpt_dir),
+        save_best=True,
+        save_latest=True,
+        push_to_hub=False,
+    )
+
+    model = DetectiveSAM(
+        layer_width=64,
+        use_dummy=True,
+        memory_enabled=True,
+        memory_key_dim=64,
+        memory_value_dim=64,
+    )
+    # Add entries
+    model.forensic_memory.add_observations(torch.randn(8, 64), torch.randn(8, 64))
+    model.forensic_memory.consolidate()
+    assert model.forensic_memory.entry_count == 8
+
+    # Save periodic checkpoint
+    saved = mgr.periodic_save(
+        model=model,
+        epoch=1,
+        step=10,
+        config={"model": {"name": "detective_sam"}},
+    )
+    assert "memory" in saved
+    assert os.path.exists(saved["memory"])
+    assert os.path.basename(saved["memory"]) == "forensic_memory.pt"
+
+    # Save best checkpoint
+    saved_best = mgr.save_checkpoint(
+        model=model,
+        epoch=1,
+        step=10,
+        current_score=0.95,
+        config={"model": {"name": "detective_sam"}},
+    )
+    assert os.path.exists(os.path.join(str(ckpt_dir), "forensic_memory_best.pt"))
+
+    # Reload into a fresh model
+    new_model = DetectiveSAM(
+        layer_width=64,
+        use_dummy=True,
+        memory_enabled=True,
+        memory_key_dim=64,
+        memory_value_dim=64,
+    )
+    assert new_model.forensic_memory.entry_count == 0
+
+    mgr.load_checkpoint(
+        checkpoint_path=saved["latest"],
+        model=new_model,
+    )
+    assert new_model.forensic_memory.entry_count == 8
+
+
+def test_unet_from_checkpoint_loads_database_nicely(tmp_path):
+    """Verify UNet.from_checkpoint restores forensic memory from both embedded dict and sibling file."""
+    from sid_unet.models.unet import UNet
+
+    # 1. Test embedded state dict restoration
+    ckpt_path = tmp_path / "model_ckpt.pt"
+    mem = ForensicVectorMemory(memory_enabled=True, memory_key_dim=64, memory_value_dim=64)
+    mem.add_observations(torch.randn(12, 64))
+    mem.consolidate()
+
+    state = {
+        "model_state_dict": {},
+        "forensic_memory_state_dict": mem.state_dict(),
+        "config": {
+            "model": {
+                "name": "detective_sam",
+                "use_dummy": True,
+                "memory_enabled": True,
+                "memory_key_dim": 64,
+                "memory_value_dim": 64,
+            }
+        }
+    }
+    torch.save(state, str(ckpt_path))
+
+    loaded_model = UNet.from_checkpoint(str(ckpt_path))
+    assert loaded_model.forensic_memory is not None
+    assert loaded_model.forensic_memory.entry_count == 12
+
+    # 2. Test sibling file restoration (when forensic_memory_state_dict is omitted from main checkpoint)
+    sibling_ckpt_dir = tmp_path / "sibling_run" / "checkpoints"
+    sibling_ckpt_dir.mkdir(parents=True)
+    sibling_model_pt = sibling_ckpt_dir / "checkpoint_best.pt"
+    sibling_mem_pt = sibling_ckpt_dir / "forensic_memory.pt"
+
+    # Save standalone memory file
+    mem.save(str(sibling_mem_pt))
+
+    # Save checkpoint without embedded memory state dict
+    clean_state = {
+        "model_state_dict": {},
+        "config": {
+            "model": {
+                "name": "detective_sam",
+                "use_dummy": True,
+                "memory_enabled": True,
+                "memory_key_dim": 64,
+                "memory_value_dim": 64,
+            }
+        }
+    }
+    torch.save(clean_state, str(sibling_model_pt))
+
+    loaded_sibling_model = UNet.from_checkpoint(str(sibling_model_pt))
+    assert loaded_sibling_model.forensic_memory is not None
+    assert loaded_sibling_model.forensic_memory.entry_count == 12
+
+
+def test_checkpoint_sync_finds_database_artifacts(tmp_path):
+    """Verify find_local_checkpoint_artifacts discovers forensic_memory.pt for synchronization."""
+    from sid_unet.checkpoint_sync import find_local_checkpoint_artifacts
+
+    run_dir = tmp_path / "outputs" / "RUN" / "detective_sam" / "checkpoints"
+    run_dir.mkdir(parents=True)
+
+    torch.save({"dummy": 1}, str(run_dir / "checkpoint_best.pt"))
+    torch.save({"keys": torch.randn(5, 64)}, str(run_dir / "forensic_memory.pt"))
+    torch.save({"keys": torch.randn(5, 64)}, str(run_dir / "forensic_memory_best.pt"))
+
+    artifacts = find_local_checkpoint_artifacts(source_dir=str(tmp_path / "outputs" / "RUN" / "detective_sam"))
+    assert "checkpoint_best.pt" in artifacts["checkpoints"]
+    assert "forensic_memory.pt" in artifacts["checkpoints"]
+    assert "forensic_memory_best.pt" in artifacts["checkpoints"]
+

@@ -230,3 +230,47 @@ def test_compute_binary_metrics_low_precision_dtypes(dtype):
     metrics = compute_binary_metrics(pred, target)
     assert metrics["iou"] == 1.0
     assert metrics["pixel_acc"] == 1.0
+
+
+def test_filter_zero_positive_masks():
+    # Sample 0: Authentic image (all zero ground-truth). Model has 1 spurious false positive pixel.
+    # IoU for Sample 0 is 0.0 because tp=0, fp=1, fn=0 -> 0/1 = 0.
+    # Sample 1: Tampered image with genuine positive region. Model predicts it perfectly (IoU = 1.0).
+    targets = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    targets[1, 0, :8, :] = 1.0  # 128 positive pixels
+
+    preds = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    preds[0, 0, 0, 0] = 1.0     # 1 false positive pixel
+    preds[1, 0, :8, :] = 1.0    # Perfect prediction on positive sample
+
+    # 1. Unfiltered tracker (legacy behavior): Sample 0 pulls the metric down to 0.5
+    tracker_unfiltered = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=False)
+    tracker_unfiltered.update(preds, targets)
+    overall_unfiltered, _ = tracker_unfiltered.compute()
+    assert overall_unfiltered["iou"] == pytest.approx(0.5, abs=1e-4)
+    assert overall_unfiltered["positive_samples"] == 1
+    assert overall_unfiltered["zero_positive_samples"] == 1
+
+    # 2. Filtered tracker (justified behavior): filters out zero-positive mask (Sample 0)
+    tracker_filtered = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=True)
+    tracker_filtered.update(preds, targets)
+    overall_filtered, _ = tracker_filtered.compute()
+    assert overall_filtered["iou"] == pytest.approx(1.0, abs=1e-4)
+    assert overall_filtered["iou_all"] == pytest.approx(0.5, abs=1e-4)
+    assert overall_filtered["iou_positive"] == pytest.approx(1.0, abs=1e-4)
+    assert overall_filtered["positive_samples"] == 1
+    assert overall_filtered["zero_positive_samples"] == 1
+
+
+def test_filter_zero_positive_all_zero_fallback():
+    # When all samples in evaluation have 0 positive pixels
+    targets = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    preds = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+
+    tracker = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=True)
+    tracker.update(preds, targets)
+    overall, _ = tracker.compute()
+    assert overall["positive_samples"] == 0
+    assert overall["zero_positive_samples"] == 2
+    assert overall["iou"] == 1.0  # clean fallback
+

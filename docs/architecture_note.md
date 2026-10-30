@@ -120,10 +120,12 @@ We select **Candidate 1: `MaskAdapter` Coarse Transformer Tokens ($R \in \mathbb
 - For each image $b$ in the training batch:
   1. Identify valid spatial locations where $Y_{\text{feat}}[b, 0, y, x] == 1$.
   2. If the image has zero tampered pixels (authentic/untampered image), **zero** vectors are collected (strict authentic exclusion).
-  3. If tampered pixels exist, sample up to $K_{\text{per\_img}} = \text{memory\_vectors\_per\_image}$ (default: 16) spatial coordinates.
+  3. If tampered pixels exist, sample up to $K_{\text{per-img}} = \texttt{memory\_vectors\_per\_image}$ (default: 16) spatial coordinates.
   4. Extract corresponding feature vectors $v \in \mathbb{R}^{d}$ from $F_{\text{fuse}}[b, :, y, x]$.
   5. Detach from the computation graph and transfer in a single batch to CPU memory:
-     $$\text{epoch\_observations}.\text{append}(v.\text{detach}().\text{cpu}())$$
+     ```python
+     epoch_observations.append(v.detach().cpu())
+     ```
 
 ---
 
@@ -134,7 +136,7 @@ We select **Candidate 1: `MaskAdapter` Coarse Transformer Tokens ($R \in \mathbb
 | `keys` | Stored forensic memory keys | $[N_{\text{mem}}, d]$ ($d=64$, $N_{\text{mem}} \le N_{\text{max}}$) | CPU | `float32` |
 | `values` | Stored forensic memory values | $[N_{\text{mem}}, d]$ ($d=64$) | CPU | `float32` |
 | $q$ | Image query key | $[B, d]$ (global average pool of $R$) | GPU/CPU | `float32` |
-| $V_{\text{ret}}$ | Retrieved nearest-neighbor vectors | $[B, k, d]$ ($k=\text{retrieval\_k}$) | GPU | Same as $R$ |
+| $V_{\text{ret}}$ | Retrieved nearest-neighbor vectors | $[B, k, d]$ ($k=\texttt{memory\_retrieval\_k}$) | GPU | Same as $R$ |
 | $R$ | Original coarse query tensor | $[B, N_{\text{coarse}}, d]$ | GPU | `float32` / `bfloat16` |
 | $R_t$ | Retrieved query tensor | $[B, N_{\text{coarse}}, d]$ | GPU | Same as $R$ |
 | $R_x$ | Stop-gradient query tensor | $[B, N_{\text{coarse}}, d]$ | GPU | Same as $R$ |
@@ -155,14 +157,14 @@ We select **Candidate 1: `MaskAdapter` Coarse Transformer Tokens ($R \in \mathbb
 
 1. **Initialization & Warm-Up**:
    - Memory starts empty: $N_{\text{mem}} = 0$.
-   - Warm-up condition: Retrieval is bypassed until $N_{\text{mem}} \ge \text{memory\_retrieval\_k}$. During warm-up, $R_x = R$ (exact baseline behavior).
+   - Warm-up condition: Retrieval is bypassed until $N_{\text{mem}} \ge \texttt{memory\_retrieval\_k}$. During warm-up, $R_x = R$ (exact baseline behavior).
 2. **Epoch Collection**:
    - Observations accumulate in `epoch_observations` (CPU-resident list of tensors).
    - Training batches access only the consolidated database from previous epochs (no future-batch leakage).
 3. **Epoch-End Consolidation**:
    - Observations are concatenated and deduplicated against existing memory using chunked similarity:
      - Vector chunk size: 512 candidates.
-     - Vectors with similarity $\ge \text{memory\_dedup\_threshold}$ to an existing entry are discarded.
+     - Vectors with similarity $\ge \texttt{memory\_dedup\_threshold}$ to an existing entry are discarded.
    - Bounded database enforcement: If total entries exceed `memory_max_entries`, deterministic diversity/strided pruning or k-means selection with `memory_seed` bounds the size to `memory_max_entries`.
    - Never forms an unrestricted $N \times N$ similarity matrix, ensuring $O(N)$ memory and predictable execution.
 4. **Checkpointing & Resumption**:

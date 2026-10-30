@@ -5,7 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-10-29
+## [Unreleased] - 2026-10-30
+
+### Fixed
+- **GitHub Markdown Math Mode Rendering Errors**:
+  - Resolved `'_' allowed only in math mode` LaTeX/KaTeX syntax errors across documentation files (`README.md`, `docs/architecture_note.md`, and `configs/experiments/mask_clip/INVESTIGATION_BACKBONE_ABLATION.md`).
+  - Corrected occurrences of unescaped underscores inside `\text{...}` blocks (e.g. `\text{head\_dim}`, `K_{\text{per\_img}}`, `memory\_dedup\_threshold`) by converting them to semantic wording, hyphens (`\text{high-res}`), or formatted code literals (`\texttt{...}`).
+- **Cross-Evaluation and Evaluation Metric Justification on Zero-Positive Masks**:
+  - Addressed metric skew where authentic images without positive ground-truth pixels (`tp + fn == 0`) produced IoU = 0.0 upon any single false-positive pixel, dragging down the dataset average IoU unfairly regardless of model segmentation quality.
+  - Implemented `filter_zero_positive` option in `SegmentationMetricTracker` (`sid_unet/metrics/segmentation.py`), tracking `iou_positive` exclusively on masks containing positive ground-truth pixels while maintaining `iou_all` and sample counts for complete reporting.
+  - Added CLI flags `--filter-zero-positive` (enabled by default) and `--no-filter-zero-positive` across `sid-cross-eval` (`sid_unet/cross_eval.py`) and `sid-eval` (`sid_unet/evaluate.py`).
+
+### Added
+- **Detective SAM Large Variant Support**:
+  - Implemented full configuration and instantiation support for `DetectiveSAM` using Meta's `facebook/sam2-hiera-large` ViT backbone.
+  - Verified architectural compatibility: SAM2 Large outputs identical hierarchical FPN channel dimensions `[32, 64, 256]` across scales, allowing seamless coupling with Detective SAM's multi-scale `FeatureAdapter` layers and `MaskAdapter`.
+  - Added pre-configured experiment recipes:
+    - `configs/experiments/sam2/detective_sam_large.yaml`: base Detective SAM with large ViT backbone, effective batch size 16 (1 sample/GPU with gradient accumulation steps 16), and target resolution 512x512.
+    - `configs/experiments/sam2/detective_sam_large_memory.yaml`: Detective SAM Large integrated with Learnable Forensic Vector Memory.
+  - Added unit and config regression tests in `tests/test_detective_sam.py` (`test_detective_sam_large_variant_init_and_forward` and `test_detective_sam_large_configs`).
+- **Forensic Memory Database Persistence, Checkpointing, and Hub Synchronization**:
+  - Checkpointed standalone database files alongside model checkpoints: `forensic_memory.pt`, `forensic_memory_best.pt`, and `forensic_memory_periodic.pt` in `sid_unet/training/callbacks.py`.
+  - Added resilient multi-stage loading in `UNet.from_checkpoint`: restores from embedded `forensic_memory_state_dict`, searches sibling files in the checkpoint directory, or falls back to explicit `memory_path`.
+  - Integrated database artifact discovery into `find_local_checkpoint_artifacts` in `sid_unet/checkpoint_sync.py` and opportunistic downloads in `sid_unet/utils/checkpoint.py`, ensuring `sid-push` automatically uploads the forensic memory database to Hugging Face Hub repositories.
+  - Added 3 automated tests in `tests/test_forensic_memory.py` covering manager persistence, sibling loading, and synchronization artifact discovery.
+
+## [0.1.2] - 2026-10-29
 
 ### Added
 - **Learnable Forensic Vector Memory for Detective SAM**: Implemented a CPU-resident vector database containing forensic representations extracted exclusively from ground-truth tampered image regions:
