@@ -142,3 +142,74 @@ def test_iml_build_model():
     }
     model = build_model(cfg)
     assert isinstance(model, IMLMaskformer)
+
+
+def test_iml_maskformer_parameter_forwarding():
+    """Verify sam2_repo, checkpoint_path, config_path, and device are forwarded correctly."""
+    model = IMLMaskformer(
+        variant="large",
+        sam2_repo="/content/sam2",
+        config_path="configs/sam2.1/sam2.1_hiera_l.yaml",
+        checkpoint_path="/content/sam2/checkpoints/sam2.1_hiera_large.pt",
+        embed_dim=64,
+        num_queries=10,
+        pixel_num_layers=2,
+        decoder_num_layers=3,
+        use_dummy=True,
+        device="cpu",
+    )
+    backbone = model.pixel_module.pixel_encoder.sam_backbone
+    assert backbone.variant == "large"
+    assert backbone.sam2_repo == "/content/sam2"
+    assert backbone.config_path == "configs/sam2.1/sam2.1_hiera_l.yaml"
+    assert backbone.checkpoint_path == "/content/sam2/checkpoints/sam2.1_hiera_large.pt"
+    assert backbone.device == "cpu"
+    assert backbone.use_dummy is True
+
+
+def test_iml_maskformer_dummy_fallback_disabled(monkeypatch):
+    """Verify that when use_dummy=False, failure to load weights raises RuntimeError instead of falling back to dummy."""
+    from sid_unet.models import iml_maskformer
+
+    def mock_build_sam2(*args, **kwargs):
+        raise ValueError("Simulated build_sam2 failure for testing")
+
+    monkeypatch.setattr("sam2.build_sam.build_sam2", mock_build_sam2)
+
+    with pytest.raises(RuntimeError, match="Dummy weights fallback is strictly disabled"):
+        IMLMaskformer(
+            variant="large",
+            use_dummy=False,
+            device="cpu",
+        )
+
+
+def test_iml_maskformer_real_trunk_init_and_forward():
+    """Verify IMLMaskformer loads real SAM2 Hiera weights when use_dummy=False and executes forward."""
+    from pathlib import Path
+    ckpt_path = Path("/content/sam2/checkpoints/sam2.1_hiera_large.pt")
+    if not ckpt_path.exists():
+        pytest.skip(f"SAM2 checkpoint not present at {ckpt_path}")
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model = IMLMaskformer(
+        variant="large",
+        sam2_repo="/content/sam2",
+        checkpoint_path=str(ckpt_path),
+        embed_dim=256,
+        num_queries=10,
+        pixel_num_layers=2,
+        decoder_num_layers=2,
+        target_size=(384, 384),
+        use_dummy=False,
+        device=dev,
+    ).to(dev)
+
+    assert model.pixel_module.pixel_encoder.sam_backbone.use_dummy is False
+    assert model.pixel_module.pixel_encoder.sam_backbone.image_encoder is not None
+
+    x = torch.randn(1, 3, 384, 384, device=dev)
+    out = model(x)
+    assert out.shape == (1, 1, 384, 384)
+    assert torch.isfinite(out).all()
+
