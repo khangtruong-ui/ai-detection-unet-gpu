@@ -22,6 +22,24 @@ def find_free_port() -> int:
     return port
 
 
+def is_kaggle_environment() -> bool:
+    """
+    Check if the current runtime environment is Kaggle.
+    Detects Kaggle container indicators, environment variables, and filesystem paths.
+    """
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return True
+    if os.environ.get("KAGGLE_CONTAINER_NAME"):
+        return True
+    if os.environ.get("KAGGLE_URL_BASE"):
+        return True
+    if any(k.startswith("KAGGLE_") for k in os.environ):
+        return True
+    if os.path.exists("/kaggle"):
+        return True
+    return False
+
+
 def is_dist_avail_and_initialized() -> bool:
     """Check if PyTorch distributed package is available and process group is initialized."""
     if not dist.is_available():

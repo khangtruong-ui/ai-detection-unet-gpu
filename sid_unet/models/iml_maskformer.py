@@ -464,6 +464,7 @@ class SinusoidPositionEmbeddings2D(nn.Module):
         self.temperature = temperature
         self.spatial_shape = tuple(spatial_shape)
         self.normalize = normalize
+        self._build_position_embeddings()
 
     def _compute_position_embeddings(self, pos_x: Tensor, pos_y: Tensor, dtype: torch.dtype) -> Tensor:
         c = self.embed_dim
@@ -507,10 +508,13 @@ class SinusoidPositionEmbeddings2D(nn.Module):
 
     def forward(self, x: Tensor, pad_mask: Optional[Tensor] = None) -> Tensor:
         b, c, h, w = x.shape
-        if not hasattr(self, "position_embeddings"):
-            pe = self._build_position_embeddings()
-        else:
+        if hasattr(self, "position_embeddings") and self.position_embeddings.shape[-2:] == (h, w):
             pe = self.position_embeddings
+        else:
+            dtype = torch.float32
+            pos_x = torch.arange(1, w + 1, dtype=dtype, device=x.device)[None, None, None, :].expand(1, 1, h, w)
+            pos_y = torch.arange(1, h + 1, dtype=dtype, device=x.device)[None, None, :, None].expand(1, 1, h, w)
+            pe = self._compute_position_embeddings(pos_x, pos_y, dtype=dtype)
         if pe.size(0) != b:
             pe = pe.expand(b, -1, h, w)
         return pe.to(device=x.device, dtype=x.dtype)

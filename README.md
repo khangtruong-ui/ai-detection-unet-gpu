@@ -2588,7 +2588,17 @@ sid-cross-eval \
   --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
   --split test \
   --filter-zero-positive
+
+# Multi-GPU acceleration (automatically enabled on Kaggle across all available GPUs)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/*.yaml \
+  --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
+  --data-parallel \
+  --device-ids 0 1
 ```
+
+> [!TIP]
+> **Kaggle Multi-GPU Acceleration**: On Kaggle (and multi-GPU systems), `sid-cross-eval` automatically detects available GPUs (e.g. 2x Tesla T4) and enables `DataParallel` across all devices by default, evenly distributing batch workloads and tracking per-device peak VRAM and allocated memory in reports. To restrict to a single device, pass `--no-data-parallel`.
 
 > [!NOTE]
 > **Justified IoU Metric on Authentic Images (`--filter-zero-positive`)**: When an authentic/unaltered image has zero positive pixels in its ground-truth mask, any single false positive pixel yields $\text{IoU} = \frac{0}{\text{FP}} = 0.0$, which drastically pulls down the dataset-wide mean IoU. Both `sid-cross-eval` and `sid-eval` enable `--filter-zero-positive` by default, computing `iou_positive` exclusively on masks containing actual positive ground-truth regions while tracking all-mask metrics (`iou_all`) and sample counts in reports. To include zero-positive masks, pass `--no-filter-zero-positive`.

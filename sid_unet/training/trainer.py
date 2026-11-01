@@ -183,6 +183,12 @@ class Trainer:
             clear_memory_cache(self.device)
             self.model = loaded_model.to(self.device)
             if self.is_distributed:
+                for buf in self.model.buffers():
+                    if buf is not None and buf.device != self.device:
+                        buf.data = buf.data.to(self.device)
+                for p in self.model.parameters():
+                    if p is not None and p.device != self.device:
+                        p.data = p.data.to(self.device)
                 find_unused = bool(config.training.get("find_unused_parameters", False))
                 self.model = nn.parallel.DistributedDataParallel(
                     self.model,
@@ -989,6 +995,11 @@ class Trainer:
             self.logger.warning(f"Auto batch sizing probe encountered warning: {e}")
             sys.stdout.flush()
         finally:
+            if not getattr(self, "is_quantized", False):
+                self.raw_model.to(self.device)
+                for buf in self.raw_model.buffers():
+                    if buf is not None and buf.device != self.device:
+                        buf.data = buf.data.to(self.device)
             clear_memory_cache(self.device)
             gc.collect()
 
