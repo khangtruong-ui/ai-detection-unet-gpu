@@ -183,3 +183,131 @@ def test_cross_eval_cli_data_parallel_flags(monkeypatch):
         assert args_nodp.data_parallel is False
     finally:
         sys.argv = orig_argv
+
+
+def test_cross_eval_dataparallel_small_batch_and_nontensor_kwargs():
+    """Verify eval_single_batch handles DataParallel with small batches and non-tensor kwargs safely."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("Test requires at least 2 CUDA devices.")
+
+    from sid_unet.cross_eval import eval_single_batch
+    from sid_unet.metrics.segmentation import SegmentationMetricTracker
+    from sid_unet.metrics.classification import ClassificationMetricTracker
+    from sid_unet.losses.auxiliary import build_loss
+    from sid_unet.utils.config import load_config
+
+    class SimpleModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 1, kernel_size=1)
+        def forward(self, x, f_r=None, img_ids=None):
+            if x.size(0) == 0:
+                raise RuntimeError("Batch size 0 should not reach forward!")
+            return self.conv(x)
+
+    base_model = SimpleModel().to("cuda:0")
+    dp_model = nn.DataParallel(base_model, device_ids=[0, 1])
+
+    cfg = load_config("configs/test_smoke.yaml", overrides=["project.device=cuda"])
+    loss_fn = build_loss(cfg).to("cuda:0")
+
+    # 1. Test batch size 1 (< 2 GPUs) with non-tensor img_ids
+    batch_1 = {
+        "image": torch.randn(1, 3, 32, 32),
+        "mask": torch.zeros(1, 1, 32, 32),
+        "label": torch.tensor([0]),
+        "f_r": torch.randn(1, 16),
+        "img_id": ["sample_0"],
+    }
+    raw_tracker = SegmentationMetricTracker(threshold=0.5)
+    cls_tracker = ClassificationMetricTracker(3)
+
+    loss_val, count, _ = eval_single_batch(
+        batch_1,
+        dp_model,
+        loss_fn,
+        torch.device("cuda:0"),
+        raw_tracker,
+        cls_tracker,
+    )
+    assert count == 1
+    assert loss_val >= 0.0
+
+    # 2. Test batch size 4 (>= 2 GPUs) with non-tensor img_ids
+    batch_4 = {
+        "image": torch.randn(4, 3, 32, 32),
+        "mask": torch.zeros(4, 1, 32, 32),
+        "label": torch.tensor([0, 1, 0, 1]),
+        "f_r": torch.randn(4, 16),
+        "img_id": ["s0", "s1", "s2", "s3"],
+    }
+    loss_val4, count4, _ = eval_single_batch(
+        batch_4,
+        dp_model,
+        loss_fn,
+        torch.device("cuda:0"),
+        raw_tracker,
+        cls_tracker,
+    )
+    assert count4 == 4
+    assert loss_val4 >= 0.0
+
+
+def test_unet_from_checkpoint_auto_detects_iml(tmp_path):
+    """Verify UNet.from_checkpoint correctly infers 'iml' model architecture from state dict keys."""
+    ckpt_path = str(tmp_path / "iml_checkpoint.pt")
+    # Simulate an IML checkpoint without explicit config.model.name
+    state_dict = {
+        "pixel_module.input_projs.0.0.weight": torch.randn(256, 192, 1, 1),
+        "transformer_decoder.layers.0.self_attn.out_proj.weight": torch.randn(256, 256),
+    }
+    torch.save({"model_state_dict": state_dict, "config": {}}, ckpt_path)
+
+    # UNet.from_checkpoint with use_dummy for SAM2 so it initializes without network downloads
+    model, cfg = UNet.from_checkpoint(
+        ckpt_path,
+        device="cpu",
+        return_config=True,
+        override_config={"model": {"use_dummy": True}},
+        strict=False,
+    )
+    assert cfg.model.name == "iml"
+    assert model.__class__.__name__ == "IMLMaskformer"
+
+
+def test_sam2_concurrent_download_safety(tmp_path):
+    """Verify SAM2ImageEncoder._download_checkpoint handles concurrent threads safely."""
+    import concurrent.futures
+    from sid_unet.models.iml_maskformer import SAM2ImageEncoder
+
+    encoder = SAM2ImageEncoder(use_dummy=True)
+    target = tmp_path / "checkpoints" / "sam2.1_hiera_test.pt"
+
+    # Mock urllib.request.urlretrieve to simulate writing > 10MB file with brief delay
+    import urllib.request
+    dummy_data = b"0" * 10_000_100
+
+    def mock_urlretrieve(url, filename):
+        import time
+        time.sleep(0.01)
+        with open(filename, "wb") as f:
+            f.write(dummy_data)
+
+    orig_retrieve = urllib.request.urlretrieve
+    urllib.request.urlretrieve = mock_urlretrieve
+
+    try:
+        def download_task(idx):
+            return encoder._download_checkpoint(target, variant="tiny")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(download_task, i) for i in range(6)]
+            results = [f.result() for f in futures]
+
+        assert len(results) == 6
+        assert all(r == str(target) for r in results)
+        assert target.exists()
+        assert target.stat().st_size == len(dummy_data)
+    finally:
+        urllib.request.urlretrieve = orig_retrieve
+

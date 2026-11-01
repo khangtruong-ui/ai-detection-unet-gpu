@@ -321,6 +321,8 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "diffusion_diff"
             elif any(k.startswith("vae.") for k in state_dict.keys()):
                 merged["model"]["name"] = "vae_finetune"
+            elif any(k.startswith(("pixel_module.", "transformer_decoder.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "iml"
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config

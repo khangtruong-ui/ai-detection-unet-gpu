@@ -523,7 +523,7 @@ class SinusoidPositionEmbeddings2D(nn.Module):
 def _ensure_sam2_available(repo_dir: Path) -> None:
     """
     Ensure Meta's official SAM 2 repository/package is importable.
-    Searches installed packages, local repo paths, or clones if missing.
+    Searches installed packages, local repo paths, or clones if missing with multi-GPU process safety.
     """
     try:
         import sam2  # noqa: F401
@@ -533,6 +533,12 @@ def _ensure_sam2_available(repo_dir: Path) -> None:
         pass
 
     import sys
+    import time
+    import shutil
+    import subprocess
+    import contextlib
+    from sid_unet.utils.distributed import is_dist_avail_and_initialized
+    import torch.distributed as dist
 
     # 1. Check if repo_dir has sam2 package
     if repo_dir.exists() and (repo_dir / "sam2").is_dir():
@@ -557,25 +563,51 @@ def _ensure_sam2_available(repo_dir: Path) -> None:
             except ImportError:
                 pass
 
-    # 3. Clone repository if missing
-    import shutil
-    import subprocess
-    logger.info(f"Cloning official SAM2 repository to {repo_dir}...")
-    tmp_clone = Path("/tmp/sam2_clone")
-    if not (tmp_clone / "sam2").is_dir():
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/facebookresearch/sam2.git", str(tmp_clone)],
-            check=True,
-            capture_output=True,
-        )
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    for item in tmp_clone.iterdir():
-        dest = repo_dir / item.name
-        if not dest.exists():
-            if item.is_dir():
-                shutil.copytree(item, dest)
-            else:
-                shutil.copy2(item, dest)
+    # 3. Clone repository if missing, guarded by process-level lock to prevent multi-GPU race
+    lock_file = "/tmp/sam2_clone.lock"
+    try:
+        from filelock import FileLock
+        lock_ctx = FileLock(lock_file, timeout=600)
+    except ImportError:
+        lock_ctx = contextlib.nullcontext()
+
+    with lock_ctx:
+        # Check again under lock in case another process completed it
+        if repo_dir.exists() and (repo_dir / "sam2").is_dir():
+            if str(repo_dir) not in sys.path:
+                sys.path.insert(0, str(repo_dir))
+            try:
+                import sam2  # noqa: F401
+                from sam2.build_sam import build_sam2  # noqa: F401
+                return
+            except ImportError:
+                pass
+
+        logger.info(f"Cloning official SAM2 repository to {repo_dir}...")
+        tmp_clone = Path(f"/tmp/sam2_clone_{os.getpid()}_{time.time_ns()}")
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "https://github.com/facebookresearch/sam2.git", str(tmp_clone)],
+                check=True,
+                capture_output=True,
+            )
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            for item in tmp_clone.iterdir():
+                dest = repo_dir / item.name
+                if not dest.exists():
+                    if item.is_dir():
+                        shutil.copytree(item, dest, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, dest)
+        finally:
+            if tmp_clone.exists():
+                try:
+                    shutil.rmtree(tmp_clone, ignore_errors=True)
+                except Exception:
+                    pass
+
+    if is_dist_avail_and_initialized():
+        dist.barrier()
 
     if str(repo_dir) not in sys.path:
         sys.path.insert(0, str(repo_dir))
@@ -611,19 +643,26 @@ class SAM2ImageEncoder(nn.Module):
             self.image_encoder = None
             return
 
-        resolved_device = "cuda" if (self.device == "cuda" or (self.device == "auto" and torch.cuda.is_available())) else "cpu"
+        if self.device not in (None, "auto"):
+            resolved_device = str(self.device)
+        elif torch.cuda.is_available():
+            from sid_unet.utils.distributed import get_local_rank, is_dist_avail_and_initialized
+            resolved_device = f"cuda:{get_local_rank()}" if (is_dist_avail_and_initialized() or "LOCAL_RANK" in os.environ) else "cuda"
+        else:
+            resolved_device = "cpu"
+
         repo_dir = self._find_sam2_repo(sam2_repo)
         cfg_file = config_path or SAM2_CONFIGS.get(self.variant, SAM2_CONFIGS["large"])
 
-        # Resolve checkpoint file
-        if checkpoint_path and Path(checkpoint_path).exists():
+        # Resolve checkpoint file (must exist and be > 10MB to avoid partial/corrupted downloads)
+        if checkpoint_path and Path(checkpoint_path).exists() and Path(checkpoint_path).stat().st_size > 10_000_000:
             ckpt_file = str(checkpoint_path)
         elif checkpoint_path:
             ckpt_file = self._download_checkpoint(Path(checkpoint_path), self.variant)
         else:
             ckpt_name = f"sam2.1_hiera_{self.variant}.pt"
             candidate_ckpt = repo_dir / "checkpoints" / ckpt_name
-            if candidate_ckpt.exists():
+            if candidate_ckpt.exists() and candidate_ckpt.stat().st_size > 10_000_000:
                 ckpt_file = str(candidate_ckpt)
             else:
                 ckpt_file = self._download_checkpoint(candidate_ckpt, self.variant)
@@ -653,11 +692,50 @@ class SAM2ImageEncoder(nn.Module):
         return Path(explicit_repo or "/content/sam2")
 
     def _download_checkpoint(self, target_path: Path, variant: str) -> str:
+        """Download SAM2 weights with process locks, atomic renaming, and DDP rank synchronization."""
         target_path.parent.mkdir(parents=True, exist_ok=True)
         url = SAM2_WEIGHTS_URLS.get(variant, SAM2_WEIGHTS_URLS["large"])
-        logger.info(f"Downloading SAM2 checkpoint from {url} to {target_path}...")
-        import urllib.request
-        urllib.request.urlretrieve(url, str(target_path))
+
+        if target_path.exists() and target_path.stat().st_size > 10_000_000:
+            return str(target_path)
+
+        import time
+        import contextlib
+        lock_path = f"{str(target_path)}.lock"
+        try:
+            from filelock import FileLock
+            lock_ctx = FileLock(lock_path, timeout=900)
+        except ImportError:
+            lock_ctx = contextlib.nullcontext()
+
+        from sid_unet.utils.distributed import is_dist_avail_and_initialized
+        import torch.distributed as dist
+
+        with lock_ctx:
+            if target_path.exists() and target_path.stat().st_size > 10_000_000:
+                return str(target_path)
+
+            logger.info(f"Downloading SAM2 checkpoint from {url} to {target_path}...")
+            import urllib.request
+            temp_path = Path(f"{str(target_path)}.tmp.{os.getpid()}_{time.time_ns()}")
+            try:
+                urllib.request.urlretrieve(url, str(temp_path))
+                if not temp_path.exists() or temp_path.stat().st_size < 10_000_000:
+                    raise RuntimeError(
+                        f"Downloaded SAM2 checkpoint '{temp_path}' is incomplete or corrupted "
+                        f"(size: {temp_path.stat().st_size if temp_path.exists() else 0} bytes)."
+                    )
+                os.replace(str(temp_path), str(target_path))
+            finally:
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+
+        if is_dist_avail_and_initialized():
+            dist.barrier()
+
         return str(target_path)
 
     @torch.no_grad()

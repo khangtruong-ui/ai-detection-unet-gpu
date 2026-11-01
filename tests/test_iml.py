@@ -170,6 +170,8 @@ def test_iml_maskformer_parameter_forwarding():
 def test_iml_maskformer_dummy_fallback_disabled(monkeypatch):
     """Verify that when use_dummy=False, failure to load weights raises RuntimeError instead of falling back to dummy."""
     from sid_unet.models import iml_maskformer
+    from pathlib import Path
+    iml_maskformer._ensure_sam2_available(Path("/content/sam2"))
 
     def mock_build_sam2(*args, **kwargs):
         raise ValueError("Simulated build_sam2 failure for testing")
