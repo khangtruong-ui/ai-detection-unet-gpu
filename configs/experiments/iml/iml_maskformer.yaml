@@ -9,7 +9,7 @@ project:
   output_dir: "outputs/RUN/iml_maskformer"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   use_parquet_loader: true
   save_to_disk: true
