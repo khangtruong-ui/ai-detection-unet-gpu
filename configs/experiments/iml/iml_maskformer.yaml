@@ -16,7 +16,7 @@ data:
   background_download: true
   columns: ["image", "mask"]
   image_size: [384, 384]
-  batch_size: 2                     # Tuned for 15GB VRAM Tesla T4
+  batch_size: 4                     # Tuned for 15GB VRAM Tesla T4
   num_workers: -1
   pin_memory: true
   prefetch_batches: 32
