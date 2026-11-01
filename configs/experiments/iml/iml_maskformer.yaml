@@ -10,7 +10,7 @@ project:
 
 data:
   dataset_name: "KhangTruong/DEAL300K-30K"
-  streaming: true
+  streaming: false
   use_parquet_loader: true
   save_to_disk: true
   background_download: true
