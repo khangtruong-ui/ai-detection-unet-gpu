@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-10-30
+## [Unreleased] - 2026-11-01
+
+### Fixed
+- **DistributedDataParallel CPU Buffer Synchronization Failure (`.logs.txt`)**:
+  - Fixed `RuntimeError: No backend type associated with device type cpu` in `sid_unet/models/iml_maskformer.py` occurring during DDP buffer synchronization over the NCCL backend.
+  - Resolved root cause where `SinusoidPositionEmbeddings2D` lazily generated positional embeddings on CPU during the forward pass and called `register_buffer()` dynamically on Rank 0 during memory batch size probing, causing buffer registry asymmetry between ranks.
+  - Eagerly pre-computes and registers `position_embeddings` in `__init__`, allowing proper recursive movement to CUDA (`cuda:0`, `cuda:1`) upon model initialization.
+  - Prohibited dynamic buffer registration during `forward()`; dynamic spatial shapes are computed purely functional on `x.device` without modifying module `_buffers`.
+  - Added pre-DDP buffer device reconciliation in `sid_unet/training/trainer.py` to ensure all registered buffers and parameters reside strictly on `self.device` prior to DDP wrapping and after batch size probing.
+
+- **Kaggle Multi-GPU Acceleration for Cross-Evaluation (`sid-cross-eval`)**:
+  - Upgraded `sid-cross-eval` (`sid_unet/cross_eval.py`) to automatically detect Kaggle multi-GPU runtime environments via `is_kaggle_environment()`.
+  - Enables `torch.nn.DataParallel` across all available GPUs (e.g. 2x Tesla T4) by default on Kaggle, partitioning batches evenly across devices and doubling evaluation throughput.
+  - Added CLI flags `--data-parallel` / `--no-data-parallel` and `--device-ids` to give users full control over device selection.
+  - Added real-time multi-device hardware utilization tracking, reporting per-GPU peak VRAM and allocated memory in evaluation summaries and master reports.
+  - Extended multi-device support to single checkpoint evaluation (`sid_unet/evaluate.py`).
 
 ### Fixed
 - **IML MaskFormer Official SAM 2.1 Hiera Vision Backbone Integration**:

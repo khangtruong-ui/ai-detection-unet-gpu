@@ -34,6 +34,7 @@ from sid_unet.models.unet import UNet
 from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
+from sid_unet.utils.distributed import is_kaggle_environment
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
 from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_cross_eval_heatmaps
 from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
@@ -215,6 +216,30 @@ def parse_args():
         dest="filter_zero_positive",
         action="store_false",
         help="Include zero-positive ground-truth masks in average IoU.",
+    )
+    # Multi-GPU / Device options
+    parser.add_argument(
+        "--data-parallel",
+        "--dp",
+        dest="data_parallel",
+        action="store_true",
+        default=None,
+        help="Enable multi-GPU DataParallel evaluation across all available GPUs (default: True on Kaggle / multi-GPU).",
+    )
+    parser.add_argument(
+        "--no-data-parallel",
+        "--no-dp",
+        dest="data_parallel",
+        action="store_false",
+        help="Disable multi-GPU DataParallel and force single-device evaluation.",
+    )
+    parser.add_argument(
+        "--device-ids",
+        "--devices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Specific CUDA device IDs to use for evaluation (e.g. --device-ids 0 1).",
     )
     return parser.parse_args()
 
@@ -467,6 +492,8 @@ def evaluate_checkpoint_on_config(
     max_illustrations: int = 6,
     master_output_dir: Optional[str] = None,
     filter_zero_positive: bool = True,
+    data_parallel: Optional[bool] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -492,6 +519,34 @@ def evaluate_checkpoint_on_config(
     device_str = eval_config.project.get("device", ckpt_config.project.get("device", "auto"))
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) or device_str == "cuda" else "cpu")
 
+    is_kaggle = is_kaggle_environment()
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    if data_parallel is False:
+        use_data_parallel = False
+    elif data_parallel is True:
+        use_data_parallel = available_gpus > 1 and device.type == "cuda"
+    else:
+        config_dp = eval_config.project.get("data_parallel", None)
+        if config_dp is not None:
+            use_data_parallel = bool(config_dp) and available_gpus > 1 and device.type == "cuda"
+        else:
+            # On Kaggle: Always use all available GPU devices by default.
+            use_data_parallel = (is_kaggle or str(device_str) in ("auto", "cuda")) and available_gpus > 1 and device.type == "cuda"
+
+    target_device_ids = None
+    if use_data_parallel:
+        if device_ids:
+            target_device_ids = [int(d) for d in device_ids if int(d) < available_gpus]
+        else:
+            target_device_ids = list(range(available_gpus))
+        if len(target_device_ids) <= 1:
+            use_data_parallel = False
+            target_device_ids = None
+
+    if use_data_parallel and target_device_ids:
+        device = torch.device(f"cuda:{target_device_ids[0]}")
+
     refiner = None
     if segment:
         refiner = get_sam_refiner(segment, device=device, threshold=threshold)
@@ -506,6 +561,17 @@ def evaluate_checkpoint_on_config(
 
     model.to(device)
     model.eval()
+
+    eval_logger = logging.getLogger("SID_CrossEval")
+    if use_data_parallel and target_device_ids:
+        model = torch.nn.DataParallel(model, device_ids=target_device_ids)
+        eval_logger.info(
+            f"🚀 [MULTI-GPU EVALUATION] Enabled nn.DataParallel across {len(target_device_ids)} GPUs: "
+            f"{target_device_ids} (Kaggle: {is_kaggle})"
+        )
+        for d_id in target_device_ids:
+            dev_obj = torch.device(f"cuda:{d_id}")
+            eval_logger.info(f"   GPU {d_id} ({torch.cuda.get_device_name(d_id)}): {format_memory_summary(dev_obj)}")
 
     loss_fn = build_loss(eval_config).to(device)
 
@@ -669,6 +735,25 @@ def evaluate_checkpoint_on_config(
             "total_samples": len(all_change_metrics),
         }
 
+    gpu_utilization: Dict[str, Any] = {}
+    if use_data_parallel and target_device_ids:
+        for d_id in target_device_ids:
+            d_obj = torch.device(f"cuda:{d_id}")
+            peak_mb = torch.cuda.max_memory_allocated(d_obj) / (1024 * 1024)
+            alloc_mb = torch.cuda.memory_allocated(d_obj) / (1024 * 1024)
+            gpu_utilization[f"cuda:{d_id}"] = {
+                "device_name": torch.cuda.get_device_name(d_id),
+                "peak_memory_mb": round(peak_mb, 2),
+                "allocated_memory_mb": round(alloc_mb, 2),
+            }
+            eval_logger.info(
+                f"   [GPU Utilization] GPU {d_id} ({torch.cuda.get_device_name(d_id)}): "
+                f"Peak: {peak_mb:.1f} MB | Allocated: {alloc_mb:.1f} MB"
+            )
+        overall_metrics["num_devices"] = len(target_device_ids)
+        overall_metrics["devices"] = [f"cuda:{d}" for d in target_device_ids]
+        overall_metrics["gpu_utilization"] = gpu_utilization
+
     # Generate dataset-specific visual illustration grid
     dataset_illustration_path = None
     if save_illustrations and collected_samples and master_output_dir:
@@ -685,7 +770,7 @@ def evaluate_checkpoint_on_config(
         except Exception as e:
             dataset_illustration_path = None
 
-    return {
+    res = {
         "checkpoint_path": checkpoint_path,
         "checkpoint_name": ckpt_run_name,
         "config_path": config_path,
@@ -705,7 +790,17 @@ def evaluate_checkpoint_on_config(
         "eval_config": eval_config.to_dict() if hasattr(eval_config, "to_dict") else dict(eval_config),
         "checkpoint_hyperparameters": extract_key_hyperparameters(ckpt_config),
         "eval_hyperparameters": extract_key_hyperparameters(eval_config),
+        "devices": [f"cuda:{d}" for d in target_device_ids] if (use_data_parallel and target_device_ids) else [str(device)],
+        "gpu_utilization": gpu_utilization,
     }
+
+    try:
+        del model
+    except Exception:
+        pass
+    clear_memory_cache(device)
+
+    return res
 
 
 def run_cross_evaluation(
@@ -726,6 +821,8 @@ def run_cross_evaluation(
     max_illustrations: int = 6,
     skip_collision: bool = True,
     filter_zero_positive: bool = True,
+    data_parallel: Optional[bool] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -745,6 +842,9 @@ def run_cross_evaluation(
         log_file=os.path.join(master_output_dir, "cross_evaluation.log"),
     )
 
+    is_kaggle = is_kaggle_environment()
+    avail_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
     logger.info("=" * 75)
     logger.info(f"🚀 Starting Cross-Evaluation Matrix")
     logger.info(f"   Checkpoints ({len(checkpoint_paths)}): {checkpoint_paths}")
@@ -753,6 +853,14 @@ def run_cross_evaluation(
     logger.info(f"   Collision Detection / Skip: {skip_collision}")
     if segment:
         logger.info(f"   Segment Mask Refinement Model: {segment}")
+    logger.info(f"   Kaggle Environment: {is_kaggle} | Available GPUs: {avail_gpus}")
+    if data_parallel is not False and (is_kaggle or data_parallel is True) and avail_gpus > 1:
+        devs_str = str(device_ids) if device_ids else f"All {avail_gpus} GPUs ({list(range(avail_gpus))})"
+        logger.info(f"   Multi-Device DataParallel: ENABLED across {devs_str}")
+    elif data_parallel is False:
+        logger.info("   Multi-Device DataParallel: explicitly disabled (single device)")
+    else:
+        logger.info("   Multi-Device DataParallel: default (auto-detected per configuration)")
     logger.info(f"   Master Output Directory: {master_output_dir}")
     logger.info("=" * 75)
 
@@ -884,6 +992,8 @@ def run_cross_evaluation(
                 max_illustrations=max_illustrations,
                 master_output_dir=master_output_dir,
                 filter_zero_positive=filter_zero_positive,
+                data_parallel=data_parallel,
+                device_ids=device_ids,
             )
 
             all_cross_results.append(res)
@@ -1082,6 +1192,8 @@ def main():
         max_illustrations=args.max_illustrations,
         skip_collision=args.skip_collision,
         filter_zero_positive=args.filter_zero_positive,
+        data_parallel=args.data_parallel,
+        device_ids=args.device_ids,
     )
     return results
 

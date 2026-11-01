@@ -43,6 +43,7 @@ from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_co
 from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
+from sid_unet.utils.distributed import is_kaggle_environment
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
 from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_eval_ablation_bar_chart
 from sid_unet.utils.report import generate_evaluation_report, generate_multi_experiment_report
@@ -203,6 +204,30 @@ def parse_args():
         dest="filter_zero_positive",
         action="store_false",
         help="Include zero-positive ground-truth masks in average IoU.",
+    )
+    # Multi-GPU / Device options
+    parser.add_argument(
+        "--data-parallel",
+        "--dp",
+        dest="data_parallel",
+        action="store_true",
+        default=None,
+        help="Enable multi-GPU DataParallel evaluation across all available GPUs (default: True on Kaggle / multi-GPU).",
+    )
+    parser.add_argument(
+        "--no-data-parallel",
+        "--no-dp",
+        dest="data_parallel",
+        action="store_false",
+        help="Disable multi-GPU DataParallel and force single-device evaluation.",
+    )
+    parser.add_argument(
+        "--device-ids",
+        "--devices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Specific CUDA device IDs to use for evaluation (e.g. --device-ids 0 1).",
     )
     return parser.parse_args()
 
@@ -387,6 +412,8 @@ def evaluate_single_checkpoint(
     multi_run: bool = False,
     skip_collision: bool = True,
     filter_zero_positive: bool = True,
+    data_parallel: Optional[bool] = None,
+    device_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Run full evaluation on a single checkpoint with ablation tracking and illustration generation."""
     if not os.path.exists(checkpoint_path):
@@ -478,9 +505,42 @@ def evaluate_single_checkpoint(
 
     device_str = config.project.get("device", "auto")
     device = torch.device("cuda" if (device_str == "auto" and torch.cuda.is_available()) or device_str == "cuda" else "cpu")
+
+    is_kaggle = is_kaggle_environment()
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    if data_parallel is False:
+        use_data_parallel = False
+    elif data_parallel is True:
+        use_data_parallel = available_gpus > 1 and device.type == "cuda"
+    else:
+        config_dp = config.project.get("data_parallel", None)
+        if config_dp is not None:
+            use_data_parallel = bool(config_dp) and available_gpus > 1 and device.type == "cuda"
+        else:
+            use_data_parallel = (is_kaggle or str(device_str) in ("auto", "cuda")) and available_gpus > 1 and device.type == "cuda"
+
+    target_device_ids = None
+    if use_data_parallel:
+        if device_ids:
+            target_device_ids = [int(d) for d in device_ids if int(d) < available_gpus]
+        else:
+            target_device_ids = list(range(available_gpus))
+        if len(target_device_ids) <= 1:
+            use_data_parallel = False
+            target_device_ids = None
+
+    if use_data_parallel and target_device_ids:
+        device = torch.device(f"cuda:{target_device_ids[0]}")
+
     logger.info(f"Evaluation device: {device}")
     if device.type == "cuda":
         logger.info(f"GPU Memory: {format_memory_summary(device)}")
+    if use_data_parallel and target_device_ids:
+        logger.info(
+            f"🚀 [MULTI-GPU EVALUATION] Enabled nn.DataParallel across {len(target_device_ids)} GPUs: "
+            f"{target_device_ids} (Kaggle: {is_kaggle})"
+        )
 
     # Initialize SAM Refiner if requested
     refiner = None
@@ -508,6 +568,9 @@ def evaluate_single_checkpoint(
 
     model.to(device)
     model.eval()
+
+    if use_data_parallel and target_device_ids:
+        model = torch.nn.DataParallel(model, device_ids=target_device_ids)
 
     loss_fn = build_loss(config).to(device)
 
@@ -827,6 +890,8 @@ def main():
             multi_run=False,
             skip_collision=args.skip_collision,
             filter_zero_positive=args.filter_zero_positive,
+            data_parallel=args.data_parallel,
+            device_ids=args.device_ids,
         )
         return res["report_result"]
 
@@ -859,6 +924,8 @@ def main():
             multi_run=True,
             skip_collision=args.skip_collision,
             filter_zero_positive=args.filter_zero_positive,
+            data_parallel=args.data_parallel,
+            device_ids=args.device_ids,
         )
         all_results.append(res)
 
