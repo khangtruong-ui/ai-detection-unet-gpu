@@ -276,6 +276,7 @@ def _ddp_trainer_hard_mining_worker(rank, world_size, port, tmpdir):
     cfg.data.num_workers = 0
     cfg.data.batch_size = 4
     cfg.training.epochs = 2
+    cfg.training.auto_batch_size = False
     cfg.training.data_parallel = True
     cfg.training.use_hard_mining = True
     cfg.hard_mining = {"enabled": True, "metric": "median", "reset_epochs": 5}

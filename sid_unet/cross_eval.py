@@ -382,10 +382,26 @@ def eval_single_batch(
         except Exception:
             pass
 
-    outputs = model(images, **model_kwargs) if model_kwargs else model(images)
-    loss, _ = loss_fn(outputs, masks, labels)
-
     b_size = images.size(0)
+
+    # Multi-GPU DataParallel safety:
+    # 1. If batch size is smaller than the number of GPUs (e.g. 1 sample remaining),
+    #    fallback to single-device model.module to prevent empty micro-batches (0 samples) on secondary GPUs.
+    # 2. When forward_model is DataParallel, strip non-tensor kwargs (e.g. string img_ids)
+    #    because PyTorch DataParallel scatter cannot slice non-tensor collections.
+    is_dp = isinstance(model, torch.nn.DataParallel)
+    if is_dp and (b_size < len(model.device_ids) or b_size <= 1):
+        forward_model = getattr(model, "module", model)
+    else:
+        forward_model = model
+
+    if isinstance(forward_model, torch.nn.DataParallel):
+        filtered_kwargs = {k: v for k, v in model_kwargs.items() if isinstance(v, torch.Tensor)}
+    else:
+        filtered_kwargs = model_kwargs
+
+    outputs = forward_model(images, **filtered_kwargs) if filtered_kwargs else forward_model(images)
+    loss, _ = loss_fn(outputs, masks, labels)
     if isinstance(outputs, (tuple, list)):
         mask_logits = outputs[0]
         class_logits = outputs[1] if len(outputs) > 1 else None
@@ -564,6 +580,13 @@ def evaluate_checkpoint_on_config(
 
     eval_logger = logging.getLogger("SID_CrossEval")
     if use_data_parallel and target_device_ids:
+        # Reconcile all buffers and parameters to primary device before DataParallel wrapping
+        for buf in model.buffers():
+            if buf is not None and buf.device != device:
+                buf.data = buf.data.to(device)
+        for p in model.parameters():
+            if p is not None and p.device != device:
+                p.data = p.data.to(device)
         model = torch.nn.DataParallel(model, device_ids=target_device_ids)
         eval_logger.info(
             f"🚀 [MULTI-GPU EVALUATION] Enabled nn.DataParallel across {len(target_device_ids)} GPUs: "

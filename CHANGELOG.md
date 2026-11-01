@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-11-01
 
 ### Fixed
+- **Multi-GPU Distributed Training Hang & SAM 2 Download Race Condition (`.logs.txt`)**:
+  - Fixed the root cause of the indefinite hang following the final line in `.logs.txt`: concurrent DDP ranks raced to clone the SAM 2 repository and download the ~900MB SAM 2 weights directly into identical file paths without locks, atomic renaming, or rank barriers. Rank 1 encountered incomplete/corrupted weights and stalled/crashed, causing Rank 0 to hang indefinitely waiting for collective NCCL broadcast in `DistributedDataParallel(...)`.
+  - Implemented cross-process file locks via `filelock.FileLock` and unique per-process temporary cloning paths (`/tmp/sam2_clone_{pid}_{timestamp}`) in `_ensure_sam2_available()`.
+  - Implemented atomic download with file locking, size validation (>10MB), and `dist.barrier()` synchronization across ranks in `_download_checkpoint()`.
+  - Updated device resolution in `SAM2ImageEncoder.__init__` to properly resolve to `cuda:{get_local_rank()}` in distributed modes, ensuring each rank initializes on its dedicated GPU device.
+- **Multi-GPU Cross-Evaluation (`sid-cross-eval`) Robustness**:
+  - Added parameter and buffer device reconciliation in `sid_unet/cross_eval.py` prior to wrapping models in `torch.nn.DataParallel`.
+  - Added small-batch handling in `eval_single_batch()`: automatically falls back to single-device evaluation (`model.module`) whenever `batch_size < num_gpus` to prevent empty micro-batch tensor dimension errors on secondary GPUs.
+  - Filtered non-tensor kwargs (e.g. Python string lists such as `img_ids`) when invoking `DataParallel`, preventing scatter type errors across GPUs.
+  - Added automatic model name detection for `iml` (`IMLMaskformer`) in `UNet.from_checkpoint()` based on `pixel_module.` and `transformer_decoder.` keys in `state_dict`.
+  - Added test suite in `tests/test_kaggle_multigpu_and_buffer_fixes.py` verifying multi-GPU `DataParallel` cross-evaluation, small-batch fallback, non-tensor kwarg handling, and concurrent download safety.
 - **DistributedDataParallel CPU Buffer Synchronization Failure (`.logs.txt`)**:
   - Fixed `RuntimeError: No backend type associated with device type cpu` in `sid_unet/models/iml_maskformer.py` occurring during DDP buffer synchronization over the NCCL backend.
   - Resolved root cause where `SinusoidPositionEmbeddings2D` lazily generated positional embeddings on CPU during the forward pass and called `register_buffer()` dynamically on Rank 0 during memory batch size probing, causing buffer registry asymmetry between ranks.
