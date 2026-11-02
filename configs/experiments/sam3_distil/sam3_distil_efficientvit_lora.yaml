@@ -1,4 +1,4 @@
-# Configuration: SAM3-Distil EfficientViT-b0 LoRA on COCO-inpainted
+# Configuration: SAM3-Distil EfficientViT-b0 LoRA on DEAL300K-30K
 # EfficientSAM3 with EfficientViT-b0 backbone for real-time mobile/edge latency profile.
 # Parameter-efficient fine-tuning via PEFT LoRA (r=16, alpha=32).
 # Training environment mirrors diffusion-diff baseline.
@@ -10,7 +10,7 @@ project:
   output_dir: "outputs/experiments/sam3_distil_efficientvit_lora"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 8

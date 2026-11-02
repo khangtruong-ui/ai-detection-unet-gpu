@@ -1,4 +1,4 @@
-# Configuration: SAM3-Distil 4-bit Quantized LoRA (QLoRA) on COCO-inpainted
+# Configuration: SAM3-Distil 4-bit Quantized LoRA (QLoRA) on DEAL300K-30K
 # EfficientSAM3 with 4-bit quantized base model and LoRA adapter weights (r=16, alpha=32).
 # Minimal VRAM footprint (~1.5GB - 2GB) suitable for entry-level consumer GPUs.
 # Training environment mirrors diffusion-diff baseline.
@@ -10,7 +10,7 @@ project:
   output_dir: "outputs/experiments/sam3_distil_qlora"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 8

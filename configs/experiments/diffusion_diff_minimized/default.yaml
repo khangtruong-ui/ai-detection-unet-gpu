@@ -5,7 +5,7 @@ project:
   output_dir: "outputs/experiments/diffusion_diff_minimized"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 8

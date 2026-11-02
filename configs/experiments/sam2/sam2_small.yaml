@@ -1,4 +1,4 @@
-# Configuration: SAM2 Small (Hiera) + QLoRA Baseline on COCO-inpainted
+# Configuration: SAM2 Small (Hiera) + QLoRA Baseline on DEAL300K-30K
 # Meta SAM2 small foundation model (facebook/sam2-hiera-small)
 # with 4-bit NF4 NormalFloat quantization via bitsandbytes and Low-Rank Adaptation (LoRA r=8, alpha=16) via PEFT.
 
@@ -9,7 +9,7 @@ project:
   output_dir: "outputs/RUN/sam2_small"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   use_parquet_loader: true
   save_to_disk: true

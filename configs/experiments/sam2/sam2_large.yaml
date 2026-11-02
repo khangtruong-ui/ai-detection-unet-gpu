@@ -1,4 +1,4 @@
-# Configuration: SAM2 Large (Hiera) + QLoRA on COCO-inpainted
+# Configuration: SAM2 Large (Hiera) + QLoRA on DEAL300K-30K
 # Meta SAM2 large foundation model (facebook/sam2-hiera-large)
 # with 4-bit NF4 NormalFloat quantization via bitsandbytes and Low-Rank Adaptation (LoRA r=8, alpha=16) via PEFT.
 
@@ -9,7 +9,7 @@ project:
   output_dir: "outputs/RUN/sam2_large"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 1                     # Maximum batch size for 12GB VRAM budget (~7.7 GB peak reserved; bs=2 exceeds 14GB)

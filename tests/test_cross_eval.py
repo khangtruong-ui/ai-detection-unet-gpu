@@ -393,14 +393,17 @@ def test_cross_eval_num_workers_cli_and_cap(monkeypatch):
 
 
 def test_base_coco_inpainted_config_spec():
-    """Verify that configs/cross-eval/base.yaml correctly targets KhangTruong/COCO-inpainted with 1024 samples."""
+    """Verify that configs/cross-eval/coco-inpainted.yaml correctly targets KhangTruong/COCO-inpainted with 1024 samples."""
     from sid_unet.utils.config import load_config
-    cfg = load_config("configs/cross-eval/base.yaml")
+    cfg = load_config("configs/cross-eval/coco-inpainted.yaml")
     assert cfg.data.dataset_name == "KhangTruong/COCO-inpainted"
     assert cfg.data.test_samples == 1024
     assert cfg.data.val_samples == 1024
     assert cfg.data.eval_split in ("validation", "test")
     assert os.path.exists("configs/base.yaml")
+    # Verify backwards compatible fallback from legacy base.yaml path
+    cfg_legacy = load_config("configs/cross-eval/base.yaml")
+    assert cfg_legacy.data.dataset_name == "KhangTruong/COCO-inpainted"
 
 
 def test_cross_eval_neighbor_report_naming_and_collision(monkeypatch):

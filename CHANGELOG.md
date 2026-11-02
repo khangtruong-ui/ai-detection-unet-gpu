@@ -5,7 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-01
+## [Unreleased] - 2026-11-02
+
+### Added
+- **Background Detachment for `sid-cache` and `sid-cross-eval`**:
+  - Implemented terminal detachment (`--detach`, default `True`) for both `sid-cache` and `sid-cross-eval`, matching the detachment behavior of `sid-train`.
+  - Spawns background worker process logging standard output and standard error continuously to `.logs.txt` (or custom `--log-file`).
+  - Added foreground attached execution via `--no-detach`, `--foreground`, and `-f`.
+  - Added comprehensive test coverage in `tests/test_detach.py` for detachment lifecycle, child arguments, and log headers across all CLIs.
+- **Default `--delete-on-update` for `sid-cache`**:
+  - Made `--delete-on-update` (and aliases `--delete-local-on-upload`, `--delete-on-upload`) enabled by default (`True`) in `sid-cache` and `DatasetCacheManager` / `AsyncHubUploader`.
+  - Automatically deletes local Parquet shards once uploaded to Hugging Face Hub to conserve local disk space.
+  - Added `--no-delete-on-update`, `--no-delete-local-on-upload`, and `--keep-local` flags to preserve local shard files.
+
+### Changed
+- **Experiment Configs Migration from `COCO-inpainted` to `DEAL300K-30K`**:
+  - Switched all 37 experiment configuration files in `configs/experiments/` from `KhangTruong/COCO-inpainted` to `KhangTruong/DEAL300K-30K`.
+  - Updated dataset references and descriptions in `configs/experiments/README.md` and related architecture documentation.
+  - Updated `tests/test_config.py` to validate `KhangTruong/DEAL300K-30K` as an approved dataset.
+- **Cross-Evaluation Config Renaming (`base.yaml` -> `coco-inpainted.yaml`)**:
+  - Renamed `configs/cross-eval/base.yaml` to `configs/cross-eval/coco-inpainted.yaml` to explicitly reflect its target evaluation benchmark (`KhangTruong/COCO-inpainted`).
+  - Updated project identifier from `eval_base` to `eval_coco_inpainted`.
+  - Added transparent backwards compatibility in `sid_unet.utils.config.load_config` and `sid_unet.cross_eval.expand_config_patterns` to resolve `configs/cross-eval/base.yaml` seamlessly to `coco-inpainted.yaml`.
+
+## [0.1.0] - 2026-11-01
 
 ### Fixed
 - **Multi-GPU Distributed Training Hang & SAM 2 Download Race Condition (`.logs.txt`)**:
