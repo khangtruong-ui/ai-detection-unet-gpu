@@ -7,7 +7,7 @@ data:
   dataset_name: "KhangTruong/AutoSplice"
   streaming: false
   image_size: [384, 384]
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   pin_memory: true
   eval_split: "cross_test"
