@@ -1,6 +1,6 @@
-# Configuration: SAM3 + QLoRA Higher Rank (r=16, alpha=32) on COCO-inpainted
+# Configuration: SAM3 + QLoRA Higher Rank (r=16, alpha=32) on DEAL300K-30K
 # Enhanced adaptation capacity attaching LoRA adapters to all attention projections (q, k, v, out)
-# with 4-bit NF4 quantization on KhangTruong/COCO-inpainted.
+# with 4-bit NF4 quantization on KhangTruong/DEAL300K-30K.
 
 project:
   name: "sid_sam3_qlora_beyondthebrush_r16"
@@ -9,7 +9,7 @@ project:
   output_dir: "outputs/RUN/sam3_qlora_beyondthebrush_r16"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 1

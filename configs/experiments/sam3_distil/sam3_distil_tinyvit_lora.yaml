@@ -1,4 +1,4 @@
-# Configuration: SAM3-Distil TinyViT-11m LoRA on COCO-inpainted
+# Configuration: SAM3-Distil TinyViT-11m LoRA on DEAL300K-30K
 # EfficientSAM3 with TinyViT backbone (11M params) + MobileCLIP-S0 text encoder.
 # Parameter-efficient fine-tuning via PEFT LoRA (r=16, alpha=32) on transformer & backbone attention projections.
 # Training environment mirrors diffusion-diff baseline with multi-worker prefetch and mixed precision.
@@ -10,7 +10,7 @@ project:
   output_dir: "outputs/experiments/sam3_distil_tinyvit_lora"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 8

@@ -9,7 +9,7 @@ import argparse
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -28,6 +28,31 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         type=str,
         default="configs/experiments/diffusion_diff_minimized/default.yaml",
         help="Path to YAML model configuration file (default: configs/experiments/diffusion_diff_minimized/default.yaml)",
+    )
+    parser.add_argument(
+        "--detach",
+        dest="detach",
+        action="store_true",
+        default=True,
+        help="Detach from terminal and run dataset caching in background logging to .logs.txt (default: True)",
+    )
+    parser.add_argument(
+        "--no-detach",
+        "--no_detach",
+        "--foreground",
+        "-f",
+        dest="detach",
+        action="store_false",
+        help="Run dataset caching in foreground attached to terminal (do not detach)",
+    )
+    parser.add_argument(
+        "--log-file",
+        "--logfile",
+        "--logs-file",
+        dest="log_file",
+        type=str,
+        default=".logs.txt",
+        help="File path to redirect standard output and error when detached (default: .logs.txt)",
     )
     parser.add_argument(
         "--dataset",
@@ -114,10 +139,22 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Do not resume; restart caching from shard index 0",
     )
     parser.add_argument(
+        "--delete-on-update",
         "--delete-local-on-upload",
+        "--delete-on-upload",
+        dest="delete_on_update",
         action="store_true",
-        default=False,
-        help="Remove local Parquet files once uploaded to Hugging Face Hub to save disk space",
+        default=True,
+        help="Remove local Parquet files once uploaded to Hugging Face Hub to save disk space (default: True)",
+    )
+    parser.add_argument(
+        "--no-delete-on-update",
+        "--no-delete-local-on-upload",
+        "--no-delete-on-upload",
+        "--keep-local",
+        dest="delete_on_update",
+        action="store_false",
+        help="Keep local Parquet files after uploading to Hugging Face Hub",
     )
     parser.add_argument(
         "--fp16",
@@ -167,14 +204,73 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         dest="prefetch_batches",
         help="Number of batches to prefetch ahead in RAM for non-blocking GPU execution (default: 16 or from config)",
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    parsed.delete_local_on_upload = getattr(parsed, "delete_on_update", True)
+    return parsed
 
 
-def cli_main(args: Optional[list] = None) -> None:
+def cli_main(args: Optional[list] = None) -> Any:
     from sid_unet.utils.signals import shield_process_signals
     shield_process_signals()
 
     parsed_args = parse_args(args)
+
+    # Check if we should detach from controlling terminal and run in background logging to .logs.txt
+    in_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ)
+    in_pytest = ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
+    already_detached = bool(os.environ.get("SID_UNET_DETACHED", False))
+    no_detach_env = bool(os.environ.get("SID_UNET_NO_DETACH", False)) or bool(os.environ.get("SID_UNET_FOREGROUND", False))
+
+    if bool(getattr(parsed_args, "detach", True)) and not in_dist and not in_pytest and not already_detached and not no_detach_env:
+        import subprocess
+        from datetime import datetime
+
+        log_path = os.path.abspath(getattr(parsed_args, "log_file", None) or ".logs.txt")
+        log_dir = os.path.dirname(log_path)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        log_fp = open(log_path, "a", encoding="utf-8")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_fp.write(
+            f"\n{'='*70}\n"
+            f"🚀 [sid-cache detached session started at {now_str}]\n"
+            f"Command: {' '.join(sys.argv if args is None else [sys.executable, '-m', 'sid_unet.cache.cli'] + list(args))}\n"
+            f"{'='*70}\n\n"
+        )
+        log_fp.flush()
+
+        child_env = os.environ.copy()
+        child_env["SID_UNET_DETACHED"] = "1"
+        child_env["PYTHONUNBUFFERED"] = "1"
+
+        sys_args = list(args) if args is not None else sys.argv[1:]
+        child_argv = [a for a in sys_args if a != "--detach"]
+        if not any(a in ("--no-detach", "--no_detach", "--foreground", "-f") for a in child_argv):
+            child_argv.insert(0, "--no-detach")
+
+        cmd = [sys.executable, "-m", "sid_unet.cache.cli"] + child_argv
+
+        sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            **sub_kwargs,
+        )
+        log_fp.close()
+
+        print("\n" + "=" * 70)
+        print(f"🚀 [DETACHED] sid-cache running in background (PID: {proc.pid})")
+        print(f"📄 Logging output to: {log_path}")
+        print(f"🔍 To monitor logs live: tail -f {getattr(parsed_args, 'log_file', '.logs.txt')}")
+        print("🛑 To stop caching: sid-kill")
+        print("=" * 70 + "\n")
+        sys.stdout.flush()
+        return {"status": "detached", "pid": proc.pid, "log_file": log_path}
+
     logger = setup_logger(name="sid_cache")
 
     logger.info("🔧 Loading configuration...")
@@ -184,7 +280,7 @@ def cli_main(args: Optional[list] = None) -> None:
 
     overrides = list(parsed_args.override or [])
     cfg = load_config(parsed_args.config, overrides=overrides)
-    source_dataset = parsed_args.dataset_name or cfg.data.get("dataset_name", "KhangTruong/COCO-inpainted")
+    source_dataset = parsed_args.dataset_name or cfg.data.get("dataset_name", "KhangTruong/DEAL300K-30K")
     hf_repo = parsed_args.hf_repo or cfg.data.get("cached_hf_repo", None)
 
     # Determine push_to_hub default
@@ -259,6 +355,8 @@ def cli_main(args: Optional[list] = None) -> None:
     logger.info(f"🎉 Dataset caching finished! Total shards generated: {sum(len(v) for v in all_shards.values())}")
     if push_hub and hf_repo:
         logger.info(f"🔗 Hugging Face Hub dataset URL: https://huggingface.co/datasets/{hf_repo}")
+
+    return all_shards
 
 
 if __name__ == "__main__":

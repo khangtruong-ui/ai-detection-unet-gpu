@@ -5,7 +5,7 @@ This directory contains organized configurations designed for higher throughput,
 Directory Layout:
 - **`unet_scratch/`**: Standard UNet architectures trained from scratch with varying widths, depths, loss formulations, and resolution budgets.
 - **`efficientnet/`**: Pretrained EfficientNet backbones with UNet multi-scale feature skip connections or the **Sacrifice of Pixel** linear-zoom architecture.
-- **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/COCO-inpainted`.
+- **`sam3-qlora/`**: Meta SAM3 foundation model with 4-bit NormalFloat quantization (bitsandbytes) and Low-Rank Adaptation (LoRA) fine-tuned on streamed datasets like `KhangTruong/DEAL300K-30K`.
 - **`sam3_distil/`**: Distilled EfficientSAM3 foundation model (TinyViT, EfficientViT backbones) with PEFT Low-Rank Adaptation (LoRA / QLoRA) trained in the diffusion-diff environment.
 - **`gap_sam/`**: GAP-SAM (Global Artifact Prior + sam-distil models: TinyViT, EfficientViT, RepViT) with frozen VAE reconstruction, Paired Artifact Encoder, zero-gated FiLM FPN modulation, and artifact classification.
 - **`sd_vae_finetune/`**: Finetuned Stable Diffusion 1.5 VAE (AutoencoderKL) adapted for binary synthetic image mask segmentation.
@@ -21,10 +21,10 @@ Directory Layout:
 
 | Configuration File | Model & Quantization | Dataset & Mode | LoRA Config | Loss | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [`sam3_qlora_beyondthebrush_b1.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=8, \alpha=16$ ($q, v$) | Combined (BCE + Dice + Focal) | Baseline parameter-efficient fine-tuning on 12GB GPUs with gradient accumulation steps 16. |
-| [`sam3_qlora_beyondthebrush_r16.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_r16.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=16, \alpha=32$ ($q, k, v, out$) | Combined (BCE + Dice + Focal) | Expanded adaptation capacity across all attention projection layers. |
-| [`sam3_qlora_beyondthebrush_focal.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_focal.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=8, \alpha=16$ ($q, v$) | Focal ($\gamma=2.0, \alpha=0.25$) | Hard-mining loss addressing extreme foreground-background mask imbalance in subtle inpainting boundaries. |
-| [`sam3_qlora_beyondthebrush_dice.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_dice.yaml) | SAM3 + 4-bit NF4 QLoRA | COCO-inpainted (streaming) | $r=8, \alpha=16$ ($q, v$) | Dice | Soft Sørensen-Dice direct optimization for sharp mask boundary overlap. |
+| [`sam3_qlora_beyondthebrush_b1.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_b1.yaml) | SAM3 + 4-bit NF4 QLoRA | DEAL300K-30K (streaming) | $r=8, \alpha=16$ ($q, v$) | Combined (BCE + Dice + Focal) | Baseline parameter-efficient fine-tuning on 12GB GPUs with gradient accumulation steps 16. |
+| [`sam3_qlora_beyondthebrush_r16.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_r16.yaml) | SAM3 + 4-bit NF4 QLoRA | DEAL300K-30K (streaming) | $r=16, \alpha=32$ ($q, k, v, out$) | Combined (BCE + Dice + Focal) | Expanded adaptation capacity across all attention projection layers. |
+| [`sam3_qlora_beyondthebrush_focal.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_focal.yaml) | SAM3 + 4-bit NF4 QLoRA | DEAL300K-30K (streaming) | $r=8, \alpha=16$ ($q, v$) | Focal ($\gamma=2.0, \alpha=0.25$) | Hard-mining loss addressing extreme foreground-background mask imbalance in subtle inpainting boundaries. |
+| [`sam3_qlora_beyondthebrush_dice.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3-qlora/sam3_qlora_beyondthebrush_dice.yaml) | SAM3 + 4-bit NF4 QLoRA | DEAL300K-30K (streaming) | $r=8, \alpha=16$ ($q, v$) | Dice | Soft Sørensen-Dice direct optimization for sharp mask boundary overlap. |
 
 ---
 
@@ -82,10 +82,10 @@ Directory Layout:
 
 | Configuration File | Backbone & Model | LoRA Adaptation | Dataset & Mode | Loss | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/default.yaml) | EfficientSAM3 TinyViT-11m | LoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | Baseline distilled SAM3 adaptation using identical environment (batch size 8, grad accum 4, AdamW, cosine) to diffusion-diff. |
-| [`sam3_distil_tinyvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_tinyvit_lora.yaml) | EfficientSAM3 TinyViT-11m | LoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | Dedicated TinyViT LoRA targeting attention projections and DETR transformer layers with MobileCLIP-S0 text encoder. |
-| [`sam3_distil_efficientvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_efficientvit_lora.yaml) | EfficientSAM3 EfficientViT-b0 | LoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | High-speed mobile-efficient backbone adapted via LoRA for ultra-low inference latency. |
-| [`sam3_distil_qlora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_qlora.yaml) | EfficientSAM3 TinyViT-11m | 4-bit NF4 QLoRA ($r=16, \alpha=32$) | COCO-inpainted (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | 4-bit quantized base weights for minimal GPU VRAM consumption (~1.5GB - 2GB). |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/default.yaml) | EfficientSAM3 TinyViT-11m | LoRA ($r=16, \alpha=32$) | DEAL300K-30K (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | Baseline distilled SAM3 adaptation using identical environment (batch size 8, grad accum 4, AdamW, cosine) to diffusion-diff. |
+| [`sam3_distil_tinyvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_tinyvit_lora.yaml) | EfficientSAM3 TinyViT-11m | LoRA ($r=16, \alpha=32$) | DEAL300K-30K (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | Dedicated TinyViT LoRA targeting attention projections and DETR transformer layers with MobileCLIP-S0 text encoder. |
+| [`sam3_distil_efficientvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_efficientvit_lora.yaml) | EfficientSAM3 EfficientViT-b0 | LoRA ($r=16, \alpha=32$) | DEAL300K-30K (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | High-speed mobile-efficient backbone adapted via LoRA for ultra-low inference latency. |
+| [`sam3_distil_qlora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/sam3_distil/sam3_distil_qlora.yaml) | EfficientSAM3 TinyViT-11m | 4-bit NF4 QLoRA ($r=16, \alpha=32$) | DEAL300K-30K (streaming, $B=8$) | Combined (BCE + Dice + Focal) + Aux (0.2) | 4-bit quantized base weights for minimal GPU VRAM consumption (~1.5GB - 2GB). |
 
 ---
 
@@ -103,7 +103,7 @@ Directory Layout:
 
 | Configuration File | Backbone & Model | VAE Architecture | LoRA Config | Loss | Target Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/gap_sam/default.yaml) | EfficientSAM3 TinyViT-11m | `stabilityai/sd-vae-ft-mse` | $r=16, \alpha=32$ | Combined + Aux (0.2) + Artifact (1.0) | Standard GAP-SAM baseline on COCO-inpainted with zero-gated FiLM multiscale FPN conditioning. |
+| [`default.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/gap_sam/default.yaml) | EfficientSAM3 TinyViT-11m | `stabilityai/sd-vae-ft-mse` | $r=16, \alpha=32$ | Combined + Aux (0.2) + Artifact (1.0) | Standard GAP-SAM baseline on DEAL300K-30K with zero-gated FiLM multiscale FPN conditioning. |
 | [`gap_sam_tinyvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/gap_sam/gap_sam_tinyvit_lora.yaml) | EfficientSAM3 TinyViT-11m | `stabilityai/sd-vae-ft-mse` | $r=16, \alpha=32$ | Combined + Aux (0.2) + Artifact (1.0) | Dedicated TinyViT LoRA pairing observed and frozen VAE reconstruction features. |
 | [`gap_sam_efficientvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/gap_sam/gap_sam_efficientvit_lora.yaml) | EfficientSAM3 EfficientViT-b0 | `stabilityai/sd-vae-ft-mse` | $r=16, \alpha=32$ | Combined + Aux (0.2) + Artifact (1.0) | Ultra-fast mobile/edge inference latency profile. |
 | [`gap_sam_repvit_lora.yaml`](file:///workspace/ai-detection-unet-gpu/configs/experiments/gap_sam/gap_sam_repvit_lora.yaml) | EfficientSAM3 RepViT-m1.1 | `stabilityai/sd-vae-ft-mse` | $r=16, \alpha=32$ | Combined + Aux (0.2) + Artifact (1.0) | Structural re-parameterization vision backbone. |

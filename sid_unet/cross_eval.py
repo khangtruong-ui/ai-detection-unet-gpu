@@ -46,7 +46,7 @@ from sid_unet.utils.report import (
 )
 
 
-def parse_args():
+def parse_args(args: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Cross-evaluate SID-UNet checkpoints across multiple dataset/experiment configurations"
     )
@@ -67,6 +67,31 @@ def parse_args():
         dest="checkpoints",
         required=True,
         help="Path(s) to checkpoint .pt file(s), run directories, or glob pattern(s).",
+    )
+    parser.add_argument(
+        "--detach",
+        dest="detach",
+        action="store_true",
+        default=True,
+        help="Detach from terminal and run evaluation in background logging to .logs.txt (default: True)",
+    )
+    parser.add_argument(
+        "--no-detach",
+        "--no_detach",
+        "--foreground",
+        "-f",
+        dest="detach",
+        action="store_false",
+        help="Run evaluation in foreground attached to terminal (do not detach)",
+    )
+    parser.add_argument(
+        "--log-file",
+        "--logfile",
+        "--logs-file",
+        dest="log_file",
+        type=str,
+        default=".logs.txt",
+        help="File path to redirect standard output and error when detached (default: .logs.txt)",
     )
     parser.add_argument(
         "--split",
@@ -241,7 +266,7 @@ def parse_args():
         default=None,
         help="Specific CUDA device IDs to use for evaluation (e.g. --device-ids 0 1).",
     )
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
 def expand_config_patterns(patterns: List[str]) -> List[str]:
@@ -257,6 +282,13 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
             resolved.extend([m for m in matches if os.path.isfile(m)])
         elif os.path.isfile(pat):
             resolved.append(pat)
+        elif pat.replace("\\", "/") == "configs/cross-eval/base.yaml":
+            for alt in ["configs/cross-eval/coco-inpainted.yaml", "configs/cross-eval/coco_inpainted.yaml"]:
+                if os.path.isfile(alt):
+                    resolved.append(alt)
+                    break
+            else:
+                raise FileNotFoundError(f"Configuration path not found: {pat}")
         else:
             raise FileNotFoundError(f"Configuration path not found: {pat}")
 
@@ -1177,15 +1209,72 @@ def run_cross_evaluation(
     }
 
 
-def main():
+def main(args: Optional[List[str]] = None):
     from sid_unet.utils.signals import shield_process_signals
     shield_process_signals()
 
-    args = parse_args()
-    raw_configs = args.cross_configs if isinstance(args.cross_configs, list) else [args.cross_configs]
+    parsed_args = parse_args(args)
+
+    # Check if we should detach from controlling terminal and run in background logging to .logs.txt
+    in_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ)
+    in_pytest = ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
+    already_detached = bool(os.environ.get("SID_UNET_DETACHED", False))
+    no_detach_env = bool(os.environ.get("SID_UNET_NO_DETACH", False)) or bool(os.environ.get("SID_UNET_FOREGROUND", False))
+
+    if bool(getattr(parsed_args, "detach", True)) and not in_dist and not in_pytest and not already_detached and not no_detach_env:
+        import subprocess
+        from datetime import datetime
+
+        log_path = os.path.abspath(getattr(parsed_args, "log_file", None) or ".logs.txt")
+        log_dir = os.path.dirname(log_path)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        log_fp = open(log_path, "a", encoding="utf-8")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_fp.write(
+            f"\n{'='*70}\n"
+            f"🚀 [sid-cross-eval detached session started at {now_str}]\n"
+            f"Command: {' '.join(sys.argv if args is None else [sys.executable, '-m', 'sid_unet.cross_eval'] + list(args))}\n"
+            f"{'='*70}\n\n"
+        )
+        log_fp.flush()
+
+        child_env = os.environ.copy()
+        child_env["SID_UNET_DETACHED"] = "1"
+        child_env["PYTHONUNBUFFERED"] = "1"
+
+        sys_args = list(args) if args is not None else sys.argv[1:]
+        child_argv = [a for a in sys_args if a != "--detach"]
+        if not any(a in ("--no-detach", "--no_detach", "--foreground", "-f") for a in child_argv):
+            child_argv.insert(0, "--no-detach")
+
+        cmd = [sys.executable, "-m", "sid_unet.cross_eval"] + child_argv
+
+        sub_kwargs = {"start_new_session": True} if os.name != "nt" else {}
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            **sub_kwargs,
+        )
+        log_fp.close()
+
+        print("\n" + "=" * 70)
+        print(f"🚀 [DETACHED] sid-cross-eval running in background (PID: {proc.pid})")
+        print(f"📄 Logging output to: {log_path}")
+        print(f"🔍 To monitor logs live: tail -f {getattr(parsed_args, 'log_file', '.logs.txt')}")
+        print("🛑 To stop evaluation: sid-kill")
+        print("=" * 70 + "\n")
+        sys.stdout.flush()
+        return {"status": "detached", "pid": proc.pid, "log_file": log_path}
+
+    raw_configs = parsed_args.cross_configs if isinstance(parsed_args.cross_configs, list) else [parsed_args.cross_configs]
     config_paths = expand_config_patterns(raw_configs)
 
-    raw_ckpts = args.checkpoints if isinstance(args.checkpoints, list) else [args.checkpoints]
+    raw_ckpts = parsed_args.checkpoints if isinstance(parsed_args.checkpoints, list) else [parsed_args.checkpoints]
     checkpoint_paths = expand_checkpoint_patterns(raw_ckpts)
 
     if not config_paths:
@@ -1193,30 +1282,30 @@ def main():
     if not checkpoint_paths:
         raise FileNotFoundError(f"No valid checkpoints found matching: {raw_ckpts}")
 
-    overrides = list(args.override or [])
-    if getattr(args, "num_workers", None) is not None:
-        overrides.append(f"data.num_workers={args.num_workers}")
+    overrides = list(parsed_args.override or [])
+    if getattr(parsed_args, "num_workers", None) is not None:
+        overrides.append(f"data.num_workers={parsed_args.num_workers}")
 
     results = run_cross_evaluation(
         checkpoint_paths=checkpoint_paths,
         config_paths=config_paths,
-        split=args.split,
-        samples=args.samples,
-        batch_size=args.batch_size,
+        split=parsed_args.split,
+        samples=parsed_args.samples,
+        batch_size=parsed_args.batch_size,
         overrides=overrides,
-        output_dir=args.output_dir,
-        threshold=args.threshold,
-        segment=args.segment,
-        post_process=args.post_process,
-        min_area=args.min_area,
-        fill_holes=args.fill_holes,
-        morphology=args.morphology,
-        save_illustrations=args.save_illustrations,
-        max_illustrations=args.max_illustrations,
-        skip_collision=args.skip_collision,
-        filter_zero_positive=args.filter_zero_positive,
-        data_parallel=args.data_parallel,
-        device_ids=args.device_ids,
+        output_dir=parsed_args.output_dir,
+        threshold=parsed_args.threshold,
+        segment=parsed_args.segment,
+        post_process=parsed_args.post_process,
+        min_area=parsed_args.min_area,
+        fill_holes=parsed_args.fill_holes,
+        morphology=parsed_args.morphology,
+        save_illustrations=parsed_args.save_illustrations,
+        max_illustrations=parsed_args.max_illustrations,
+        skip_collision=parsed_args.skip_collision,
+        filter_zero_positive=parsed_args.filter_zero_positive,
+        data_parallel=parsed_args.data_parallel,
+        device_ids=parsed_args.device_ids,
     )
     return results
 

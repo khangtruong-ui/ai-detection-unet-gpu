@@ -1,4 +1,4 @@
-# Configuration: SAM3 + QLoRA with Binary Focal Loss on COCO-inpainted
+# Configuration: SAM3 + QLoRA with Binary Focal Loss on DEAL300K-30K
 # Addresses severe foreground-background mask imbalance where tampered areas occupy small fractions of the image.
 # Uses Binary Focal Loss (gamma=2.0, alpha=0.25) with 4-bit NF4 quantization.
 
@@ -9,7 +9,7 @@ project:
   output_dir: "outputs/RUN/sam3_qlora_beyondthebrush_focal"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 1

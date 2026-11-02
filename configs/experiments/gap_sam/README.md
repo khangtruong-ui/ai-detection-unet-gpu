@@ -59,7 +59,7 @@ All configurations strictly align with the hyperparameters reported in the paper
 
 | Config File | Backbone | Variant | VAE | LoRA $(r, \alpha, \text{dropout})$ | Epochs | Use Case |
 |---|---|---|---|---|---|---|
-| [`default.yaml`](default.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | Paper-aligned GAP-SAM baseline on COCO-inpainted |
+| [`default.yaml`](default.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | Paper-aligned GAP-SAM baseline on DEAL300K-30K |
 | [`gap_sam_tinyvit_lora.yaml`](gap_sam_tinyvit_lora.yaml) | `tinyvit` | `11m` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | Optimized TinyViT configuration |
 | [`gap_sam_efficientvit_lora.yaml`](gap_sam_efficientvit_lora.yaml) | `efficientvit` | `b0` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | Real-time / mobile inference latency profile |
 | [`gap_sam_repvit_lora.yaml`](gap_sam_repvit_lora.yaml) | `repvit` | `m1.1` | `sd-vae-ft-mse` | $(8, 16, 0.0)$ | 3 | Structural re-parameterization vision backbone |

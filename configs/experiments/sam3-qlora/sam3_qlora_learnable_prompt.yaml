@@ -1,4 +1,4 @@
-# Configuration: SAM3 + QLoRA with Learnable Prompt Tuning on COCO-inpainted
+# Configuration: SAM3 + QLoRA with Learnable Prompt Tuning on DEAL300K-30K
 # Meta SAM3 foundation model with 4-bit NF4 NormalFloat quantization via bitsandbytes
 # and Low-Rank Adaptation (LoRA r=8, alpha=16) via PEFT.
 # Redesigned transformer conditioning: Replaces fixed "tampered region" text input with
@@ -11,7 +11,7 @@ project:
   output_dir: "outputs/RUN/sam3_qlora_learnable_prompt"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 1                     # Maximum batch size for 12GB VRAM budget (interpolates to 1008x1008; ~6.5-7.5 GB peak reserved)

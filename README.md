@@ -2384,8 +2384,8 @@ data:
 ### 1. Training
 
 > [!NOTE]
-> **Detached Execution by Default**: `sid-train` defaults to detaching from the terminal session (`--detach`, default `true`), spawning the training process in the background and redirecting all standard output and error in real-time into `.logs.txt`.
-> - **Live Monitoring**: Inspect training logs with `tail -f .logs.txt`.
+> **Detached Background Execution by Default**: `sid-train`, `sid-cross-eval`, and `sid-cache` default to detaching from the terminal session (`--detach`, default `true`), spawning execution in the background and redirecting output in real-time into `.logs.txt`.
+> - **Live Monitoring**: Inspect progress and logs with `tail -f .logs.txt`.
 > - **Process Termination**: Terminate running or background tasks anytime via `sid-kill`.
 > - **Foreground Execution**: To run attached to the terminal instead, pass `--no-detach`, `--foreground`, or `-f`.
 > - **Custom Log File**: Pass `--log-file <path>` to log to an alternate file instead of `.logs.txt`.
@@ -2582,12 +2582,18 @@ sid-eval --checkpoints \
 
 #### C. Cross-Evaluation Matrix Benchmarking (`sid-cross-eval`)
 ```bash
-# Cross-evaluate checkpoints across multiple dataset configurations with collision skipping
+# Cross-evaluate checkpoints in background (detached by default; logs to .logs.txt)
 sid-cross-eval \
   --cross-configs configs/cross-eval/*.yaml \
   --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
   --split test \
   --filter-zero-positive
+
+# Run cross-evaluation attached in foreground
+sid-cross-eval \
+  --cross-configs configs/cross-eval/coco-inpainted.yaml \
+  --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
+  --no-detach
 
 # Multi-GPU acceleration (automatically enabled on Kaggle across all available GPUs)
 sid-cross-eval \
@@ -2596,6 +2602,9 @@ sid-cross-eval \
   --data-parallel \
   --device-ids 0 1
 ```
+
+> [!TIP]
+> **Cross-Evaluation Configurations**: Pre-configured evaluation benchmarks in `configs/cross-eval/` target specific validation distributions, including `coco-inpainted.yaml` (formerly `base.yaml`), `cocoglide.yaml`, `autosplice.yaml`, `casia_v2.0.yaml`, `diffseg30k.yaml`, and `open-sdid.yaml`. Legacy references to `base.yaml` are transparently resolved to `coco-inpainted.yaml`.
 
 > [!TIP]
 > **Kaggle Multi-GPU Acceleration**: On Kaggle (and multi-GPU systems), `sid-cross-eval` automatically detects available GPUs (e.g. 2x Tesla T4) and enables `DataParallel` across all devices by default, evenly distributing batch workloads and tracking per-device peak VRAM and allocated memory in reports. To restrict to a single device, pass `--no-data-parallel`.
@@ -2652,12 +2661,13 @@ The `sid-cache` (or `sid-dataset-cache`) CLI extracts representations once and p
 
 #### A. Pre-computing Dataset Cache (`sid-cache`)
 
+`sid-cache` runs in the background by default (`--detach`, logs to `.logs.txt`), automatically deleting local shards upon upload (`--delete-on-update`, default `true`) to conserve disk space. To run attached in the foreground, pass `--no-detach` / `-f`. To preserve local shards, pass `--keep-local` or `--no-delete-on-update`.
+
 ```bash
-# 1. Progressively extract representation Z and upload shards asynchronously to Hugging Face Hub:
-# (GPU computes next shard while background worker uploads previous shard concurrently)
+# 1. Progressively extract representation Z and upload shards asynchronously in background:
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
-  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --hf-repo KhangTruong/DEAL300K-30K-cache \
   --splits train validation \
   --batch-size 32 \
   --samples-per-shard 2000 \
@@ -2667,43 +2677,43 @@ sid-cache \
 # Automatically detects completed remote/local shards and skips already-processed samples:
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
-  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --hf-repo KhangTruong/DEAL300K-30K-cache \
   --resume
 
-# 3. Low-disk mode: delete local parquet files once uploaded to Hugging Face Hub:
+# 3. Retain local files on disk (disable delete-on-update):
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
-  --hf-repo KhangTruong/COCO-inpainted-cache \
-  --delete-local-on-upload
+  --hf-repo KhangTruong/DEAL300K-30K-cache \
+  --keep-local
 
-# 4. Extract and save locally only (without pushing to HF Hub):
+# 4. Extract and save locally only in foreground (without pushing to HF Hub):
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
-  --output-dir datasets/COCO-inpainted-cache \
+  --output-dir datasets/DEAL300K-30K-cache \
   --splits train validation \
-  --no-push-to-hub
+  --no-push-to-hub \
+  --no-detach
 
-# 5. Fast verification run with a small sample limit:
+# 5. Fast verification run with a small sample limit in foreground:
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
   --output-dir datasets/test-cache \
   --max-samples 100 \
-  --no-push-to-hub
+  --no-push-to-hub \
+  --no-detach
 
 # 6. High-resolution cache extraction with dynamic CLI overrides:
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/default.yaml \
   --override data.image_size=[512,512] \
-  --hf-repo KhangTruong/COCO-inpainted-cache \
-  --delete-local-on-upload
+  --hf-repo KhangTruong/DEAL300K-30K-cache
 
 # 7. Tuned high-throughput pipelined caching with background CPU workers:
 sid-cache \
   --config configs/experiments/diffusion_diff_minimized/diffusion_diff_minimized_512.yaml \
-  --hf-repo KhangTruong/COCO-inpainted-cache \
+  --hf-repo KhangTruong/DEAL300K-30K-cache \
   --num-workers 4 \
-  --prefetch-batches 16 \
-  --delete-local-on-upload
+  --prefetch-batches 16
 ```
 
 #### B. Pipelined Asynchronous Caching Architecture

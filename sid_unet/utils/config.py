@@ -234,6 +234,19 @@ def load_config(
     """
     config = copy.deepcopy(DEFAULT_CONFIG)
 
+    if config_path is not None and not os.path.exists(config_path):
+        normalized = config_path.replace("\\", "/")
+        if normalized == "configs/cross-eval/base.yaml":
+            for alt in ["configs/cross-eval/coco-inpainted.yaml", "configs/cross-eval/coco_inpainted.yaml"]:
+                if os.path.exists(alt):
+                    config_path = alt
+                    break
+        elif normalized in ("configs/cross-eval/coco_inpainted.yaml", "configs/cross-eval/coco-inpainted.yaml"):
+            for alt in ["configs/cross-eval/coco-inpainted.yaml", "configs/cross-eval/coco_inpainted.yaml"]:
+                if os.path.exists(alt):
+                    config_path = alt
+                    break
+
     if config_path is not None and os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             user_config = yaml.safe_load(f)

@@ -1,7 +1,7 @@
-# Configuration: SAM3 + QLoRA Baseline on COCO-inpainted
+# Configuration: SAM3 + QLoRA Baseline on DEAL300K-30K
 # Meta SAM3 foundation model with 4-bit NF4 NormalFloat quantization via bitsandbytes
 # and Low-Rank Adaptation (LoRA r=8, alpha=16) via PEFT.
-# Streamed dataset from KhangTruong/COCO-inpainted with binary masks.
+# Streamed dataset from KhangTruong/DEAL300K-30K with binary masks.
 
 project:
   name: "sid_sam3_qlora_beyondthebrush_b1"
@@ -10,7 +10,7 @@ project:
   output_dir: "outputs/RUN/sam3_qlora_beyondthebrush_b1"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 1

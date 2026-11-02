@@ -1,5 +1,5 @@
 project:
-  name: "eval_base"
+  name: "eval_coco_inpainted"
   device: "auto"
   output_dir: "outputs/cross_eval_results"
 

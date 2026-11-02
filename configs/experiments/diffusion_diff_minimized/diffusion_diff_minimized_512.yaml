@@ -4,7 +4,7 @@ project:
   device: auto
   output_dir: outputs/experiments/diffusion_diff_minimized_512
 data:
-  dataset_name: KhangTruong/COCO-inpainted
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size:
   - 512

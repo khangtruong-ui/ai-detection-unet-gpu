@@ -9,7 +9,7 @@ project:
   output_dir: "outputs/experiments/gap_sam/repvit_lora"
 
 data:
-  dataset_name: "KhangTruong/COCO-inpainted"
+  dataset_name: "KhangTruong/DEAL300K-30K"
   streaming: true
   image_size: [256, 256]
   batch_size: 8

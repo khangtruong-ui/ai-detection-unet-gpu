@@ -46,12 +46,16 @@ class AsyncHubUploader:
         repo_id: str,
         token: Optional[str] = None,
         max_pending: int = 3,
-        delete_local_on_upload: bool = False,
+        delete_local_on_upload: bool = True,
+        delete_on_update: Optional[bool] = None,
     ):
         self.repo_id = repo_id
         self.token = token
         self.max_pending = max(1, int(max_pending))
+        if delete_on_update is not None:
+            delete_local_on_upload = delete_on_update
         self.delete_local_on_upload = bool(delete_local_on_upload)
+        self.delete_on_update = bool(delete_local_on_upload)
         self.queue: queue.Queue = queue.Queue(maxsize=self.max_pending)
         self.stop_event = threading.Event()
         self.uploaded_files: List[str] = []
@@ -748,11 +752,12 @@ class DatasetCacheManager:
         fp16: bool = True,
         hf_token: Optional[str] = None,
         resume: bool = True,
-        delete_local_on_upload: bool = False,
+        delete_local_on_upload: bool = True,
         push_to_hub: bool = False,
         store_images: Optional[bool] = None,
         num_workers: Optional[int] = None,
         prefetch_batches: int = 16,
+        delete_on_update: Optional[bool] = None,
     ):
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -773,7 +778,10 @@ class DatasetCacheManager:
         self.fp16 = bool(fp16)
         self.hf_token = hf_token
         self.resume = bool(resume)
+        if delete_on_update is not None:
+            delete_local_on_upload = delete_on_update
         self.delete_local_on_upload = bool(delete_local_on_upload)
+        self.delete_on_update = bool(delete_local_on_upload)
         self.push_to_hub_flag = bool(push_to_hub)
         if num_workers is not None and num_workers < 0:
             self.num_workers = min(16, max(4, os.cpu_count() or 4))
