@@ -1386,6 +1386,8 @@ def create_eval_dataloader(
         is_dist = is_dist_avail_and_initialized()
         world_size = get_world_size() if is_dist else None
         rank = get_rank() if is_dist else None
+        timeout_cfg = config.data.get("timeout", config.data.get("dataloader_timeout", 300.0))
+        dataloader_timeout = float(timeout_cfg) if timeout_cfg is not None else 300.0
         return PDLDataLoader(
             dataset=eval_dataset,
             batch_size=batch_size,
@@ -1396,6 +1398,7 @@ def create_eval_dataloader(
             world_size=world_size,
             rank=rank,
             worker_type="thread",
+            timeout=dataloader_timeout,
         )
 
     if streaming:
@@ -2088,6 +2091,8 @@ def create_dataloaders(
         is_dist = is_dist_avail_and_initialized()
         world_size = get_world_size() if is_dist else None
         rank = get_rank() if is_dist else None
+        timeout_cfg = config.data.get("timeout", config.data.get("dataloader_timeout", 300.0))
+        dataloader_timeout = float(timeout_cfg) if timeout_cfg is not None else 300.0
 
         train_loader = PDLDataLoader(
             dataset=train_dataset,
@@ -2099,6 +2104,7 @@ def create_dataloaders(
             world_size=world_size,
             rank=rank,
             worker_type="thread",
+            timeout=dataloader_timeout,
         )
         val_loader = PDLDataLoader(
             dataset=val_dataset,
@@ -2110,6 +2116,7 @@ def create_dataloaders(
             world_size=world_size,
             rank=rank,
             worker_type="thread",
+            timeout=dataloader_timeout,
         )
     elif streaming:
         train_dataset = SIDStreamingDataset(

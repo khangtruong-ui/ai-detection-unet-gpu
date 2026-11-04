@@ -333,4 +333,54 @@ def test_create_dataloaders_with_max_cache_gb_forwarding(temp_parquet_dataset):
     assert b_train["mask"].shape == (4, 1, 64, 64)
 
 
+def test_pdl_dataloader_timeout_configuration(temp_parquet_dataset):
+    """Verify that timeout configuration is properly propagated to PDLDataLoader."""
+    from sid_unet.dataset.loader import PDLDataLoader
+
+    # 1. Default timeout should be 300.0
+    cfg_default = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=true",
+        "data.batch_size=4",
+        "training.data_parallel=false",
+        "data.train_samples_per_epoch=8",
+        "data.val_samples_per_epoch=4",
+        "data.image_size=[64, 64]",
+        "data.num_workers=0",
+        "data.use_parquet_loader=true",
+    ])
+    train_l, val_l = create_dataloaders(cfg_default, include_test=False)
+    assert isinstance(train_l, PDLDataLoader)
+    assert train_l.timeout == 300.0
+    assert val_l.timeout == 300.0
+
+    eval_l = create_eval_dataloader(cfg_default, split="train", max_samples=4)
+    assert isinstance(eval_l, PDLDataLoader)
+    assert eval_l.timeout == 300.0
+
+    # 2. Explicit custom timeout should be honored
+    cfg_custom = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=true",
+        "data.batch_size=4",
+        "training.data_parallel=false",
+        "data.train_samples_per_epoch=8",
+        "data.val_samples_per_epoch=4",
+        "data.image_size=[64, 64]",
+        "data.num_workers=0",
+        "data.use_parquet_loader=true",
+        "data.timeout=600.0",
+    ])
+    train_custom, val_custom = create_dataloaders(cfg_custom, include_test=False)
+    assert train_custom.timeout == 600.0
+    assert val_custom.timeout == 600.0
+
+    eval_custom = create_eval_dataloader(cfg_custom, split="train", max_samples=4)
+    assert eval_custom.timeout == 600.0
+
+
 

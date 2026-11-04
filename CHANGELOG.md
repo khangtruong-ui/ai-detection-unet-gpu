@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-02
+## [Unreleased] - 2026-11-04
+
+### Added
+- **Configurable DataLoader Batch Timeout (`timeout` / `dataloader_timeout`)**:
+  - Propagated `data.timeout` and `data.dataloader_timeout` (defaulting to 300.0s) to `PDLDataLoader` across `create_dataloaders()` (for both `train_loader` and `val_loader`) and `create_eval_dataloader()`.
+  - Prevents premature 60.0s `TimeoutError` during initial cold-cache Parquet downloads and heavy remote streaming pipelines.
+  - Added unit test coverage in `tests/test_parquet_loader_integration.py` (`test_pdl_dataloader_timeout_configuration`).
+
+## [0.1.2] - 2026-11-02
 
 ### Added
 - **Background Detachment for `sid-cache` and `sid-cross-eval`**:
