@@ -290,13 +290,14 @@ def eval_single_batch(
         mask_logits, class_logits = outputs, None
 
     # 1. Update Raw UNet baseline tracker
-    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True)
+    datasets = batch.get("dataset")
+    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True, datasets=datasets)
 
     # 2. Update Post-Processing tracker if enabled
     post_masks = None
     if post_seg_tracker is not None and postprocessor is not None:
         post_masks, _ = postprocessor.process_batch(mask_logits, is_logit=True)
-        post_seg_tracker.update(post_masks, masks, labels, is_logit=False)
+        post_seg_tracker.update(post_masks, masks, labels, is_logit=False, datasets=datasets)
 
     # 3. Update SAM Refinement tracker if enabled
     sam_masks = None
@@ -306,7 +307,7 @@ def eval_single_batch(
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits, is_logit=True)
         except TypeError:
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
-        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False)
+        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False, datasets=datasets)
 
     # 4. Update combined SAM + Post-Processing tracker if both enabled
     both_masks = None
@@ -324,7 +325,7 @@ def eval_single_batch(
             base_for_both = mask_logits
             base_is_logit = True
         both_masks, _ = postprocessor.process_batch(base_for_both, is_logit=base_is_logit)
-        both_seg_tracker.update(both_masks, masks, labels, is_logit=False)
+        both_seg_tracker.update(both_masks, masks, labels, is_logit=False, datasets=datasets)
 
     # 5. Classification metrics
     if class_logits is not None and labels is not None:
@@ -706,6 +707,31 @@ def evaluate_single_checkpoint(
         chosen_seg = both_seg
         chosen_per_label = both_per_label
 
+    chosen_per_dataset = (
+        both_seg_tracker.compute_per_dataset()
+        if both_seg_tracker is not None
+        else (
+            sam_seg_tracker.compute_per_dataset()
+            if sam_seg_tracker is not None
+            else (
+                post_seg_tracker.compute_per_dataset()
+                if post_seg_tracker is not None
+                else raw_seg_tracker.compute_per_dataset()
+            )
+        )
+    )
+
+    if chosen_per_dataset:
+        logger.info(f"📊 [PER-DATASET BREAKDOWN] Evaluated {len(chosen_per_dataset)} sub-datasets:")
+        for ds_k, ds_v in sorted(chosen_per_dataset.items(), key=lambda x: str(x[0])):
+            logger.info(
+                f"   - {ds_k:15s} | IoU: {ds_v.get('iou', 0.0):.4f} | "
+                f"Dice/F1: {ds_v.get('dice', ds_v.get('f1', 0.0)):.4f} | "
+                f"AUROC: {ds_v.get('auroc', 0.0):.4f} | "
+                f"PixelAcc: {ds_v.get('pixel_acc', 0.0):.4f} | "
+                f"Samples: {int(ds_v.get('samples', ds_v.get('count', 0)))}"
+            )
+
     overall_metrics = {
         "eval_split": resolved_split,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
@@ -713,6 +739,7 @@ def evaluate_single_checkpoint(
         **cls_metrics,
         "total_evaluated_samples": total_samples,
         "ablation_summary": ablation_dict,
+        "per_dataset_metrics": chosen_per_dataset,
     }
 
     if refiner is not None and all_change_metrics:
@@ -771,6 +798,7 @@ def evaluate_single_checkpoint(
         report_name="evaluation_report",
         ablation_results=ablation_dict if len(ablation_dict) > 1 else None,
         illustration_paths=illustration_paths if illustration_paths else None,
+        per_dataset_metrics=chosen_per_dataset,
     )
 
     # Mirror report and illustrations to local checkpoint run directory for guaranteed in-place update

@@ -208,6 +208,8 @@ def test_process_raw_sample_tampered_dataset_fake():
     processed = process_raw_sample(sample, transform=None, target_image_size=(64, 64))
     assert processed["label"].item() == 2  # Partially Synthetic / Tampered
     assert processed["mask"].shape == (1, 64, 64)
+    assert processed["dataset"] == "CASIA_V2"
+    assert processed["method"] == "Splicing"
     # Quadrant has 1s, other parts have 0s
     assert float(processed["mask"].sum()) > 0
     assert float(processed["mask"].sum()) < float(processed["mask"].numel())

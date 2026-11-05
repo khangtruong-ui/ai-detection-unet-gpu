@@ -203,6 +203,7 @@ class SegmentationMetricTracker:
             1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
             2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
         }
+        self.per_dataset_stats: Dict[str, Dict[str, Union[float, int]]] = {}
 
     def update(
         self,
@@ -210,6 +211,7 @@ class SegmentationMetricTracker:
         target_masks: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         is_logit: Optional[bool] = None,
+        datasets: Optional[Union[List[str], Sequence[str]]] = None,
     ):
         """
         Update tracker with batch predictions and ground truth.
@@ -301,13 +303,122 @@ class SegmentationMetricTracker:
                     self.per_label_stats[lbl]["precision_pos_sum"] += m["precision"]
                     self.per_label_stats[lbl]["recall_pos_sum"] += m["recall"]
 
-    def compute(self) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]]]:
+            if datasets is not None and i < len(datasets):
+                raw_ds = datasets[i]
+                if raw_ds is not None and str(raw_ds).strip():
+                    ds_name = str(raw_ds).strip()
+                    if ds_name not in self.per_dataset_stats:
+                        self.per_dataset_stats[ds_name] = {
+                            "iou_sum": 0.0,
+                            "dice_sum": 0.0,
+                            "f1_sum": 0.0,
+                            "auroc_sum": 0.0,
+                            "pixel_acc_sum": 0.0,
+                            "precision_sum": 0.0,
+                            "recall_sum": 0.0,
+                            "specificity_sum": 0.0,
+                            "count": 0,
+                            "pos_count": 0,
+                            "iou_pos_sum": 0.0,
+                            "dice_pos_sum": 0.0,
+                            "f1_pos_sum": 0.0,
+                            "precision_pos_sum": 0.0,
+                            "recall_pos_sum": 0.0,
+                        }
+                    ds_stat = self.per_dataset_stats[ds_name]
+                    ds_stat["iou_sum"] += m["iou"]
+                    ds_stat["dice_sum"] += m["dice"]
+                    ds_stat["f1_sum"] += m["f1"]
+                    ds_stat["auroc_sum"] += m["auroc"]
+                    ds_stat["pixel_acc_sum"] += m["pixel_acc"]
+                    ds_stat["precision_sum"] += m["precision"]
+                    ds_stat["recall_sum"] += m["recall"]
+                    ds_stat["specificity_sum"] += m["specificity"]
+                    ds_stat["count"] += 1
+                    if has_pos:
+                        ds_stat["pos_count"] += 1
+                        ds_stat["iou_pos_sum"] += m["iou"]
+                        ds_stat["dice_pos_sum"] += m["dice"]
+                        ds_stat["f1_pos_sum"] += m["f1"]
+                        ds_stat["precision_pos_sum"] += m["precision"]
+                        ds_stat["recall_pos_sum"] += m["recall"]
+
+    def compute_per_dataset(self) -> Dict[str, Dict[str, float]]:
+        """
+        Compute averaged metrics broken down by sub-dataset.
+        Returns:
+            Dict[dataset_name, Dict[metric_name, float]]
+        """
+        per_dataset: Dict[str, Dict[str, float]] = {}
+        for ds_name, stats in self.per_dataset_stats.items():
+            cnt = int(stats["count"])
+            pos_cnt = int(stats.get("pos_count", cnt))
+            if cnt == 0:
+                continue
+
+            ds_m: Dict[str, float] = {
+                "count": float(cnt),
+                "samples": float(cnt),
+                "pos_count": float(pos_cnt),
+                "iou_all": stats["iou_sum"] / cnt,
+                "dice_all": stats["dice_sum"] / cnt,
+                "f1_all": stats["f1_sum"] / cnt,
+                "pixel_acc": stats["pixel_acc_sum"] / cnt,
+                "auroc": stats["auroc_sum"] / cnt,
+                "pixel_auroc": stats["auroc_sum"] / cnt,
+                "precision_all": stats["precision_sum"] / cnt,
+                "recall_all": stats["recall_sum"] / cnt,
+                "specificity": stats["specificity_sum"] / cnt,
+            }
+
+            if pos_cnt > 0:
+                ds_m["iou_positive"] = stats["iou_pos_sum"] / pos_cnt
+                ds_m["dice_positive"] = stats["dice_pos_sum"] / pos_cnt
+                ds_m["f1_positive"] = stats["f1_pos_sum"] / pos_cnt
+                ds_m["precision_positive"] = stats["precision_pos_sum"] / pos_cnt
+                ds_m["recall_positive"] = stats["recall_pos_sum"] / pos_cnt
+            else:
+                ds_m["iou_positive"] = ds_m["iou_all"]
+                ds_m["dice_positive"] = ds_m["dice_all"]
+                ds_m["f1_positive"] = ds_m["f1_all"]
+                ds_m["precision_positive"] = ds_m["precision_all"]
+                ds_m["recall_positive"] = ds_m["recall_all"]
+
+            if self.filter_zero_positive and pos_cnt > 0:
+                ds_m["iou"] = ds_m["iou_positive"]
+                ds_m["dice"] = ds_m["dice_positive"]
+                ds_m["f1"] = ds_m["f1_positive"]
+                ds_m["pixel_f1"] = ds_m["f1_positive"]
+                ds_m["precision"] = ds_m["precision_positive"]
+                ds_m["recall"] = ds_m["recall_positive"]
+            else:
+                ds_m["iou"] = ds_m["iou_all"]
+                ds_m["dice"] = ds_m["dice_all"]
+                ds_m["f1"] = ds_m["f1_all"]
+                ds_m["pixel_f1"] = ds_m["f1_all"]
+                ds_m["precision"] = ds_m["precision_all"]
+                ds_m["recall"] = ds_m["recall_all"]
+
+            per_dataset[ds_name] = ds_m
+
+        return per_dataset
+
+    @property
+    def per_dataset_metrics(self) -> Dict[str, Dict[str, float]]:
+        return self.compute_per_dataset()
+
+    def compute(self, return_per_dataset: bool = False) -> Union[
+        Tuple[Dict[str, float], Dict[int, Dict[str, float]]],
+        Tuple[Dict[str, float], Dict[int, Dict[str, float]], Dict[str, Dict[str, float]]]
+    ]:
         """
         Returns:
             overall_metrics: Dict[str, float]
             per_label_metrics: Dict[int, Dict[str, float]]
         """
         if self.total_samples == 0:
+            if return_per_dataset:
+                return {k: 0.0 for k in self.metrics_sum}, {}, {}
             return {k: 0.0 for k in self.metrics_sum}, {}
 
         overall = {k: self.metrics_sum[k] / self.total_samples for k in self.metrics_sum}
@@ -407,4 +518,6 @@ class SegmentationMetricTracker:
                     "positive_samples": 0,
                 }
 
+        if return_per_dataset:
+            return overall, per_label, self.compute_per_dataset()
         return overall, per_label

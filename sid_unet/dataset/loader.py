@@ -501,11 +501,16 @@ def process_raw_sample(
         default_tf = get_transforms(image_size=target_image_size, is_train=False)
         img_tensor, mask_tensor = default_tf(pil_image, mask_arr)
 
+    raw_dataset = sample.get("dataset", sample.get("sub_dataset", None))
+    raw_method = sample.get("method", None)
+
     return {
         "image": img_tensor,           # (3, H, W)
         "mask": mask_tensor,           # (1, H, W)
         "label": torch.tensor(label, dtype=torch.long), # Scalar label (0, 1, 2)
         "img_id": img_id,
+        "dataset": str(raw_dataset) if raw_dataset is not None else "",
+        "method": str(raw_method) if raw_method is not None else "",
     }
 
 

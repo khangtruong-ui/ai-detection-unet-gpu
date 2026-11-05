@@ -8,16 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-11-05
 
 ### Added
+- **Per-Dataset Breakdown on Multi-Benchmark Datasets (`--dataset-filter`)**:
+  - Implemented multi-benchmark slicing in `sid_unet.metrics.segmentation.SegmentationMetricTracker` via `compute_per_dataset()` and `per_dataset_metrics` property, accumulating IoU, Dice/F1, AUROC, Pixel Accuracy, Precision, Recall, Specificity, and sample count for each constituent sub-dataset.
+  - Forwarded `dataset` and `method` metadata from `process_raw_sample` through batch collation and into metric trackers across `sid_unet.cross_eval` and `sid_unet.evaluate`.
+  - Added dedicated **Per-Dataset Breakdown (Multi-Benchmark Slicing)** tables to Markdown and JSON evaluation reports (`generate_checkpoint_cross_eval_report`, `generate_master_cross_evaluation_report`, and `generate_evaluation_report`).
+  - Added optional `--dataset-filter` / `--sub-dataset` CLI argument to isolate and evaluate specific sub-datasets (e.g. `--dataset-filter CASIA_V2` or `--dataset-filter CocoGlide`).
 - **MVSS-v1 Cross-Testing Protocol Configuration (`MVSS-v1-protocol.yaml`)**:
-  - Added `MVSS-v1-protocol.yaml` in `configs/cross-eval/`, `configs/cross-test/`, and `cross-test/` targeting the multi-generator tampering benchmark `KhangTruong/Tampered-Images-Combined-Dataset-Fake`.
+  - Added `MVSS-v1-protocol.yaml` in `configs/cross-eval/` targeting the multi-generator tampering benchmark `KhangTruong/Tampered-Images-Combined-Dataset-Fake`.
   - Configures `eval_split: "cross_test"` with standard resolution `[256, 256]`, combined BCE + Dice loss, and morphological post-processing.
-  - Added flexible alias path expansion in `sid_unet.cross_eval.expand_config_patterns` resolving `cross-test/`, `configs/cross-test/`, and bare filenames seamlessly.
+  - Added flexible alias path expansion in `sid_unet.cross_eval.expand_config_patterns` resolving bare filenames and mapping legacy `cross-test/` paths to `configs/cross-eval/`.
 - **Binary Fake/Tampered Dataset Mask Extraction**:
   - Implemented `is_mask_provided()` helper in `sid_unet.dataset.mask_utils` and updated `process_sample_mask()` to preserve localized ground truth tampering masks when `label == 1` and a mask is present.
   - Preserves backwards compatibility for 3-class `saberzl/SID_Set` fully synthetic images where `mask_input` is `None` (synthesizing an all-ones mask).
   - Updated `process_raw_sample()` in `sid_unet.dataset.loader` to map binary fake samples with partial masks ($0 < \text{mask\_sum} < \text{total\_pixels}$) to label `2` (tampered) in the 3-class classification taxonomy.
   - Updated `sid_unet.cache.manager` fast-path to avoid replacing localized tampering masks with blank masks when `raw_mask` is provided on label 1.
-  - Added comprehensive test coverage in `tests/test_mask_utils.py` and `tests/test_cross_eval.py`.
+  - Added comprehensive test coverage in `tests/test_metrics.py`, `tests/test_mask_utils.py`, and `tests/test_cross_eval.py`.
+
+### Removed
+- **Removed Deprecated `cross-test/` Folder**:
+  - Cleaned up temporary `cross-test/` and `configs/cross-test/` folders in favor of standard repository path `configs/cross-eval/MVSS-v1-protocol.yaml`.
 - **Configurable DataLoader Batch Timeout (`timeout` / `dataloader_timeout`)**:
   - Propagated `data.timeout` and `data.dataloader_timeout` (defaulting to 300.0s) to `PDLDataLoader` across `create_dataloaders()` (for both `train_loader` and `val_loader`) and `create_eval_dataloader()`.
   - Prevents premature 60.0s `TimeoutError` during initial cold-cache Parquet downloads and heavy remote streaming pipelines.

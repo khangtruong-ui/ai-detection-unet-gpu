@@ -125,8 +125,9 @@ The framework supports multiple dataset formats:
 - Native streaming execution via `streaming: true` avoiding local disk storage of large image collections.
 
 ### 4. Multi-Generator Tampering Combined Benchmark ([KhangTruong/Tampered-Images-Combined-Dataset-Fake](https://huggingface.co/datasets/KhangTruong/Tampered-Images-Combined-Dataset-Fake))
-- **Cross-Testing Evaluation Protocol**: Standardized evaluation benchmark (`configs/cross-eval/MVSS-v1-protocol.yaml`, also accessible via `cross-test/MVSS-v1-protocol.yaml`) aggregating 17,929 manipulated images across standard forensic suites (CASIA v1/v2, NIST16, Columbia, COVERAGE, HiFi-IFDL, IMD2020, COCO-Inpaint, OpenSDID, TGIF2).
+- **Cross-Testing Evaluation Protocol**: Standardized evaluation benchmark (`configs/cross-eval/MVSS-v1-protocol.yaml`) aggregating 17,929 manipulated images across standard forensic suites (CASIA v1/v2, NIST16, Columbia, COVERAGE, HiFi-IFDL, IMD2020, COCO-Inpaint, OpenSDID, TGIF2).
 - **Format**: Binary manipulation benchmark (`label: 1`, `label_text: 'fake'`) paired with localized ground-truth tampering masks (`mask`) and metadata (`dataset`, `method`, `mask_ratio`). The data loading pipeline automatically extracts ground-truth localized masks and maps them to label `2` (tampered) in the 3-class classification taxonomy.
+- **Per-Dataset Metric Reporting**: The evaluation pipeline automatically slices and computes segmentation metrics (IoU, Dice/Pixel F1, AUROC, Pixel Accuracy, Precision, Recall, Specificity, and sample count) individually for each constituent sub-dataset under the `dataset` column. To restrict evaluation to a single sub-dataset, specify `--dataset-filter <sub_dataset>` (e.g. `--dataset-filter CASIA_V2` or `--dataset-filter CocoGlide`).
 
 ---
 
@@ -2608,7 +2609,10 @@ sid-cross-eval \
 ```
 
 > [!TIP]
-> **Cross-Evaluation Configurations**: Pre-configured evaluation benchmarks in `configs/cross-eval/` target specific validation distributions, including `MVSS-v1-protocol.yaml` (`KhangTruong/Tampered-Images-Combined-Dataset-Fake`, also accessible via `cross-test/`), `coco-inpainted.yaml` (formerly `base.yaml`), `cocoglide.yaml`, `autosplice.yaml`, `casia_v2.0.yaml`, `diffseg30k.yaml`, and `open-sdid.yaml`. Legacy references to `base.yaml` are transparently resolved to `coco-inpainted.yaml`.
+> **Cross-Evaluation Configurations**: Pre-configured evaluation benchmarks in `configs/cross-eval/` target specific validation distributions, including `MVSS-v1-protocol.yaml` (`KhangTruong/Tampered-Images-Combined-Dataset-Fake`), `coco-inpainted.yaml` (formerly `base.yaml`), `cocoglide.yaml`, `autosplice.yaml`, `casia_v2.0.yaml`, `diffseg30k.yaml`, and `open-sdid.yaml`. Legacy references to `base.yaml` are transparently resolved to `coco-inpainted.yaml`.
+
+> [!TIP]
+> **Per-Dataset Breakdown on Combined Benchmarks (`--dataset-filter`)**: When evaluating benchmarks with a `dataset` metadata column (such as `MVSS-v1-protocol.yaml`), `sid-cross-eval` and `sid-eval` automatically generate a **Per-Dataset Breakdown** table reporting IoU, Dice/F1, AUROC, Pixel Accuracy, Precision, Recall, Specificity, and sample count for each sub-dataset in the console and reports. To evaluate only a specific sub-dataset, pass `--dataset-filter <name>` (e.g. `--dataset-filter CASIA_V2` or `--dataset-filter CocoGlide`).
 
 > [!TIP]
 > **Kaggle Multi-GPU Acceleration**: On Kaggle (and multi-GPU systems), `sid-cross-eval` automatically detects available GPUs (e.g. 2x Tesla T4) and enables `DataParallel` across all devices by default, evenly distributing batch workloads and tracking per-device peak VRAM and allocated memory in reports. To restrict to a single device, pass `--no-data-parallel`.

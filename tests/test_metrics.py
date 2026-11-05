@@ -82,6 +82,33 @@ def test_segmentation_tracker_per_label():
     assert "pixel_auroc" in overall
 
 
+def test_segmentation_tracker_per_dataset():
+    tracker = SegmentationMetricTracker(threshold=0.5)
+
+    preds = torch.full((3, 1, 32, 32), -10.0)
+    targets = torch.zeros(3, 1, 32, 32)
+    labels = torch.tensor([0, 1, 2])
+    datasets = ["CASIA_v2", "CocoGlide", "CASIA_v2"]
+
+    targets[1, 0, :, :] = 1.0  # Sample 1: target all 1s, pred -10 => IoU 0.0
+    targets[2, 0, :16, :] = 1.0
+    preds[2, 0, :16, :] = 10.0  # Sample 2: target top half 1s, pred top half 1s => IoU 1.0
+
+    tracker.update(preds, targets, labels, datasets=datasets)
+
+    per_dataset = tracker.compute_per_dataset()
+    assert "CASIA_v2" in per_dataset
+    assert "CocoGlide" in per_dataset
+    assert per_dataset["CASIA_v2"]["samples"] == 2
+    assert per_dataset["CocoGlide"]["samples"] == 1
+    assert per_dataset["CocoGlide"]["iou"] == 0.0
+
+    # Also test compute(return_per_dataset=True)
+    overall, per_label, per_ds = tracker.compute(return_per_dataset=True)
+    assert per_ds == per_dataset
+    assert tracker.per_dataset_metrics == per_dataset
+
+
 def test_classification_tracker():
     tracker = ClassificationMetricTracker(num_classes=3)
     logits = torch.tensor([

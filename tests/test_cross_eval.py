@@ -618,4 +618,96 @@ def test_mvss_v1_protocol_config_and_pattern_resolution():
     assert cfg.data.test_samples == -1
 
 
+def test_eval_single_batch_per_dataset_and_filtering():
+    from sid_unet.cross_eval import eval_single_batch
+    from sid_unet.losses.auxiliary import build_loss
+    from sid_unet.metrics.segmentation import SegmentationMetricTracker
+    from sid_unet.metrics.classification import ClassificationMetricTracker
+    from sid_unet.utils.config import load_config
+    import torch.nn as nn
+
+    class DummyModel(nn.Module):
+        def forward(self, x):
+            return torch.full((x.size(0), 1, x.size(2), x.size(3)), 5.0)
+
+    cfg = load_config()
+    loss_fn = build_loss(cfg)
+    raw_tracker = SegmentationMetricTracker(threshold=0.5)
+    cls_tracker = ClassificationMetricTracker(num_classes=3)
+
+    batch = {
+        "image": torch.randn(4, 3, 32, 32),
+        "mask": torch.ones(4, 1, 32, 32),
+        "label": torch.tensor([1, 1, 1, 1]),
+        "dataset": ["CASIA_V2", "CocoGlide", "CASIA_V2", "NIST16"],
+        "img_id": ["id1", "id2", "id3", "id4"],
+    }
+
+    # Evaluate full batch
+    loss_val, count, _ = eval_single_batch(
+        batch=batch,
+        model=DummyModel(),
+        loss_fn=loss_fn,
+        device=torch.device("cpu"),
+        raw_seg_tracker=raw_tracker,
+        cls_tracker=cls_tracker,
+    )
+    assert count == 4
+    per_ds = raw_tracker.compute_per_dataset()
+    assert "CASIA_V2" in per_ds
+    assert "CocoGlide" in per_ds
+    assert "NIST16" in per_ds
+    assert per_ds["CASIA_V2"]["samples"] == 2
+    assert per_ds["CocoGlide"]["samples"] == 1
+    assert per_ds["NIST16"]["samples"] == 1
+
+    # Evaluate with dataset_filter="CASIA_V2"
+    filter_tracker = SegmentationMetricTracker(threshold=0.5)
+    filter_cls = ClassificationMetricTracker(num_classes=3)
+    loss_val_filt, count_filt, _ = eval_single_batch(
+        batch=batch,
+        model=DummyModel(),
+        loss_fn=loss_fn,
+        device=torch.device("cpu"),
+        raw_seg_tracker=filter_tracker,
+        cls_tracker=filter_cls,
+        dataset_filter="CASIA_V2",
+    )
+    assert count_filt == 2
+    per_ds_filt = filter_tracker.compute_per_dataset()
+    assert list(per_ds_filt.keys()) == ["CASIA_V2"]
+    assert per_ds_filt["CASIA_V2"]["samples"] == 2
+
+
+def test_per_dataset_report_formatting():
+    from sid_unet.utils.report import generate_checkpoint_cross_eval_report, generate_master_cross_evaluation_report
+
+    mock_results = [{
+        "checkpoint_name": "test_ckpt",
+        "checkpoint_path": "outputs/test/checkpoints/checkpoint_best.pt",
+        "config_name": "eval_mvss_v1_protocol",
+        "config_path": "configs/cross-eval/MVSS-v1-protocol.yaml",
+        "dataset_name": "KhangTruong/Tampered-Images-Combined-Dataset-Fake",
+        "eval_split": "cross_test",
+        "total_evaluated_samples": 10,
+        "metrics": {"iou": 0.8, "dice": 0.88, "auroc": 0.95, "pixel_acc": 0.98, "eval_total_loss": 0.2},
+        "per_dataset_metrics": {
+            "CASIA_V2": {"iou": 0.85, "dice": 0.91, "auroc": 0.97, "pixel_acc": 0.99, "precision": 0.9, "recall": 0.92, "specificity": 0.99, "samples": 6},
+            "CocoGlide": {"iou": 0.75, "dice": 0.85, "auroc": 0.93, "pixel_acc": 0.97, "precision": 0.82, "recall": 0.88, "specificity": 0.98, "samples": 4},
+        },
+    }]
+
+    # Checkpoint report
+    ckpt_report = generate_checkpoint_cross_eval_report("outputs/test/checkpoints/checkpoint_best.pt", mock_results)
+    assert "Per-Dataset Breakdown (Multi-Benchmark Slicing)" in ckpt_report["markdown"]
+    assert "CASIA_V2" in ckpt_report["markdown"]
+    assert "CocoGlide" in ckpt_report["markdown"]
+
+    # Master report
+    master_report = generate_master_cross_evaluation_report(mock_results)
+    assert "Per-Dataset Breakdown" in master_report["markdown"]
+    assert "CASIA_V2" in master_report["markdown"]
+    assert "CocoGlide" in master_report["markdown"]
+
+
 
