@@ -124,6 +124,10 @@ The framework supports multiple dataset formats:
 - **`mask`**: Binary mask ($L$ mode, values $0$ and $255$) highlighting fine inpainting, brush edits, and object synthesis.
 - Native streaming execution via `streaming: true` avoiding local disk storage of large image collections.
 
+### 4. Multi-Generator Tampering Combined Benchmark ([KhangTruong/Tampered-Images-Combined-Dataset-Fake](https://huggingface.co/datasets/KhangTruong/Tampered-Images-Combined-Dataset-Fake))
+- **Cross-Testing Evaluation Protocol**: Standardized evaluation benchmark (`configs/cross-eval/MVSS-v1-protocol.yaml`, also accessible via `cross-test/MVSS-v1-protocol.yaml`) aggregating 17,929 manipulated images across standard forensic suites (CASIA v1/v2, NIST16, Columbia, COVERAGE, HiFi-IFDL, IMD2020, COCO-Inpaint, OpenSDID, TGIF2).
+- **Format**: Binary manipulation benchmark (`label: 1`, `label_text: 'fake'`) paired with localized ground-truth tampering masks (`mask`) and metadata (`dataset`, `method`, `mask_ratio`). The data loading pipeline automatically extracts ground-truth localized masks and maps them to label `2` (tampered) in the 3-class classification taxonomy.
+
 ---
 
 ## Architectures & Backbones
@@ -2604,7 +2608,7 @@ sid-cross-eval \
 ```
 
 > [!TIP]
-> **Cross-Evaluation Configurations**: Pre-configured evaluation benchmarks in `configs/cross-eval/` target specific validation distributions, including `coco-inpainted.yaml` (formerly `base.yaml`), `cocoglide.yaml`, `autosplice.yaml`, `casia_v2.0.yaml`, `diffseg30k.yaml`, and `open-sdid.yaml`. Legacy references to `base.yaml` are transparently resolved to `coco-inpainted.yaml`.
+> **Cross-Evaluation Configurations**: Pre-configured evaluation benchmarks in `configs/cross-eval/` target specific validation distributions, including `MVSS-v1-protocol.yaml` (`KhangTruong/Tampered-Images-Combined-Dataset-Fake`, also accessible via `cross-test/`), `coco-inpainted.yaml` (formerly `base.yaml`), `cocoglide.yaml`, `autosplice.yaml`, `casia_v2.0.yaml`, `diffseg30k.yaml`, and `open-sdid.yaml`. Legacy references to `base.yaml` are transparently resolved to `coco-inpainted.yaml`.
 
 > [!TIP]
 > **Kaggle Multi-GPU Acceleration**: On Kaggle (and multi-GPU systems), `sid-cross-eval` automatically detects available GPUs (e.g. 2x Tesla T4) and enables `DataParallel` across all devices by default, evenly distributing batch workloads and tracking per-device peak VRAM and allocated memory in reports. To restrict to a single device, pass `--no-data-parallel`.

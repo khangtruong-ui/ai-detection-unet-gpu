@@ -5,9 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-04
+## [Unreleased] - 2026-11-05
 
 ### Added
+- **MVSS-v1 Cross-Testing Protocol Configuration (`MVSS-v1-protocol.yaml`)**:
+  - Added `MVSS-v1-protocol.yaml` in `configs/cross-eval/`, `configs/cross-test/`, and `cross-test/` targeting the multi-generator tampering benchmark `KhangTruong/Tampered-Images-Combined-Dataset-Fake`.
+  - Configures `eval_split: "cross_test"` with standard resolution `[256, 256]`, combined BCE + Dice loss, and morphological post-processing.
+  - Added flexible alias path expansion in `sid_unet.cross_eval.expand_config_patterns` resolving `cross-test/`, `configs/cross-test/`, and bare filenames seamlessly.
+- **Binary Fake/Tampered Dataset Mask Extraction**:
+  - Implemented `is_mask_provided()` helper in `sid_unet.dataset.mask_utils` and updated `process_sample_mask()` to preserve localized ground truth tampering masks when `label == 1` and a mask is present.
+  - Preserves backwards compatibility for 3-class `saberzl/SID_Set` fully synthetic images where `mask_input` is `None` (synthesizing an all-ones mask).
+  - Updated `process_raw_sample()` in `sid_unet.dataset.loader` to map binary fake samples with partial masks ($0 < \text{mask\_sum} < \text{total\_pixels}$) to label `2` (tampered) in the 3-class classification taxonomy.
+  - Updated `sid_unet.cache.manager` fast-path to avoid replacing localized tampering masks with blank masks when `raw_mask` is provided on label 1.
+  - Added comprehensive test coverage in `tests/test_mask_utils.py` and `tests/test_cross_eval.py`.
 - **Configurable DataLoader Batch Timeout (`timeout` / `dataloader_timeout`)**:
   - Propagated `data.timeout` and `data.dataloader_timeout` (defaulting to 300.0s) to `PDLDataLoader` across `create_dataloaders()` (for both `train_loader` and `val_loader`) and `create_eval_dataloader()`.
   - Prevents premature 60.0s `TimeoutError` during initial cold-cache Parquet downloads and heavy remote streaming pipelines.

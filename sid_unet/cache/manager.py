@@ -26,7 +26,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from sid_unet.cache.extractor import BaseCacheExtractor, get_extractor_for_model
-from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask
+from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask, is_mask_provided
 from sid_unet.dataset.loader import load_parquet_or_hf_dataset, safe_dataset_len
 from sid_unet.utils.memory import clear_memory_cache
 
@@ -865,8 +865,8 @@ class DatasetCacheManager:
         img_tensor = torch.from_numpy(img_arr.transpose(2, 0, 1))
 
         # Fast-path for explicit labels 0 (real / black mask) and 1 (fully synthetic / white mask)
-        # Bypasses expensive mask resizing, array allocation, and PNG compression
-        if raw_label is not None and int(raw_label) in (0, 1):
+        # when no mask is provided (bypasses expensive mask resizing, array allocation, and PNG compression)
+        if raw_label is not None and int(raw_label) in (0, 1) and not is_mask_provided(raw_mask):
             label = int(raw_label)
             mask_bytes = self._get_blank_mask_bytes(label)
         else:
@@ -881,11 +881,15 @@ class DatasetCacheManager:
                 )
                 mask_arr = np.array(mask_pil, dtype=np.float32) / 255.0
 
+            m_sum = float(mask_arr.sum())
+            total_px = float(mask_arr.size)
             if raw_label is not None:
-                label = int(raw_label)
+                raw_int = int(raw_label)
+                if raw_int == 1 and is_mask_provided(raw_mask) and 0 < m_sum < total_px:
+                    label = 2
+                else:
+                    label = raw_int
             else:
-                m_sum = float(mask_arr.sum())
-                total_px = float(mask_arr.size)
                 if m_sum == 0.0:
                     label = 0
                 elif m_sum >= total_px:
@@ -893,7 +897,7 @@ class DatasetCacheManager:
                 else:
                     label = 2
 
-            if label in (0, 1):
+            if label in (0, 1) and not is_mask_provided(raw_mask):
                 mask_bytes = self._get_blank_mask_bytes(label)
             else:
                 # Fast PNG encode with compress_level=1 and optimize=False (6x faster than level 6)

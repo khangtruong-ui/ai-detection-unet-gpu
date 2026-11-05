@@ -598,3 +598,24 @@ def test_cross_eval_eval_single_batch_dict_output_and_kwargs():
     assert "iou" in seg_m
 
 
+def test_mvss_v1_protocol_config_and_pattern_resolution():
+    from sid_unet.utils.config import load_config
+
+    # Test resolution of MVSS-v1-protocol.yaml across cross-eval, cross-test, and direct references
+    expanded_1 = expand_config_patterns(["configs/cross-eval/MVSS-v1-protocol.yaml"])
+    assert len(expanded_1) == 1
+    assert os.path.exists(expanded_1[0])
+
+    expanded_2 = expand_config_patterns(["cross-test/MVSS-v1-protocol.yaml"])
+    assert len(expanded_2) == 1
+    assert os.path.exists(expanded_2[0])
+
+    # Test config content
+    cfg = load_config("configs/cross-eval/MVSS-v1-protocol.yaml")
+    assert cfg.data.dataset_name == "KhangTruong/Tampered-Images-Combined-Dataset-Fake"
+    assert cfg.data.eval_split == "cross_test"
+    assert cfg.data.test_split == "cross_test"
+    assert cfg.data.test_samples == -1
+
+
+

@@ -189,7 +189,7 @@ def worker_init_fn(worker_id: int) -> None:
     from PIL import ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask, check_image_mask_mismatch
+from sid_unet.dataset.mask_utils import ensure_rgb_image, process_sample_mask, check_image_mask_mismatch, is_mask_provided
 from sid_unet.dataset.transforms import get_transforms, JointCompose
 
 
@@ -469,7 +469,19 @@ def process_raw_sample(
 
     # 3. Determine scalar class label (0: Real, 1: Fully Synthetic, 2: Partially Synthetic / Tampered)
     if raw_label is not None:
-        label = int(raw_label)
+        raw_int_label = int(raw_label)
+        # If binary classification format (0: real, 1: fake/tampered) and explicit localized mask is present
+        if raw_int_label == 1 and is_mask_provided(raw_mask):
+            mask_sum = float(mask_arr.sum())
+            total_pixels = float(mask_arr.size)
+            if 0 < mask_sum < total_pixels:
+                label = 2  # Partially Synthetic / Tampered in 3-class taxonomy
+            elif mask_sum >= total_pixels:
+                label = 1  # Fully Synthetic
+            else:
+                label = 0  # Real / Untampered
+        else:
+            label = raw_int_label
     else:
         # Infer class label from mask for standard 2-column image/mask datasets like KhangTruong/IMD2020
         mask_sum = float(mask_arr.sum())

@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 from PIL import Image
 import torch
-from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image, check_image_mask_mismatch
+from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image, check_image_mask_mismatch, is_mask_provided
+from sid_unet.dataset.loader import process_raw_sample
 
 
 def test_label_0_full_black_mask():
@@ -155,5 +156,61 @@ def test_mask_utils_with_dict_and_bytes():
     mask_out = process_sample_mask({"bytes": mask_b}, label=2, image_size=(64, 64))
     assert mask_out.shape == (64, 64)
     assert np.all(mask_out == 1.0)
+
+
+def test_is_mask_provided():
+    assert is_mask_provided(None) is False
+    assert is_mask_provided({"bytes": None, "path": None}) is False
+    assert is_mask_provided(b"") is False
+    assert is_mask_provided(Image.new("L", (10, 10))) is True
+    assert is_mask_provided({"bytes": b"fake_bytes"}) is True
+    assert is_mask_provided(np.zeros((10, 10))) is True
+    assert is_mask_provided(torch.zeros((10, 10))) is True
+
+
+def test_label_1_with_provided_tampering_mask():
+    # When label is 1 but an explicit ground truth mask is provided (e.g. KhangTruong/Tampered-Images-Combined-Dataset-Fake)
+    raw_mask = Image.new("L", (100, 100), color=0)
+    for x in range(50):
+        for y in range(50):
+            raw_mask.putpixel((x, y), 255)
+
+    processed = process_sample_mask(mask_input=raw_mask, label=1, image_size=(256, 256))
+    assert processed.shape == (256, 256)
+    # Top-left quadrant should be 1.0, rest should be 0.0
+    assert np.all(processed[:128, :128] == 1.0)
+    assert np.all(processed[128:, :] == 0.0)
+    assert np.all(processed[:, 128:] == 0.0)
+
+    # When label is 1 and mask_input is None (saberzl/SID_Set fully synthetic), returns all ones
+    synthetic_mask = process_sample_mask(mask_input=None, label=1, image_size=(256, 256))
+    assert np.all(synthetic_mask == 1.0)
+
+
+def test_process_raw_sample_tampered_dataset_fake():
+    # Emulates a sample from KhangTruong/Tampered-Images-Combined-Dataset-Fake:
+    # label is 1 (fake), mask is a localized tampering mask (not all ones)
+    raw_img = Image.new("RGB", (64, 64), color="blue")
+    raw_mask = Image.new("L", (64, 64), color=0)
+    for x in range(32):
+        for y in range(32):
+            raw_mask.putpixel((x, y), 255)
+
+    sample = {
+        "id": "sample_001",
+        "image": raw_img,
+        "mask": raw_mask,
+        "label": 1,
+        "label_text": "fake",
+        "dataset": "CASIA_V2",
+        "method": "Splicing",
+    }
+    processed = process_raw_sample(sample, transform=None, target_image_size=(64, 64))
+    assert processed["label"].item() == 2  # Partially Synthetic / Tampered
+    assert processed["mask"].shape == (1, 64, 64)
+    # Quadrant has 1s, other parts have 0s
+    assert float(processed["mask"].sum()) > 0
+    assert float(processed["mask"].sum()) < float(processed["mask"].numel())
+
 
 

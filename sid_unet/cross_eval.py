@@ -290,7 +290,29 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
             else:
                 raise FileNotFoundError(f"Configuration path not found: {pat}")
         else:
-            raise FileNotFoundError(f"Configuration path not found: {pat}")
+            alt_candidates = [
+                os.path.join("configs", "cross-eval", os.path.basename(pat)),
+                os.path.join("configs", "cross-test", os.path.basename(pat)),
+                os.path.join("cross-test", os.path.basename(pat)),
+                os.path.join("configs", pat),
+                pat.replace("cross-test", "configs/cross-eval"),
+                pat.replace("cross_test", "configs/cross-eval"),
+            ]
+            found = False
+            for alt in alt_candidates:
+                if os.path.isfile(alt):
+                    resolved.append(alt)
+                    found = True
+                    break
+                elif os.path.isdir(alt):
+                    matches = glob.glob(os.path.join(alt, "**", "*.yaml"), recursive=True) + \
+                              glob.glob(os.path.join(alt, "**", "*.yml"), recursive=True)
+                    if matches:
+                        resolved.extend([m for m in matches if os.path.isfile(m)])
+                        found = True
+                        break
+            if not found:
+                raise FileNotFoundError(f"Configuration path not found: {pat}")
 
     seen = set()
     unique = []
