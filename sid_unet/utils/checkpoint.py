@@ -299,12 +299,67 @@ def inspect_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
     best_score = ckpt.get("best_score", None)
     best_epoch = int(ckpt.get("best_epoch", -1)) if ckpt.get("best_epoch") is not None else -1
 
+    hf_repo = ckpt.get("hf_repo") or ckpt.get("hub_repo") or ckpt.get("repo_id")
+    hf_version = ckpt.get("hf_version") or ckpt.get("hub_version")
+    if not hf_repo and isinstance(ckpt.get("config"), dict):
+        cfg = ckpt["config"]
+        hf_repo = (
+            cfg.get("training", {}).get("hf_repo")
+            or cfg.get("training", {}).get("hub_repo")
+            or cfg.get("project", {}).get("hub_repo")
+            or cfg.get("project", {}).get("resume_repo")
+        )
+        if not hf_version:
+            hf_version = cfg.get("training", {}).get("hub_version") or cfg.get("training", {}).get("hf_version")
+
+    # Check companion .hf_repo_info.json or config.yaml in checkpoint folder
+    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    if not hf_repo:
+        repo_info_file = os.path.join(ckpt_dir, ".hf_repo_info.json")
+        if os.path.isfile(repo_info_file):
+            try:
+                import json
+                with open(repo_info_file, "r", encoding="utf-8") as rf:
+                    rinfo = json.load(rf)
+                    hf_repo = rinfo.get("repo_id") or rinfo.get("hf_repo")
+                    if not hf_version:
+                        hf_version = rinfo.get("version") or rinfo.get("hf_version")
+            except Exception:
+                pass
+
+    if not hf_repo:
+        for cfg_cand in [
+            os.path.join(ckpt_dir, "config.yaml"),
+            os.path.join(ckpt_dir, "checkpoint_best_config.yaml"),
+            os.path.join(ckpt_dir, "checkpoint_latest_config.yaml"),
+            os.path.join(os.path.dirname(ckpt_dir), "config.yaml"),
+        ]:
+            if os.path.isfile(cfg_cand):
+                try:
+                    import yaml
+                    with open(cfg_cand, "r", encoding="utf-8") as f:
+                        c = yaml.safe_load(f) or {}
+                    hf_repo = (
+                        c.get("training", {}).get("hf_repo")
+                        or c.get("training", {}).get("hub_repo")
+                        or c.get("project", {}).get("hub_repo")
+                    )
+                    if hf_repo:
+                        if not hf_version:
+                            hf_version = c.get("training", {}).get("hub_version") or c.get("training", {}).get("hf_version")
+                        break
+                except Exception:
+                    pass
+
     return {
         "epoch": epoch,
         "step": step,
         "metrics": metrics,
         "best_score": best_score,
         "best_epoch": best_epoch,
+        "hf_repo": hf_repo,
+        "hub_repo": hf_repo,
+        "hf_version": hf_version,
         "has_optimizer": "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None,
         "has_scheduler": "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"] is not None,
         "has_scaler": "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None,

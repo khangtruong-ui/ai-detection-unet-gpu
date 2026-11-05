@@ -275,6 +275,49 @@ def parse_args(args: Optional[List[str]] = None):
         default=None,
         help="Filter evaluation to only process samples matching a specific sub-dataset column value (e.g. 'CASIA_v2', 'CocoGlide').",
     )
+    # Hugging Face Hub synchronization flags
+    parser.add_argument(
+        "--push-to-hub",
+        "--push_to_hub",
+        "--push-hub",
+        dest="push_to_hub",
+        action="store_true",
+        default=None,
+        help="Push cross-evaluation reports and illustrations to the linked Hugging Face repository and update its README.md.",
+    )
+    parser.add_argument(
+        "--no-push-to-hub",
+        "--no_push_to_hub",
+        dest="push_to_hub",
+        action="store_false",
+        help="Disable pushing cross-evaluation results to Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        "--hf_repo",
+        "--hub-repo",
+        "--hub_repo",
+        dest="hf_repo",
+        type=str,
+        default=None,
+        help="Explicit Hugging Face model repository ID (e.g. 'KhangTruong/Detective-SAM-small-Casia-v2.0').",
+    )
+    parser.add_argument(
+        "--hf-version",
+        "--hf_version",
+        dest="hf_version",
+        type=str,
+        default=None,
+        help="Version tag for Hugging Face Hub (default: 'v1' or matching checkpoint version).",
+    )
+    parser.add_argument(
+        "--hf-token",
+        "--token",
+        dest="hf_token",
+        type=str,
+        default=None,
+        help="Hugging Face API token for repository update.",
+    )
     return parser.parse_args(args)
 
 
@@ -400,6 +443,53 @@ def resolve_checkpoint_neighbor_dir(checkpoint_path: str) -> str:
         run_dir = os.path.dirname(ckpt_dir)
         return os.path.join(run_dir, "cross_eval_reports")
     return os.path.join(ckpt_dir, "cross_eval_reports")
+
+
+def extract_hf_repo_from_checkpoint(ckpt_path: str, explicit_repo: Optional[str] = None) -> Optional[str]:
+    """Extract associated Hugging Face repository ID from checkpoint metadata or its configuration."""
+    if explicit_repo:
+        return explicit_repo
+    try:
+        from sid_unet.utils.checkpoint import inspect_checkpoint
+        meta = inspect_checkpoint(ckpt_path)
+        if meta.get("hf_repo"):
+            return str(meta["hf_repo"])
+    except Exception:
+        pass
+
+    ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path))
+    repo_info_path = os.path.join(ckpt_dir, ".hf_repo_info.json")
+    if os.path.isfile(repo_info_path):
+        try:
+            with open(repo_info_path, "r", encoding="utf-8") as f:
+                rinfo = json.load(f)
+            if rinfo.get("repo_id"):
+                return str(rinfo["repo_id"])
+        except Exception:
+            pass
+
+    for cfg_cand in [
+        os.path.join(ckpt_dir, "config.yaml"),
+        os.path.join(ckpt_dir, "checkpoint_best_config.yaml"),
+        os.path.join(ckpt_dir, "checkpoint_latest_config.yaml"),
+        os.path.join(os.path.dirname(ckpt_dir), "config.yaml"),
+        os.path.join(os.path.dirname(ckpt_dir), "effective_config.yaml"),
+    ]:
+        if os.path.isfile(cfg_cand):
+            try:
+                import yaml
+                with open(cfg_cand, "r", encoding="utf-8") as f:
+                    c = yaml.safe_load(f) or {}
+                repo = (
+                    c.get("training", {}).get("hf_repo")
+                    or c.get("training", {}).get("hub_repo")
+                    or c.get("project", {}).get("hub_repo")
+                )
+                if repo:
+                    return str(repo)
+            except Exception:
+                pass
+    return None
 
 
 def eval_single_batch(
@@ -598,6 +688,10 @@ def evaluate_checkpoint_on_config(
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
     dataset_filter: Optional[str] = None,
+    push_to_hub: Optional[bool] = None,
+    hf_repo: Optional[str] = None,
+    hf_version: Optional[str] = None,
+    hf_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -968,6 +1062,10 @@ def run_cross_evaluation(
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
     dataset_filter: Optional[str] = None,
+    push_to_hub: Optional[bool] = None,
+    hf_repo: Optional[str] = None,
+    hf_version: Optional[str] = None,
+    hf_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -1199,6 +1297,47 @@ def run_cross_evaluation(
             )
         logger.info(f"✅ Checkpoint neighbor report saved at: {os.path.join(neighbor_dir, 'cross_evaluation_report.md')}")
 
+        # Acknowledge Hugging Face repository & log results into README.md on that repo
+        target_hf_repo = hf_repo or extract_hf_repo_from_checkpoint(ckpt_path)
+        should_push = False
+        if push_to_hub is True:
+            should_push = bool(target_hf_repo)
+        elif push_to_hub is False:
+            should_push = False
+        else:
+            # Auto-detect if target_hf_repo is present and write access is verified
+            if target_hf_repo:
+                try:
+                    from sid_unet.checkpoint_sync import verify_hf_repo_checkpointable
+                    ok, _ = verify_hf_repo_checkpointable(target_hf_repo, token=hf_token, raise_on_error=False)
+                    should_push = ok
+                except Exception:
+                    should_push = False
+
+        if should_push and target_hf_repo:
+            try:
+                from sid_unet.checkpoint_sync import push_cross_eval_to_hf
+                logger.info(
+                    f"🚀 [HF Cross-Eval] Acknowledging Hugging Face repo '{target_hf_repo}' "
+                    f"for checkpoint '{os.path.basename(ckpt_path)}'. Logging cross-evaluation results into README..."
+                )
+                hf_sync_res = push_cross_eval_to_hf(
+                    repo_id_or_uri=target_hf_repo,
+                    source_dir=neighbor_dir,
+                    results=results,
+                    version=hf_version,
+                    token=hf_token,
+                    message=f"feat(cross-eval): log cross-eval results for {os.path.basename(ckpt_path)} into README",
+                )
+                logger.info(
+                    f"✅ [HF Cross-Eval] Successfully logged cross-eval results to "
+                    f"https://huggingface.co/{target_hf_repo} and updated model card README.md."
+                )
+            except Exception as hf_err:
+                logger.warning(
+                    f"⚠️ [HF Cross-Eval] Failed to push cross-evaluation results to Hugging Face '{target_hf_repo}': {hf_err}"
+                )
+
     # Merge newly evaluated results with existing master results to ensure continuous accumulation
     evaluated_keys = set()
     for r in all_cross_results:
@@ -1398,6 +1537,10 @@ def main(args: Optional[List[str]] = None):
         data_parallel=parsed_args.data_parallel,
         device_ids=parsed_args.device_ids,
         dataset_filter=getattr(parsed_args, "dataset_filter", None),
+        push_to_hub=parsed_args.push_to_hub,
+        hf_repo=parsed_args.hf_repo,
+        hf_version=parsed_args.hf_version,
+        hf_token=parsed_args.hf_token,
     )
     return results
 

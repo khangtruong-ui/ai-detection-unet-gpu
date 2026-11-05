@@ -291,3 +291,164 @@ def test_verify_hf_repo_checkpointable_live_testing_model():
     ok, err = verify_hf_repo_checkpointable("KhangTruong/Testing-model", raise_on_error=False)
     assert ok is True, f"Live verification failed: {err}"
 
+
+def test_checkpoint_hf_repo_info_persistence():
+    """Verify that CheckpointManager persists HF repo name and version into checkpoint files, and inspect_checkpoint extracts them."""
+    from sid_unet.models.unet import UNet
+    from sid_unet.utils.checkpoint import inspect_checkpoint
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch("sid_unet.checkpoint_sync.verify_hf_repo_checkpointable", return_value=(True, None)):
+            mgr = CheckpointManager(
+                checkpoint_dir=tmpdir,
+                push_to_hub=True,
+                hf_repo="KhangTruong/Detective-SAM-small-Casia-v2.0",
+                hf_version="v1",
+                verify_repo=False,
+            )
+            model = UNet(in_channels=3, out_channels=1, features=[4, 8], bilinear=True)
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            saved = mgr.save(
+                epoch=1,
+                model=model,
+                optimizer=opt,
+                metrics={"val_iou": 0.8},
+                is_best=True,
+            )
+            best_path = saved["best"]
+            meta = inspect_checkpoint(best_path)
+            assert meta["hf_repo"] == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+            assert meta["hub_repo"] == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+            assert meta["hf_version"] == "v1"
+
+            # Periodic save also includes repo info
+            p_saved = mgr.save_periodic(epoch=2, model=model, optimizer=opt)
+            p_meta = inspect_checkpoint(p_saved["periodic"])
+            assert p_meta["hf_repo"] == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+
+
+def test_resolve_repo_from_local_checkpoint():
+    """Verify that resolve_repo_and_version auto-resolves repo ID from local checkpoint metadata when name/repo is omitted."""
+    from sid_unet.checkpoint_sync import resolve_repo_and_version
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_dir = os.path.join(tmpdir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_p = os.path.join(ckpt_dir, "checkpoint_best.pt")
+        torch.save({
+            "epoch": 8,
+            "hf_repo": "KhangTruong/Detective-SAM-small-Casia-v2.0",
+            "hf_version": "v1",
+        }, ckpt_p)
+
+        with patch("sid_unet.utils.checkpoint.find_auto_resume_checkpoint", return_value={"checkpoint_path": ckpt_p}):
+            repo, ver = resolve_repo_and_version(name=None, repo=None)
+            assert repo == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+            assert ver == "v1"
+
+
+def test_find_local_checkpoint_artifacts_with_cross_eval():
+    """Verify that find_local_checkpoint_artifacts discovers cross_eval_reports and illustrations."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_dir = os.path.join(tmpdir, "checkpoints")
+        ce_dir = os.path.join(tmpdir, "cross_eval_reports")
+        ill_dir = os.path.join(ce_dir, "illustrations")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(ill_dir, exist_ok=True)
+
+        torch.save({"epoch": 1}, os.path.join(ckpt_dir, "checkpoint_best.pt"))
+        with open(os.path.join(ce_dir, "cross_evaluation_report.md"), "w") as f:
+            f.write("# Cross Eval")
+        with open(os.path.join(ce_dir, "cross_evaluation_report.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(ill_dir, "sample.png"), "wb") as f:
+            f.write(b"png")
+
+        artifacts = find_local_checkpoint_artifacts(source_dir=tmpdir)
+        assert "cross_eval_reports" in artifacts
+        assert "cross_evaluation_report.md" in artifacts["cross_eval_reports"]
+        assert "cross_evaluation_report.json" in artifacts["cross_eval_reports"]
+        assert "illustrations/sample.png" in artifacts["cross_eval_reports"]
+
+
+def test_format_and_update_readme_with_cross_eval():
+    """Verify format_cross_eval_readme_section and update_readme_with_cross_eval."""
+    from sid_unet.checkpoint_sync import format_cross_eval_readme_section, update_readme_with_cross_eval
+
+    mock_results = [{
+        "config_name": "eval_mvss_v1_protocol",
+        "dataset_name": "KhangTruong/Tampered-Images-Combined-Dataset-Fake",
+        "eval_split": "cross_test",
+        "metrics": {
+            "total_evaluated_samples": 17929,
+            "eval_total_loss": 0.7570,
+            "iou": 0.1508,
+            "f1": 0.1972,
+            "auroc": 0.6202,
+            "pixel_acc": 0.8181,
+            "per_dataset_metrics": {
+                "CASIA_V1": {"iou": 0.3249, "f1": 0.3904, "auroc": 0.6912, "pixel_acc": 0.8264, "samples": 920},
+                "CASIA_V2": {"iou": 0.5020, "f1": 0.5733, "auroc": 0.7713, "pixel_acc": 0.8719, "samples": 1000},
+            },
+        },
+    }]
+
+    section = format_cross_eval_readme_section(mock_results)
+    assert "## 📊 Cross-Evaluation Benchmark Results" in section
+    assert "eval_mvss_v1_protocol" in section
+    assert "0.1508" in section
+    assert "CASIA_V1" in section
+    assert "CASIA_V2" in section
+
+    initial_readme = (
+        "# Model\n\n## 📌 Available Versions\n| `v1` | 0.8 |\n\n"
+        "## 🚀 Quickstart & Checkpoint Usage\nsid-pull --name repo\n"
+    )
+    updated = update_readme_with_cross_eval(initial_readme, section)
+    assert "## 📊 Cross-Evaluation Benchmark Results" in updated
+    assert "## 🚀 Quickstart & Checkpoint Usage" in updated
+    # Idempotent replacement
+    re_updated = update_readme_with_cross_eval(updated, section)
+    assert re_updated.count("## 📊 Cross-Evaluation Benchmark Results") == 1
+
+
+@patch("sid_unet.checkpoint_sync._get_hf_token", return_value="fake_token")
+@patch("sid_unet.checkpoint_sync.HfApi")
+def test_push_cross_eval_to_hf_mocked(mock_api_cls, mock_token):
+    """Verify push_cross_eval_to_hf uploads cross-eval files and updates README.md."""
+    from sid_unet.checkpoint_sync import push_cross_eval_to_hf
+
+    mock_api = MagicMock()
+    mock_api_cls.return_value = mock_api
+    mock_api.whoami.return_value = {"name": "KhangTruong"}
+    mock_api.repo_exists.return_value = True
+    mock_api.auth_check.return_value = None
+    mock_commit = MagicMock()
+    mock_commit.oid = "commit123456"
+    mock_api.create_commit.return_value = mock_commit
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ce_dir = os.path.join(tmpdir, "cross_eval_reports")
+        os.makedirs(ce_dir, exist_ok=True)
+        with open(os.path.join(ce_dir, "cross_evaluation_report.md"), "w") as f:
+            f.write("# Cross Eval Report")
+        with open(os.path.join(ce_dir, "cross_evaluation_report.json"), "w") as f:
+            json.dump({"results": [{"config_name": "eval_test", "metrics": {"iou": 0.5}}]}, f)
+
+        res = push_cross_eval_to_hf(
+            repo_id_or_uri="KhangTruong/Detective-SAM-small-Casia-v2.0",
+            source_dir=ce_dir,
+            version="v1",
+        )
+        assert res["repo_id"] == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+        assert res["commit"] == "commit123456"
+        assert mock_api.create_commit.called
+        # Check operations added README.md and report files
+        ops = mock_api.create_commit.call_args[1]["operations"]
+        paths_in_repo = [op.path_in_repo for op in ops]
+        assert "README.md" in paths_in_repo
+        assert "cross_eval_reports/cross_evaluation_report.md" in paths_in_repo
+        assert "cross_eval_reports/cross_evaluation_report.json" in paths_in_repo
+
+

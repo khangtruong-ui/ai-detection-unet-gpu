@@ -710,4 +710,32 @@ def test_per_dataset_report_formatting():
     assert "CocoGlide" in master_report["markdown"]
 
 
+def test_cross_eval_extract_hf_repo_and_acknowledgment():
+    """Verify extract_hf_repo_from_checkpoint extracts repo ID and run_cross_evaluation acknowledges it."""
+    from sid_unet.cross_eval import extract_hf_repo_from_checkpoint, parse_args
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_p = os.path.join(tmpdir, "checkpoint_best.pt")
+        torch.save({
+            "epoch": 8,
+            "hf_repo": "KhangTruong/Detective-SAM-small-Casia-v2.0",
+        }, ckpt_p)
+
+        repo = extract_hf_repo_from_checkpoint(ckpt_p)
+        assert repo == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+
+        # CLI parsing check
+        args = parse_args([
+            "--cross-configs", "configs/cross-eval/cocoglide.yaml",
+            "--checkpoints", ckpt_p,
+            "--push-to-hub",
+            "--hf-repo", "KhangTruong/Detective-SAM-small-Casia-v2.0",
+            "--hf-version", "v1",
+        ])
+        assert args.push_to_hub is True
+        assert args.hf_repo == "KhangTruong/Detective-SAM-small-Casia-v2.0"
+        assert args.hf_version == "v1"
+
+
+
 

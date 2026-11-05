@@ -2503,12 +2503,15 @@ sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml --n
 **Upfront Repository Verification:**
 Before training begins (on the first hand), `sid-train` validates whether the Hugging Face repository exists, is accessible, and has write permissions with your credentials (`HF_TOKEN` / `huggingface-cli login`). If the repository does not exist, it creates it and validates write access. If the Hugging Face checkpointing flag is not active, a warning is emitted noting that checkpoints will only be saved locally.
 
-#### E. Hugging Face Checkpoint Synchronization (`sid-push` & `sid-pull`)
-Easily push and pull model checkpoints to and from Hugging Face repositories with version archiving, automated model card (`README.md`) generation, and multi-version tracking (`manifest.json`):
+#### E. Hugging Face Checkpoint Synchronization & Cross-Evaluation Logging (`sid-push`, `sid-pull`, `sid-cross-eval`)
+Easily push and pull model checkpoints to and from Hugging Face repositories with version archiving, automated model card (`README.md`) generation, cross-evaluation benchmark logging, and multi-version tracking (`manifest.json`):
 
 ```bash
 # 1. Pull checkpoints from Hugging Face Hub (pulls latest best and latest checkpoint into local directory)
 sid-pull --name KhangTruong/diffusion-diff-minimized
+
+# Zero-argument pull: automatically discovers repository identifier from local checkpoint or configuration
+sid-pull
 
 # Pull a specific version
 sid-pull --name KhangTruong/diffusion-diff-minimized --version v1
@@ -2516,17 +2519,27 @@ sid-pull --name KhangTruong/diffusion-diff-minimized --version v1
 # List available versions and checkpoints in remote repository without downloading
 sid-pull --name KhangTruong/diffusion-diff-minimized --list
 
-# 2. Push checkpoints to Hugging Face Hub with versioning
+# 2. Push checkpoints to Hugging Face Hub with versioning and cross-evaluation report sync
 sid-push --name KhangTruong/diffusion-diff-minimized --version v2 --message "Release v2 after 40 epochs"
 
 # Reformat repository to clean multi-version structure, archiving into versions/ and removing legacy output paths
 sid-push --name KhangTruong/diffusion-diff-minimized --version v1 --reformat
 
-# 3. Unified CLI command (sid-checkpoint push / pull / list)
+# 3. Synchronize cross-evaluation results and update model card README on Hugging Face Hub
+sid-cross-eval --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml --checkpoints "outputs/*/checkpoints/checkpoint_best.pt" --push-to-hub
+
+# Explicit cross-eval upload subcommand
+sid-checkpoint push-cross-eval --repo KhangTruong/Detective-SAM-small-Casia-v2.0 --dir outputs/RUN/default/cross_eval_reports
+
+# 4. Unified CLI command (sid-checkpoint push / pull / list / push-cross-eval)
 sid-checkpoint list --name KhangTruong/diffusion-diff-minimized
 sid-checkpoint pull --name KhangTruong/diffusion-diff-minimized
 sid-checkpoint push --name KhangTruong/diffusion-diff-minimized --version v2
 ```
+
+**Checkpoint Provenance & Auto-Resumption:**
+When saving checkpoints tied to a Hugging Face repository, `CheckpointManager` embeds `hf_repo`, `hub_repo`, and `hf_version` into the checkpoint file state and companion `.hf_repo_info.json`. Subsequent `sid-pull` commands automatically resolve the target repository without re-entering the identifier. When running `sid-cross-eval`, checkpoints automatically acknowledge their source Hugging Face repository and synchronize cross-benchmark results directly into the remote model card's `README.md`.
+
 
 #### F. Resuming Training & Adaptive Learning Rate Scheduling (`--resume-lr-mode`, `--resume-lr`)
 When continuing to train a model after an initial cosine schedule has completed, standard PyTorch cosine schedulers can get trapped at the minimum learning rate (`1e-6`). `sid-train` automatically detects this state and intelligently reschedules or restarts the learning rate schedule over the new epoch horizon:

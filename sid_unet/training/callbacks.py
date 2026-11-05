@@ -296,6 +296,10 @@ class CheckpointManager:
         }
         if hard_mining is not None:
             state["hard_mining"] = hard_mining
+        if self.hf_repo:
+            state["hf_repo"] = self.hf_repo
+            state["hub_repo"] = self.hf_repo
+            state["hf_version"] = self.hf_version
         saved: Dict[str, str] = {}
         if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None:
             state["forensic_memory_state_dict"] = model_to_save.forensic_memory.state_dict()
@@ -461,6 +465,10 @@ class CheckpointManager:
         }
         if hard_mining is not None:
             state["hard_mining"] = hard_mining
+        if self.hf_repo:
+            state["hf_repo"] = self.hf_repo
+            state["hub_repo"] = self.hf_repo
+            state["hf_version"] = self.hf_version
         if hasattr(model_to_save, "forensic_memory") and model_to_save.forensic_memory is not None:
             state["forensic_memory_state_dict"] = model_to_save.forensic_memory.state_dict()
 

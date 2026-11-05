@@ -608,6 +608,10 @@ class Trainer:
                         "history": self.history,
                         "config": cfg_dict,
                     }
+                    if getattr(self.ckpt_manager, "hf_repo", None):
+                        state["hf_repo"] = self.ckpt_manager.hf_repo
+                        state["hub_repo"] = self.ckpt_manager.hf_repo
+                        state["hf_version"] = self.ckpt_manager.hf_version
                     torch.save(state, latest_path)
                     save_config(cfg_dict, os.path.join(self.checkpoint_dir, "checkpoint_latest_config.yaml"))
                 except Exception as sync_err:

@@ -210,9 +210,76 @@ def resolve_repo_and_version(
             or project_cfg.get("resume_repo")
             or training_cfg.get("hub_repo")
             or training_cfg.get("resume_repo")
+            or training_cfg.get("hf_repo")
         )
         if cfg_repo and not cfg_repo.endswith(".pt"):
             resolved_repo = str(cfg_repo)
+            if not resolved_version:
+                resolved_version = training_cfg.get("hub_version") or training_cfg.get("hf_version")
+
+    # Fallback to local checkpoints or configuration files in the workspace
+    if not resolved_repo:
+        try:
+            from sid_unet.utils.checkpoint import find_auto_resume_checkpoint, inspect_checkpoint
+            auto_ckpt = find_auto_resume_checkpoint()
+            if auto_ckpt and auto_ckpt.get("checkpoint_path"):
+                meta = inspect_checkpoint(auto_ckpt["checkpoint_path"])
+                if meta.get("hf_repo"):
+                    resolved_repo = str(meta["hf_repo"])
+                    if not resolved_version and meta.get("hf_version"):
+                        resolved_version = str(meta["hf_version"])
+        except Exception:
+            pass
+
+    if not resolved_repo:
+        # Search candidate checkpoint and config locations in the workspace
+        candidate_dirs = [
+            "outputs/RUN/default/checkpoints",
+            "outputs/RUN/default",
+            "outputs/checkpoints",
+            "checkpoints",
+        ]
+        for cdir in candidate_dirs:
+            if not os.path.isdir(cdir):
+                continue
+            # Check companion .hf_repo_info.json
+            info_p = os.path.join(cdir, ".hf_repo_info.json")
+            if os.path.isfile(info_p):
+                try:
+                    with open(info_p, "r", encoding="utf-8") as f:
+                        info_data = json.load(f)
+                    if info_data.get("repo_id"):
+                        resolved_repo = info_data["repo_id"]
+                        if not resolved_version and info_data.get("version"):
+                            resolved_version = info_data["version"]
+                        break
+                except Exception:
+                    pass
+            # Check local config.yaml
+            for cfg_cand in ["config.yaml", "checkpoint_best_config.yaml", "effective_config.yaml"]:
+                cfg_p = os.path.join(cdir, cfg_cand)
+                if os.path.isfile(cfg_p):
+                    try:
+                        with open(cfg_p, "r", encoding="utf-8") as f:
+                            raw_c = yaml.safe_load(f) or {}
+                        c_repo = (
+                            raw_c.get("training", {}).get("hf_repo")
+                            or raw_c.get("training", {}).get("hub_repo")
+                            or raw_c.get("project", {}).get("hub_repo")
+                        )
+                        if c_repo:
+                            resolved_repo = str(c_repo)
+                            if not resolved_version:
+                                resolved_version = (
+                                    raw_c.get("training", {}).get("hub_version")
+                                    or raw_c.get("training", {}).get("hf_version")
+                                    or "v1"
+                                )
+                            break
+                    except Exception:
+                        pass
+            if resolved_repo:
+                break
 
     if not resolved_repo:
         if name:
@@ -339,12 +406,36 @@ def find_local_checkpoint_artifacts(
         if os.path.isfile(full_rep):
             reports[rep] = full_rep
 
+    # Locate cross-evaluation reports and illustrations
+    cross_eval_reports: Dict[str, str] = {}
+    cross_eval_candidates = [
+        os.path.join(target_dir, "cross_eval_reports"),
+        os.path.join(os.path.dirname(ckpt_dir), "cross_eval_reports"),
+        os.path.join(target_dir, "outputs", "cross_evaluation"),
+        "outputs/cross_evaluation",
+    ]
+    seen_cross_dirs = set()
+    for ce_cand in cross_eval_candidates:
+        if os.path.isdir(ce_cand):
+            norm_ce = os.path.abspath(ce_cand)
+            if norm_ce in seen_cross_dirs:
+                continue
+            seen_cross_dirs.add(norm_ce)
+            for root, _, files in os.walk(norm_ce):
+                for f in files:
+                    if f.endswith((".json", ".md", ".png", ".jpg", ".pdf", ".csv", ".log")):
+                        full_f = os.path.join(root, f)
+                        rel_f = os.path.relpath(full_f, norm_ce)
+                        if rel_f not in cross_eval_reports:
+                            cross_eval_reports[rel_f] = full_f
+
     return {
         "base_dir": target_dir,
         "checkpoint_dir": ckpt_dir,
         "checkpoints": checkpoints,
         "configs": configs,
         "reports": reports,
+        "cross_eval_reports": cross_eval_reports,
     }
 
 
@@ -353,6 +444,7 @@ def generate_model_card_content(
     version: str,
     manifest: Dict[str, Any],
     config_dict: Optional[Dict[str, Any]] = None,
+    cross_eval_section: Optional[str] = None,
 ) -> str:
     """Generate a clean, structured Hugging Face README.md Model Card."""
     model_name = repo_id.split("/")[-1]
@@ -380,6 +472,8 @@ def generate_model_card_content(
         table_rows.append(f"| `{v}` | {v_score} | {v_ep} | {v_date} |")
     versions_table = "\n".join(table_rows) if table_rows else f"| `{version}` | {best_score} | {best_epoch} | {datetime.now(timezone.utc).strftime('%Y-%m-%d')} |"
 
+    cross_eval_block = f"\n\n---\n\n{cross_eval_section}\n" if cross_eval_section else ""
+
     card = f"""---
 license: apache-2.0
 tags:
@@ -400,8 +494,7 @@ Official repository for **{model_name}** checkpoints, evaluated on AI-generated 
 
 - **Active Version:** `{version}`
 - **Best Validation Score:** `{best_score}` (Epoch `{best_epoch}`)
-- **Total Training Epochs:** `{total_epochs}`
-
+- **Total Training Epochs:** `{total_epochs}`{cross_eval_block}
 ---
 
 ## 🚀 Quickstart & Checkpoint Usage
@@ -455,6 +548,173 @@ sid-push --name {repo_id} --version v2
 ```
 """
     return card
+
+
+def format_cross_eval_readme_section(
+    cross_results_or_report: Union[List[Dict[str, Any]], Dict[str, Any], str],
+) -> str:
+    """Format a clean, structured Hugging Face / GitHub markdown section for cross-evaluation benchmark results."""
+    results: List[Dict[str, Any]] = []
+
+    if isinstance(cross_results_or_report, str):
+        if os.path.isfile(cross_results_or_report):
+            try:
+                with open(cross_results_or_report, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    results = data.get("results") or data.get("cross_results") or [data]
+                elif isinstance(data, list):
+                    results = data
+            except Exception:
+                pass
+        elif os.path.isdir(cross_results_or_report):
+            for cand in ["cross_evaluation_report.json", "master_cross_evaluation_report.json"]:
+                p = os.path.join(cross_results_or_report, cand)
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        results = data.get("results") or data.get("cross_results") or []
+                        if results:
+                            break
+                    except Exception:
+                        pass
+    elif isinstance(cross_results_or_report, dict):
+        if "cross_evaluation_report.json" in cross_results_or_report:
+            return format_cross_eval_readme_section(cross_results_or_report["cross_evaluation_report.json"])
+        results = cross_results_or_report.get("results") or cross_results_or_report.get("cross_results") or [cross_results_or_report]
+    elif isinstance(cross_results_or_report, list):
+        results = cross_results_or_report
+
+    if not results:
+        return ""
+
+    lines = [
+        "## 📊 Cross-Evaluation Benchmark Results",
+        "",
+        "Cross-dataset evaluation across standard forensic protocols and multi-generator benchmarks.",
+        "",
+        "### Cross-Dataset Performance Summary",
+        "",
+        "| Configuration | Dataset | Split | Samples | Loss | IoU | Dice / F1 | AUROC | Pixel Acc |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+
+    per_dataset_tables = []
+
+    for r in results:
+        cfg_name = r.get("config_name") or r.get("config_stem") or "config"
+        ds_name = r.get("dataset_name") or "dataset"
+        split = r.get("eval_split") or r.get("split") or "test"
+        metrics = r.get("metrics") or r.get("overall_metrics") or {}
+
+        samples = metrics.get("total_evaluated_samples") or metrics.get("samples") or r.get("total_evaluated_samples") or "N/A"
+        samples_str = f"{int(samples):,}" if isinstance(samples, (int, float)) and samples != "N/A" else str(samples)
+
+        loss = metrics.get("eval_total_loss", metrics.get("eval_loss", metrics.get("loss", "N/A")))
+        loss_str = f"{float(loss):.4f}" if isinstance(loss, (int, float)) else str(loss)
+
+        iou = metrics.get("iou", "N/A")
+        iou_str = f"**{float(iou):.4f}**" if isinstance(iou, (int, float)) else str(iou)
+
+        f1 = metrics.get("f1", metrics.get("dice", "N/A"))
+        f1_str = f"**{float(f1):.4f}**" if isinstance(f1, (int, float)) else str(f1)
+
+        auroc = metrics.get("auroc", metrics.get("pixel_auroc", "N/A"))
+        auroc_str = f"**{float(auroc):.4f}**" if isinstance(auroc, (int, float)) else str(auroc)
+
+        pix_acc = metrics.get("pixel_acc", "N/A")
+        pix_acc_str = f"**{float(pix_acc):.4f}**" if isinstance(pix_acc, (int, float)) else str(pix_acc)
+
+        lines.append(
+            f"| `{cfg_name}` | {ds_name} | {split} | {samples_str} | {loss_str} | {iou_str} | {f1_str} | {auroc_str} | {pix_acc_str} |"
+        )
+
+        sub_datasets = (
+            r.get("per_dataset_metrics")
+            or metrics.get("per_dataset_metrics")
+            or metrics.get("per_dataset")
+            or {}
+        )
+        if sub_datasets and isinstance(sub_datasets, dict):
+            sub_lines = [
+                f"\n### Per-Dataset Breakdown (Multi-Benchmark Slicing: `{cfg_name}`)\n",
+                "| Sub-Dataset | IoU | Dice / F1 | AUROC | Pixel Acc | Precision | Recall | Specificity | Samples |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            ]
+            for sname in sorted(sub_datasets.keys()):
+                sm = sub_datasets[sname]
+                s_iou = f"{sm.get('iou', 0.0):.4f}" if isinstance(sm.get("iou"), (int, float)) else str(sm.get("iou", "N/A"))
+                s_f1 = f"{sm.get('f1', sm.get('dice', 0.0)):.4f}" if isinstance(sm.get("f1", sm.get("dice")), (int, float)) else "N/A"
+                s_auroc = f"{sm.get('auroc', 0.0):.4f}" if isinstance(sm.get("auroc"), (int, float)) else "N/A"
+                s_pacc = f"{sm.get('pixel_acc', 0.0):.4f}" if isinstance(sm.get("pixel_acc"), (int, float)) else "N/A"
+                s_prec = f"{sm.get('precision', 0.0):.4f}" if isinstance(sm.get("precision"), (int, float)) else "N/A"
+                s_rec = f"{sm.get('recall', 0.0):.4f}" if isinstance(sm.get("recall"), (int, float)) else "N/A"
+                s_spec = f"{sm.get('specificity', 0.0):.4f}" if isinstance(sm.get("specificity"), (int, float)) else "N/A"
+                s_cnt = sm.get("samples") or sm.get("count", "N/A")
+                s_cnt_str = f"{int(s_cnt):,}" if isinstance(s_cnt, (int, float)) else str(s_cnt)
+                sub_lines.append(
+                    f"| {sname} | {s_iou} | {s_f1} | {s_auroc} | {s_pacc} | {s_prec} | {s_rec} | {s_spec} | {s_cnt_str} |"
+                )
+            per_dataset_tables.append("\n".join(sub_lines))
+
+    if per_dataset_tables:
+        lines.append("")
+        lines.extend(per_dataset_tables)
+
+    lines.extend([
+        "",
+        "### 🖼️ Visual Predictions & Reports",
+        "",
+        "Full cross-evaluation reports and visual prediction grids are archived in the repository:",
+        "- [`cross_eval_reports/cross_evaluation_report.md`](cross_eval_reports/cross_evaluation_report.md)",
+        "- [`cross_eval_reports/cross_evaluation_report.json`](cross_eval_reports/cross_evaluation_report.json)",
+        "- Sample prediction illustrations: [`cross_eval_reports/illustrations/`](cross_eval_reports/illustrations/)",
+    ])
+
+    return "\n".join(lines).strip()
+
+
+def update_readme_with_cross_eval(existing_readme: str, cross_eval_section: str) -> str:
+    """Insert or replace the Cross-Evaluation Benchmark Results section in README.md."""
+    if not cross_eval_section:
+        return existing_readme
+
+    heading = "## 📊 Cross-Evaluation Benchmark Results"
+    if heading in existing_readme:
+        # Match cross-eval section until the next top-level heading '## ' or end of string
+        pattern = r"## 📊 Cross-Evaluation Benchmark Results.*?(?=(?:\n## |\Z))"
+        updated = re.sub(pattern, cross_eval_section + "\n\n", existing_readme, flags=re.DOTALL)
+        return updated.strip() + "\n"
+
+    # Insert before Quickstart if found
+    quickstart_heading = "## 🚀 Quickstart & Checkpoint Usage"
+    if quickstart_heading in existing_readme:
+        parts = existing_readme.split(quickstart_heading, 1)
+        return (
+            parts[0].rstrip()
+            + "\n\n---\n\n"
+            + cross_eval_section
+            + "\n\n---\n\n"
+            + quickstart_heading
+            + parts[1]
+        )
+
+    # Insert before Repository Layout if found
+    layout_heading = "## 📂 Repository Layout"
+    if layout_heading in existing_readme:
+        parts = existing_readme.split(layout_heading, 1)
+        return (
+            parts[0].rstrip()
+            + "\n\n---\n\n"
+            + cross_eval_section
+            + "\n\n---\n\n"
+            + layout_heading
+            + parts[1]
+        )
+
+    # Otherwise append
+    return existing_readme.rstrip() + "\n\n---\n\n" + cross_eval_section + "\n"
 
 
 def push_checkpoint(
@@ -574,12 +834,23 @@ def push_checkpoint(
             if set_latest:
                 operations.append(CommitOperationAdd(path_in_repo=f"reports/{fname}", path_or_fileobj=fpath))
 
+        # Upload cross-eval reports if present
+        for rel_name, fpath in artifacts.get("cross_eval_reports", {}).items():
+            operations.append(CommitOperationAdd(path_in_repo=f"versions/{ver}/cross_eval_reports/{rel_name}", path_or_fileobj=fpath))
+            if set_latest:
+                operations.append(CommitOperationAdd(path_in_repo=f"cross_eval_reports/{rel_name}", path_or_fileobj=fpath))
+
     # Upload manifest.json and README.md
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
     operations.append(CommitOperationAdd(path_in_repo="manifest.json", path_or_fileobj=manifest_bytes))
     operations.append(CommitOperationAdd(path_in_repo=f"versions/{ver}/manifest.json", path_or_fileobj=manifest_bytes))
 
     card_text = generate_model_card_content(repo_id=repo_id, version=ver, manifest=manifest)
+    if include_reports and artifacts.get("cross_eval_reports"):
+        cross_eval_sec = format_cross_eval_readme_section(artifacts["cross_eval_reports"])
+        if cross_eval_sec:
+            card_text = update_readme_with_cross_eval(card_text, cross_eval_sec)
+
     operations.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=card_text.encode("utf-8")))
 
     # Reformat / Clean up legacy ugly structure (e.g. outputs/RUN/default/...)
@@ -624,6 +895,126 @@ def push_checkpoint(
         "repo_url": repo_url,
         "commit": getattr(commit_info, "oid", None),
         "manifest": manifest,
+    }
+
+
+def push_cross_eval_to_hf(
+    repo_id_or_uri: str,
+    source_dir: Optional[str] = None,
+    results: Optional[List[Dict[str, Any]]] = None,
+    version: Optional[str] = None,
+    token: Optional[str] = None,
+    message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Push cross-evaluation reports and illustrations to Hugging Face Hub and update model card README.md."""
+    if not _HF_AVAILABLE:
+        raise ImportError("huggingface_hub is required for Hugging Face checkpoint synchronization.")
+
+    hf_token = _get_hf_token(token)
+    api = HfApi(token=hf_token)
+
+    repo_id, ver = resolve_repo_and_version(
+        repo=repo_id_or_uri,
+        version=version,
+        token=hf_token,
+    )
+
+    verify_hf_repo_checkpointable(
+        repo_id_or_uri=repo_id,
+        token=hf_token,
+        create_if_missing=True,
+        raise_on_error=True,
+    )
+
+    # 1. Resolve source directory for cross-eval artifacts
+    cross_eval_dir = None
+    if source_dir and os.path.isdir(source_dir):
+        if os.path.basename(source_dir) == "cross_eval_reports":
+            cross_eval_dir = os.path.abspath(source_dir)
+        elif os.path.isdir(os.path.join(source_dir, "cross_eval_reports")):
+            cross_eval_dir = os.path.abspath(os.path.join(source_dir, "cross_eval_reports"))
+        else:
+            cross_eval_dir = os.path.abspath(source_dir)
+    else:
+        for cand in [
+            "outputs/RUN/default/cross_eval_reports",
+            "outputs/cross_evaluation",
+            "outputs/RUN/detective_sam/cross_eval_reports",
+        ]:
+            if os.path.isdir(cand):
+                cross_eval_dir = os.path.abspath(cand)
+                break
+
+    files_to_upload: Dict[str, str] = {}
+    if cross_eval_dir and os.path.isdir(cross_eval_dir):
+        for root, _, filenames in os.walk(cross_eval_dir):
+            for fn in filenames:
+                if fn.endswith((".json", ".md", ".png", ".jpg", ".pdf", ".csv", ".log")):
+                    full_p = os.path.join(root, fn)
+                    rel_p = os.path.relpath(full_p, cross_eval_dir)
+                    files_to_upload[rel_p] = full_p
+
+    # Also include illustrations from outputs/cross_evaluation if not already in files_to_upload
+    master_cross_dir = os.path.abspath("outputs/cross_evaluation")
+    if os.path.isdir(master_cross_dir) and cross_eval_dir != master_cross_dir:
+        for root, _, filenames in os.walk(master_cross_dir):
+            for fn in filenames:
+                if fn.endswith((".json", ".md", ".png", ".jpg", ".pdf", ".csv")):
+                    full_p = os.path.join(root, fn)
+                    rel_p = os.path.relpath(full_p, master_cross_dir)
+                    if rel_p not in files_to_upload:
+                        files_to_upload[rel_p] = full_p
+
+    # 2. Format cross-eval section for README
+    cross_eval_section = ""
+    if results:
+        cross_eval_section = format_cross_eval_readme_section(results)
+    elif cross_eval_dir:
+        cross_eval_section = format_cross_eval_readme_section(cross_eval_dir)
+    elif os.path.isdir("outputs/cross_evaluation"):
+        cross_eval_section = format_cross_eval_readme_section("outputs/cross_evaluation")
+
+    # 3. Retrieve or generate README.md
+    existing_readme = ""
+    try:
+        remote_readme_path = hf_hub_download(repo_id=repo_id, filename="README.md", token=hf_token)
+        with open(remote_readme_path, "r", encoding="utf-8") as rf:
+            existing_readme = rf.read()
+    except Exception:
+        existing_readme = generate_model_card_content(repo_id=repo_id, version=ver, manifest={"versions": [ver]})
+
+    updated_readme = update_readme_with_cross_eval(existing_readme, cross_eval_section) if cross_eval_section else existing_readme
+
+    # 4. Prepare commit operations
+    operations = []
+    operations.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=updated_readme.encode("utf-8")))
+    operations.append(CommitOperationAdd(path_in_repo=f"versions/{ver}/README.md", path_or_fileobj=updated_readme.encode("utf-8")))
+
+    for rel_path, full_path in files_to_upload.items():
+        operations.append(CommitOperationAdd(path_in_repo=f"cross_eval_reports/{rel_path}", path_or_fileobj=full_path))
+        operations.append(CommitOperationAdd(path_in_repo=f"versions/{ver}/cross_eval_reports/{rel_path}", path_or_fileobj=full_path))
+
+    commit_msg = message or f"feat(cross-eval): log cross-eval benchmark results for {repo_id} to README"
+    print(f"🚀 Uploading cross-evaluation results to Hugging Face '{repo_id}' ({len(files_to_upload)} files)...")
+
+    commit_info = api.create_commit(
+        repo_id=repo_id,
+        repo_type="model",
+        operations=operations,
+        commit_message=commit_msg,
+    )
+
+    repo_url = f"https://huggingface.co/{repo_id}"
+    print(f"✅ Successfully updated Hugging Face README and pushed cross-eval results to: {repo_url}")
+    print(f"   Files uploaded: {len(files_to_upload)}")
+
+    return {
+        "repo_id": repo_id,
+        "version": ver,
+        "repo_url": repo_url,
+        "commit": getattr(commit_info, "oid", None),
+        "uploaded_files": list(files_to_upload.keys()),
+        "updated_readme": updated_readme,
     }
 
 
@@ -813,11 +1204,38 @@ def pull_checkpoint(
 
     # Also synchronize convenience directory outputs/RUN/default so auto_resume finds it everywhere
     legacy_run_dir = os.path.abspath(os.path.join("outputs", "RUN", "default", "checkpoints"))
-    if os.path.abspath(ckpt_target_dir) != legacy_run_dir:
+    if not output_dir and os.path.abspath(ckpt_target_dir) != legacy_run_dir:
         os.makedirs(legacy_run_dir, exist_ok=True)
         for fname, fpath in downloaded_paths.items():
             if fname.endswith(".pt"):
                 shutil.copy2(fpath, os.path.join(legacy_run_dir, fname))
+
+    # Persist repo metadata for seamless future pulling, pushing, and cross-evaluation
+    repo_info_path = os.path.join(ckpt_target_dir, ".hf_repo_info.json")
+    try:
+        with open(repo_info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "repo_id": repo_id,
+                "version": ver,
+                "pulled_at": datetime.now(timezone.utc).isoformat(),
+                "files": list(downloaded_paths.keys()),
+            }, f, indent=2)
+    except Exception:
+        pass
+
+    for cfg_cand in [os.path.join(ckpt_target_dir, "config.yaml"), os.path.join(target_dir, "config.yaml")]:
+        if os.path.isfile(cfg_cand):
+            try:
+                with open(cfg_cand, "r", encoding="utf-8") as f:
+                    c_data = yaml.safe_load(f) or {}
+                if isinstance(c_data, dict):
+                    c_data.setdefault("training", {})["hf_repo"] = repo_id
+                    c_data.setdefault("training", {})["hub_repo"] = repo_id
+                    c_data.setdefault("project", {})["hub_repo"] = repo_id
+                    with open(cfg_cand, "w", encoding="utf-8") as f:
+                        yaml.dump(c_data, f, default_flow_style=False)
+            except Exception:
+                pass
 
     print(f"✅ Successfully pulled {len(downloaded_paths)} file(s) into: {ckpt_target_dir}")
     for fname, fpath in downloaded_paths.items():
@@ -956,11 +1374,32 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     list_p.add_argument("--repo", "-r", type=str, default=None)
     list_p.add_argument("--token", type=str, default=None)
 
+    # Subcommand push-cross-eval
+    pce_p = subparsers.add_parser("push-cross-eval", help="Push cross-evaluation reports and update README on Hugging Face Hub")
+    pce_p.add_argument("--repo", "-r", "--name", "-n", dest="repo", type=str, default=None)
+    pce_p.add_argument("--dir", "-d", dest="source_dir", type=str, default=None)
+    pce_p.add_argument("--version", "-v", type=str, default=None)
+    pce_p.add_argument("--message", "-m", type=str, default=None)
+    pce_p.add_argument("--token", type=str, default=None)
+
     args, unknown = parser.parse_known_args(argv)
     if args.command == "push":
         return cli_push(argv[1:] if argv else None)
     elif args.command == "pull":
         return cli_pull(argv[1:] if argv else None)
+    elif args.command == "push-cross-eval":
+        try:
+            push_cross_eval_to_hf(
+                repo_id_or_uri=args.repo or "",
+                source_dir=args.source_dir,
+                version=args.version,
+                token=args.token,
+                message=args.message,
+            )
+            return 0
+        except Exception as e:
+            print(f"Error during push-cross-eval: {e}", file=sys.stderr)
+            return 1
     elif args.command == "list":
         try:
             pull_checkpoint(name=args.name, repo=args.repo, list_only=True, token=args.token)

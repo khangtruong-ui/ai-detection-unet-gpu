@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-11-05
 
 ### Added
+- **Hugging Face Model Card Cross-Evaluation Logging & Hub Synchronization (`sid-cross-eval`)**:
+  - Implemented automatic Hugging Face repository acknowledgment (`extract_hf_repo_from_checkpoint`) in `sid_unet.cross_eval`. Checkpoints associated with a Hugging Face model repository automatically synchronize cross-evaluation reports, JSON metrics, and sample prediction illustrations to the Hub.
+  - Implemented `format_cross_eval_readme_section()` and `update_readme_with_cross_eval()` in `sid_unet.checkpoint_sync`, generating structured Markdown benchmark performance tables (Cross-Dataset Performance Summary and Per-Dataset Breakdown multi-benchmark slicing) and logging them directly into the remote model card `README.md`.
+  - Added dedicated `push_cross_eval_to_hf()` API and `sid-checkpoint push-cross-eval` CLI subcommand.
+  - Added CLI options `--push-to-hub`, `--no-push-to-hub`, `--hf-repo`, `--hf-version`, and `--hf-token` to `sid-cross-eval`.
+  - Updated `find_local_checkpoint_artifacts` in `sid_unet.checkpoint_sync` to automatically discover `cross_eval_reports/` directories and illustrations.
+- **Hugging Face Checkpoint Association & Persistent Provenance Metadata**:
+  - `CheckpointManager` (`sid_unet.training.callbacks`) and `Trainer` (`sid_unet.training.trainer`) now embed repository metadata (`hf_repo`, `hub_repo`, `hf_version`) directly into checkpoint dictionaries (`state["hf_repo"]`, `state["hub_repo"]`, `state["hf_version"]`).
+  - Updated `inspect_checkpoint` (`sid_unet.utils.checkpoint`) to extract `hf_repo`, `hub_repo`, and `hf_version` from checkpoint state dictionaries, embedded configurations, and sibling `.hf_repo_info.json` metadata files.
+- **Automatic HF Repository Resolution for Future Pulling (`sid-pull`)**:
+  - Enhanced `resolve_repo_and_version()` in `sid_unet.checkpoint_sync` to auto-resolve Hugging Face repositories from local checkpoint metadata or configuration files (`checkpoint_best.pt`, `config.yaml`, `.hf_repo_info.json`) when `--name` or `--repo` is omitted.
+  - Updated `pull_checkpoint()` to record `.hf_repo_info.json` in downloaded checkpoint directories and stamp `config.yaml` with origin repository information, enabling zero-configuration subsequent pulls and cross-evaluations.
 - **Per-Dataset Breakdown on Multi-Benchmark Datasets (`--dataset-filter`)**:
   - Implemented multi-benchmark slicing in `sid_unet.metrics.segmentation.SegmentationMetricTracker` via `compute_per_dataset()` and `per_dataset_metrics` property, accumulating IoU, Dice/F1, AUROC, Pixel Accuracy, Precision, Recall, Specificity, and sample count for each constituent sub-dataset.
   - Forwarded `dataset` and `method` metadata from `process_raw_sample` through batch collation and into metric trackers across `sid_unet.cross_eval` and `sid_unet.evaluate`.
