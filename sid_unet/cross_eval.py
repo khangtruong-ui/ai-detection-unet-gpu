@@ -266,6 +266,15 @@ def parse_args(args: Optional[List[str]] = None):
         default=None,
         help="Specific CUDA device IDs to use for evaluation (e.g. --device-ids 0 1).",
     )
+    parser.add_argument(
+        "--dataset-filter",
+        "--sub-dataset",
+        "--filter-dataset",
+        dest="dataset_filter",
+        type=str,
+        default=None,
+        help="Filter evaluation to only process samples matching a specific sub-dataset column value (e.g. 'CASIA_v2', 'CocoGlide').",
+    )
     return parser.parse_args(args)
 
 
@@ -290,7 +299,27 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
             else:
                 raise FileNotFoundError(f"Configuration path not found: {pat}")
         else:
-            raise FileNotFoundError(f"Configuration path not found: {pat}")
+            alt_candidates = [
+                os.path.join("configs", "cross-eval", os.path.basename(pat)),
+                os.path.join("configs", pat),
+                pat.replace("cross-test", "configs/cross-eval"),
+                pat.replace("cross_test", "configs/cross-eval"),
+            ]
+            found = False
+            for alt in alt_candidates:
+                if os.path.isfile(alt):
+                    resolved.append(alt)
+                    found = True
+                    break
+                elif os.path.isdir(alt):
+                    matches = glob.glob(os.path.join(alt, "**", "*.yaml"), recursive=True) + \
+                              glob.glob(os.path.join(alt, "**", "*.yml"), recursive=True)
+                    if matches:
+                        resolved.extend([m for m in matches if os.path.isfile(m)])
+                        found = True
+                        break
+            if not found:
+                raise FileNotFoundError(f"Configuration path not found: {pat}")
 
     seen = set()
     unique = []
@@ -388,13 +417,39 @@ def eval_single_batch(
     refiner: Optional[Any] = None,
     collect_samples: Optional[List[Dict[str, Any]]] = None,
     max_collect: int = 6,
+    dataset_filter: Optional[str] = None,
 ) -> Tuple[float, int, List[Dict[str, Any]]]:
     """Execute forward evaluation for a single batch across active pipeline variants."""
+    batch_datasets = batch.get("dataset")
+    if dataset_filter is not None and batch_datasets:
+        filter_lower = str(dataset_filter).strip().lower()
+        keep_indices = [
+            i for i, d in enumerate(batch_datasets)
+            if str(d).strip().lower() == filter_lower
+        ]
+        if not keep_indices:
+            return 0.0, 0, []
+        if len(keep_indices) < len(batch_datasets):
+            idx_tensor = torch.tensor(keep_indices, dtype=torch.long)
+            new_batch = {
+                "image": batch["image"][idx_tensor],
+                "mask": batch["mask"][idx_tensor],
+                "label": batch["label"][idx_tensor] if batch.get("label") is not None else None,
+                "dataset": [batch_datasets[i] for i in keep_indices],
+                "img_id": [batch["img_id"][i] for i in keep_indices] if isinstance(batch.get("img_id"), list) else batch.get("img_id"),
+            }
+            if "f_r" in batch and isinstance(batch["f_r"], torch.Tensor):
+                new_batch["f_r"] = batch["f_r"][idx_tensor]
+            if "gap_r" in batch and isinstance(batch["gap_r"], torch.Tensor):
+                new_batch["gap_r"] = batch["gap_r"][idx_tensor]
+            batch = new_batch
+
     images = batch["image"].to(device, non_blocking=True)
     masks = batch["mask"].to(device, non_blocking=True)
     labels = batch.get("label")
     if labels is not None:
         labels = labels.to(device, non_blocking=True)
+    datasets = batch.get("dataset")
 
     model_kwargs: Dict[str, Any] = {}
     if "f_r" in batch and isinstance(batch["f_r"], torch.Tensor):
@@ -444,13 +499,13 @@ def eval_single_batch(
         mask_logits, class_logits = outputs, None
 
     # 1. Baseline Raw UNet
-    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True)
+    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True, datasets=datasets)
 
     # 2. Post-processed UNet
     post_masks = None
     if post_seg_tracker is not None and postprocessor is not None:
         post_masks, _ = postprocessor.process_batch(mask_logits, is_logit=True)
-        post_seg_tracker.update(post_masks, masks, labels, is_logit=False)
+        post_seg_tracker.update(post_masks, masks, labels, is_logit=False, datasets=datasets)
 
     # 3. SAM-Refined UNet
     sam_masks = None
@@ -460,7 +515,7 @@ def eval_single_batch(
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits, is_logit=True)
         except TypeError:
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
-        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False)
+        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False, datasets=datasets)
 
     # 4. SAM + Post-Processing
     both_masks = None
@@ -478,7 +533,7 @@ def eval_single_batch(
             base_for_both = mask_logits
             base_is_logit = True
         both_masks, _ = postprocessor.process_batch(base_for_both, is_logit=base_is_logit)
-        both_seg_tracker.update(both_masks, masks, labels, is_logit=False)
+        both_seg_tracker.update(both_masks, masks, labels, is_logit=False, datasets=datasets)
 
     # 5. Classification tracker
     if class_logits is not None and labels is not None:
@@ -542,6 +597,7 @@ def evaluate_checkpoint_on_config(
     filter_zero_positive: bool = True,
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
+    dataset_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -553,6 +609,8 @@ def evaluate_checkpoint_on_config(
         overrides.append(f"data.batch_size={batch_size}")
 
     eval_config = load_config(config_path, overrides=overrides)
+    if dataset_filter is None:
+        dataset_filter = eval_config.data.get("dataset_filter", eval_config.data.get("sub_dataset", None))
 
     # Load model from checkpoint
     model, ckpt_config = UNet.from_checkpoint(
@@ -675,6 +733,7 @@ def evaluate_checkpoint_on_config(
                     refiner=refiner,
                     collect_samples=collected_samples,
                     max_collect=max_illustrations,
+                    dataset_filter=dataset_filter,
                 )
                 total_loss_sum += loss_contrib
                 total_samples += count
@@ -701,6 +760,7 @@ def evaluate_checkpoint_on_config(
                                 refiner=refiner,
                                 collect_samples=collected_samples,
                                 max_collect=max_illustrations,
+                                dataset_filter=dataset_filter,
                             )
                             total_loss_sum += loss_contrib
                             total_samples += count
@@ -726,6 +786,7 @@ def evaluate_checkpoint_on_config(
                                         refiner=refiner,
                                         collect_samples=collected_samples,
                                         max_collect=max_illustrations,
+                                        dataset_filter=dataset_filter,
                                     )
                                     total_loss_sum += loss_contrib
                                     total_samples += count
@@ -764,6 +825,31 @@ def evaluate_checkpoint_on_config(
         chosen_seg = both_seg
         chosen_per_label = both_per_label
 
+    chosen_per_dataset = (
+        both_seg_tracker.compute_per_dataset()
+        if both_seg_tracker is not None
+        else (
+            sam_seg_tracker.compute_per_dataset()
+            if sam_seg_tracker is not None
+            else (
+                post_seg_tracker.compute_per_dataset()
+                if post_seg_tracker is not None
+                else raw_seg_tracker.compute_per_dataset()
+            )
+        )
+    )
+
+    if chosen_per_dataset:
+        eval_logger.info(f"📊 [PER-DATASET BREAKDOWN] Evaluated {len(chosen_per_dataset)} sub-datasets:")
+        for ds_k, ds_v in sorted(chosen_per_dataset.items(), key=lambda x: str(x[0])):
+            eval_logger.info(
+                f"   - {ds_k:15s} | IoU: {ds_v.get('iou', 0.0):.4f} | "
+                f"Dice/F1: {ds_v.get('dice', ds_v.get('f1', 0.0)):.4f} | "
+                f"AUROC: {ds_v.get('auroc', 0.0):.4f} | "
+                f"PixelAcc: {ds_v.get('pixel_acc', 0.0):.4f} | "
+                f"Samples: {int(ds_v.get('samples', ds_v.get('count', 0)))}"
+            )
+
     overall_metrics = {
         "eval_split": resolved_split,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
@@ -771,6 +857,7 @@ def evaluate_checkpoint_on_config(
         **cls_metrics,
         "total_evaluated_samples": total_samples,
         "ablation_summary": ablation_dict,
+        "per_dataset_metrics": chosen_per_dataset,
     }
 
     if refiner is not None and all_change_metrics:
@@ -839,6 +926,8 @@ def evaluate_checkpoint_on_config(
         "ablation_metrics": ablation_dict,
         "per_label_metrics": chosen_per_label,
         "raw_per_label_metrics": raw_per_label,
+        "per_dataset_metrics": chosen_per_dataset,
+        "raw_per_dataset_metrics": raw_seg_tracker.compute_per_dataset(),
         "confusion_matrix": confusion_mat,
         "dataset_illustration_path": dataset_illustration_path,
         "checkpoint_config": ckpt_config.to_dict() if hasattr(ckpt_config, "to_dict") else dict(ckpt_config),
@@ -878,6 +967,7 @@ def run_cross_evaluation(
     filter_zero_positive: bool = True,
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
+    dataset_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -1049,6 +1139,7 @@ def run_cross_evaluation(
                 filter_zero_positive=filter_zero_positive,
                 data_parallel=data_parallel,
                 device_ids=device_ids,
+                dataset_filter=dataset_filter,
             )
 
             all_cross_results.append(res)
@@ -1306,6 +1397,7 @@ def main(args: Optional[List[str]] = None):
         filter_zero_positive=parsed_args.filter_zero_positive,
         data_parallel=parsed_args.data_parallel,
         device_ids=parsed_args.device_ids,
+        dataset_filter=getattr(parsed_args, "dataset_filter", None),
     )
     return results
 

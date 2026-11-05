@@ -176,6 +176,7 @@ def generate_evaluation_report(
     curves_path: Optional[str] = None,
     ablation_results: Optional[Dict[str, Dict[str, Any]]] = None,
     illustration_paths: Optional[List[str]] = None,
+    per_dataset_metrics: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """
     Generate comprehensive evaluation report with configuration details, ablation study, overall metrics,
@@ -272,6 +273,31 @@ def generate_evaluation_report(
             per_label_rows.append(row)
         per_label_headers = ["Subset", "Mean IoU", "Dice / F1", "Pixel Accuracy", "Sample Count"]
         md_lines.append(tabulate(per_label_rows, headers=per_label_headers, tablefmt="github"))
+        md_lines.append("\n")
+
+    per_ds = per_dataset_metrics or overall_metrics.get("per_dataset_metrics")
+    if per_ds:
+        report_dict["per_dataset_metrics"] = per_ds
+        md_lines.append("### Per-Dataset Metrics Breakdown (Multi-Benchmark Slicing)\n")
+        ds_rows = []
+        for ds_name, ds_stats in sorted(per_ds.items(), key=lambda x: str(x[0])):
+            ds_rows.append([
+                str(ds_name),
+                f"{ds_stats.get('iou', 0.0):.4f}",
+                f"{ds_stats.get('dice', ds_stats.get('f1', 0.0)):.4f}",
+                f"{ds_stats.get('auroc', 0.0):.4f}",
+                f"{ds_stats.get('pixel_acc', 0.0):.4f}",
+                f"{ds_stats.get('precision', 0.0):.4f}",
+                f"{ds_stats.get('recall', 0.0):.4f}",
+                f"{ds_stats.get('specificity', 0.0):.4f}",
+                f"{int(ds_stats.get('samples', ds_stats.get('count', 0)))}",
+            ])
+        md_lines.append(tabulate(
+            ds_rows,
+            headers=["Sub-Dataset", "Mean IoU", "Dice / F1", "AUROC", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
+            tablefmt="github",
+            disable_numparse=True,
+        ))
         md_lines.append("\n")
 
     if confusion_matrix is not None and len(confusion_matrix) > 0:
@@ -541,6 +567,30 @@ def generate_checkpoint_cross_eval_report(
                 ])
             md_lines.append("#### Per-Subset Breakdown\n")
             md_lines.append(tabulate(pl_rows, headers=["Subset", "IoU", "Dice / F1", "Pixel Acc", "Samples"], tablefmt="github", disable_numparse=True))
+            md_lines.append("\n")
+
+        per_dataset = res.get("per_dataset_metrics", {})
+        if per_dataset:
+            ds_rows = []
+            for ds_k, ds_stats in sorted(per_dataset.items(), key=lambda x: str(x[0])):
+                ds_rows.append([
+                    str(ds_k),
+                    f"{ds_stats.get('iou', 0.0):.4f}",
+                    f"{ds_stats.get('dice', ds_stats.get('f1', 0.0)):.4f}",
+                    f"{ds_stats.get('auroc', 0.0):.4f}",
+                    f"{ds_stats.get('pixel_acc', 0.0):.4f}",
+                    f"{ds_stats.get('precision', 0.0):.4f}",
+                    f"{ds_stats.get('recall', 0.0):.4f}",
+                    f"{ds_stats.get('specificity', 0.0):.4f}",
+                    f"{int(ds_stats.get('samples', ds_stats.get('count', 0)))}",
+                ])
+            md_lines.append("#### Per-Dataset Breakdown (Multi-Benchmark Slicing)\n")
+            md_lines.append(tabulate(
+                ds_rows,
+                headers=["Sub-Dataset", "IoU", "Dice / F1", "AUROC", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
+                tablefmt="github",
+                disable_numparse=True,
+            ))
             md_lines.append("\n")
 
         if cm and len(cm) > 0:
@@ -822,6 +872,31 @@ def generate_master_cross_evaluation_report(
             ])
         md_lines.append(tabulate(cfg_rows, headers=["Checkpoint", "Loss", "IoU", "Dice / F1", "AUROC", "Pixel Acc", "Samples"], tablefmt="github"))
         md_lines.append("\n")
+
+        for cr in cfg_runs:
+            per_ds = cr.get("per_dataset_metrics", {})
+            if per_ds:
+                md_lines.append(f"#### Per-Dataset Breakdown: {cr.get('checkpoint_name', 'Checkpoint')} on {kn}\n")
+                ds_rows = []
+                for ds_k, ds_stats in sorted(per_ds.items(), key=lambda x: str(x[0])):
+                    ds_rows.append([
+                        str(ds_k),
+                        f"{ds_stats.get('iou', 0.0):.4f}",
+                        f"{ds_stats.get('dice', ds_stats.get('f1', 0.0)):.4f}",
+                        f"{ds_stats.get('auroc', 0.0):.4f}",
+                        f"{ds_stats.get('pixel_acc', 0.0):.4f}",
+                        f"{ds_stats.get('precision', 0.0):.4f}",
+                        f"{ds_stats.get('recall', 0.0):.4f}",
+                        f"{ds_stats.get('specificity', 0.0):.4f}",
+                        f"{int(ds_stats.get('samples', ds_stats.get('count', 0)))}",
+                    ])
+                md_lines.append(tabulate(
+                    ds_rows,
+                    headers=["Sub-Dataset", "IoU", "Dice / F1", "AUROC", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
+                    tablefmt="github",
+                    disable_numparse=True,
+                ))
+                md_lines.append("\n")
 
     markdown_content = "\n".join(md_lines)
 

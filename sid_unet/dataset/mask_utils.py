@@ -76,8 +76,19 @@ def _extract_and_binarize_mask(
     return (mask_arr >= threshold).astype(np.float32)
 
 
+def is_mask_provided(mask_input: Any) -> bool:
+    """Check if mask_input contains valid, non-null mask data."""
+    if mask_input is None:
+        return False
+    if isinstance(mask_input, dict):
+        return bool(mask_input.get("bytes") or mask_input.get("path"))
+    if isinstance(mask_input, (bytes, bytearray)):
+        return len(mask_input) > 0
+    return True
+
+
 def process_sample_mask(
-    mask_input: Optional[Union[Image.Image, np.ndarray, torch.Tensor]],
+    mask_input: Optional[Union[Image.Image, np.ndarray, torch.Tensor, Dict[str, Any], bytes, bytearray, io.BytesIO]],
     label: Optional[int] = None,
     image_size: Tuple[int, int] = (256, 256),  # (width, height) in PIL convention or (H, W)
     threshold: float = 0.5,
@@ -85,8 +96,10 @@ def process_sample_mask(
     """
     Process or synthesize binary mask based on dataset label and provided mask.
 
-    - Label 0 (Real): Full black mask (all 0s).
-    - Label 1 (Fully Synthetic): Full white mask (all 1s).
+    - Label 0 (Real): Full black mask (all 0s). If `mask_input` is provided, binarizes provided mask.
+    - Label 1: If `mask_input` is provided (e.g. binary fake/tampered datasets like
+      KhangTruong/Tampered-Images-Combined-Dataset-Fake), extracts and binarizes the provided ground truth mask.
+      If `mask_input` is None (e.g. saberzl/SID_Set fully synthetic), synthesizes a full white mask (all 1s).
     - Label 2 (Partially Synthetic / Inpainting): Ground truth binary mask from `mask_input`.
     - Label is None (Standard 2-column image + mask dataset, e.g. KhangTruong/IMD2020):
       Directly processes and binarizes `mask_input`.
@@ -98,15 +111,17 @@ def process_sample_mask(
 
     if label is not None:
         if label == 0:
-            # Full black mask (0 = real background)
+            if is_mask_provided(mask_input):
+                return _extract_and_binarize_mask(mask_input, image_size=(w, h), threshold=threshold)
             return np.zeros((h, w), dtype=np.float32)
         elif label == 1:
-            # Full white mask (1 = fully synthetic)
+            if is_mask_provided(mask_input):
+                return _extract_and_binarize_mask(mask_input, image_size=(w, h), threshold=threshold)
             return np.ones((h, w), dtype=np.float32)
         elif label == 2:
             return _extract_and_binarize_mask(mask_input, image_size=(w, h), threshold=threshold)
         else:
-            if mask_input is not None:
+            if is_mask_provided(mask_input):
                 return _extract_and_binarize_mask(mask_input, image_size=(w, h), threshold=threshold)
             return np.zeros((h, w), dtype=np.float32)
 
