@@ -1618,7 +1618,9 @@ Both training (`sid-train`) and evaluation (`sid-eval`, `sid-cross-eval`) native
 
 ### 10. Memory Management & OOM Dynamic Auto-Recovery
 
-- **Pre-Execution VRAM Probing**: Automatically searches safe batch sizes and scales gradient accumulation.
+- **Pre-Execution VRAM Probing**: Automatically searches safe batch sizes and scales gradient accumulation, with robust fallback on CUDA / SDPA accelerator kernel limits and chunked feature extraction.
+- **Asynchronous CUDA Memory Prefetching (`CUDAPrefetcher`)**: Streams pinned batches to GPU on a dedicated asynchronous CUDA stream, overlapping host-to-device transfers with compute.
+- **GPU-Vectorized Evaluation Metrics**: Evaluates IoU, Dice/Pixel F1, and AUROC (via rankdata sort & midranks) entirely on GPU tensors, eliminating CPU detachment stalls and GPU utilization fluctuations.
 - **Activation Checkpointing**: Recomputes forward activations during backpropagation, saving 60-70% activation VRAM.
 - **Dynamic OOM Fallback Catching**: Recursively bisects batches into micro-batches on CUDA OOM without crashing.
 
@@ -2516,8 +2518,11 @@ sid-pull --name KhangTruong/diffusion-diff-minimized --version v1
 # List available versions and checkpoints in remote repository without downloading
 sid-pull --name KhangTruong/diffusion-diff-minimized --list
 
-# 2. Push checkpoints to Hugging Face Hub with versioning
+# 2. Push checkpoints to Hugging Face Hub with versioning (also automatically discovers and synchronizes master cross-evaluation reports, matrices, logs, and illustrations)
 sid-push --name KhangTruong/diffusion-diff-minimized --version v2 --message "Release v2 after 40 epochs"
+
+# Push active checkpoints and master cross-evaluation results from a specific output directory
+sid-push --name KhangTruong/Detective-SAM-small-MVSS-Set --dir outputs/RUN/default
 
 # Reformat repository to clean multi-version structure, archiving into versions/ and removing legacy output paths
 sid-push --name KhangTruong/diffusion-diff-minimized --version v1 --reformat

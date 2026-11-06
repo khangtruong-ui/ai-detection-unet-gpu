@@ -318,6 +318,8 @@ def find_local_checkpoint_artifacts(
     # Locate config files
     configs: Dict[str, str] = {}
     for cfg_cand in [
+        os.path.join(target_dir, "config.yaml"),
+        os.path.join(ckpt_dir, "config.yaml"),
         os.path.join(target_dir, "effective_config.yaml"),
         os.path.join(ckpt_dir, "checkpoint_best_config.yaml"),
         os.path.join(ckpt_dir, "checkpoint_latest_config.yaml"),
@@ -339,12 +341,35 @@ def find_local_checkpoint_artifacts(
         if os.path.isfile(full_rep):
             reports[rep] = full_rep
 
+    # Locate master cross-evaluation reports and illustrations
+    cross_eval_artifacts: Dict[str, str] = {}
+    cross_eval_candidates = [
+        os.path.join(target_dir, "cross_evaluation"),
+        os.path.join(target_dir, "cross_eval"),
+        os.path.join(target_dir, "cross_eval_reports"),
+        os.path.join(os.path.dirname(ckpt_dir), "cross_evaluation"),
+        "outputs/cross_evaluation",
+        "cross_eval_reports",
+    ]
+    seen_cross_paths = set()
+    for ce_cand in cross_eval_candidates:
+        abs_ce = os.path.abspath(ce_cand)
+        if os.path.isdir(abs_ce) and abs_ce not in seen_cross_paths:
+            seen_cross_paths.add(abs_ce)
+            for root, _, files in os.walk(abs_ce):
+                for f in files:
+                    full_p = os.path.join(root, f)
+                    rel_p = os.path.relpath(full_p, abs_ce)
+                    if rel_p not in cross_eval_artifacts:
+                        cross_eval_artifacts[rel_p] = full_p
+
     return {
         "base_dir": target_dir,
         "checkpoint_dir": ckpt_dir,
         "checkpoints": checkpoints,
         "configs": configs,
         "reports": reports,
+        "cross_eval": cross_eval_artifacts,
     }
 
 
@@ -353,6 +378,7 @@ def generate_model_card_content(
     version: str,
     manifest: Dict[str, Any],
     config_dict: Optional[Dict[str, Any]] = None,
+    cross_eval_summary: Optional[str] = None,
 ) -> str:
     """Generate a clean, structured Hugging Face README.md Model Card."""
     model_name = repo_id.split("/")[-1]
@@ -380,6 +406,10 @@ def generate_model_card_content(
         table_rows.append(f"| `{v}` | {v_score} | {v_ep} | {v_date} |")
     versions_table = "\n".join(table_rows) if table_rows else f"| `{version}` | {best_score} | {best_epoch} | {datetime.now(timezone.utc).strftime('%Y-%m-%d')} |"
 
+    cross_eval_section = ""
+    if cross_eval_summary:
+        cross_eval_section = f"\n\n---\n\n## 📊 Master Cross-Evaluation Results\n\n{cross_eval_summary}\n"
+
     card = f"""---
 license: apache-2.0
 tags:
@@ -401,7 +431,7 @@ Official repository for **{model_name}** checkpoints, evaluated on AI-generated 
 - **Active Version:** `{version}`
 - **Best Validation Score:** `{best_score}` (Epoch `{best_epoch}`)
 - **Total Training Epochs:** `{total_epochs}`
-
+{cross_eval_section}
 ---
 
 ## 🚀 Quickstart & Checkpoint Usage
@@ -448,10 +478,15 @@ sid-push --name {repo_id} --version v2
 ├── reports/                # Evaluation reports & plots
 │   ├── training_curves.png
 │   └── test_evaluation_report.json
+├── cross_evaluation/       # Master evaluation matrices & illustrations
+│   ├── master_cross_evaluation_report.md
+│   ├── cross_eval_matrix.json
+│   └── illustrations/
 └── versions/               # Version Archive
     └── {version}/
         ├── checkpoints/
-        └── reports/
+        ├── reports/
+        └── cross_evaluation/
 ```
 """
     return card
@@ -574,12 +609,32 @@ def push_checkpoint(
             if set_latest:
                 operations.append(CommitOperationAdd(path_in_repo=f"reports/{fname}", path_or_fileobj=fpath))
 
+        # Upload master evaluation & cross-evaluation results if present
+        for rel_path, fpath in artifacts.get("cross_eval", {}).items():
+            operations.append(CommitOperationAdd(path_in_repo=f"versions/{ver}/cross_evaluation/{rel_path}", path_or_fileobj=fpath))
+            if set_latest:
+                operations.append(CommitOperationAdd(path_in_repo=f"cross_evaluation/{rel_path}", path_or_fileobj=fpath))
+
     # Upload manifest.json and README.md
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
     operations.append(CommitOperationAdd(path_in_repo="manifest.json", path_or_fileobj=manifest_bytes))
     operations.append(CommitOperationAdd(path_in_repo=f"versions/{ver}/manifest.json", path_or_fileobj=manifest_bytes))
 
-    card_text = generate_model_card_content(repo_id=repo_id, version=ver, manifest=manifest)
+    cross_eval_summary = None
+    master_rep_file = artifacts.get("cross_eval", {}).get("master_cross_evaluation_report.md")
+    if master_rep_file and os.path.isfile(master_rep_file):
+        try:
+            with open(master_rep_file, "r", encoding="utf-8") as f:
+                cross_eval_summary = f.read().strip()
+        except Exception:
+            pass
+
+    card_text = generate_model_card_content(
+        repo_id=repo_id,
+        version=ver,
+        manifest=manifest,
+        cross_eval_summary=cross_eval_summary,
+    )
     operations.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=card_text.encode("utf-8")))
 
     # Reformat / Clean up legacy ugly structure (e.g. outputs/RUN/default/...)
@@ -617,6 +672,9 @@ def push_checkpoint(
     print(f"   Version: {ver} | Commit: {commit_info.oid[:8] if hasattr(commit_info, 'oid') else 'done'}")
     print(f"   Active Checkpoints: checkpoints/checkpoint_best.pt, checkpoints/checkpoint_latest.pt")
     print(f"   Archived Version: versions/{ver}/checkpoints/")
+    if artifacts.get("cross_eval"):
+        print(f"   Master Evaluation: {len(artifacts['cross_eval'])} cross-evaluation artifact(s) synchronized to cross_evaluation/")
+
 
     return {
         "repo_id": repo_id,

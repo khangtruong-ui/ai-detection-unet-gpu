@@ -19,12 +19,19 @@ import torch.nn as nn
 def is_oom_error(exc: BaseException) -> bool:
     """
     Check whether an exception was caused by CUDA or host memory exhaustion (Out of Memory).
-    Handles torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, MemoryError, and
-    RuntimeError with CUDA OOM message patterns.
+    Handles torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, MemoryError,
+    torch.AcceleratorError, and RuntimeError with CUDA memory/launch limit patterns.
     """
+    accelerator_err_cls = getattr(torch, "AcceleratorError", ())
     if isinstance(exc, (MemoryError, getattr(torch, "OutOfMemoryError", ()))) or (
         hasattr(torch.cuda, "OutOfMemoryError") and isinstance(exc, torch.cuda.OutOfMemoryError)
+    ) or (
+        accelerator_err_cls and isinstance(exc, accelerator_err_cls)
     ):
+        return True
+
+    exc_name = type(exc).__name__.lower()
+    if "acceleratorerror" in exc_name:
         return True
 
     exc_msg = str(exc).lower()
@@ -38,6 +45,8 @@ def is_oom_error(exc: BaseException) -> bool:
         "trying to allocate",
         "cudamalloc",
         "hip out of memory",
+        "acceleratorerror",
+        "too many resources requested for launch",
     ]
     return any(pattern in exc_msg for pattern in oom_patterns)
 
@@ -339,9 +348,18 @@ def find_optimal_batch_size(
                 break
 
             except Exception as exc:
-                if is_oom_error(exc):
+                exc_str = str(exc).lower()
+                is_probe_failure = (
+                    is_oom_error(exc)
+                    or "acceleratorerror" in type(exc).__name__.lower()
+                    or "cuda error" in exc_str
+                    or "cudamalloc" in exc_str
+                    or "invalid argument" in exc_str
+                    or "device-side assert" in exc_str
+                )
+                if is_probe_failure:
                     if logger:
-                        logger.warning(f"⚠️ Batch size {bs} triggered OOM on {device}. Trying smaller candidate...")
+                        logger.warning(f"⚠️ Batch size {bs} triggered hardware/memory limit ({exc}) on {device}. Trying smaller candidate...")
                         sys.stdout.flush()
                     clear_memory_cache(device)
                     optimizer.zero_grad(set_to_none=True)

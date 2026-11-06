@@ -5,7 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-05
+## [Unreleased] - 2026-11-06
+
+### Added
+- **Vectorized GPU Evaluation Metrics & AUROC Calculation**:
+  - Implemented `compute_binary_metrics_batch` and `compute_binary_auroc_batch` in `sid_unet.metrics.segmentation` computing IoU, Dice/F1, AUROC (via vectorized sort and mid-ranks), Accuracy, Precision, Recall, and Specificity in parallel on GPU tensor memory, eliminating CPU detachment bottlenecks and GPU idle stalls.
+  - Refactored `SegmentationMetricTracker.update` to use batch-parallel metric computation with vectorized per-label and per-dataset statistics aggregation.
+- **Asynchronous CUDA Memory Prefetcher (`CUDAPrefetcher`)**:
+  - Implemented `CUDAPrefetcher` in `sid_unet.dataset.loader` to stream pinned tensor batches from host memory to GPU on a dedicated asynchronous CUDA stream, overlapping data transfer with forward model execution across validation, evaluation, and cross-evaluation loops.
+- **Multi-Threaded Mask Post-Processing**:
+  - Accelerated `MaskPostProcessor.process_batch` with `ThreadPoolExecutor` parallelization for morphological operations across CPU threads, and implemented a tensor binarization fast path on GPU when post-processing is disabled.
+- **Master Cross-Evaluation Upload Support in `sid-push`**:
+  - Enhanced `find_local_checkpoint_artifacts` in `sid_unet.checkpoint_sync` to automatically discover master cross-evaluation reports, JSON matrices, logs, and illustrations (`outputs/cross_evaluation/*`, `cross_eval_reports/*`).
+  - Updated `push_checkpoint` to upload master cross-evaluation artifacts to Hugging Face Hub under both active root `cross_evaluation/` and versioned `versions/{version}/cross_evaluation/`.
+  - Updated `generate_model_card_content` to render master evaluation matrices and updated repository layout in the generated `README.md`.
+
+### Fixed
+- **Validation & Cross-Eval GPU Utilization Fluctuations**:
+  - Resolved GPU utilization drops to 0% during validation and cross-evaluation by vectorizing metric calculation on device, wrapping evaluation loaders with `CUDAPrefetcher`, and running inference under `torch.inference_mode()` with mixed precision (`torch.amp.autocast`).
+- **Bottleneck Warning Timing During Initial Training Warmup**:
+  - Updated `Trainer.train_epoch` to only record steps in `BottleneckDetector` after step 2 of the first epoch (`step_in_epoch > 2` when `epoch == start_epoch`), preventing false acute data stall warnings during initial worker startup and PyArrow cache initialization.
+- **Periodic Checkpoint Timer Epoch Reset**:
+  - Added `reset_periodic_timer()` to `CheckpointManager` and invoked it at the start of each epoch in `Trainer.train()`, ensuring periodic save intervals reset cleanly at epoch boundaries and preventing timer leakage from previous epochs.
+- **Probing Safe Batch Size Failure (Detective SAM)**:
+  - Expanded `is_oom_error` to catch `torch.AcceleratorError` and CUDA driver/device constraint errors (`invalid argument`, `too many resources requested for launch`, `cuda error`).
+  - Enabled graceful fallback in `find_optimal_batch_size` when large candidate batch sizes trigger accelerator/kernel exceptions.
+  - Added batch chunking (`max_chunk = 16`) to `DetectiveSAM._extract_sam2_features` to protect SAM2 Hiera vision encoder against SDPA attention dimension overflow on large candidate batches.
+
+## [0.1.3] - 2026-11-05
 
 ### Added
 - **Per-Dataset Breakdown on Multi-Benchmark Datasets (`--dataset-filter`)**:

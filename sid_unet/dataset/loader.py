@@ -343,6 +343,94 @@ class BackgroundPrefetcher:
             pass
 
 
+class CUDAPrefetcher:
+    """
+    Asynchronous CUDA memory prefetcher that overlaps host-to-device transfers
+    with GPU compute on a dedicated CUDA stream.
+    Works seamlessly with any DataLoader or iterable yielding dictionaries/tuples/tensors.
+    """
+
+    def __init__(self, loader: Any, device: Optional[Union[str, torch.device]] = None):
+        self.loader = loader
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+        self.is_cuda = (self.device.type == "cuda") and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream(device=self.device) if self.is_cuda else None
+        self._iterator: Optional[Iterator[Any]] = None
+        self.next_batch: Any = None
+
+    def __iter__(self) -> CUDAPrefetcher:
+        self._iterator = iter(self.loader)
+        if self.is_cuda:
+            self._preload()
+        return self
+
+    def _to_device(self, item: Any) -> Any:
+        if isinstance(item, torch.Tensor):
+            return item.to(self.device, non_blocking=self.is_cuda)
+        elif isinstance(item, dict):
+            return {k: self._to_device(v) for k, v in item.items()}
+        elif isinstance(item, list):
+            return [self._to_device(v) for v in item]
+        elif isinstance(item, tuple):
+            return tuple(self._to_device(v) for v in item)
+        return item
+
+    def _record_stream(self, item: Any) -> None:
+        if not self.is_cuda:
+            return
+        curr_stream = torch.cuda.current_stream(device=self.device)
+        if isinstance(item, torch.Tensor):
+            item.record_stream(curr_stream)
+        elif isinstance(item, dict):
+            for v in item.values():
+                self._record_stream(v)
+        elif isinstance(item, (list, tuple)):
+            for v in item:
+                self._record_stream(v)
+
+    def _preload(self) -> None:
+        try:
+            raw_batch = next(self._iterator)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_batch = self._to_device(raw_batch)
+
+    def __next__(self) -> Any:
+        if not self.is_cuda:
+            return self._to_device(next(self._iterator))
+
+        if self.next_batch is None:
+            raise StopIteration
+
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+        batch = self.next_batch
+        self._record_stream(batch)
+        self._preload()
+        return batch
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    @property
+    def dataset(self) -> Any:
+        return getattr(self.loader, "dataset", None)
+
+    @property
+    def batch_size(self) -> Optional[int]:
+        return getattr(self.loader, "batch_size", None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.loader, name)
+
+
 class _RawSamplePrefetchIterator:
     """
     Asynchronously pre-buffers raw samples from the streaming HuggingFace/PyArrow dataset.
@@ -1468,16 +1556,20 @@ def create_eval_dataloader(
                 shuffle=False,
                 seed=seed,
             )
-        return DataLoader(
-            eval_dataset,
-            batch_size=batch_size,
-            sampler=eval_sampler,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            multiprocessing_context=mp_context,
-            worker_init_fn=worker_init_fn,
-        )
+        eval_loader_kwargs = {
+            "batch_size": batch_size,
+            "sampler": eval_sampler,
+            "shuffle": False,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "multiprocessing_context": mp_context,
+            "worker_init_fn": worker_init_fn,
+        }
+        if num_workers > 0:
+            eval_loader_kwargs["persistent_workers"] = True
+            eval_loader_kwargs["prefetch_factor"] = int(config.data.get("prefetch_factor", 2))
+        return DataLoader(eval_dataset, **eval_loader_kwargs)
+
 
 
 def resolve_cached_parquet_files(

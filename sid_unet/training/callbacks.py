@@ -251,6 +251,10 @@ class CheckpointManager:
             return score > self.best_score
         return score < self.best_score
 
+    def reset_periodic_timer(self) -> None:
+        """Reset the periodic checkpoint timer at the beginning of an epoch."""
+        self.last_periodic_save_time = time.time()
+
     def should_save_periodic(self, step: Optional[int] = None) -> bool:
         """Check whether the configured checkpoint period or step interval has elapsed."""
         now = time.time()

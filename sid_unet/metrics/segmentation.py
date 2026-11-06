@@ -5,13 +5,21 @@ Includes robust per-sample edge case handling and running accumulators.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 
 
 from scipy.stats import rankdata
+
+__all__ = [
+    "compute_binary_auroc",
+    "compute_binary_auroc_batch",
+    "compute_binary_metrics",
+    "compute_binary_metrics_batch",
+    "SegmentationMetricTracker",
+]
 
 
 def compute_binary_auroc(
@@ -158,6 +166,178 @@ def compute_binary_metrics(
     }
 
 
+def compute_binary_auroc_batch(
+    pred_probs: torch.Tensor,
+    target_masks: torch.Tensor,
+    is_logit: Optional[bool] = None,
+) -> torch.Tensor:
+    """
+    Compute AUROC curve on continuous pixel probabilities across a batch of masks on device.
+    Robustly handles single-class masks (all-authentic or all-tampered), soft labels, ties, and raw logits.
+
+    Args:
+        pred_probs: Tensor of shape (B, 1, H, W), (B, H, W), or (B, N).
+        target_masks: Tensor of same shape with ground truth values.
+        is_logit: Optional bool indicating if pred_probs are logits.
+
+    Returns:
+        torch.Tensor of shape (B,) containing AUROC scores in [0.0, 1.0].
+    """
+    if pred_probs.dim() > 2:
+        p = pred_probs.reshape(pred_probs.size(0), -1).float()
+    else:
+        p = pred_probs.float()
+
+    if target_masks.dim() > 2:
+        t = target_masks.reshape(target_masks.size(0), -1).float()
+    else:
+        t = target_masks.float()
+
+    p = torch.nan_to_num(p, nan=0.0, posinf=1.0, neginf=0.0)
+    t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0)
+
+    if is_logit is True:
+        p = torch.sigmoid(p.clamp(-500.0, 500.0))
+    elif is_logit is False:
+        pass
+    elif (p < 0.0).any() or (p > 1.0).any():
+        p = torch.sigmoid(p.clamp(-500.0, 500.0))
+
+    t_bin = (t >= 0.5).long()
+    b, n = p.shape
+    device = p.device
+
+    n_pos = t_bin.sum(dim=-1).double()
+    n_neg = (n - n_pos).double()
+
+    # Fast path: sort along last dim
+    sorted_p, sort_idx = torch.sort(p, dim=-1)
+    sorted_t = torch.gather(t_bin, dim=-1, index=sort_idx)
+
+    diff = sorted_p[:, 1:] != sorted_p[:, :-1]
+    has_ties = diff.sum(dim=-1) < (n - 1)
+
+    ranks = torch.arange(1, n + 1, device=device, dtype=torch.float64).unsqueeze(0).expand(b, n)
+    pos_rank_sum = (ranks * sorted_t.double()).sum(dim=-1)
+    u_stat = pos_rank_sum - (n_pos * (n_pos + 1.0)) / 2.0
+    auroc_no_ties = u_stat / (n_pos * n_neg).clamp(min=1e-7)
+
+    aurocs = torch.empty(b, dtype=torch.float32, device=device)
+    for i in range(b):
+        np_i = int(n_pos[i].item())
+        nn_i = int(n_neg[i].item())
+        if np_i == 0:
+            mp = float(p[i].mean().item())
+            aurocs[i] = 1.0 if mp < 0.5 else max(0.0, 1.0 - mp)
+        elif nn_i == 0:
+            mp = float(p[i].mean().item())
+            aurocs[i] = 1.0 if mp >= 0.5 else max(0.0, mp)
+        elif not has_ties[i].item():
+            aurocs[i] = float(auroc_no_ties[i].item())
+        else:
+            diff_i = diff[i]
+            if not diff_i.any():
+                aurocs[i] = 0.5
+            else:
+                split_idx = torch.nonzero(diff_i, as_tuple=False).flatten() + 1
+                starts = torch.cat([torch.tensor([0], device=device), split_idx])
+                ends = torch.cat([split_idx, torch.tensor([n], device=device)])
+                midranks = (starts + ends + 1).to(torch.float64) / 2.0
+                repeats = ends - starts
+                sorted_ranks = torch.repeat_interleave(midranks, repeats)
+                pos_r_sum = (sorted_ranks * sorted_t[i].to(torch.float64)).sum().item()
+                u_i = pos_r_sum - (np_i * (np_i + 1)) / 2.0
+                aurocs[i] = float(u_i / (np_i * nn_i))
+
+    return aurocs
+
+
+def compute_binary_metrics_batch(
+    pred_masks: torch.Tensor,
+    target_masks: torch.Tensor,
+    threshold: float = 0.5,
+    is_logit: Optional[bool] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute binary segmentation metrics (IoU, Dice/F1, AUROC, Accuracy, Precision, Recall, Specificity)
+    in parallel across a batch on the tensor's native device.
+
+    Args:
+        pred_masks: Tensor of shape (B, 1, H, W) or (B, H, W) with logits or probabilities.
+        target_masks: Tensor of shape (B, 1, H, W) or (B, H, W) with ground truth masks.
+        threshold: Binarization probability threshold.
+        is_logit: Optional bool indicating if pred_masks are raw logits.
+
+    Returns:
+        Dict mapping metric name to 1D Tensor of shape (B,) on same device.
+    """
+    if pred_masks.dim() > 2:
+        p_raw = pred_masks.reshape(pred_masks.size(0), -1).float()
+    else:
+        p_raw = pred_masks.float()
+
+    if target_masks.dim() > 2:
+        t_raw = target_masks.reshape(target_masks.size(0), -1).float()
+    else:
+        t_raw = target_masks.float()
+
+    p_raw = torch.nan_to_num(p_raw, nan=0.0, posinf=1.0, neginf=0.0)
+    t_raw = torch.nan_to_num(t_raw, nan=0.0, posinf=1.0, neginf=0.0)
+
+    if is_logit is True:
+        p_probs = torch.sigmoid(p_raw.clamp(-500.0, 500.0))
+    elif is_logit is False:
+        p_probs = p_raw
+    elif (p_raw < 0.0).any() or (p_raw > 1.0).any():
+        p_probs = torch.sigmoid(p_raw.clamp(-500.0, 500.0))
+    else:
+        p_probs = p_raw
+
+    p_bin = p_probs >= threshold
+    t_bin = t_raw >= threshold
+
+    tp = (p_bin & t_bin).sum(dim=-1).float()
+    fp = (p_bin & (~t_bin)).sum(dim=-1).float()
+    fn = ((~p_bin) & t_bin).sum(dim=-1).float()
+    tn = ((~p_bin) & (~t_bin)).sum(dim=-1).float()
+    total_pixels = float(p_raw.size(-1))
+
+    pixel_acc = (tp + tn) / max(total_pixels, 1.0)
+    union = tp + fp + fn
+    iou = torch.where(union == 0, torch.ones_like(union), tp / union.clamp(min=1e-7))
+    dice = torch.where(union == 0, torch.ones_like(union), (2.0 * tp) / (2.0 * tp + fp + fn).clamp(min=1e-7))
+    pixel_f1 = dice
+
+    prec_denom = tp + fp
+    precision = torch.where(prec_denom > 0, tp / prec_denom.clamp(min=1e-7), torch.where(fn == 0, torch.ones_like(tp), torch.zeros_like(tp)))
+
+    rec_denom = tp + fn
+    recall = torch.where(rec_denom > 0, tp / rec_denom.clamp(min=1e-7), torch.where(fp == 0, torch.ones_like(tp), torch.zeros_like(tp)))
+
+    spec_denom = tn + fp
+    specificity = torch.where(spec_denom > 0, tn / spec_denom.clamp(min=1e-7), torch.ones_like(tn))
+
+    auroc = compute_binary_auroc_batch(p_probs, t_raw, is_logit=False)
+
+    num_pos = (tp + fn).long()
+    has_pos = (tp + fn) > 0
+
+    return {
+        "iou": iou,
+        "dice": dice,
+        "f1": pixel_f1,
+        "pixel_f1": pixel_f1,
+        "auroc": auroc,
+        "pixel_auroc": auroc,
+        "pixel_acc": pixel_acc,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "num_positive_pixels": num_pos,
+        "has_positive": has_pos,
+    }
+
+
 class SegmentationMetricTracker:
     """Accumulates and computes dataset-wide aggregated and per-label segmentation metrics including F1 and AUROC.
     
@@ -228,120 +408,103 @@ class SegmentationMetricTracker:
         target_masks = target_masks.float()
 
         b = pred_masks.size(0)
+        if b == 0:
+            return
 
-        # Distinguish between raw logits and already probabilities/binary masks
-        pred_float = pred_masks.float()
-        if is_logit is True:
-            probs = torch.sigmoid(pred_float)
-        elif is_logit is False:
-            probs = pred_float
-        else:
-            # Auto-detect: if values fall outside [0, 1], they are raw logits requiring sigmoid
-            if (pred_float < 0.0).any() or (pred_float > 1.0).any():
-                probs = torch.sigmoid(pred_float)
-            else:
-                probs = pred_float
+        batch_metrics = compute_binary_metrics_batch(
+            pred_masks,
+            target_masks,
+            threshold=self.threshold,
+            is_logit=is_logit,
+        )
 
+        has_pos = batch_metrics["has_positive"]
+        num_pos = int(has_pos.sum().item())
+
+        self.total_samples += b
+        self.positive_samples += num_pos
+        self.zero_positive_samples += (b - num_pos)
+
+        # Global sums
+        for k in self.metrics_sum:
+            self.metrics_sum[k] += float(batch_metrics[k].sum().item())
+
+        if num_pos > 0:
+            for k in self.positive_metrics_sum:
+                self.positive_metrics_sum[k] += float(batch_metrics[k][has_pos].sum().item())
+
+        # Per-label stats
         if labels is not None:
             labels_flat = labels.view(-1)
-        else:
-            labels_flat = None
-
-        for i in range(b):
-            m = compute_binary_metrics(
-                probs[i],
-                target_masks[i],
-                threshold=self.threshold,
-                is_logit=False,
-            )
-            self.total_samples += 1
-            has_pos = m.get("has_positive", True)
-            if has_pos:
-                self.positive_samples += 1
-                for k in self.positive_metrics_sum:
-                    self.positive_metrics_sum[k] += m.get(k, 0.0)
-            else:
-                self.zero_positive_samples += 1
-
-            for k in self.metrics_sum:
-                self.metrics_sum[k] += m.get(k, 0.0)
-
-            if labels_flat is not None and i < len(labels_flat):
-                lbl = int(labels_flat[i].item())
+            unique_labels = torch.unique(labels_flat)
+            for lbl_t in unique_labels:
+                lbl = int(lbl_t.item())
                 if lbl not in self.per_label_stats:
                     self.per_label_stats[lbl] = {
-                        "iou_sum": 0.0,
-                        "dice_sum": 0.0,
-                        "f1_sum": 0.0,
-                        "auroc_sum": 0.0,
-                        "pixel_acc_sum": 0.0,
-                        "precision_sum": 0.0,
-                        "recall_sum": 0.0,
-                        "specificity_sum": 0.0,
-                        "count": 0,
-                        "pos_count": 0,
-                        "iou_pos_sum": 0.0,
-                        "dice_pos_sum": 0.0,
-                        "f1_pos_sum": 0.0,
-                        "precision_pos_sum": 0.0,
-                        "recall_pos_sum": 0.0,
+                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0,
+                        "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0,
+                        "specificity_sum": 0.0, "count": 0, "pos_count": 0,
+                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0,
+                        "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
                     }
-                self.per_label_stats[lbl]["iou_sum"] += m["iou"]
-                self.per_label_stats[lbl]["dice_sum"] += m["dice"]
-                self.per_label_stats[lbl]["f1_sum"] += m["f1"]
-                self.per_label_stats[lbl]["auroc_sum"] += m["auroc"]
-                self.per_label_stats[lbl]["pixel_acc_sum"] += m["pixel_acc"]
-                self.per_label_stats[lbl]["precision_sum"] += m["precision"]
-                self.per_label_stats[lbl]["recall_sum"] += m["recall"]
-                self.per_label_stats[lbl]["specificity_sum"] += m["specificity"]
-                self.per_label_stats[lbl]["count"] += 1
-                if has_pos:
-                    self.per_label_stats[lbl]["pos_count"] += 1
-                    self.per_label_stats[lbl]["iou_pos_sum"] += m["iou"]
-                    self.per_label_stats[lbl]["dice_pos_sum"] += m["dice"]
-                    self.per_label_stats[lbl]["f1_pos_sum"] += m["f1"]
-                    self.per_label_stats[lbl]["precision_pos_sum"] += m["precision"]
-                    self.per_label_stats[lbl]["recall_pos_sum"] += m["recall"]
+                mask_lbl = (labels_flat == lbl_t)
+                cnt_lbl = int(mask_lbl.sum().item())
+                pos_mask_lbl = mask_lbl & has_pos
+                pos_cnt_lbl = int(pos_mask_lbl.sum().item())
 
-            if datasets is not None and i < len(datasets):
-                raw_ds = datasets[i]
-                if raw_ds is not None and str(raw_ds).strip():
-                    ds_name = str(raw_ds).strip()
-                    if ds_name not in self.per_dataset_stats:
-                        self.per_dataset_stats[ds_name] = {
-                            "iou_sum": 0.0,
-                            "dice_sum": 0.0,
-                            "f1_sum": 0.0,
-                            "auroc_sum": 0.0,
-                            "pixel_acc_sum": 0.0,
-                            "precision_sum": 0.0,
-                            "recall_sum": 0.0,
-                            "specificity_sum": 0.0,
-                            "count": 0,
-                            "pos_count": 0,
-                            "iou_pos_sum": 0.0,
-                            "dice_pos_sum": 0.0,
-                            "f1_pos_sum": 0.0,
-                            "precision_pos_sum": 0.0,
-                            "recall_pos_sum": 0.0,
-                        }
-                    ds_stat = self.per_dataset_stats[ds_name]
-                    ds_stat["iou_sum"] += m["iou"]
-                    ds_stat["dice_sum"] += m["dice"]
-                    ds_stat["f1_sum"] += m["f1"]
-                    ds_stat["auroc_sum"] += m["auroc"]
-                    ds_stat["pixel_acc_sum"] += m["pixel_acc"]
-                    ds_stat["precision_sum"] += m["precision"]
-                    ds_stat["recall_sum"] += m["recall"]
-                    ds_stat["specificity_sum"] += m["specificity"]
-                    ds_stat["count"] += 1
-                    if has_pos:
-                        ds_stat["pos_count"] += 1
-                        ds_stat["iou_pos_sum"] += m["iou"]
-                        ds_stat["dice_pos_sum"] += m["dice"]
-                        ds_stat["f1_pos_sum"] += m["f1"]
-                        ds_stat["precision_pos_sum"] += m["precision"]
-                        ds_stat["recall_pos_sum"] += m["recall"]
+                l_stat = self.per_label_stats[lbl]
+                l_stat["count"] += cnt_lbl
+                l_stat["pos_count"] += pos_cnt_lbl
+                l_stat["iou_sum"] += float(batch_metrics["iou"][mask_lbl].sum().item())
+                l_stat["dice_sum"] += float(batch_metrics["dice"][mask_lbl].sum().item())
+                l_stat["f1_sum"] += float(batch_metrics["f1"][mask_lbl].sum().item())
+                l_stat["auroc_sum"] += float(batch_metrics["auroc"][mask_lbl].sum().item())
+                l_stat["pixel_acc_sum"] += float(batch_metrics["pixel_acc"][mask_lbl].sum().item())
+                l_stat["precision_sum"] += float(batch_metrics["precision"][mask_lbl].sum().item())
+                l_stat["recall_sum"] += float(batch_metrics["recall"][mask_lbl].sum().item())
+                l_stat["specificity_sum"] += float(batch_metrics["specificity"][mask_lbl].sum().item())
+
+                if pos_cnt_lbl > 0:
+                    l_stat["iou_pos_sum"] += float(batch_metrics["iou"][pos_mask_lbl].sum().item())
+                    l_stat["dice_pos_sum"] += float(batch_metrics["dice"][pos_mask_lbl].sum().item())
+                    l_stat["f1_pos_sum"] += float(batch_metrics["f1"][pos_mask_lbl].sum().item())
+                    l_stat["precision_pos_sum"] += float(batch_metrics["precision"][pos_mask_lbl].sum().item())
+                    l_stat["recall_pos_sum"] += float(batch_metrics["recall"][pos_mask_lbl].sum().item())
+
+        # Per-dataset stats
+        if datasets is not None:
+            for i, raw_ds in enumerate(datasets):
+                if i >= b:
+                    break
+                if raw_ds is None or not str(raw_ds).strip():
+                    continue
+                ds_name = str(raw_ds).strip()
+                if ds_name not in self.per_dataset_stats:
+                    self.per_dataset_stats[ds_name] = {
+                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0,
+                        "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0,
+                        "specificity_sum": 0.0, "count": 0, "pos_count": 0,
+                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0,
+                        "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
+                    }
+                ds_stat = self.per_dataset_stats[ds_name]
+                ds_stat["count"] += 1
+                ds_stat["iou_sum"] += float(batch_metrics["iou"][i].item())
+                ds_stat["dice_sum"] += float(batch_metrics["dice"][i].item())
+                ds_stat["f1_sum"] += float(batch_metrics["f1"][i].item())
+                ds_stat["auroc_sum"] += float(batch_metrics["auroc"][i].item())
+                ds_stat["pixel_acc_sum"] += float(batch_metrics["pixel_acc"][i].item())
+                ds_stat["precision_sum"] += float(batch_metrics["precision"][i].item())
+                ds_stat["recall_sum"] += float(batch_metrics["recall"][i].item())
+                ds_stat["specificity_sum"] += float(batch_metrics["specificity"][i].item())
+
+                if bool(has_pos[i].item()):
+                    ds_stat["pos_count"] += 1
+                    ds_stat["iou_pos_sum"] += float(batch_metrics["iou"][i].item())
+                    ds_stat["dice_pos_sum"] += float(batch_metrics["dice"][i].item())
+                    ds_stat["f1_pos_sum"] += float(batch_metrics["f1"][i].item())
+                    ds_stat["precision_pos_sum"] += float(batch_metrics["precision"][i].item())
+                    ds_stat["recall_pos_sum"] += float(batch_metrics["recall"][i].item())
 
     def compute_per_dataset(self) -> Dict[str, Dict[str, float]]:
         """

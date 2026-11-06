@@ -549,6 +549,19 @@ class DetectiveSAM(nn.Module):
 
         # Use Sam2Model vision feature extraction
         b_sz = pixel_values.shape[0]
+        max_chunk = 16
+        if b_sz > max_chunk:
+            sub_embeddings: List[List[torch.Tensor]] = []
+            for start_idx in range(0, b_sz, max_chunk):
+                chunk = pixel_values[start_idx : start_idx + max_chunk]
+                chunk_embs = self._extract_sam2_features(chunk)
+                sub_embeddings.append(chunk_embs)
+            concatenated = []
+            num_scales = len(sub_embeddings[0])
+            for s in range(num_scales):
+                concatenated.append(torch.cat([se[s] for se in sub_embeddings], dim=0))
+            return concatenated
+
         image_outputs = self.sam2_model.get_image_features(pixel_values, return_dict=True)
         feature_maps = list(image_outputs.fpn_hidden_states)
 

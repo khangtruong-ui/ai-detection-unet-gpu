@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
+from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len, CUDAPrefetcher
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
@@ -487,8 +487,11 @@ def eval_single_batch(
     else:
         filtered_kwargs = model_kwargs
 
-    outputs = forward_model(images, **filtered_kwargs) if filtered_kwargs else forward_model(images)
-    loss, _ = loss_fn(outputs, masks, labels)
+    use_amp = (device.type == "cuda") and torch.cuda.is_available()
+    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        outputs = forward_model(images, **filtered_kwargs) if filtered_kwargs else forward_model(images)
+        loss, _ = loss_fn(outputs, masks, labels)
     if isinstance(outputs, (tuple, list)):
         mask_logits = outputs[0]
         class_logits = outputs[1] if len(outputs) > 1 else None
@@ -705,8 +708,9 @@ def evaluate_checkpoint_on_config(
 
     clear_memory_cache(device)
     eval_total = safe_dataloader_len(eval_loader)
+    prefetcher = CUDAPrefetcher(eval_loader, device=device)
     pbar = tqdm(
-        eval_loader,
+        prefetcher,
         desc=f"Cross-Eval [{ckpt_run_name} x {cfg_proj_name}] ({resolved_split})",
         total=eval_total,
         leave=True,
@@ -714,7 +718,7 @@ def evaluate_checkpoint_on_config(
         dynamic_ncols=True,
     )
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in pbar:
             b_sz = len(batch["image"])
             try:
