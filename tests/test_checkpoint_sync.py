@@ -291,3 +291,57 @@ def test_verify_hf_repo_checkpointable_live_testing_model():
     ok, err = verify_hf_repo_checkpointable("KhangTruong/Testing-model", raise_on_error=False)
     assert ok is True, f"Live verification failed: {err}"
 
+
+def test_find_local_checkpoint_artifacts_with_cross_eval():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_dir = os.path.join(tmpdir, "checkpoints")
+        ce_dir = os.path.join(tmpdir, "cross_evaluation")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(os.path.join(ce_dir, "illustrations"), exist_ok=True)
+
+        torch.save({"epoch": 1}, os.path.join(ckpt_dir, "checkpoint_best.pt"))
+        with open(os.path.join(tmpdir, "config.yaml"), "w") as f:
+            f.write("test: 1\n")
+        with open(os.path.join(ce_dir, "master_cross_evaluation_report.md"), "w") as f:
+            f.write("# Master Report\n")
+        with open(os.path.join(ce_dir, "illustrations", "heatmap.png"), "w") as f:
+            f.write("fake_png")
+
+        artifacts = find_local_checkpoint_artifacts(source_dir=tmpdir)
+        assert "checkpoint_best.pt" in artifacts["checkpoints"]
+        assert "config.yaml" in artifacts["configs"]
+        assert "master_cross_evaluation_report.md" in artifacts["cross_eval"]
+        assert "illustrations/heatmap.png" in artifacts["cross_eval"]
+
+
+def test_push_checkpoint_includes_cross_eval(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_dir = os.path.join(tmpdir, "checkpoints")
+        ce_dir = os.path.join(tmpdir, "cross_evaluation")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(ce_dir, exist_ok=True)
+
+        torch.save({"epoch": 1, "best_score": 0.85}, os.path.join(ckpt_dir, "checkpoint_best.pt"))
+        with open(os.path.join(ce_dir, "master_cross_evaluation_report.md"), "w") as f:
+            f.write("# Master Cross-Eval Summary\n")
+
+        mock_api = MagicMock()
+        monkeypatch.setattr("sid_unet.checkpoint_sync.HfApi", lambda **kwargs: mock_api)
+        monkeypatch.setattr("sid_unet.checkpoint_sync.verify_hf_repo_checkpointable", lambda *args, **kwargs: True)
+
+        res = push_checkpoint(
+            repo="KhangTruong/test-model",
+            version="v1",
+            source_dir=tmpdir,
+            token="fake_token",
+        )
+
+        assert mock_api.create_commit.called
+        ops = mock_api.create_commit.call_args[1]["operations"]
+        op_paths = [op.path_in_repo for op in ops]
+
+        assert "cross_evaluation/master_cross_evaluation_report.md" in op_paths
+        assert "versions/v1/cross_evaluation/master_cross_evaluation_report.md" in op_paths
+        assert "README.md" in op_paths
+
+

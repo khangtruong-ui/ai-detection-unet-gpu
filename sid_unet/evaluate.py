@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
+from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len, CUDAPrefetcher
 from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
@@ -279,8 +279,11 @@ def eval_single_batch(
         except Exception:
             pass
 
-    outputs = model(images, **model_kwargs) if model_kwargs else model(images)
-    loss, _ = loss_fn(outputs, masks, labels)
+    use_amp = (device.type == "cuda") and torch.cuda.is_available()
+    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        outputs = model(images, **model_kwargs) if model_kwargs else model(images)
+        loss, _ = loss_fn(outputs, masks, labels)
 
     b_size = images.size(0)
     if isinstance(outputs, (tuple, list)):
@@ -595,8 +598,9 @@ def evaluate_single_checkpoint(
 
     clear_memory_cache(device)
     eval_total = safe_dataloader_len(eval_loader)
-    pbar = tqdm(eval_loader, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True, file=sys.stdout, dynamic_ncols=True)
-    with torch.no_grad():
+    prefetcher = CUDAPrefetcher(eval_loader, device=device)
+    pbar = tqdm(prefetcher, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True, file=sys.stdout, dynamic_ncols=True)
+    with torch.inference_mode():
         for batch in pbar:
             b_sz = len(batch["image"])
             try:

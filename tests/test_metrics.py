@@ -373,3 +373,55 @@ def test_segmentation_tracker_per_label_with_filter_zero_positive():
     assert per_label[0]["positive_samples"] == 0
 
 
+def test_compute_binary_metrics_batch():
+    from sid_unet.metrics.segmentation import compute_binary_metrics_batch, compute_binary_auroc_batch
+
+    targets = torch.zeros((3, 1, 16, 16), dtype=torch.float32)
+    targets[1, 0, :8, :] = 1.0
+    targets[2, 0, :8, :] = 1.0
+
+    preds = torch.zeros((3, 1, 16, 16), dtype=torch.float32)
+    preds[1, 0, :8, :] = 1.0
+    preds[2, 0, 8:, :] = 1.0
+
+    res = compute_binary_metrics_batch(preds, targets, threshold=0.5, is_logit=False)
+    assert res["iou"].shape == (3,)
+    assert res["iou"][0].item() == 1.0
+    assert res["iou"][1].item() == 1.0
+    assert res["iou"][2].item() == 0.0
+
+    assert res["dice"][0].item() == 1.0
+    assert res["dice"][1].item() == 1.0
+    assert res["dice"][2].item() == 0.0
+
+    assert res["pixel_acc"][0].item() == 1.0
+    assert res["pixel_acc"][1].item() == 1.0
+    assert res["pixel_acc"][2].item() == 0.0
+
+    assert res["auroc"][1].item() == 1.0
+    assert bool(res["has_positive"][0].item()) is False
+    assert bool(res["has_positive"][1].item()) is True
+    assert bool(res["has_positive"][2].item()) is True
+
+
+def test_compute_binary_auroc_batch_ties_and_extremes():
+    from sid_unet.metrics.segmentation import compute_binary_auroc_batch
+
+    p = torch.tensor([
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [0.2, 0.2, 0.8, 0.8],
+    ])
+    t = torch.tensor([
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ])
+
+    aurocs = compute_binary_auroc_batch(p, t, is_logit=False)
+    assert aurocs[0].item() == 1.0
+    assert aurocs[1].item() == 1.0
+    assert aurocs[2].item() == 1.0
+
+
+

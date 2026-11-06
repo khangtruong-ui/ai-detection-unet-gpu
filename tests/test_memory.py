@@ -289,3 +289,53 @@ def test_find_optimal_batch_size_diffusion_diff_minimized():
     )
     assert opt_bs in (1, 2, 4, 8)
 
+
+def test_is_oom_error_accelerator_error():
+    assert is_oom_error(RuntimeError("CUDA error: out of memory"))
+    assert is_oom_error(RuntimeError("torch.AcceleratorError: CUDA error: invalid argument"))
+    assert is_oom_error(RuntimeError("CUDA error: too many resources requested for launch"))
+    assert not is_oom_error(ValueError("Invalid shape provided"))
+
+
+def test_find_optimal_batch_size_detective_sam():
+    from sid_unet.models.detective_sam import DetectiveSAM
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DetectiveSAM(use_dummy=True, in_channels=3)
+
+    opt_bs = find_optimal_batch_size(
+        model=model,
+        sample_shape=(3, 64, 64),
+        mask_shape=(64, 64),
+        device=device,
+        max_batch_size=16,
+        min_batch_size=1,
+        use_amp=(device.type == "cuda"),
+        aux_classifier=False,
+        force_probe=True,
+    )
+    assert opt_bs in (1, 2, 4, 8, 16)
+
+
+def test_find_optimal_batch_size_accelerator_recovery():
+    class DummyFailingModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3, padding=1)
+
+        def forward(self, x):
+            if x.size(0) > 4:
+                raise RuntimeError("torch.AcceleratorError: CUDA error: invalid argument from sdpa")
+            return self.conv(x)
+
+    model = DummyFailingModel()
+    safe_bs = find_optimal_batch_size(
+        model=model,
+        sample_shape=(3, 32, 32),
+        max_batch_size=16,
+        min_batch_size=1,
+        force_probe=True,
+    )
+    assert safe_bs <= 4
+
+

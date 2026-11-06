@@ -9,6 +9,7 @@ Provides algorithms to clean, regularize, and refine raw UNet predicted segmenta
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -285,14 +286,45 @@ class MaskPostProcessor:
         else:
             probs = masks
 
+        if not self.enabled:
+            # Fast tensor binarization directly on device
+            bin_tensor = (probs >= self.threshold).to(dtype=dtype)
+            if bin_tensor.ndim == 3:
+                bin_tensor = bin_tensor.unsqueeze(1)
+            stats_list = [
+                {
+                    "enabled": False,
+                    "original_area": float(bin_tensor[i].sum().item()),
+                    "final_area": float(bin_tensor[i].sum().item()),
+                    "pixels_changed": 0,
+                    "pixel_change_ratio": 0.0,
+                    "components_removed": 0,
+                    "hole_pixels_filled": 0,
+                }
+                for i in range(b_sz)
+            ]
+            return bin_tensor, stats_list
+
         processed_tensors = []
         stats_list = []
 
-        for i in range(b_sz):
-            sample_m = probs[i]
+        if b_sz > 1:
+            # Multi-threaded execution across CPU cores for morphological operations
+            prob_slices = [probs[i].detach().cpu().float().numpy() for i in range(b_sz)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, b_sz)) as executor:
+                results = list(executor.map(self.process_single, prob_slices))
+            for proc_np, stats in results:
+                stats_list.append(stats)
+                proc_t = torch.from_numpy(proc_np).to(device=device, dtype=dtype)
+                if proc_t.ndim == 2:
+                    proc_t = proc_t.unsqueeze(0)
+                elif proc_t.ndim == 3 and proc_t.size(0) != 1:
+                    proc_t = proc_t[0:1]
+                processed_tensors.append(proc_t)
+        else:
+            sample_m = probs[0]
             proc_np, stats = self.process_single(sample_m)
             stats_list.append(stats)
-
             proc_t = torch.from_numpy(proc_np).to(device=device, dtype=dtype)
             if proc_t.ndim == 2:
                 proc_t = proc_t.unsqueeze(0)

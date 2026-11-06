@@ -29,7 +29,7 @@ from sid_unet.utils.distributed import (
     broadcast_scalar,
 )
 
-from sid_unet.dataset.loader import safe_dataloader_len
+from sid_unet.dataset.loader import safe_dataloader_len, CUDAPrefetcher
 from sid_unet.losses.auxiliary import SIDTotalLoss, build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
@@ -967,6 +967,8 @@ class Trainer:
                 )
                 sys.stdout.flush()
                 self.config.data.batch_size = adjusted_bs
+                self.config.data.base_batch_size = adjusted_bs
+                self.config.data._batch_size_scaled = True
                 self.config.training.gradient_accumulation_steps = adjusted_grad_accum
                 self.gradient_accumulation_steps = adjusted_grad_accum
 
@@ -1284,7 +1286,9 @@ class Trainer:
                     prev_batch_end_time = time.perf_counter()
 
                     if self.bottleneck_detector is not None:
-                        self.bottleneck_detector.record_step(data_time=data_time, compute_time=compute_time)
+                        is_first_epoch = (epoch == self.start_epoch)
+                        if not (is_first_epoch and step_in_epoch <= 2):
+                            self.bottleneck_detector.record_step(data_time=data_time, compute_time=compute_time)
 
                     net_str = self.network_monitor.get_speed_str() if self.network_monitor is not None else "0.0 MB/s"
                     postfix_dict = {
@@ -1438,7 +1442,8 @@ class Trainer:
             self.logger.info(f"⏳ [{split_name.title()}]: Evaluating model across {val_count_str} batches...")
             sys.stdout.flush()
 
-        pbar = tqdm(target_loader, desc=desc_str, total=val_total, leave=(epoch is None), disable=not self.is_main_process, file=sys.stdout, dynamic_ncols=True)
+        prefetcher = CUDAPrefetcher(target_loader, device=self.device)
+        pbar = tqdm(prefetcher, desc=desc_str, total=val_total, leave=(epoch is None), disable=not self.is_main_process, file=sys.stdout, dynamic_ncols=True)
         if self.is_main_process:
             pbar.refresh()
             sys.stdout.flush()
@@ -1553,6 +1558,8 @@ class Trainer:
                 for epoch in range(self.start_epoch, self.epochs + 1):
                     self._current_epoch = epoch
                     epoch_start = time.time()
+                    if self.ckpt_manager is not None:
+                        self.ckpt_manager.reset_periodic_timer()
                     train_metrics = self.train_epoch(epoch)
 
                     if self._early_stopped:
