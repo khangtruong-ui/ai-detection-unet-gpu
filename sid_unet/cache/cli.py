@@ -433,6 +433,8 @@ def cli_main(args: Optional[list] = None) -> Any:
         else:
             manager.close()
 
+        if args is None:
+            sys.exit(0)
         return {"vector_db": [saved_file]}
 
     logger.info(
@@ -452,6 +454,8 @@ def cli_main(args: Optional[list] = None) -> Any:
     if push_hub and hf_repo:
         logger.info(f"🔗 Hugging Face Hub dataset URL: https://huggingface.co/datasets/{hf_repo}")
 
+    if args is None:
+        sys.exit(0)
     return all_shards
 
 
