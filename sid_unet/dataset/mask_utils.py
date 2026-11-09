@@ -76,6 +76,95 @@ def _extract_and_binarize_mask(
     return (mask_arr >= threshold).astype(np.float32)
 
 
+def decode_mask_bytes(
+    mask_input: Optional[Union[bytes, bytearray, io.BytesIO, Dict[str, Any], np.ndarray, torch.Tensor, Image.Image]],
+    image_size: Optional[Tuple[int, int]] = None,
+    threshold: Optional[float] = 0.5,
+) -> np.ndarray:
+    """
+    Decode raw mask bytes (e.g. PNG bytes), buffer, or array into a float32 numpy array.
+
+    Args:
+        mask_input: Encoded mask image bytes (e.g. PNG), bytearray, BytesIO stream,
+            Hugging Face dict format (e.g. {'bytes': ...}), PIL Image, numpy array, or Tensor.
+        image_size: Optional target size (height, width) or (width, height) to resize mask.
+            If None, preserves the original dimensions of the decoded image.
+        threshold: Optional binarization threshold in [0.0, 1.0]. If specified (default 0.5),
+            binarizes array to {0.0, 1.0}. If None, returns normalized continuous values in [0.0, 1.0].
+
+    Returns:
+        np.ndarray: 2D float32 numpy array with shape (H, W).
+    """
+    if mask_input is None:
+        if image_size is not None:
+            w, h = image_size if len(image_size) == 2 else (image_size[1], image_size[0])
+            return np.zeros((h, w), dtype=np.float32)
+        return np.zeros((256, 256), dtype=np.float32)
+
+    if isinstance(mask_input, dict):
+        if "bytes" in mask_input and mask_input["bytes"] is not None:
+            mask_input = Image.open(io.BytesIO(mask_input["bytes"]))
+        elif "path" in mask_input and mask_input["path"] is not None:
+            mask_input = Image.open(mask_input["path"])
+        else:
+            if image_size is not None:
+                w, h = image_size if len(image_size) == 2 else (image_size[1], image_size[0])
+                return np.zeros((h, w), dtype=np.float32)
+            return np.zeros((256, 256), dtype=np.float32)
+    elif isinstance(mask_input, (bytes, bytearray)):
+        if len(mask_input) == 0:
+            if image_size is not None:
+                w, h = image_size if len(image_size) == 2 else (image_size[1], image_size[0])
+                return np.zeros((h, w), dtype=np.float32)
+            return np.zeros((256, 256), dtype=np.float32)
+        mask_input = Image.open(io.BytesIO(mask_input))
+    elif isinstance(mask_input, io.BytesIO):
+        mask_input = Image.open(mask_input)
+
+    if isinstance(mask_input, Image.Image):
+        try:
+            mask_input.load()
+        except Exception:
+            pass
+        mask_gray = mask_input.convert("L")
+        if image_size is not None:
+            w, h = image_size if len(image_size) == 2 else (image_size[1], image_size[0])
+            if mask_gray.size != (w, h):
+                mask_gray = mask_gray.resize((w, h), resample=Image.NEAREST)
+        mask_arr = np.array(mask_gray, dtype=np.float32) / 255.0
+    elif isinstance(mask_input, torch.Tensor):
+        t = mask_input.float()
+        if t.ndim == 3 and t.size(0) in (1, 3, 4):
+            t = t.mean(dim=0)
+        mask_arr = t.detach().cpu().numpy()
+        if mask_arr.max() > 1.0:
+            mask_arr = mask_arr / 255.0
+        if image_size is not None:
+            w, h = image_size if len(image_size) == 2 else (image_size[1], image_size[0])
+            if mask_arr.shape != (h, w):
+                pil_mask = Image.fromarray((mask_arr * 255).astype(np.uint8))
+                pil_mask = pil_mask.resize((w, h), resample=Image.NEAREST)
+                mask_arr = np.array(pil_mask, dtype=np.float32) / 255.0
+    elif isinstance(mask_input, np.ndarray):
+        mask_arr = mask_input.astype(np.float32)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr.mean(axis=2) if mask_arr.shape[2] in (3, 4) else mask_arr[0]
+        if mask_arr.max() > 1.0:
+            mask_arr = mask_arr / 255.0
+        if image_size is not None:
+            w, h = image_size if len(image_size) == 2 else (image_size[1], image_size[0])
+            if mask_arr.shape != (h, w):
+                pil_mask = Image.fromarray((mask_arr * 255).astype(np.uint8))
+                pil_mask = pil_mask.resize((w, h), resample=Image.NEAREST)
+                mask_arr = np.array(pil_mask, dtype=np.float32) / 255.0
+    else:
+        raise TypeError(f"Unsupported mask input type: {type(mask_input)}")
+
+    if threshold is not None:
+        return (mask_arr >= threshold).astype(np.float32)
+    return mask_arr.astype(np.float32)
+
+
 def is_mask_provided(mask_input: Any) -> bool:
     """Check if mask_input contains valid, non-null mask data."""
     if mask_input is None:

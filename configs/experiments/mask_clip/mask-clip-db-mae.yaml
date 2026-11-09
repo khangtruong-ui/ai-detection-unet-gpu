@@ -1,0 +1,76 @@
+# Configuration: Extract MaskCLIP Pre-TVCA Embeddings & Build 100k Vector Database
+# Extracts dense pre-TVCA F_s representations (256-D) from MaskCLIP and continuous
+# patch-level ground-truth tampered fraction labels from KhangTruong/DEAL300K-30K.
+#
+# Strict 90% forged (label > 0.0) / 10% authentic (label == 0.0) sampling ratio,
+# serialized in float16 quantization (~51.6 MB total, bounded well under 2 GB).
+
+project:
+  name: "mask_clip_db_mae"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/cache/mask_clip_db_mae"
+
+data:
+  dataset_name: "KhangTruong/DEAL300K-30K"
+  streaming: true
+  image_size: [512, 512]
+  batch_size: 4
+  num_workers: 4
+  splits: ["train"]
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+
+model:
+  name: "mask_clip"
+  model_setting_name: "ViTL"
+  pretrained: true
+  pretrained_mode: "opensdi"
+  pretrained_model_name_or_path: "nebula/MaskCLIP-weights"
+  checkpoint_filename: "MaskCLIP_sd15_20241108_09_14_22.pth"
+  mae_pretrained_url: "https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_base.pth"
+  clip_model_name: "ViT-L/14"
+  allow_random_init: false
+  resolution: 512
+  selected_layers: [2, 4, 8, 12, 16, 20, 23]
+  fusion_map:
+    1: 0
+    2: 1
+    3: 2
+    4: 3
+    5: 4
+    6: 5
+    7: 6
+  language_ctx: 10
+  language_depth: 5
+  aux_classifier: true
+  num_classes: 2
+  in_channels: 3
+  out_channels: 1
+  input_normalize: true
+  freeze_clip: true
+  freeze_mae: true
+
+loss:
+  mask_loss_type: "bce"
+  bce_weight: 1.0
+  dice_weight: 0.0
+  focal_weight: 0.0
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 1.0
+  edge_weight: 20.0
+  edge_mask_width: 7
+
+cache:
+  mode: "vector_db"
+  vector_db_filename: "mask_clip_db_mae.pt"
+  target_entries: 100000
+  forged_ratio: 0.9
+  authentic_ratio: 0.1
+  dtype: "float16"
+  max_entries: 100000
+  tap_point: "linear_fuse_pre_tvca"
+  max_patches_per_image_forged: 32
+  max_patches_per_image_authentic: 4

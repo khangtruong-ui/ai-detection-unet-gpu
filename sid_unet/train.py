@@ -204,6 +204,16 @@ def parse_args():
         help="Hugging Face dataset repository ID or local path containing pre-computed cached forensic latents (e.g. 'KhangTruong/COCO-inpainted-cache').",
     )
     parser.add_argument(
+        "--memory-path",
+        "--memory_path",
+        "--cached-vector-db",
+        "--vector-db",
+        type=str,
+        default=None,
+        dest="memory_path",
+        help="Local file path or Hugging Face repository containing cached forensic vector database (e.g. 'outputs/cache/mask_clip_db_mae/mask_clip_db_mae.pt' or 'KhangTruong/mask-clip-db-mae-cache').",
+    )
+    parser.add_argument(
         "--push-to-hub",
         "--push_to_hub",
         "--hf-checkpoint",
@@ -485,11 +495,86 @@ def train_single_run(
     base_output_dir: Optional[str] = None,
     skip_collision: bool = True,
     cached_hf_repo: Optional[str] = None,
+    memory_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a single training experiment with its given config."""
+    logger = logging.getLogger("sid_unet.train")
     config = load_config(config_path, overrides=overrides or [])
+
+    model_name = str(config.model.get("name", "")).lower()
+    is_noise_rag = any(k in model_name for k in ("noise-rag", "noise_rag", "noiserag"))
+    has_retrieval_memory = (
+        is_noise_rag
+        or hasattr(config.model, "memory_path")
+        or config.model.get("memory_path", None) is not None
+    )
+
+    if memory_path:
+        config.model.memory_path = memory_path
+
     if cached_hf_repo:
-        config.data.cached_hf_repo = cached_hf_repo
+        # Check if cached_hf_repo is a Vector Database repository or if the model is a retrieval model
+        # such as noise-rag-prototype-v1 that requires raw RGB image inputs rather than cached latent tensors
+        is_vector_db_repo = False
+        if has_retrieval_memory:
+            is_vector_db_repo = True
+        else:
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                repo_files = api.list_repo_files(repo_id=cached_hf_repo, repo_type="dataset")
+                if any(f.endswith(".pt") for f in repo_files) and not any(f.endswith(".parquet") for f in repo_files):
+                    is_vector_db_repo = True
+            except Exception:
+                pass
+
+        if is_vector_db_repo:
+            logger.info(
+                f"⚡ [VECTOR DB CACHE] Detected vector database repository '{cached_hf_repo}'. "
+                f"Routing to model retrieval memory path for model '{model_name}'..."
+            )
+            resolved_mem_path = None
+            try:
+                from huggingface_hub import hf_hub_download
+                for fname in ["mask_clip_db_mae.pt", "vector_db.pt", "forensic_memory.pt"]:
+                    try:
+                        resolved_mem_path = hf_hub_download(
+                            repo_id=cached_hf_repo,
+                            filename=fname,
+                            repo_type="dataset",
+                        )
+                        break
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning(f"Could not check HF Hub for vector DB: {e}")
+
+            if resolved_mem_path is not None:
+                config.model.memory_path = resolved_mem_path
+                logger.info(f"✅ Downloaded vector database from '{cached_hf_repo}' to: {resolved_mem_path}")
+            else:
+                config.model.memory_path = cached_hf_repo
+
+            # CRITICAL: Do NOT set config.data.cached_hf_repo!
+            # Retrieval models train on genuine raw RGB image datasets (e.g. DEAL300K-30K).
+        else:
+            config.data.cached_hf_repo = cached_hf_repo
+
+    # Also resolve configured memory_path if it doesn't exist at the given path
+    if has_retrieval_memory and config.model.get("memory_path"):
+        mem_p = str(config.model.get("memory_path"))
+        if not os.path.exists(mem_p):
+            candidates = [
+                os.path.join("outputs", "dataset_cache", "mask_clip_db_mae.pt"),
+                os.path.join("outputs", "cache", "mask_clip_db_mae", "mask_clip_db_mae.pt"),
+                os.path.join("outputs", "dataset_cache", os.path.basename(mem_p)),
+                os.path.join(os.path.dirname(config_path), os.path.basename(mem_p)),
+            ]
+            for cand in candidates:
+                if os.path.isfile(cand):
+                    config.model.memory_path = os.path.abspath(cand)
+                    logger.info(f"⚡ [VECTOR DB RESOLVE] Resolved vector DB from candidate path: {config.model.memory_path}")
+                    break
 
     # Set random seed
     seed = int(config.project.get("seed", 42))
@@ -1001,6 +1086,7 @@ def main():
                 base_output_dir=args.output_dir,
                 skip_collision=args.skip_collision,
                 cached_hf_repo=getattr(args, "cached_hf_repo", None),
+                memory_path=getattr(args, "memory_path", None),
             )
             return results
 
@@ -1042,6 +1128,7 @@ def main():
                 base_output_dir=suite_run_dir,
                 skip_collision=args.skip_collision,
                 cached_hf_repo=getattr(args, "cached_hf_repo", None),
+                memory_path=getattr(args, "memory_path", None),
             )
             all_results.append(res)
 

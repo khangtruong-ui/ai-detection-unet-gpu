@@ -1,4 +1,4 @@
-from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image
+from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image, decode_mask_bytes
 from sid_unet.dataset.transforms import get_transforms, JointCompose
 from sid_unet.dataset.loader import (
     SIDStreamingDataset,
@@ -25,6 +25,7 @@ from sid_unet.dataset.loader import (
 __all__ = [
     "process_sample_mask",
     "ensure_rgb_image",
+    "decode_mask_bytes",
     "get_transforms",
     "JointCompose",
     "SIDStreamingDataset",
