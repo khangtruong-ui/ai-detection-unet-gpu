@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-06
+## [Unreleased] - 2026-11-09
+
+### Added
+- **Mask Byte Decoding Utility (`decode_mask_bytes`)**:
+  - Implemented `decode_mask_bytes` in `sid_unet.dataset.mask_utils` (and exported in `sid_unet.dataset`) to decode raw mask image bytes (PNG, JPEG), bytearrays, BytesIO streams, HF dictionary structures, PIL Images, and numpy/PyTorch tensors into normalized float32 arrays with optional resizing and binarization thresholding.
+- **Hugging Face Hub Vector Database Sync in `sid-cache`**:
+  - Added synchronous vector database upload to Hugging Face Hub upon cache completion in `sid_unet.cache.cli` when `--cached-hf-repo` / `--push-to-hub` is provided, along with clean manager termination.
+- **Vector DB Auto-Restoration in `UNet.from_checkpoint`**:
+  - Added automatic detection and restoration of sibling `mask_clip_db_mae.pt` / `vector_db.pt` into the model's `retrieval` module in `sid_unet.models.unet.from_checkpoint`.
+- **Extended Test Suite for Noise-RAG and Vector DB Caching**:
+  - Added unit tests for `decode_mask_bytes` in `tests/test_mask_utils.py` covering PNG decoding, resizing, continuous vs thresholded decoding, and edge cases.
+  - Added integration tests in `tests/test_noise_rag.py` verifying vector DB extraction with encoded PNG mask bytes, `ForensicVectorMemory` continuous patch label storage and consolidation, `ForensicVectorDBRetrieval` fallback and loaded modes, `UNet.from_checkpoint` roundtrip restoration, combined `mse+entropy` alignment loss gradient flow, full `MaskCLIP.extract_pre_tvca_features` tap, and `sid-cache` vector DB CLI execution.
+
+### Fixed
+- **`sid-cache` Vector DB Mask Decoding Import Error**:
+  - Resolved `ImportError: cannot import name 'decode_mask_bytes'` when executing `sid-cache` with `mask-clip-db-mae.yaml`.
+- **MaskCLIP Experiment Config Validation**:
+  - Added `loss` configuration section to `configs/experiments/mask_clip/mask-clip-db-mae.yaml`, resolving `AttributeError: Configuration has no attribute 'edge_weight'` in `test_all_mask_clip_yaml_configs`.
+
+## [0.1.4] - 2026-11-06
 
 ### Added
 - **Vectorized GPU Evaluation Metrics & AUROC Calculation**:

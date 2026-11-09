@@ -52,6 +52,17 @@ model:
   freeze_clip: true
   freeze_mae: true
 
+loss:
+  mask_loss_type: "bce"
+  bce_weight: 1.0
+  dice_weight: 0.0
+  focal_weight: 0.0
+  aux_classifier: true
+  aux_loss_type: "cross_entropy"
+  aux_weight: 1.0
+  edge_weight: 20.0
+  edge_mask_width: 7
+
 cache:
   mode: "vector_db"
   vector_db_filename: "mask_clip_db_mae.pt"

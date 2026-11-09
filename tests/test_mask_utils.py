@@ -2,7 +2,13 @@ import numpy as np
 import pytest
 from PIL import Image
 import torch
-from sid_unet.dataset.mask_utils import process_sample_mask, ensure_rgb_image, check_image_mask_mismatch, is_mask_provided
+from sid_unet.dataset.mask_utils import (
+    process_sample_mask,
+    ensure_rgb_image,
+    check_image_mask_mismatch,
+    is_mask_provided,
+    decode_mask_bytes,
+)
 from sid_unet.dataset.loader import process_raw_sample
 
 
@@ -213,6 +219,99 @@ def test_process_raw_sample_tampered_dataset_fake():
     # Quadrant has 1s, other parts have 0s
     assert float(processed["mask"].sum()) > 0
     assert float(processed["mask"].sum()) < float(processed["mask"].numel())
+
+
+def test_decode_mask_bytes_png():
+    import io
+    # Create known binary mask
+    m = Image.new("L", (64, 64), color=0)
+    for y in range(32):
+        for x in range(64):
+            m.putpixel((x, y), 255)
+
+    buf = io.BytesIO()
+    m.save(buf, format="PNG")
+    raw_b = buf.getvalue()
+
+    decoded = decode_mask_bytes(raw_b)
+    assert isinstance(decoded, np.ndarray)
+    assert decoded.shape == (64, 64)
+    assert decoded.dtype == np.float32
+    assert np.all(decoded[:32, :] == 1.0)
+    assert np.all(decoded[32:, :] == 0.0)
+
+
+def test_decode_mask_bytes_resize():
+    import io
+    m = Image.new("L", (64, 64), color=255)
+    buf = io.BytesIO()
+    m.save(buf, format="PNG")
+    raw_b = buf.getvalue()
+
+    decoded_resized = decode_mask_bytes(raw_b, image_size=(128, 128))
+    assert decoded_resized.shape == (128, 128)
+    assert np.all(decoded_resized == 1.0)
+
+    decoded_rect = decode_mask_bytes(raw_b, image_size=(32, 64))
+    assert decoded_rect.shape == (64, 32) or decoded_rect.shape == (32, 64)
+
+
+def test_decode_mask_bytes_continuous_vs_threshold():
+    import io
+    # Grayscale image with gradient values
+    grad_arr = np.linspace(0, 255, 100, dtype=np.uint8).reshape(10, 10)
+    pil_grad = Image.fromarray(grad_arr, mode="L")
+    buf = io.BytesIO()
+    pil_grad.save(buf, format="PNG")
+    raw_b = buf.getvalue()
+
+    # Continuous decoding (threshold=None)
+    cont = decode_mask_bytes(raw_b, threshold=None)
+    assert cont.min() == 0.0
+    assert cont.max() == 1.0
+    # Must contain continuous values between 0 and 1
+    assert np.any((cont > 0.0) & (cont < 1.0))
+
+    # Binarized decoding (threshold=0.5)
+    binary = decode_mask_bytes(raw_b, threshold=0.5)
+    unique_vals = set(np.unique(binary))
+    assert unique_vals.issubset({0.0, 1.0})
+
+
+def test_decode_mask_bytes_edge_cases():
+    import io
+    # 1. None returns zeros
+    zeros_none = decode_mask_bytes(None, image_size=(64, 64))
+    assert zeros_none.shape == (64, 64)
+    assert np.all(zeros_none == 0.0)
+
+    # 2. Empty bytes returns zeros
+    zeros_empty = decode_mask_bytes(b"", image_size=(64, 64))
+    assert zeros_empty.shape == (64, 64)
+    assert np.all(zeros_empty == 0.0)
+
+    # 3. Bytearray and BytesIO
+    m = Image.new("L", (32, 32), color=255)
+    buf = io.BytesIO()
+    m.save(buf, format="PNG")
+    raw_b = buf.getvalue()
+
+    assert decode_mask_bytes(bytearray(raw_b)).shape == (32, 32)
+    assert decode_mask_bytes(io.BytesIO(raw_b)).shape == (32, 32)
+
+    # 4. Dict with bytes
+    assert decode_mask_bytes({"bytes": raw_b}).shape == (32, 32)
+
+    # 5. Numpy array & Torch Tensor
+    arr = np.ones((40, 40), dtype=np.float32)
+    assert decode_mask_bytes(arr).shape == (40, 40)
+    t = torch.ones(40, 40)
+    assert decode_mask_bytes(t).shape == (40, 40)
+
+    # 6. Invalid type
+    with pytest.raises(TypeError, match="Unsupported mask input type"):
+        decode_mask_bytes(12345)
+
 
 
 

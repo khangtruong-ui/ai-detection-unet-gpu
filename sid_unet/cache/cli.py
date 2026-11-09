@@ -416,6 +416,23 @@ def cli_main(args: Optional[list] = None) -> Any:
         loader.close()
         saved_file = builder.save(output_db_path)
         logger.info(f"🎉 Vector database successfully saved to: {saved_file}")
+
+        if manager.uploader is not None:
+            logger.info(f"📡 Uploading vector database to Hugging Face Hub: '{hf_repo}'...")
+            try:
+                manager.uploader.upload_file_sync(
+                    local_path=saved_file,
+                    rel_repo_path=os.path.basename(saved_file),
+                    commit_message=f"Upload MaskCLIP Pre-TVCA Vector Database ({builder.target_entries} entries)",
+                )
+                logger.info(f"🎉 Vector database successfully uploaded to Hugging Face Hub: '{hf_repo}'")
+            except Exception as e:
+                logger.warning(f"Failed to upload vector database to Hugging Face Hub: {e}")
+            finally:
+                manager.close()
+        else:
+            manager.close()
+
         return {"vector_db": [saved_file]}
 
     logger.info(

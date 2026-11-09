@@ -321,3 +321,279 @@ def test_build_model_from_configs():
     assert cfg_clip.cache.target_entries == 100000
     assert cfg_clip.cache.forged_ratio == 0.9
     assert cfg_clip.cache.authentic_ratio == 0.1
+
+
+def test_vector_db_extraction_with_encoded_mask_bytes():
+    """Verify vector DB extraction when loader yields encoded PNG mask bytes using decode_mask_bytes."""
+    import io
+    from PIL import Image
+    from sid_unet.cache.vector_db import extract_mask_clip_vector_db_from_loader
+
+    # Create dummy model with extract_pre_tvca_features
+    class MockMaskCLIP(nn.Module):
+        def extract_pre_tvca_features(self, imgs):
+            b = imgs.shape[0]
+            return torch.randn(b, 256, 16, 16)
+
+    model = MockMaskCLIP()
+
+    # Create dummy batches with raw PNG mask bytes
+    # Top half tampered (1.0), bottom half pristine (0.0)
+    m1 = Image.new("L", (64, 64), color=0)
+    for y in range(32):
+        for x in range(64):
+            m1.putpixel((x, y), 255)
+    buf1 = io.BytesIO()
+    m1.save(buf1, format="PNG")
+    b1 = buf1.getvalue()
+
+    # Pristine mask
+    m2 = Image.new("L", (64, 64), color=0)
+    buf2 = io.BytesIO()
+    m2.save(buf2, format="PNG")
+    b2 = buf2.getvalue()
+
+    dummy_batches = [
+        {
+            "images": torch.rand(2, 3, 64, 64),
+            "masks": [b1, b2],
+        }
+        for _ in range(5)
+    ]
+
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        saved_path = extract_mask_clip_vector_db_from_loader(
+            model=model,
+            loader=dummy_batches,
+            output_path=db_path,
+            target_entries=50,
+            forged_ratio=0.8,
+            authentic_ratio=0.2,
+            dtype="float16",
+        )
+        assert os.path.exists(saved_path)
+        payload = torch.load(saved_path, map_location="cpu", weights_only=False)
+        assert "keys" in payload
+        assert "labels" in payload
+        assert payload["keys"].shape[1] == 256
+        assert payload["keys"].dtype == torch.float16
+        assert payload["labels"].dtype == torch.float16
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_forensic_vector_memory_labels_support():
+    """Verify ForensicVectorMemory stores, consolidates, and saves continuous patch labels."""
+    mem = ForensicVectorMemory(
+        memory_enabled=True,
+        memory_max_entries=100,
+        memory_key_dim=32,
+        memory_value_dim=32,
+        memory_dedup_threshold=0.9,
+        memory_consolidation_method="dedup_greedy",
+        memory_dtype="float16",
+    )
+
+    # Add observations with labels
+    keys = torch.randn(60, 32)
+    labels = torch.rand(60, 1)
+    added = mem.add_observations(keys=keys, values=keys, labels=labels)
+
+    assert added == 60
+    assert len(mem._epoch_observed_labels) == 1
+
+    stats = mem.consolidate()
+    assert mem.entry_count > 0
+    assert mem.labels.shape == (mem.entry_count, 1)
+
+    # Test state dict roundtrip
+    sd = mem.state_dict()
+    assert "labels" in sd
+    assert sd["labels"] is not None
+    assert sd["labels"].shape == (mem.entry_count, 1)
+
+    mem2 = ForensicVectorMemory(
+        memory_enabled=True,
+        memory_max_entries=100,
+        memory_key_dim=32,
+        memory_value_dim=32,
+    )
+    mem2.load_state_dict(sd)
+    assert mem2.entry_count == mem.entry_count
+    assert torch.allclose(mem2.labels, mem.labels)
+
+
+def test_forensic_vector_db_retrieval():
+    """Verify ForensicVectorDBRetrieval works in both fallback and loaded database modes."""
+    retrieval = ForensicVectorDBRetrieval(memory_path=None, memory_dtype="float16", retrieval_k=3, embed_dim=64)
+    assert not retrieval.has_database
+
+    x_t = torch.randn(2, 64, 8, 8)
+    # When no DB is loaded, acts as identity fallback
+    out_fallback = retrieval(x_t)
+    assert torch.allclose(out_fallback, x_t)
+
+    # Create dummy database
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        keys = torch.randn(30, 64, dtype=torch.float16)
+        labels = torch.rand(30, 1, dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels}, db_path)
+
+        retrieval.load_database(db_path)
+        assert retrieval.has_database
+        assert retrieval.db_keys.shape == (30, 64)
+
+        out_retrieved = retrieval(x_t)
+        assert out_retrieved.shape == (2, 64, 8, 8)
+        assert torch.isfinite(out_retrieved).all()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_noise_rag_checkpoint_roundtrip_unet():
+    """Verify UNet.from_checkpoint restores NoiseRAGPrototypeV1 and sibling vector DB."""
+    from sid_unet.models.unet import UNet
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = os.path.join(tmp_dir, "mask_clip_db_mae.pt")
+        keys = torch.randn(20, 256, dtype=torch.float16)
+        labels = torch.rand(20, 1, dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels}, db_path)
+
+        model = NoiseRAGPrototypeV1(
+            memory_path=db_path,
+            memory_dtype="float16",
+            embed_dim=256,
+            num_cross_stages=2,
+            conv_backbone="mobilenetv3_small_100",
+        )
+        model.eval()
+
+        ckpt_path = os.path.join(tmp_dir, "checkpoint.pt")
+        cfg_dict = {
+            "model": {
+                "name": "noise-rag-prototype-v1",
+                "memory_path": db_path,
+                "memory_dtype": "float16",
+                "embed_dim": 256,
+                "num_cross_stages": 2,
+                "conv_backbone": "mobilenetv3_small_100",
+            }
+        }
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "config": cfg_dict,
+            "epoch": 1,
+        }, ckpt_path)
+
+        loaded_model = UNet.from_checkpoint(ckpt_path, device="cpu")
+        assert isinstance(loaded_model, NoiseRAGPrototypeV1)
+        assert loaded_model.retrieval.has_database
+
+        x = torch.rand(1, 3, 64, 64)
+        with torch.no_grad():
+            out_orig = model(x, return_dict=True)
+            out_loaded = loaded_model(x, return_dict=True)
+
+        assert torch.allclose(out_orig["mask_logits"], out_loaded["mask_logits"], atol=1e-5)
+
+
+def test_combined_alignment_loss_mse_plus_entropy():
+    """Verify NoiseRAGPrototypeV1 combined mse+entropy alignment loss computation and backward flow."""
+    model = NoiseRAGPrototypeV1(
+        freeze_noiseprint=True,
+        align_loss_type="mse+entropy",
+        align_loss_weight=0.5,
+    )
+
+    x_t = torch.randn(2, 256, 8, 8, requires_grad=True)
+    x_s = torch.randn(2, 256, 8, 8)
+
+    loss = model.compute_alignment_loss(x_t=x_t, x_s=x_s)
+    assert loss.ndim == 0
+    assert loss.item() > 0.0
+
+    loss.backward()
+    assert x_t.grad is not None
+    assert x_t.grad.norm() > 0.0
+
+
+def test_mask_clip_full_extract_pre_tvca_features():
+    """Verify MaskCLIP.extract_pre_tvca_features extracts F_s of shape [B, 256, H/4, W/4]."""
+    from sid_unet.models.mask_clip import MaskCLIP
+
+    model = MaskCLIP(
+        clip_model_name="ViT-B/16",
+        pretrained=False,
+        allow_random_init=True,
+        device="cpu",
+    )
+    model.eval()
+
+    x = torch.rand(2, 3, 128, 128)
+    with torch.no_grad():
+        f_s = model.extract_pre_tvca_features(x)
+
+    assert f_s.shape == (2, 256, 32, 32)
+    assert torch.isfinite(f_s).all()
+
+
+def test_sid_cache_cli_vector_db_mode_run():
+    """Verify sid-cache CLI executes vector DB mode without errors using mock dataset."""
+    from sid_unet.cache.cli import cli_main
+    from sid_unet.dataset.loader import generate_mock_raw_sample
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cfg_path = os.path.join(tmp_dir, "test_cache_cfg.yaml")
+        cfg_content = """project:
+  name: "test_cache"
+  seed: 42
+data:
+  dataset_name: "mock"
+  image_size: [64, 64]
+  batch_size: 2
+  splits: ["train"]
+model:
+  name: "mask_clip"
+  clip_model_name: "ViT-B/16"
+  pretrained: false
+  allow_random_init: true
+loss:
+  edge_weight: 0.0
+cache:
+  mode: "vector_db"
+  vector_db_filename: "test_db.pt"
+  target_entries: 10
+  forged_ratio: 0.5
+  authentic_ratio: 0.5
+  dtype: "float16"
+"""
+        with open(cfg_path, "w") as f:
+            f.write(cfg_content)
+
+        raw_samples = [generate_mock_raw_sample(i, target_image_size=(64, 64)) for i in range(10)]
+        with patch("sid_unet.dataset.loader.load_parquet_or_hf_dataset", return_value=(raw_samples, "train")):
+            result = cli_main([
+                "--config", cfg_path,
+                "--output-dir", tmp_dir,
+                "--no-detach",
+                "--max-samples", "4",
+                "--no-push-to-hub",
+                "--num-workers", "1",
+            ])
+
+        out_db = os.path.join(tmp_dir, "test_db.pt")
+        assert os.path.exists(out_db)
+        loaded = torch.load(out_db, map_location="cpu", weights_only=False)
+        assert "keys" in loaded
+        assert "labels" in loaded
+

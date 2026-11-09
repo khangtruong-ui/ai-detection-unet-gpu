@@ -378,6 +378,27 @@ class UNet(nn.Module):
                 except Exception as mem_err:
                     logger.warning(f"Could not load forensic memory from memory_path '{raw_model.memory_path}': {mem_err}")
 
+        # Restore vector DB retrieval for models with retrieval (e.g. NoiseRAGPrototypeV1)
+        if hasattr(raw_model, "retrieval") and hasattr(raw_model.retrieval, "load_database") and not getattr(raw_model.retrieval, "has_database", False):
+            loaded_db = False
+            ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+            for cand in ["mask_clip_db_mae.pt", "vector_db.pt", "forensic_memory.pt"]:
+                cand_path = os.path.join(ckpt_dir, cand)
+                if os.path.isfile(cand_path):
+                    try:
+                        raw_model.retrieval.load_database(cand_path)
+                        logger.info(f"Loaded vector DB into retrieval module from sibling file '{cand_path}'.")
+                        loaded_db = True
+                        break
+                    except Exception as db_err:
+                        logger.warning(f"Could not load vector DB from sibling file '{cand_path}': {db_err}")
+            if not loaded_db and hasattr(raw_model, "memory_path") and raw_model.memory_path and os.path.isfile(raw_model.memory_path):
+                try:
+                    raw_model.retrieval.load_database(raw_model.memory_path)
+                    logger.info(f"Loaded vector DB into retrieval module from memory_path '{raw_model.memory_path}'.")
+                except Exception as db_err:
+                    logger.warning(f"Could not load vector DB from memory_path '{raw_model.memory_path}': {db_err}")
+
         model.eval()
 
         if device is not None:
