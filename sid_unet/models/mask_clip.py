@@ -584,14 +584,18 @@ class MaskDecoder(nn.Module):
 
         return out.reshape(B, C, 1, 1).expand(B, C, H, W)
 
-    def forward(self, query: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def extract_pre_tvca(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract pre-TVCA feature tensor F_s of shape [B, 256, H/4, W/4] after linear_fuse."""
         features = [stage(x) for stage in self.stages]
         _, _, h, w = features[0].shape
         aligned_features = [
             F.interpolate(feat, size=(h, w), mode="bilinear", align_corners=False)
             for feat in features
         ]
-        x = self.linear_fuse(torch.cat(aligned_features, dim=1))
+        return self.linear_fuse(torch.cat(aligned_features, dim=1))
+
+    def forward(self, query: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        x = self.extract_pre_tvca(x)
 
         attn_out = self.cross_attention(x, query)
         x = x + attn_out
@@ -639,10 +643,14 @@ class SideCLIPMaskDecoder(nn.Module):
             nn.Conv2d(decoder_dim, decoder_dim, kernel_size=3, padding=1),
         )
 
+    def extract_pre_tvca(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract pre-query pixel feature tensor [B, decoder_dim, 4H, 4W]."""
+        pix = self.pix_mlp(x)
+        return self.refiner(pix)
+
     def forward(self, query: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         q = self.query_mlp(query)  # [B, C]
-        pix = self.pix_mlp(x)
-        pix = self.refiner(pix)  # [B, C, 4H, 4W]
+        pix = self.extract_pre_tvca(x)  # [B, C, 4H, 4W]
         return torch.einsum("bc,bchw->bhw", q, pix).unsqueeze(1)
 
 
@@ -818,6 +826,21 @@ class SideAdapterNetwork(nn.Module):
 
         # Optional custom spatial backbone adapter hook for model surgery
         self.custom_spatial_adapter: Optional[nn.Module] = None
+
+    def extract_pre_tvca(
+        self,
+        image: torch.Tensor,
+        clip_features: List[torch.Tensor],
+        block_hook: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
+        decoder_hook: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Extract pre-TVCA feature tensor F_s before cross attention."""
+        image_features = self.forward_features(image, clip_features, block_hook=block_hook)
+        if decoder_hook is not None:
+            image_features = decoder_hook(image_features)
+        if hasattr(self.mask_decoder, "extract_pre_tvca"):
+            return self.mask_decoder.extract_pre_tvca(image_features)
+        raise NotImplementedError(f"{type(self.mask_decoder).__name__} does not implement extract_pre_tvca")
 
     def forward(
         self,
@@ -1614,6 +1637,51 @@ class MaskCLIP(nn.Module):
         H_p, W_p = patch_stack.shape[2], patch_stack.shape[3]
         cls_flat = cls_features.reshape(images.shape[0], -1, 1, 1).expand(-1, -1, H_p, W_p)
         return torch.cat([patch_stack, cls_flat], dim=1)
+
+    @torch.no_grad()
+    def extract_pre_tvca_features(
+        self,
+        images: torch.Tensor,
+        cached_clip_features: Optional[Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]] = None,
+    ) -> torch.Tensor:
+        """
+        Extract pre-TVCA feature tensor F_s of shape [B, 256, H/4, W/4].
+        Directly taps right after MaskDecoder.linear_fuse and before MaskDecoder.cross_attention.
+        """
+        self.eval()
+        orig_h, orig_w = images.shape[2], images.shape[3]
+        norm_image = self._preprocess_image(images)
+
+        if cached_clip_features is not None:
+            if isinstance(cached_clip_features, (tuple, list)):
+                cls_features, patch_features = cached_clip_features
+            else:
+                cls_features, patch_features = self._unpack_cached_clip_features(cached_clip_features)
+        else:
+            cls_features, patch_features = self.extract_clip_features(norm_image)
+
+        mae_input = norm_image
+        if orig_h < 32 or orig_w < 32:
+            mae_input = F.interpolate(
+                norm_image, size=(self.resolution, self.resolution), mode="bilinear", align_corners=False
+            )
+
+        def _block_hook(block_idx: int, feat: torch.Tensor) -> torch.Tensor:
+            for fn in self._surgery_hooks["mae_block_post_fusion"]:
+                feat = fn(block_idx, feat)
+            return feat
+
+        def _decoder_hook(feat: torch.Tensor) -> torch.Tensor:
+            for fn in self._surgery_hooks["decoder_features"]:
+                feat = fn(feat)
+            return feat
+
+        return self.aggregator.extract_pre_tvca(
+            mae_input,
+            patch_features,
+            block_hook=_block_hook if self._surgery_hooks["mae_block_post_fusion"] else None,
+            decoder_hook=_decoder_hook if self._surgery_hooks["decoder_features"] else None,
+        )
 
     def forward(
         self,

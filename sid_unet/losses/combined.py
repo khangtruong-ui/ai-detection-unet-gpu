@@ -30,6 +30,9 @@ class CombinedMaskLoss(nn.Module):
     ):
         super().__init__()
         self.loss_type = loss_type.lower()
+        if self.loss_type in ("bce_dice", "bce+dice"):
+            self.loss_type = "combined"
+            self.focal_weight = 0.0
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight

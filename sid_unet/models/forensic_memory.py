@@ -98,6 +98,7 @@ class ForensicVectorMemory:
         memory_dedup_threshold: float = 0.95,
         memory_consolidation_method: str = "dedup_greedy",
         memory_seed: int = 42,
+        memory_dtype: str = "float32",
     ):
         self.memory_enabled = bool(memory_enabled)
         self.memory_max_entries = int(memory_max_entries)
@@ -109,22 +110,25 @@ class ForensicVectorMemory:
         self.memory_dedup_threshold = float(memory_dedup_threshold)
         self.memory_consolidation_method = str(memory_consolidation_method).lower()
         self.memory_seed = int(memory_seed)
+        self.memory_dtype = str(memory_dtype).lower().strip()
 
         self._validate_config()
 
         # Authoritative database stored strictly in CPU RAM
         self._keys: torch.Tensor = torch.empty((0, self.memory_key_dim), dtype=torch.float32, device="cpu")
         self._values: torch.Tensor = torch.empty((0, self.memory_value_dim), dtype=torch.float32, device="cpu")
+        self._labels: torch.Tensor = torch.empty((0, 1), dtype=torch.float32, device="cpu")
 
         # Unconsolidated observations accumulated during current epoch
         self._epoch_observed_keys: List[torch.Tensor] = []
         self._epoch_observed_values: List[torch.Tensor] = []
+        self._epoch_observed_labels: List[torch.Tensor] = []
 
         logger.info(
             f"Initialized ForensicVectorMemory (enabled={self.memory_enabled}, "
             f"max_entries={self.memory_max_entries}, dim={self.memory_key_dim}, "
             f"k={self.memory_retrieval_k}, metric='{self.memory_similarity_metric}', "
-            f"consolidation='{self.memory_consolidation_method}')"
+            f"consolidation='{self.memory_consolidation_method}', dtype='{self.memory_dtype}')"
         )
 
     def _validate_config(self) -> None:
@@ -180,11 +184,29 @@ class ForensicVectorMemory:
             ),
         }
 
+    @property
+    def labels(self) -> torch.Tensor:
+        """Stored ground-truth continuous/binary labels corresponding to entries."""
+        return self._labels
+
+    @property
+    def keys(self) -> torch.Tensor:
+        """Stored authoritative keys."""
+        return self._keys
+
+    @property
+    def values(self) -> torch.Tensor:
+        """Stored authoritative values."""
+        return self._values
+
     def get_memory_bytes(self) -> int:
-        """Calculate total CPU RAM bytes consumed by stored keys and values."""
-        return (self._keys.numel() * self._keys.element_size()) + (
+        """Calculate total CPU RAM bytes consumed by stored keys, values, and labels."""
+        total = (self._keys.numel() * self._keys.element_size()) + (
             self._values.numel() * self._values.element_size()
         )
+        if self._labels.numel() > 0:
+            total += self._labels.numel() * self._labels.element_size()
+        return total
 
     # =========================================================================
     # Memory Collection (Training Epoch)
@@ -194,6 +216,7 @@ class ForensicVectorMemory:
         self,
         keys: torch.Tensor,
         values: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
     ) -> int:
         """
         Add detached observation batch to epoch collection buffer.
@@ -203,6 +226,7 @@ class ForensicVectorMemory:
             keys (torch.Tensor): Forensic feature keys [M, key_dim].
             values (Optional[torch.Tensor]): Forensic feature values [M, value_dim].
                 If None, keys are used as values.
+            labels (Optional[torch.Tensor]): Corresponding ground-truth labels [M, 1] or [M].
 
         Returns:
             int: Number of observations added.
@@ -238,12 +262,23 @@ class ForensicVectorMemory:
         self._epoch_observed_keys.append(keys_cpu)
         self._epoch_observed_values.append(values_cpu)
 
+        if labels is not None:
+            if labels.ndim == 1:
+                labels = labels.unsqueeze(1)
+            if labels.shape[0] != keys.shape[0]:
+                raise ValueError(
+                    f"Keys count ({keys.shape[0]}) does not match labels count ({labels.shape[0]})"
+                )
+            labels_cpu = labels.detach().to(device="cpu", dtype=torch.float32)
+            self._epoch_observed_labels.append(labels_cpu)
+
         return keys_cpu.shape[0]
 
     def clear_epoch_observations(self) -> None:
         """Clear unconsolidated observations without affecting authoritative memory."""
         self._epoch_observed_keys.clear()
         self._epoch_observed_values.clear()
+        self._epoch_observed_labels.clear()
 
     # =========================================================================
     # Memory Retrieval
@@ -254,7 +289,11 @@ class ForensicVectorMemory:
         query: torch.Tensor,
         k: Optional[int] = None,
         random_retrieval: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], float]:
+        return_labels: bool = False,
+    ) -> Union[
+        Tuple[Optional[torch.Tensor], Optional[torch.Tensor], float],
+        Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], float],
+    ]:
         """
         Retrieve top-k value vectors from CPU memory for given query batch.
 
@@ -263,18 +302,22 @@ class ForensicVectorMemory:
             k (Optional[int]): Number of neighbors (defaults to memory_retrieval_k).
             random_retrieval (bool): If True, randomly samples k memory entries per query
                 (used for Baseline C ablation to isolate semantic retrieval).
+            return_labels (bool): If True, returns (retrieved_values, retrieved_keys, retrieved_labels, latency_seconds).
 
         Returns:
-            Tuple[retrieved_values, retrieved_keys, latency_seconds]:
+            Tuple[retrieved_values, retrieved_keys, latency_seconds] (or with retrieved_labels if return_labels=True):
                 - retrieved_values: [B, k, value_dim] on the query tensor's device & dtype,
                   or None if memory is not warmed up.
                 - retrieved_keys: [B, k, key_dim] on the query tensor's device & dtype,
                   or None if memory is not warmed up.
+                - retrieved_labels: [B, k, 1] on the query tensor's device & dtype (if return_labels=True).
                 - latency_seconds: Time taken for CPU search and transfer.
         """
         start_time = time.perf_counter()
 
         if not self.memory_enabled or not self.is_warmed_up or self.entry_count == 0:
+            if return_labels:
+                return None, None, None, 0.0
             return None, None, 0.0
 
         if query.ndim != 2 or query.shape[1] != self.memory_key_dim:
@@ -287,6 +330,8 @@ class ForensicVectorMemory:
         k_actual = min(k_req, self.entry_count)
 
         if k_actual <= 0:
+            if return_labels:
+                return None, None, None, 0.0
             return None, None, 0.0
 
         target_device = query.device
@@ -304,7 +349,14 @@ class ForensicVectorMemory:
 
             retrieved_vals = self._values[indices].to(device=target_device, dtype=target_dtype)
             retrieved_ks = self._keys[indices].to(device=target_device, dtype=target_dtype)
+            retrieved_labels = (
+                self._labels[indices].to(device=target_device, dtype=target_dtype)
+                if self._labels.shape[0] == self.entry_count
+                else None
+            )
             elapsed = time.perf_counter() - start_time
+            if return_labels:
+                return retrieved_vals, retrieved_ks, retrieved_labels, elapsed
             return retrieved_vals, retrieved_ks, elapsed
 
         # Authoritative Nearest-Neighbor Retrieval on CPU
@@ -317,9 +369,25 @@ class ForensicVectorMemory:
 
         retrieved_vals = self._values[topk_indices].to(device=target_device, dtype=target_dtype)
         retrieved_ks = self._keys[topk_indices].to(device=target_device, dtype=target_dtype)
+        retrieved_labels = (
+            self._labels[topk_indices].to(device=target_device, dtype=target_dtype)
+            if self._labels.shape[0] == self.entry_count
+            else None
+        )
 
         elapsed = time.perf_counter() - start_time
+        if return_labels:
+            return retrieved_vals, retrieved_ks, retrieved_labels, elapsed
         return retrieved_vals, retrieved_ks, elapsed
+
+    def retrieve_with_labels(
+        self,
+        query: torch.Tensor,
+        k: Optional[int] = None,
+        random_retrieval: bool = False,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], float]:
+        """Convenience wrapper around retrieve() with return_labels=True."""
+        return self.retrieve(query, k=k, random_retrieval=random_retrieval, return_labels=True)
 
     def _compute_similarity(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         """
@@ -386,6 +454,8 @@ class ForensicVectorMemory:
 
         new_keys = torch.cat(self._epoch_observed_keys, dim=0)
         new_values = torch.cat(self._epoch_observed_values, dim=0)
+        has_observed_labels = bool(self._epoch_observed_labels)
+        new_labels = torch.cat(self._epoch_observed_labels, dim=0) if has_observed_labels else None
         num_new = new_keys.shape[0]
 
         # Reset epoch buffer
@@ -395,6 +465,7 @@ class ForensicVectorMemory:
         if self.entry_count == 0:
             kept_keys = []
             kept_values = []
+            kept_labels = []
             chunk_size = 512
 
             for i in range(0, num_new, chunk_size):
@@ -402,20 +473,28 @@ class ForensicVectorMemory:
                 v_chunk = new_values[i : i + chunk_size]
                 kept_keys.append(k_chunk)
                 kept_values.append(v_chunk)
+                if new_labels is not None:
+                    kept_labels.append(new_labels[i : i + chunk_size])
 
             self._keys = torch.cat(kept_keys, dim=0)
             self._values = torch.cat(kept_values, dim=0)
+            if kept_labels:
+                self._labels = torch.cat(kept_labels, dim=0)
+            else:
+                self._labels = torch.empty((self.entry_count, 1), dtype=torch.float32, device="cpu")
             duplicates_removed = 0
         else:
             # Chunked deduplication of new candidates against authoritative database
             chunk_size = 512
             accepted_keys = []
             accepted_values = []
+            accepted_labels = []
             duplicates_removed = 0
 
             for i in range(0, num_new, chunk_size):
                 cand_k = new_keys[i : i + chunk_size]
                 cand_v = new_values[i : i + chunk_size]
+                cand_l = new_labels[i : i + chunk_size] if new_labels is not None else None
 
                 # Compute similarity of candidate chunk against existing keys
                 sim = self._compute_similarity(cand_k, self._keys)  # [chunk, N_existing]
@@ -427,12 +506,24 @@ class ForensicVectorMemory:
                 if is_unique.any():
                     accepted_keys.append(cand_k[is_unique])
                     accepted_values.append(cand_v[is_unique])
+                    if cand_l is not None:
+                        accepted_labels.append(cand_l[is_unique])
 
             if accepted_keys:
                 all_new_k = torch.cat(accepted_keys, dim=0)
                 all_new_v = torch.cat(accepted_values, dim=0)
                 self._keys = torch.cat([self._keys, all_new_k], dim=0)
                 self._values = torch.cat([self._values, all_new_v], dim=0)
+                if accepted_labels:
+                    all_new_l = torch.cat(accepted_labels, dim=0)
+                    if self._labels.shape[0] == 0:
+                        self._labels = all_new_l
+                    else:
+                        self._labels = torch.cat([self._labels, all_new_l], dim=0)
+                elif self._labels.shape[0] > 0:
+                    # Pad dummy zero labels if previous entries had labels
+                    pad_l = torch.zeros((all_new_k.shape[0], self._labels.shape[1]), dtype=self._labels.dtype, device="cpu")
+                    self._labels = torch.cat([self._labels, pad_l], dim=0)
 
         # Enforce memory_max_entries capacity limit
         capacity_pruned = 0
@@ -443,6 +534,8 @@ class ForensicVectorMemory:
                 # Keep the newest max_entries
                 self._keys = self._keys[-self.memory_max_entries :]
                 self._values = self._values[-self.memory_max_entries :]
+                if self._labels.shape[0] >= self.memory_max_entries:
+                    self._labels = self._labels[-self.memory_max_entries :]
 
             elif self.memory_consolidation_method == "reservoir":
                 # Deterministic random subsample
@@ -451,6 +544,8 @@ class ForensicVectorMemory:
                 keep_indices = torch.sort(keep_indices)[0]
                 self._keys = self._keys[keep_indices]
                 self._values = self._values[keep_indices]
+                if self._labels.shape[0] >= self.entry_count:
+                    self._labels = self._labels[keep_indices]
 
             else:
                 # Default: 'dedup_greedy' with uniform strided diversity selection
@@ -462,6 +557,8 @@ class ForensicVectorMemory:
                 )
                 self._keys = self._keys[indices]
                 self._values = self._values[indices]
+                if self._labels.shape[0] >= self.entry_count:
+                    self._labels = self._labels[indices]
 
         duration = time.perf_counter() - start_time
         stats = {
@@ -489,6 +586,7 @@ class ForensicVectorMemory:
             "version": "1.0",
             "keys": self._keys.clone(),
             "values": self._values.clone(),
+            "labels": self._labels.clone() if self._labels.shape[0] > 0 else None,
             "entry_count": self.entry_count,
             "config": {
                 "memory_enabled": self.memory_enabled,
@@ -501,6 +599,7 @@ class ForensicVectorMemory:
                 "memory_dedup_threshold": self.memory_dedup_threshold,
                 "memory_consolidation_method": self.memory_consolidation_method,
                 "memory_seed": self.memory_seed,
+                "memory_dtype": self.memory_dtype,
             },
         }
 
@@ -517,6 +616,12 @@ class ForensicVectorMemory:
 
         loaded_keys = state_dict["keys"].cpu().to(dtype=torch.float32)
         loaded_values = state_dict.get("values", loaded_keys).cpu().to(dtype=torch.float32)
+        if "labels" in state_dict and state_dict["labels"] is not None:
+            loaded_labels = state_dict["labels"].cpu().to(dtype=torch.float32)
+            if loaded_labels.ndim == 1:
+                loaded_labels = loaded_labels.unsqueeze(1)
+        else:
+            loaded_labels = torch.empty((loaded_keys.shape[0], 1), dtype=torch.float32, device="cpu")
 
         if strict_dims:
             saved_cfg = state_dict.get("config", {})
@@ -545,6 +650,10 @@ class ForensicVectorMemory:
 
         self._keys = loaded_keys
         self._values = loaded_values
+        self._labels = loaded_labels
+        if "config" in state_dict and isinstance(state_dict["config"], dict):
+            if "memory_dtype" in state_dict["config"]:
+                self.memory_dtype = str(state_dict["config"]["memory_dtype"]).lower().strip()
         self.clear_epoch_observations()
 
         logger.info(

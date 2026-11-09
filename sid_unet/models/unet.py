@@ -321,6 +321,8 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "diffusion_diff"
             elif any(k.startswith("vae.") for k in state_dict.keys()):
                 merged["model"]["name"] = "vae_finetune"
+            elif any(k.startswith(("noiseprint.", "conv_vit_x.", "conv_vit_n.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "noise-rag-prototype-v1"
             elif any(k.startswith(("pixel_module.", "transformer_decoder.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "iml"
 
@@ -413,6 +415,30 @@ def build_model(config: Any) -> nn.Module:
 
     model_name = str(model_cfg.get("name", "unet")).lower()
     backbone = str(model_cfg.get("backbone", "")).lower()
+
+    if any(k in model_name for k in ["noise-rag", "noise_rag", "noiserag"]) or any(
+        k in backbone for k in ["noise-rag", "noise_rag", "noiserag"]
+    ):
+        from sid_unet.models.noise_rag import NoiseRAGPrototypeV1
+        return NoiseRAGPrototypeV1(
+            noiseprint_weights=model_cfg.get("noiseprint_weights", None),
+            freeze_noiseprint=bool(model_cfg.get("freeze_noiseprint", True)),
+            memory_path=model_cfg.get("memory_path", None),
+            memory_dtype=str(model_cfg.get("memory_dtype", "float16")),
+            embed_dim=int(model_cfg.get("embed_dim", 256)),
+            conv_backbone=str(model_cfg.get("conv_backbone", "mobilenetv3_small_100")),
+            num_vit_blocks=int(model_cfg.get("num_vit_blocks", 2)),
+            num_cross_stages=int(model_cfg.get("num_cross_stages", 3)),
+            out_stride=int(model_cfg.get("out_stride", 8)),
+            retrieval_k=int(model_cfg.get("retrieval_k", 4)),
+            align_loss_type=str(model_cfg.get("align_loss_type", "mse")),
+            align_loss_weight=float(model_cfg.get("align_loss_weight", 0.2)),
+            entropy_temperature=float(model_cfg.get("entropy_temperature", 1.0)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            num_classes=int(model_cfg.get("num_classes", 2)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+        )
 
     if any(k in model_name for k in ["mask_clip", "mask-clip", "maskclip", "opensdi", "open_sdi", "sideclip"]) or any(
         k in backbone for k in ["mask_clip", "mask-clip", "maskclip", "opensdi"]

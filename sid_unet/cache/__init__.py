@@ -13,6 +13,7 @@ from sid_unet.cache.extractor import (
 )
 from sid_unet.cache.dataset import CachedTensorDataset, CachedStreamingDataset
 from sid_unet.cache.manager import DatasetCacheManager
+from sid_unet.cache.vector_db import MaskCLIPVectorDBBuilder
 
 __all__ = [
     "BaseCacheExtractor",
@@ -23,4 +24,5 @@ __all__ = [
     "CachedTensorDataset",
     "CachedStreamingDataset",
     "DatasetCacheManager",
+    "MaskCLIPVectorDBBuilder",
 ]

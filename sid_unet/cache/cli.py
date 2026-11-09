@@ -339,6 +339,85 @@ def cli_main(args: Optional[list] = None) -> Any:
         prefetch_batches=prefetch_batches,
     )
 
+    is_vector_db_mode = (
+        cfg.get("cache", {}).get("mode") == "vector_db"
+        or "vector_db" in getattr(parsed_args, "config", "")
+        or "mask-clip-db-mae" in getattr(parsed_args, "config", "")
+    )
+
+    if is_vector_db_mode:
+        from sid_unet.cache.vector_db import MaskCLIPVectorDBBuilder
+        from sid_unet.cache.manager import PrefetchedBatchLoader
+        from sid_unet.dataset.loader import load_parquet_or_hf_dataset
+        from sid_unet.dataset.mask_utils import decode_mask_bytes
+        from tqdm import tqdm
+
+        cache_cfg = cfg.get("cache", {})
+        target_entries = int(cache_cfg.get("target_entries", 100000))
+        forged_ratio = float(cache_cfg.get("forged_ratio", 0.9))
+        authentic_ratio = float(cache_cfg.get("authentic_ratio", 0.1))
+        db_filename = cache_cfg.get("vector_db_filename", "mask_clip_db_mae.pt")
+        output_db_path = os.path.join(parsed_args.output_dir, db_filename)
+        dtype_str = "float16" if parsed_args.fp16 else cache_cfg.get("dtype", "float16")
+
+        builder = MaskCLIPVectorDBBuilder(
+            model=model,
+            target_entries=target_entries,
+            forged_ratio=forged_ratio,
+            authentic_ratio=authentic_ratio,
+            dtype=dtype_str,
+            max_patches_per_image_forged=int(cache_cfg.get("max_patches_per_image_forged", 32)),
+            max_patches_per_image_authentic=int(cache_cfg.get("max_patches_per_image_authentic", 4)),
+            seed=int(cfg.get("project", {}).get("seed", 42)),
+        )
+
+        split_to_use = parsed_args.splits[0] if parsed_args.splits else "train"
+        ds, _ = load_parquet_or_hf_dataset(source_dataset, requested_split=split_to_use, streaming=True)
+
+        loader = PrefetchedBatchLoader(
+            dataset=ds,
+            process_sample_fn=manager._process_sample_to_tensors,
+            batch_size=batch_size,
+            max_samples=parsed_args.max_samples,
+            store_images=False,
+            num_workers=num_workers,
+        )
+
+        logger.info(
+            f"🚀 [VECTOR DB] Extracting MaskCLIP Pre-TVCA Vector Database: "
+            f"target={target_entries} (90% forged / 10% authentic), output='{output_db_path}'"
+        )
+        pbar = tqdm(total=target_entries, desc="MaskCLIP Vector DB")
+        for batch in loader:
+            images = batch["images"]
+            masks_raw = batch["masks"]
+            decoded_masks = []
+            for m in masks_raw:
+                if isinstance(m, bytes):
+                    decoded_masks.append(torch.from_numpy(decode_mask_bytes(m)))
+                elif isinstance(m, torch.Tensor):
+                    decoded_masks.append(m)
+                else:
+                    decoded_masks.append(torch.zeros(images.shape[2:], dtype=torch.float32))
+            masks = torch.stack(decoded_masks, dim=0)
+
+            builder.process_batch(images, masks)
+            total_curr = builder.num_forged + builder.num_authentic
+            pbar.n = min(total_curr, target_entries)
+            pbar.set_postfix({
+                "forged": f"{builder.num_forged}/{builder.target_forged}",
+                "auth": f"{builder.num_authentic}/{builder.target_authentic}",
+            })
+            pbar.refresh()
+            if builder.is_complete:
+                break
+
+        pbar.close()
+        loader.close()
+        saved_file = builder.save(output_db_path)
+        logger.info(f"🎉 Vector database successfully saved to: {saved_file}")
+        return {"vector_db": [saved_file]}
+
     logger.info(
         f"🚀 Running progressive cache extraction: source='{source_dataset}', splits={parsed_args.splits}, "
         f"max_samples={parsed_args.max_samples}, output_dir='{parsed_args.output_dir}', "

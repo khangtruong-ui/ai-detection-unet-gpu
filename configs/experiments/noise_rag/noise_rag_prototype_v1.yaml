@@ -1,0 +1,68 @@
+# Configuration: Noise-RAG-Prototype-V1 Forensic Model
+# Uses frozen pretrained NoisePrint++ (17-layer DnCNN from TruFor) and cached MaskCLIP Pre-TVCA Vector Database.
+#
+# Architecture Dataflow:
+#   Image (X) -> N = NoisePrint++(X) -> NT = SomeConvVisionTransformerBlocks(N)
+#   Image (X) -> XT = SomeConvVisionTransformerBlocks(X) -> Retrieve(XT) -> XS = StopGrad(XR - XT) + XT
+#   Alignment Loss L_align(XT, XS) [MSE or Entropy/KL]
+#   O_1 = XS; O_{i+1} = CrossAttention(NT, O_i, O_i) + LightViTBlock
+#   Output maps at different layers with deep supervision via SIDTotalLoss.
+
+project:
+  name: "noise_rag_prototype_v1"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/experiments/noise_rag/noise_rag_prototype_v1"
+
+data:
+  dataset_name: "KhangTruong/DEAL300K-30K"
+  streaming: true
+  image_size: [512, 512]
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  prefetch_batches: 16
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.5
+
+model:
+  name: "noise-rag-prototype-v1"
+  freeze_noiseprint: true
+  memory_path: "outputs/cache/mask_clip_db_mae/mask_clip_db_mae.pt"
+  memory_dtype: "float16"
+  embed_dim: 256
+  conv_backbone: "mobilenetv3_small_100"
+  num_vit_blocks: 2
+  num_cross_stages: 3
+  out_stride: 8
+  retrieval_k: 4
+  align_loss_type: "mse"
+  align_loss_weight: 0.2
+  entropy_temperature: 1.0
+  aux_classifier: true
+  num_classes: 2
+  in_channels: 3
+  out_channels: 1
+
+training:
+  epochs: 20
+  batch_size: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  amp: true
+  mixed_precision: "bf16"
+  gradient_clip: 1.0
+  save_best: true
+  save_latest: true
+
+loss:
+  mask_loss_type: "combined"
+  aux_classifier: true
+  aux_weight: 0.2
+  multiscale_weight: 0.4
+  artifact_weight: 0.2
