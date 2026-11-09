@@ -103,29 +103,67 @@ For each spatial coordinate $(y, x)$ in the $F_s$ grid of size $(H_f, W_f) = (H/
 
 Given an input batch of RGB images $X \in [0, 1]^{B \times 3 \times H \times W}$:
 
+```text
+Input RGB Image X [B, 3, H, W]
+  │
+  ├──> Frozen Pretrained NoisePrint++ (17-layer DnCNN)
+  │      └──> Noise Residual N = NoisePrint++(X) [B, 3, H, W]
+  │             └──> SomeConvVisionTransformerBlocks_N (Pretrained ConvStem + Light ViT)
+  │                    └──> Noise Token Map NT [B, 256, H', W']
+  │
+  └──> SomeConvVisionTransformerBlocks_X (Pretrained ConvStem + Light ViT)
+         └──> Visual Token Map XT [B, 256, H', W']
+                │
+                ├──> Retrieve(X): Query Vector DB (100k x 256-D + float patch labels)
+                │      └──> Retrieved Representation XR [B, 256, H', W']
+                │
+                ├──> Alignment Loss L_align(XT, StopGrad(XS))  [MSE / Cosine / InfoNCE / KL-Entropy]
+                │      (Pulls trainable encoder representation XT toward retrieved prior XS / XR)
+                │
+                └──> Surrogate Stop-Gradient Replacement:
+                       XS = StopGrad(XR - XT) + XT  [B, 256, H', W']
+                         │
+                         ▼
+                       O_1 = XS  ──────────────────────────────────────────┐
+                         │                                                 │
+                         ▼                                                 │
+                       Stage 1: CrossAttention(Q=NT, K=O_1, V=O_1) + ViT   │
+                         │                                                 │
+                         ▼                                                 ├──> Multi-Scale / Progressive
+                       O_2       ──────────────────────────────────────────┤    Segmentation Head
+                         │                                                 │      │
+                         ▼                                                 │      ▼
+                       Stage i: CrossAttention(Q=NT, K=O_i, V=O_i) + ViT   │    Mask Logits [B, 1, H, W]
+                         │                                                 │    + Deep Supervision on {O_i}
+                         ▼                                                 │
+                       O_{L+1}   ──────────────────────────────────────────┘
+```
+
 ```mermaid
 flowchart TD
-    X["Input RGB Image X [B, 3, H, W]"] --> NP["Frozen Pretrained NoisePrint++ (DnCNN 17-layer)"]
-    X --> ConvViT_X["SomeConvVisionTransformerBlocks_X (Pretrained ConvStem + Light ViT)"]
-    NP --> N["Noise Residual N = NoisePrint++(X) [B, 3, H, W]"]
-    N --> ConvViT_N["SomeConvVisionTransformerBlocks_N (Pretrained ConvStem + Light ViT)"]
-    ConvViT_X --> XT["Visual Token Map XT [B, D, H', W'] (D=256)"]
-    XT --> Ret["Retrieve(X): Query Vector DB (100k x 256-D + float labels)"]
-    Ret --> XR["Retrieved Representation XR [B, D, H', W']"]
+    X["Input RGB Image X"] --> NP["Frozen Pretrained NoisePrint++"]
+    X --> ConvViT_X["SomeConvVisionTransformerBlocks_X"]
+    NP --> N["Noise Residual N"]
+    N --> ConvViT_N["SomeConvVisionTransformerBlocks_N"]
+    ConvViT_X --> XT["Visual Token Map XT"]
+    XT --> Ret["Retrieve from 100k Vector DB"]
+    Ret --> XR["Retrieved Representation XR"]
     XT --> SG["XS = StopGrad(XR - XT) + XT"]
     XR --> SG
-    ConvViT_N --> NT["Noise Token Map NT [B, D, H', W'] (D=256)"]
+    XT -.-> AlignLoss["Proximity Loss L_align(XT, XS): MSE or Entropy/KL"]
+    SG -.-> AlignLoss
+    ConvViT_N --> NT["Noise Token Map NT"]
     SG --> O1["Layer 1 Output Map: O_1 = XS"]
-    O1 --> CA1["Stage 1: CrossAttention(Q=NT, K=O_1, V=O_1) + LightViTBlock"]
+    O1 --> CA1["Stage 1 CrossAttention(NT, O_1, O_1) + LightViT"]
     NT --> CA1
     CA1 --> O2["Layer 2 Output Map: O_2"]
-    O2 --> CAK["Stage i: CrossAttention(Q=NT, K=O_i, V=O_i) + LightViTBlock"]
+    O2 --> CAK["Stage i CrossAttention(NT, O_i, O_i) + LightViT"]
     NT --> CAK
-    CAK --> OL["Layer L+1 Output Map: O_{L+1}"]
-    O1 --> Head["Multi-Scale / Progressive Segmentation Head"]
+    CAK --> OL["Layer L+1 Output Map: O_L+1"]
+    O1 --> Head["Progressive Multi-Scale Segmentation Head"]
     O2 --> Head
     OL --> Head
-    Head --> Mask["Predicted Manipulation Mask Logits [B, 1, H, W]"]
+    Head --> Mask["Predicted Mask Logits + Deep Supervision"]
 ```
 
 ### 4.2 Mathematical Equations & Component Breakdown
@@ -152,9 +190,22 @@ flowchart TD
    - Reuses [`stop_gradient_query_replacement(original_query=X_T, retrieved_query=X_R)`](../sid_unet/models/forensic_memory.py#L22-L62):
      - **Forward value**: $X_S = X_R$ (directly injects retrieved MaskCLIP pre-TVCA forensic priors & label signals).
      - **Backward gradient**: $\frac{\partial X_S}{\partial X_T} = I$, $\frac{\partial X_S}{\partial X_R} = 0$ (gradients flow cleanly into `SomeConvVisionTransformerBlocks_X` without backpropagating through the discrete database lookup).
-   - Optionally also train an auxiliary alignment loss (e.g. cosine/MSE distillation or patch-label prediction loss) if configured.
 
-5. **Iterative Noise-Guided Cross-Attention & Multi-Layer Output Maps ($O_1, \dots, O_{L+1}$)**:
+5. **Proximity / Alignment Loss Between $X_S$ and $X_T$ ($\mathcal{L}_{\text{align}}(X_T, X_S)$)**:
+   - **Rationale**: In the forward pass, $X_S$ takes the exact value of $X_R$ ($X_S = \text{StopGrad}(X_R - X_T) + X_T = X_R$), while task gradients flow straight through to $X_T$. However, without a commitment/proximity constraint, the encoder output $X_T$ can drift away from the retrieved embedding manifold $X_S$ (analogous to VQ-VAE commitment loss). Therefore, an explicit loss is required to pull $X_T$ close to $\text{StopGrad}(X_S)$ (where $\text{StopGrad}(X_S) = \text{StopGrad}(X_R)$).
+   - **Supported Loss Formulations** (configurable via `model.align_loss_type: "mse" | "entropy" | "mse+entropy"`):
+     - **MSE Proximity Loss (`"mse"`)**:
+       $$\mathcal{L}_{\text{align}}^{\text{MSE}}(X_T, X_S) = \frac{1}{B \cdot D \cdot H' \cdot W'} \left\| X_T - \text{StopGrad}(X_S) \right\|_2^2 = \text{F.mse\_loss}(X_T, X_S.\text{detach}())$$
+     - **Cross-Entropy / KL Divergence Loss (`"entropy"`)**:
+       Treats channel-wise token activations (with temperature $\tau$, default $\tau = 1.0$ or $0.1$) as probability distributions over the $D = 256$ embedding channels and minimizes the divergence / cross-entropy between $X_T$ and target $\text{StopGrad}(X_S)$:
+       $$P_S = \text{softmax}\!\left(\frac{\text{StopGrad}(X_S)}{\tau},\, \text{dim}=1\right), \quad \log P_T = \text{log\_softmax}\!\left(\frac{X_T}{\tau},\, \text{dim}=1\right)$$
+       $$\mathcal{L}_{\text{align}}^{\text{entropy}}(X_T, X_S) = \text{F.kl\_div}(\log P_T, P_S, \text{reduction}=\text{"batchmean"}) \quad \text{or} \quad -\sum_{c=1}^{D} P_{S,c} \log P_{T,c}$$
+     - **Combined Mode (`"mse+entropy"`)**: Sum of MSE and temperature-scaled KL/Cross-Entropy loss.
+   - **Integration with `SIDTotalLoss`**:
+     - `NoiseRAGPrototypeV1.forward()` computes $\mathcal{L}_{\text{align}}$ during training and returns it in the output dictionary under `"artifact_loss"` (and `"align_loss"`), which [`SIDTotalLoss`](../sid_unet/losses/auxiliary.py#L140-L143) natively adds to the total loss weighted by `artifact_weight` (default e.g. `0.1`–`0.5`):
+       $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{seg}}(\hat{M}_{\text{final}}, M_{\text{gt}}) + \lambda_{\text{ms}} \sum_{i=1}^{L+1} w_i \mathcal{L}_{\text{seg}}(\hat{M}_i, M_{\text{gt}}) + \lambda_{\text{align}} \mathcal{L}_{\text{align}}(X_T, \text{StopGrad}(X_S))$$
+
+6. **Iterative Noise-Guided Cross-Attention & Multi-Layer Output Maps ($O_1, \dots, O_{L+1}$)**:
    - **Base Layer ($i = 1$)**:
      $$O_1 = X_S \in \mathbb{R}^{B \times D \times H' \times W'}$$
    - **Recurrent Cross-Attention Layers ($i = 1, \dots, L$)**:
@@ -236,9 +287,10 @@ sid-cross-eval --config configs/cross-eval/MVSS-v1-protocol.yaml \
      - $X_T = \text{ConvViT}_X(X)$, $N_T = \text{ConvViT}_N(N)$
      - $X_R = \text{Retrieve}(X_T)$ (fusing retrieved 256-D embeddings and their float tampered-fraction labels)
      - $X_S = \text{StopGrad}(X_R - X_T) + X_T$
+     - Proximity / Alignment Loss $\mathcal{L}_{\text{align}}(X_T, \text{StopGrad}(X_S))$ supporting MSE (`F.mse_loss`) and Entropy/KL (`F.kl_div` / cross-entropy over channel softmax), returned as `artifact_loss` for `SIDTotalLoss`
      - $O_1 = X_S$, $O_{i+1} = \text{CrossAttention}(N_T, O_i / X_S, O_i / X_S) + \text{LightViTBlock}$
      - Multi-layer output predictions from $\{O_1, \dots, O_{L+1}\}$ with deep supervision (`multiscale_logits`).
    - Register `noise-rag-prototype-v1` in `sid_unet/models/unet.py` (`build_model` and `from_checkpoint`).
    - Create `configs/experiments/noise_rag/noise_rag_prototype_v1.yaml`.
 4. **Tests**:
-   - Add unit & integration tests in `tests/test_noise_rag.py` verifying strict pretrained weight enforcement, 90/10 DB sampling with float patch labels, stop-gradient identity backward flow, `fp16`/`bf16` quantization, and multi-layer output shapes.
+   - Add unit & integration tests in `tests/test_noise_rag.py` verifying strict pretrained weight enforcement, 90/10 DB sampling with float patch labels, stop-gradient identity backward flow, $X_S$–$X_T$ alignment loss (MSE & entropy) gradient flow into $X_T$, `fp16`/`bf16` quantization, and multi-layer output shapes.
