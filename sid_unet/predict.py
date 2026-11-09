@@ -147,6 +147,9 @@ def _predict_chunk(model, chunk_tensors, device):
     if isinstance(outputs, (tuple, list)):
         mask_logits = outputs[0]
         class_logits = outputs[1] if len(outputs) > 1 else None
+    elif isinstance(outputs, dict):
+        mask_logits = outputs.get("mask_logits", outputs.get("pred_masks", outputs.get("masks", outputs.get("logits"))))
+        class_logits = outputs.get("class_logits", outputs.get("pred_logits"))
     else:
         mask_logits, class_logits = outputs, None
     return mask_logits, class_logits

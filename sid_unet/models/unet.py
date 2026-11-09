@@ -459,6 +459,7 @@ def build_model(config: Any) -> nn.Module:
             num_classes=int(model_cfg.get("num_classes", 2)),
             in_channels=int(model_cfg.get("in_channels", 3)),
             out_channels=int(model_cfg.get("out_channels", 1)),
+            cross_mode=str(model_cfg.get("cross_mode", "recurrent")),
         )
 
     if any(k in model_name for k in ["mask_clip", "mask-clip", "maskclip", "opensdi", "open_sdi", "sideclip"]) or any(

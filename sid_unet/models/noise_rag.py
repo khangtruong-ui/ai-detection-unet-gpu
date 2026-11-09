@@ -428,22 +428,71 @@ class ForensicVectorDBRetrieval(nn.Module):
         self.register_buffer("db_keys", torch.empty((0, embed_dim), dtype=self.storage_dtype), persistent=False)
         self.register_buffer("db_labels", torch.empty((0, 1), dtype=self.storage_dtype), persistent=False)
 
-        if memory_path and os.path.isfile(memory_path):
-            self.load_database(memory_path)
+        if memory_path:
+            try:
+                self.load_database(memory_path)
+            except Exception as load_err:
+                logger.warning(f"Could not load vector database from memory_path '{memory_path}': {load_err}")
 
     @property
     def has_database(self) -> bool:
         return self.db_keys.shape[0] > 0
 
     def load_database(self, filepath: str) -> None:
-        """Load vector database from a standalone PyTorch file (.pt)."""
-        abs_path = os.path.abspath(filepath)
-        if not os.path.exists(abs_path):
-            raise FileNotFoundError(f"MaskCLIP vector database not found: {abs_path}")
+        """
+        Load vector database from a standalone PyTorch file (.pt) or Hugging Face repository.
+        Supports local file paths, candidate resolution paths, and Hugging Face Hub dataset repo IDs.
+        """
+        resolved_path = None
 
-        ckpt = torch.load(abs_path, map_location="cpu", weights_only=False)
+        # 1. Direct path check
+        if os.path.isfile(filepath):
+            resolved_path = os.path.abspath(filepath)
+
+        # 2. Check if filepath is a Hugging Face Hub repository ID (or 'hf://<repo_id>')
+        if resolved_path is None:
+            clean_repo = filepath.replace("hf://", "").strip()
+            if "/" in clean_repo and not clean_repo.startswith((".", "/")):
+                repo_id = clean_repo
+                target_filename = "mask_clip_db_mae.pt"
+                parts = clean_repo.split("/")
+                if len(parts) > 2 and parts[-1].endswith(".pt"):
+                    repo_id = f"{parts[0]}/{parts[1]}"
+                    target_filename = "/".join(parts[2:])
+                try:
+                    from huggingface_hub import hf_hub_download
+                    resolved_path = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=target_filename,
+                        repo_type="dataset",
+                    )
+                    logger.info(f"Downloaded vector database from Hugging Face Hub '{repo_id}': {resolved_path}")
+                except Exception as hf_err:
+                    logger.debug(f"HF Hub download check failed for '{filepath}': {hf_err}")
+
+        # 3. Check candidate local directories if path doesn't exist directly
+        if resolved_path is None:
+            filename = os.path.basename(filepath) if filepath.endswith(".pt") else "mask_clip_db_mae.pt"
+            candidates = [
+                filepath,
+                os.path.join("outputs", "dataset_cache", filename),
+                os.path.join("outputs", "cache", "mask_clip_db_mae", filename),
+                os.path.join("outputs", "dataset_cache", "mask_clip_db_mae.pt"),
+                os.path.join("outputs", "cache", "mask_clip_db_mae", "mask_clip_db_mae.pt"),
+                filename,
+            ]
+            for cand in candidates:
+                if os.path.isfile(cand):
+                    resolved_path = os.path.abspath(cand)
+                    logger.info(f"Resolved vector database from candidate path: {resolved_path}")
+                    break
+
+        if resolved_path is None or not os.path.exists(resolved_path):
+            raise FileNotFoundError(f"MaskCLIP vector database not found at '{filepath}' (and could not be resolved from local cache or HF Hub).")
+
+        ckpt = torch.load(resolved_path, map_location="cpu", weights_only=False)
         if not isinstance(ckpt, dict) or "keys" not in ckpt:
-            raise ValueError(f"Invalid vector DB payload from {abs_path}: missing 'keys'")
+            raise ValueError(f"Invalid vector DB payload from {resolved_path}: missing 'keys'")
 
         keys = ckpt["keys"].to(dtype=self.storage_dtype)
         if "labels" in ckpt and ckpt["labels"] is not None:
@@ -455,9 +504,10 @@ class ForensicVectorDBRetrieval(nn.Module):
 
         self.db_keys = keys
         self.db_labels = labels
+        self.memory_path = resolved_path
         logger.info(
             f"✅ Loaded {keys.shape[0]} MaskCLIP pre-TVCA vectors into retrieval buffer "
-            f"({keys.shape[1]} dim, {self.storage_dtype}) from: {abs_path}"
+            f"({keys.shape[1]} dim, {self.storage_dtype}) from: {resolved_path}"
         )
 
     def forward(self, x_t: torch.Tensor) -> torch.Tensor:
@@ -490,20 +540,33 @@ class ForensicVectorDBRetrieval(nn.Module):
         q_norm = F.normalize(q, p=2, dim=-1)
         k_norm = F.normalize(k_entries, p=2, dim=-1)
 
-        # Similarity matrix: [B*H'*W', N_entries]
-        sim = torch.matmul(q_norm, k_norm.t())
-
         k_actual = min(self.retrieval_k, k_entries.shape[0])
-        topk_sims, topk_indices = torch.topk(sim, k=k_actual, dim=-1, largest=True, sorted=True)
+        chunk_size = 2048
+        num_tokens = q_norm.shape[0]
 
-        attn_weights = F.softmax(topk_sims / max(self.temperature, 1e-4), dim=-1).unsqueeze(-1)  # [BH'W', K, 1]
-
-        # Gather top-k vectors and labels: [BH'W', K, C] and [BH'W', K, 1]
-        ret_k = k_entries[topk_indices]
-        ret_l = l_entries[topk_indices]
-
-        agg_k = (attn_weights * ret_k).sum(dim=1)  # [BH'W', C]
-        agg_l = (attn_weights * ret_l).sum(dim=1)  # [BH'W', 1]
+        if num_tokens <= chunk_size:
+            sim = torch.matmul(q_norm, k_norm.t())
+            topk_sims, topk_indices = torch.topk(sim, k=k_actual, dim=-1, largest=True, sorted=True)
+            attn_weights = F.softmax(topk_sims / max(self.temperature, 1e-4), dim=-1).unsqueeze(-1)
+            ret_k = k_entries[topk_indices]
+            ret_l = l_entries[topk_indices]
+            agg_k = (attn_weights * ret_k).sum(dim=1)
+            agg_l = (attn_weights * ret_l).sum(dim=1)
+        else:
+            agg_k_list = []
+            agg_l_list = []
+            for start_idx in range(0, num_tokens, chunk_size):
+                end_idx = min(start_idx + chunk_size, num_tokens)
+                q_chunk = q_norm[start_idx:end_idx]
+                sim_chunk = torch.matmul(q_chunk, k_norm.t())
+                topk_sims, topk_indices = torch.topk(sim_chunk, k=k_actual, dim=-1, largest=True, sorted=True)
+                attn_weights = F.softmax(topk_sims / max(self.temperature, 1e-4), dim=-1).unsqueeze(-1)
+                ret_k = k_entries[topk_indices]
+                ret_l = l_entries[topk_indices]
+                agg_k_list.append((attn_weights * ret_k).sum(dim=1))
+                agg_l_list.append((attn_weights * ret_l).sum(dim=1))
+            agg_k = torch.cat(agg_k_list, dim=0)
+            agg_l = torch.cat(agg_l_list, dim=0)
 
         fuse_dtype = self.fuse_proj[0].weight.dtype
         fused_in = torch.cat([agg_k, agg_l], dim=-1).to(dtype=fuse_dtype)
@@ -577,6 +640,7 @@ class NoiseRAGPrototypeV1(nn.Module):
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.memory_path = memory_path
+        self.cross_mode = str(kwargs.get("cross_mode", "recurrent")).lower().strip()
 
         # 1. NoisePrint++ Extractor
         self.noiseprint = NoisePrintPlusPlus(
@@ -725,7 +789,8 @@ class NoiseRAGPrototypeV1(nn.Module):
         layer_maps: List[torch.Tensor] = [x_s]
         curr_state = x_s
         for stage in self.cross_stages:
-            curr_state = stage(q_map=n_t, kv_map=curr_state)
+            kv_input = x_s if self.cross_mode in ("xs", "surrogate") else curr_state
+            curr_state = stage(q_map=n_t, kv_map=kv_input)
             layer_maps.append(curr_state)
 
         # 7. Layer Prediction Heads with Bilinear Upsampling to full resolution

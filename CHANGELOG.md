@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-11-09
 
 ### Added
+- **Vector Database Auto-Routing in `sid-train` (`--cached-hf-repo`)**:
+  - Automatically detect when `--cached-hf-repo` points to a vector database repository (e.g. `KhangTruong/mask-clip-db-mae-cache`) or when training retrieval models like `noise-rag-prototype-v1`.
+  - Resolve and download the vector database directly into `config.model.memory_path` via Hugging Face Hub (`hf_hub_download`), preventing accidental assignment to `config.data.cached_hf_repo` which previously generated 84-channel mock latent shards and triggered input shape mismatch crashes (`RuntimeError: Given groups=1, expected input to have 3 channels, but got 84 channels instead`).
+  - Added CLI options `--memory-path`, `--cached-vector-db`, and `--vector-db` to `sid-train` for explicit vector DB path specification.
+- **Chunked Token Querying in `ForensicVectorDBRetrieval`**:
+  - Implemented token query chunking (default chunk size 2048) in `ForensicVectorDBRetrieval.forward`, avoiding peak VRAM spikes and out-of-memory errors when computing similarity against 100k vector database keys on dense feature maps ($H \times W = 4096$ tokens).
+- **Hugging Face Hub Resolution & Multi-Path Fallback in `ForensicVectorDBRetrieval`**:
+  - Enhanced `ForensicVectorDBRetrieval.load_database` to directly download vector database `.pt` files from Hugging Face Hub dataset repos (`org/repo_name`) and search local candidate locations (`outputs/cache/`, `outputs/dataset_cache/`).
+- **Configurable Cross-Attention Mode in `NoiseRAGPrototypeV1`**:
+  - Added configurable `cross_mode` ("recurrent" / "chained" vs "xs" / "surrogate") in `NoiseRAGPrototypeV1` and exposed it via `sid_unet.models.unet.build_model`.
+- **Dictionary Model Output Compatibility Across Training, Evaluation, and Prediction**:
+  - Handled dictionary model outputs (`outputs.get("mask_logits")`, `outputs.get("class_logits")`) in `Trainer._step_batch_train`, `Trainer._eval_batch_step`, `Trainer._check_and_auto_scale_batch_size`, `evaluate_single_checkpoint`, and `predict_image`, preventing `AttributeError: 'dict' object has no attribute 'detach'` / `'dim'`.
+- **Validation in `create_cached_dataloaders`**:
+  - Added explicit validation to raise an informative `ValueError` if `create_cached_dataloaders` receives a vector DB dataset repo containing `.pt` files without parquet latent shards, and set `default_channels` to `in_channels` for `noise-rag`.
 - **Mask Byte Decoding Utility (`decode_mask_bytes`)**:
   - Implemented `decode_mask_bytes` in `sid_unet.dataset.mask_utils` (and exported in `sid_unet.dataset`) to decode raw mask image bytes (PNG, JPEG), bytearrays, BytesIO streams, HF dictionary structures, PIL Images, and numpy/PyTorch tensors into normalized float32 arrays with optional resizing and binarization thresholding.
 - **Hugging Face Hub Vector Database Sync in `sid-cache`**:
@@ -16,9 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added automatic detection and restoration of sibling `mask_clip_db_mae.pt` / `vector_db.pt` into the model's `retrieval` module in `sid_unet.models.unet.from_checkpoint`.
 - **Extended Test Suite for Noise-RAG and Vector DB Caching**:
   - Added unit tests for `decode_mask_bytes` in `tests/test_mask_utils.py` covering PNG decoding, resizing, continuous vs thresholded decoding, and edge cases.
-  - Added integration tests in `tests/test_noise_rag.py` verifying vector DB extraction with encoded PNG mask bytes, `ForensicVectorMemory` continuous patch label storage and consolidation, `ForensicVectorDBRetrieval` fallback and loaded modes, `UNet.from_checkpoint` roundtrip restoration, combined `mse+entropy` alignment loss gradient flow, full `MaskCLIP.extract_pre_tvca_features` tap, and `sid-cache` vector DB CLI execution.
+  - Added comprehensive integration tests in `tests/test_noise_rag.py` (22 tests) verifying vector DB extraction with encoded PNG mask bytes, `ForensicVectorMemory` continuous patch label storage and consolidation, `ForensicVectorDBRetrieval` fallback and loaded modes, chunked token querying, HF Hub download resolution, `UNet.from_checkpoint` roundtrip restoration, combined `mse+entropy` alignment loss gradient flow, full `MaskCLIP.extract_pre_tvca_features` tap, configurable cross-attention modes, `sid-train` vector DB routing, rejection of vector DB in `create_cached_dataloaders`, `sid-eval` and `sid-cross-eval` with dict outputs, and `sid-cache` vector DB CLI execution.
 
 ### Fixed
+- **`RuntimeError` Input Channel Mismatch When Passing `--cached-hf-repo` to `sid-train`**:
+  - Fixed bug in `.logs.txt` where passing `--cached-hf-repo KhangTruong/mask-clip-db-mae-cache` caused `create_cached_dataloaders` to synthesize 84-channel mock latent shards for `NoisePrint++` (17-layer DnCNN expecting 3-channel RGB). The vector DB repo is now cleanly routed to download into `config.model.memory_path` while retaining standard RGB image loading.
+- **`UnboundLocalError` on `logger` in `train_single_run`**:
+  - Initialized module logger at entry of `train_single_run` in `sid_unet/train.py`.
+- **`AttributeError: 'dict' object has no attribute 'detach'` in Trainer Evaluation**:
+  - Extracted tensor logits from dict outputs during training and validation steps in `sid_unet/training/trainer.py`.
 - **`sid-cache` Vector DB Mask Decoding Import Error**:
   - Resolved `ImportError: cannot import name 'decode_mask_bytes'` when executing `sid-cache` with `mask-clip-db-mae.yaml`.
 - **MaskCLIP Experiment Config Validation**:

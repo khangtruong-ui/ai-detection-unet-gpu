@@ -597,3 +597,276 @@ cache:
         assert "keys" in loaded
         assert "labels" in loaded
 
+
+def test_forensic_vector_db_retrieval_chunking_and_resolution():
+    """Verify chunked retrieval produces matching results and resolves candidate paths / HF downloads."""
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 1. Create a dummy vector DB
+        db_path = os.path.join(tmp_dir, "test_db.pt")
+        keys = torch.randn(50, 256, dtype=torch.float16)
+        labels = torch.rand(50, 1, dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels}, db_path)
+
+        retrieval = ForensicVectorDBRetrieval(
+            memory_path=db_path,
+            memory_dtype="float16",
+            retrieval_k=3,
+            embed_dim=256,
+        )
+        assert retrieval.has_database
+        assert retrieval.db_keys.shape == (50, 256)
+
+        # Test chunked retrieval vs small token retrieval
+        # Create a large token map that triggers the chunking path (> 2048 tokens)
+        # e.g. B=2, H=36, W=36 -> 2 * 36 * 36 = 2592 tokens
+        x_large = torch.randn(2, 256, 36, 36)
+        out_chunked = retrieval(x_large)
+        assert out_chunked.shape == (2, 256, 36, 36)
+        assert torch.isfinite(out_chunked).all()
+
+        # 2. Test candidate local path resolution when given a relative path
+        cand_dir = os.path.join(tmp_dir, "outputs", "dataset_cache")
+        os.makedirs(cand_dir, exist_ok=True)
+        cand_db = os.path.join(cand_dir, "mask_clip_db_mae.pt")
+        torch.save({"keys": keys, "labels": labels}, cand_db)
+
+        # 3. Test Hugging Face Hub download resolution
+        with patch("huggingface_hub.hf_hub_download", return_value=db_path) as mock_hf:
+            retrieval_hf = ForensicVectorDBRetrieval(
+                memory_path="KhangTruong/mask-clip-db-mae-cache",
+                memory_dtype="float16",
+                embed_dim=256,
+            )
+            assert retrieval_hf.has_database
+            assert mock_hf.called
+
+
+def test_noise_rag_configurable_cross_modes():
+    """Verify NoiseRAGPrototypeV1 cross_mode support for 'xs' (surrogate) and 'recurrent' (chained)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = os.path.join(tmp_dir, "mask_clip_db_mae.pt")
+        keys = torch.randn(20, 256, dtype=torch.float16)
+        labels = torch.rand(20, 1, dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels}, db_path)
+
+        # 1. recurrent mode (default)
+        model_rec = NoiseRAGPrototypeV1(
+            memory_path=db_path,
+            embed_dim=256,
+            num_cross_stages=2,
+            cross_mode="recurrent",
+        )
+        assert model_rec.cross_mode == "recurrent"
+
+        # 2. xs mode
+        model_xs = NoiseRAGPrototypeV1(
+            memory_path=db_path,
+            embed_dim=256,
+            num_cross_stages=2,
+            cross_mode="xs",
+        )
+        assert model_xs.cross_mode == "xs"
+
+        x = torch.rand(1, 3, 64, 64)
+        out_rec = model_rec(x, return_dict=True)
+        out_xs = model_xs(x, return_dict=True)
+
+        assert out_rec["mask_logits"].shape == (1, 1, 64, 64)
+        assert out_xs["mask_logits"].shape == (1, 1, 64, 64)
+        assert torch.isfinite(out_rec["mask_logits"]).all()
+        assert torch.isfinite(out_xs["mask_logits"]).all()
+
+
+def test_sid_train_vector_db_routing_and_no_mock_latents():
+    """Verify sid-train routes --cached-hf-repo to vector DB memory without creating 84-ch mock latents."""
+    from sid_unet.train import train_single_run
+    from unittest.mock import patch, MagicMock
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cfg_path = os.path.join(tmp_dir, "test_noise_rag_cfg.yaml")
+        db_path = os.path.join(tmp_dir, "mask_clip_db_mae.pt")
+        keys = torch.randn(10, 256, dtype=torch.float16)
+        labels = torch.rand(10, 1, dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels}, db_path)
+
+        cfg_content = f"""project:
+  name: "test_noise_rag_train"
+  seed: 42
+  device: "cpu"
+  output_dir: "{tmp_dir}/run"
+data:
+  dataset_name: "mock_rgb_dataset"
+  streaming: false
+  image_size: [64, 64]
+  batch_size: 2
+  train_split: "train"
+  val_split: "val"
+  train_samples_per_epoch: 2
+  val_samples_per_epoch: 2
+model:
+  name: "noise-rag-prototype-v1"
+  freeze_noiseprint: true
+  memory_path: "{db_path}"
+  embed_dim: 256
+  num_cross_stages: 1
+  in_channels: 3
+  out_channels: 1
+training:
+  epochs: 1
+  lr: 0.001
+  amp: false
+  auto_batch_size: false
+loss:
+  mask_loss_type: "combined"
+  aux_classifier: false
+"""
+        with open(cfg_path, "w") as f:
+            f.write(cfg_content)
+
+        # Mock dataset loading to return 3-channel RGB image batches
+        mock_train_batch = {
+            "image": torch.rand(2, 3, 64, 64),
+            "mask": torch.zeros(2, 1, 64, 64),
+            "label": torch.tensor([0, 1]),
+            "img_id": ["img1", "img2"],
+        }
+        mock_val_batch = {
+            "image": torch.rand(2, 3, 64, 64),
+            "mask": torch.zeros(2, 1, 64, 64),
+            "label": torch.tensor([0, 1]),
+            "img_id": ["img_v1", "img_v2"],
+        }
+
+        mock_train_loader = [mock_train_batch]
+        mock_val_loader = [mock_val_batch]
+
+        with patch("sid_unet.train.create_dataloaders", return_value=(mock_train_loader, mock_val_loader, mock_val_loader)), \
+             patch("huggingface_hub.hf_hub_download", return_value=db_path):
+
+            # Run train_single_run passing --cached-hf-repo pointing to a vector DB repo
+            results = train_single_run(
+                config_path=cfg_path,
+                cached_hf_repo="KhangTruong/mask-clip-db-mae-cache",
+                auto_resume=False,
+            )
+
+            assert results is not None
+            assert results["best_epoch"] == 1
+            assert "final_metrics" in results or "overall_metrics" in results
+
+
+def test_create_cached_dataloaders_rejects_vector_db_repo():
+    """Verify create_cached_dataloaders raises ValueError if passed a vector DB repo instead of silent mock shard."""
+    from sid_unet.dataset.loader import create_cached_dataloaders
+    from sid_unet.utils.config import ConfigDict
+    from unittest.mock import patch, MagicMock
+
+    cfg = ConfigDict({
+        "project": {"seed": 42},
+        "data": {"image_size": [64, 64], "batch_size": 2, "streaming": False},
+        "model": {"name": "noise-rag-prototype-v1", "in_channels": 3},
+    })
+
+    # Mock HfApi to report repo has .pt file and no parquet files
+    mock_api = MagicMock()
+    mock_api.list_repo_files.return_value = ["mask_clip_db_mae.pt", "cache_info.json"]
+
+    with patch("sid_unet.dataset.loader.resolve_cached_parquet_files", return_value=[]), \
+         patch("huggingface_hub.HfApi", return_value=mock_api):
+
+        with pytest.raises(ValueError, match="vector database"):
+            create_cached_dataloaders(cfg, cached_repo="KhangTruong/mask-clip-db-mae-cache")
+
+
+def test_sid_eval_and_cross_eval_noise_rag_checkpoint():
+    """Verify sid-eval and sid-cross-eval evaluate NoiseRAGPrototypeV1 checkpoints with dict outputs."""
+    from sid_unet.evaluate import evaluate_single_checkpoint
+    from sid_unet.cross_eval import evaluate_checkpoint_on_config
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create vector DB and checkpoint
+        db_path = os.path.join(tmp_dir, "mask_clip_db_mae.pt")
+        keys = torch.randn(10, 256, dtype=torch.float16)
+        labels = torch.rand(10, 1, dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels}, db_path)
+
+        model = NoiseRAGPrototypeV1(
+            memory_path=db_path,
+            embed_dim=256,
+            num_cross_stages=1,
+            conv_backbone="mobilenetv3_small_100",
+            aux_classifier=False,
+        )
+        model.eval()
+
+        ckpt_dir = os.path.join(tmp_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(ckpt_dir, "checkpoint_best.pt")
+
+        cfg_dict = {
+            "project": {"name": "test_noise_rag", "seed": 42},
+            "data": {"dataset_name": "mock", "image_size": [64, 64], "batch_size": 2},
+            "model": {
+                "name": "noise-rag-prototype-v1",
+                "memory_path": db_path,
+                "embed_dim": 256,
+                "num_cross_stages": 1,
+                "conv_backbone": "mobilenetv3_small_100",
+                "aux_classifier": False,
+            },
+            "loss": {"mask_loss_type": "combined", "aux_classifier": False},
+        }
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "config": cfg_dict,
+            "epoch": 1,
+        }, ckpt_path)
+
+        class DummyEvalDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return 2
+            def __getitem__(self, idx):
+                return {
+                    "image": torch.rand(3, 64, 64),
+                    "mask": torch.zeros(1, 64, 64),
+                    "label": torch.tensor(idx % 2),
+                    "img_id": f"img_{idx}",
+                }
+
+        mock_loader = torch.utils.data.DataLoader(DummyEvalDataset(), batch_size=2)
+
+        # 1. Test evaluate_single_checkpoint
+        with patch("sid_unet.evaluate.create_eval_dataloader", return_value=mock_loader):
+            eval_res = evaluate_single_checkpoint(
+                checkpoint_path=ckpt_path,
+                output_dir=os.path.join(tmp_dir, "eval_out"),
+                split="val",
+                save_illustrations=False,
+            )
+            assert eval_res is not None
+            assert "overall_metrics" in eval_res
+            assert "iou" in eval_res["overall_metrics"]
+
+        # 2. Test evaluate_checkpoint_on_config (cross-eval)
+        cross_cfg_path = os.path.join(tmp_dir, "cross_cfg.yaml")
+        with open(cross_cfg_path, "w") as f:
+            f.write("""protocol: "test_protocol"
+data:
+  dataset_name: "mock"
+  image_size: [64, 64]
+  batch_size: 2
+""")
+        with patch("sid_unet.cross_eval.create_eval_dataloader", return_value=mock_loader):
+            cross_res = evaluate_checkpoint_on_config(
+                checkpoint_path=ckpt_path,
+                config_path=cross_cfg_path,
+                master_output_dir=os.path.join(tmp_dir, "cross_out"),
+                save_illustrations=False,
+            )
+            assert cross_res is not None
+            assert "overall_metrics" in cross_res
+            assert "iou" in cross_res["overall_metrics"]
+

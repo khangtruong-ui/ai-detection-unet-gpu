@@ -1728,7 +1728,12 @@ def create_cached_dataloaders(
     )
 
     model_name = str(config.model.get("name", "")).lower() if hasattr(config, "model") and hasattr(config.model, "get") else ""
-    default_channels = 256 if model_name in ("gap_sam", "gap-sam", "gapsam") else 84
+    if model_name in ("gap_sam", "gap-sam", "gapsam"):
+        default_channels = 256
+    elif any(k in model_name for k in ("noise-rag", "noise_rag", "noiserag")):
+        default_channels = int(config.model.get("in_channels", 3))
+    else:
+        default_channels = 84
     expected_channels = int(config.model.get("total_z_channels", default_channels))
     use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
     save_to_disk = config.data.get("save_to_disk", False)
@@ -1903,6 +1908,19 @@ def create_cached_dataloaders(
 
     # Fallback to mock shard if repo has no parquet files
     if not train_files:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            repo_fnames = api.list_repo_files(repo_id=cached_repo, repo_type="dataset")
+            if any(f.endswith(".pt") for f in repo_fnames) and not any(f.endswith(".parquet") for f in repo_fnames):
+                raise ValueError(
+                    f"Repository '{cached_repo}' contains vector database (.pt) files but no parquet shards. "
+                    f"For retrieval models like noise-rag-prototype-v1, configure it as model.memory_path or pass --memory-path."
+                )
+        except Exception as check_err:
+            if isinstance(check_err, ValueError):
+                raise check_err
+
         logger.warning(
             f"No cached parquet files found in '{cached_repo}' for split '{train_split}'. "
             "Generating temporary mock cached shard for training execution..."

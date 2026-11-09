@@ -913,7 +913,11 @@ class Trainer:
             getattr(self.raw_model, "__class__", type(self.raw_model)).__name__.lower() in ("gapsam", "gap_sam")
             or str(self.config.model.get("name", "")).lower() in ("gap_sam", "gap-sam", "gapsam")
         )
-        if bool(self.config.data.get("cached_hf_repo", False)) and not is_gap_sam:
+        is_noise_rag = (
+            getattr(self.raw_model, "__class__", type(self.raw_model)).__name__.lower() in ("noiseragprototypev1", "noise_rag", "noiserag")
+            or str(self.config.model.get("name", "")).lower() in ("noise-rag-prototype-v1", "noise_rag_prototype_v1", "noise-rag", "noise_rag")
+        )
+        if bool(self.config.data.get("cached_hf_repo", False)) and not is_gap_sam and not is_noise_rag:
             z_ch = int(self.config.model.get("total_z_channels", getattr(self.raw_model, "total_z_channels", 84)))
             sample_shape = (z_ch, img_size[0] // 8, img_size[1] // 8)
         else:
@@ -1057,7 +1061,12 @@ class Trainer:
         # that any metric sync error or numerical anomaly defaults to 0.0 without terminating training.
         try:
             with torch.no_grad():
-                mask_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+                if isinstance(outputs, dict):
+                    mask_logits = outputs.get("mask_logits", outputs.get("pred_masks", outputs.get("masks", outputs.get("logits"))))
+                elif isinstance(outputs, (tuple, list)):
+                    mask_logits = outputs[0]
+                else:
+                    mask_logits = outputs
                 if mask_logits is not None:
                     preds = (torch.sigmoid(mask_logits.detach()) >= 0.5)
                     targets = (masks >= 0.5)
@@ -1401,7 +1410,10 @@ class Trainer:
 
         metric_logger.update_dict(loss_dict, n=images.size(0))
 
-        if isinstance(outputs, (tuple, list)):
+        if isinstance(outputs, dict):
+            mask_logits = outputs.get("mask_logits", outputs.get("pred_masks", outputs.get("masks", outputs.get("logits"))))
+            class_logits = outputs.get("class_logits", outputs.get("pred_logits"))
+        elif isinstance(outputs, (tuple, list)):
             mask_logits = outputs[0]
             class_logits = outputs[1] if len(outputs) > 1 else None
         else:
