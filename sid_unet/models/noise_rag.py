@@ -713,28 +713,51 @@ class NoiseRAGPrototypeV1(nn.Module):
         else:
             self.class_head = None
 
-    def compute_alignment_loss(self, x_t: torch.Tensor, x_s: torch.Tensor) -> torch.Tensor:
+    def compute_alignment_loss(
+        self,
+        x_s: Optional[torch.Tensor] = None,
+        x_r: Optional[torch.Tensor] = None,
+        x_t: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         """
-        Compute proximity / alignment loss pulling visual tokens XT close to StopGrad(XS) (StopGrad(XR)).
+        Compute proximity / alignment loss enforcing XS to get close to XR (and XT to XR).
+
+        Supports MSE proximity loss between surrogate/visual representations and retrieved priors.
 
         Args:
-            x_t: Visual encoder tokens `[B, C, H', W']`.
             x_s: Surrogate replaced representation `[B, C, H', W']`.
+            x_r: Retrieved representation `[B, C, H', W']`.
+            x_t: Visual encoder tokens `[B, C, H', W']`.
 
         Returns:
             Scalar alignment loss tensor.
         """
-        target_s = x_s.detach()
+        # Resolve target and source representations
+        # Backward compatibility: if called as compute_alignment_loss(x_t=..., x_s=...)
+        # x_s was passed as target, x_t as source.
+        if x_r is not None:
+            target = x_r.detach()
+            source = x_t if x_t is not None else x_s
+        elif x_s is not None and x_t is not None:
+            target = x_s.detach()
+            source = x_t
+        elif x_s is not None:
+            target = x_s.detach()
+            source = x_s
+        else:
+            dev = x_t.device if x_t is not None else "cpu"
+            return torch.tensor(0.0, device=dev)
 
-        mse_loss = F.mse_loss(x_t, target_s)
+        mse_loss = F.mse_loss(source, target)
         if self.align_loss_type == "mse":
             return mse_loss * self.align_loss_weight
 
         # Channel-wise temperature-scaled Cross-Entropy / KL Divergence
         tau = max(self.entropy_temperature, 1e-4)
-        p_s = F.softmax(target_s / tau, dim=1)
-        log_p_t = F.log_softmax(x_t / tau, dim=1)
-        entropy_loss = F.kl_div(log_p_t, p_s, reduction="batchmean")
+        p_target = F.softmax(target / tau, dim=1)
+        log_p_source = F.log_softmax(source / tau, dim=1)
+        entropy_loss = F.kl_div(log_p_source, p_target, reduction="batchmean")
 
         if self.align_loss_type == "entropy":
             return entropy_loss * self.align_loss_weight
@@ -782,8 +805,8 @@ class NoiseRAGPrototypeV1(nn.Module):
         # Forward: x_s = x_r; Backward: d(x_s)/d(x_t) = I, d(x_s)/d(x_r) = 0
         x_s = stop_gradient_query_replacement(original_query=x_t, retrieved_query=x_r)
 
-        # 5. Proximity / Alignment Loss
-        align_loss = self.compute_alignment_loss(x_t=x_t, x_s=x_s)
+        # 5. Proximity / Alignment Loss (enforcing XS to get close to XR using MSE)
+        align_loss = self.compute_alignment_loss(x_s=x_s, x_r=x_r, x_t=x_t)
 
         # 6. Iterative Noise-Guided Cross-Attention Layers
         layer_maps: List[torch.Tensor] = [x_s]
@@ -814,6 +837,7 @@ class NoiseRAGPrototypeV1(nn.Module):
                 "multiscale_logits": multiscale_logits,
                 "artifact_loss": align_loss,
                 "align_loss": align_loss,
+                "xs_xr_loss": align_loss,
                 "pred_mask": torch.sigmoid(final_logits),
                 "features": layer_maps[-1],
             }

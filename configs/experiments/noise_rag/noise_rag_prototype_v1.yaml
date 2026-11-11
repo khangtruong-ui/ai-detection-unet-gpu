@@ -18,7 +18,7 @@ data:
   dataset_name: "KhangTruong/Casia-v2.0-Fake"
   streaming: true
   image_size: [512, 512]
-  batch_size: 4
+  batch_size: 2
   num_workers: -1
   pin_memory: true
   prefetch_batches: 16
@@ -51,7 +51,9 @@ model:
 
 training:
   epochs: 20
-  batch_size: 4
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0001
   lr: 0.0001
   weight_decay: 0.0001
   amp: true
@@ -61,8 +63,12 @@ training:
   save_latest: true
 
 loss:
-  mask_loss_type: "combined"
+  mask_loss_type: "bce_dice"
+  bce_weight: 0.2
+  dice_weight: 0.8
+  pos_weight: 3.0
   aux_classifier: true
   aux_weight: 0.2
   multiscale_weight: 0.4
+  align_weight: 0.2
   artifact_weight: 0.2

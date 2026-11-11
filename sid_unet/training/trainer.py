@@ -263,7 +263,7 @@ class Trainer:
             self.compatibility_8bit_details = {}
 
         # 3.2 Precision mode and GPU 16-bit configuration
-        self.lr = float(config.training.get("learning_rate", 1e-3))
+        self.lr = float(config.training.get("learning_rate", config.training.get("lr", 1e-3)))
         self.weight_decay = float(config.training.get("weight_decay", 1e-4))
         self.opt_name = str(config.training.get("optimizer", "adamw")).lower()
         use_8bit_opt = bool(config.training.get("use_8bit_optimizer", False))
@@ -487,7 +487,7 @@ class Trainer:
         # Smart Learning Rate & Scheduler Resumption Strategy
         current_opt_lr = float(self.optimizer.param_groups[0].get("lr", 0.0))
         min_lr = float(self.config.training.get("min_lr", 1e-6))
-        configured_base_lr = float(self.config.training.get("learning_rate", 1e-3))
+        configured_base_lr = float(self.config.training.get("learning_rate", self.config.training.get("lr", 1e-3)))
         custom_resume_lr = self.config.training.get("resume_lr", None)
         resume_lr_mode = str(self.config.training.get("resume_lr_mode", "auto")).lower()
 

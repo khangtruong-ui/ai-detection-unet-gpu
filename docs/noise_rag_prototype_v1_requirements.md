@@ -191,30 +191,40 @@ flowchart TD
      - **Forward value**: $X_S = X_R$ (directly injects retrieved MaskCLIP pre-TVCA forensic priors & label signals).
      - **Backward gradient**: $\frac{\partial X_S}{\partial X_T} = I$, $\frac{\partial X_S}{\partial X_R} = 0$ (gradients flow cleanly into `SomeConvVisionTransformerBlocks_X` without backpropagating through the discrete database lookup).
 
-5. **Proximity / Alignment Loss Between $X_S$ and $X_T$ ($\mathcal{L}_{\text{align}}(X_T, X_S)$)**:
-   - **Rationale**: In the forward pass, $X_S$ takes the exact value of $X_R$ ($X_S = \text{StopGrad}(X_R - X_T) + X_T = X_R$), while task gradients flow straight through to $X_T$. However, without a commitment/proximity constraint, the encoder output $X_T$ can drift away from the retrieved embedding manifold $X_S$ (analogous to VQ-VAE commitment loss). Therefore, an explicit loss is required to pull $X_T$ close to $\text{StopGrad}(X_S)$ (where $\text{StopGrad}(X_S) = \text{StopGrad}(X_R)$).
+5. **Proximity / Alignment Loss Between XS and XR (and XT to XR)**:
+   - **Rationale**: In the forward pass, XS takes the value of XR (`XS = StopGrad(XR - XT) + XT = XR`), while task gradients flow straight through to XT. An explicit loss is enforced pulling XS and XT close to `XR.detach()`.
    - **Supported Loss Formulations** (configurable via `model.align_loss_type: "mse" | "entropy" | "mse+entropy"`):
      - **MSE Proximity Loss (`"mse"`)**:
-       $$\mathcal{L}_{\text{align}}^{\text{MSE}}(X_T, X_S) = \frac{1}{B \cdot D \cdot H' \cdot W'} \left\| X_T - \text{StopGrad}(X_S) \right\|_2^2 = \text{F.mse\_loss}(X_T, X_S.\text{detach}())$$
+```math
+L_align_MSE(XT, XR) = MSE(XT, StopGrad(XR)) = F.mse_loss(XT, XR.detach())
+```
      - **Cross-Entropy / KL Divergence Loss (`"entropy"`)**:
-       Treats channel-wise token activations (with temperature $\tau$, default $\tau = 1.0$ or $0.1$) as probability distributions over the $D = 256$ embedding channels and minimizes the divergence / cross-entropy between $X_T$ and target $\text{StopGrad}(X_S)$:
-       $$P_S = \text{softmax}\!\left(\frac{\text{StopGrad}(X_S)}{\tau},\, \text{dim}=1\right), \quad \log P_T = \text{log\_softmax}\!\left(\frac{X_T}{\tau},\, \text{dim}=1\right)$$
-       $$\mathcal{L}_{\text{align}}^{\text{entropy}}(X_T, X_S) = \text{F.kl\_div}(\log P_T, P_S, \text{reduction}=\text{"batchmean"}) \quad \text{or} \quad -\sum_{c=1}^{D} P_{S,c} \log P_{T,c}$$
+       Treats channel-wise token activations (with temperature tau, default `tau = 1.0` or `0.1`) as probability distributions over the D = 256 embedding channels and minimizes divergence between XT and detached prior XR:
+```math
+P_R = softmax(XR.detach() / tau, dim=1)
+log_P_T = log_softmax(XT / tau, dim=1)
+L_align_entropy = F.kl_div(log_P_T, P_R, reduction="batchmean")
+```
      - **Combined Mode (`"mse+entropy"`)**: Sum of MSE and temperature-scaled KL/Cross-Entropy loss.
    - **Integration with `SIDTotalLoss`**:
-     - `NoiseRAGPrototypeV1.forward()` computes $\mathcal{L}_{\text{align}}$ during training and returns it in the output dictionary under `"artifact_loss"` (and `"align_loss"`), which [`SIDTotalLoss`](../sid_unet/losses/auxiliary.py#L140-L143) natively adds to the total loss weighted by `artifact_weight` (default e.g. `0.1`–`0.5`):
-       $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{seg}}(\hat{M}_{\text{final}}, M_{\text{gt}}) + \lambda_{\text{ms}} \sum_{i=1}^{L+1} w_i \mathcal{L}_{\text{seg}}(\hat{M}_i, M_{\text{gt}}) + \lambda_{\text{align}} \mathcal{L}_{\text{align}}(X_T, \text{StopGrad}(X_S))$$
+     - `NoiseRAGPrototypeV1.forward()` computes `L_align` during training and returns it in the output dictionary under `"align_loss"`, `"xs_xr_loss"`, and `"artifact_loss"`, which `SIDTotalLoss` natively adds to the total loss weighted by `align_weight` / `artifact_weight`:
+```math
+L_total = L_seg(M_final, M_gt) + lambda_ms * sum(w_i * L_seg(M_i, M_gt)) + lambda_align * L_align(XT, XR.detach())
+```
 
-6. **Iterative Noise-Guided Cross-Attention & Multi-Layer Output Maps ($O_1, \dots, O_{L+1}$)**:
-   - **Base Layer ($i = 1$)**:
-     $$O_1 = X_S \in \mathbb{R}^{B \times D \times H' \times W'}$$
-   - **Recurrent Cross-Attention Layers ($i = 1, \dots, L$)**:
-     $$O_{i+1} = \text{LightTransformerBlock}_i\big(\text{CrossAttention}_i(Q = N_T, K = O_i, V = O_i) + O_i\big)$$
-     *(Note: Allow configurable residual/query mode where $Q = N_T, K = O_i, V = O_i$ or $K = V = X_S$ per layer as written in the prompt: `O_{i+1} = CrossAttention(NT, XS, XS)` or chained `CrossAttention(NT, O_i, O_i)` followed by lightweight transformer blocks).*
+6. **Iterative Noise-Guided Cross-Attention & Multi-Layer Output Maps (O_1, ..., O_{L+1})**:
+   - **Base Layer (i = 1)**:
+```math
+O_1 = XS  [B, D, H', W']
+```
+   - **Recurrent Cross-Attention Layers (i = 1, ..., L)**:
+```math
+O_{i+1} = LightTransformerBlock_i(CrossAttention_i(Q = NT, K = O_i, V = O_i) + O_i)
+```
+     *(Note: Allow configurable residual/query mode where Q = NT, K = O_i, V = O_i or K = V = XS per layer as written in the prompt: `O_{i+1} = CrossAttention(NT, XS, XS)` or chained `CrossAttention(NT, O_i, O_i)` followed by lightweight transformer blocks).*
    - **Output Maps at Different Layers**:
-     - Each intermediate tensor $O_i \in \mathbb{R}^{B \times D \times H' \times W'}$ ($i \in \{1, \dots, L+1\}$) is projected via a lightweight prediction head (`Conv2d` / upsampler) to produce layer-specific output map logits $\hat{M}_i \in \mathbb{R}^{B \times 1 \times H \times W}$, plus a fused final prediction $\hat{M}_{\text{final}}$.
-     - Compatible with `SIDTotalLoss` (`multiscale_logits` in [`sid_unet/losses/auxiliary.py`](../sid_unet/losses/auxiliary.py#L122-L132)), enabling multi-layer deep supervision across all $O_i$ maps during training!
-
+     - Each intermediate tensor `O_i` (`i in {1, ..., L+1}`) is projected via a lightweight prediction head (`Conv2d` / upsampler) to produce layer-specific output map logits `M_i`, plus a fused final prediction `M_final`.
+     - Compatible with `SIDTotalLoss` (`multiscale_logits` in [`sid_unet/losses/auxiliary.py`](../sid_unet/losses/auxiliary.py#L122-L132)), enabling multi-layer deep supervision across all O_i maps during training!
 ---
 
 ## 5. Requirement 4: Float16 / BFloat16 Quantization & Mixed Precision

@@ -110,7 +110,10 @@ class SIDTotalLoss(nn.Module):
         elif isinstance(model_output, dict):
             mask_logits = model_output.get("mask_logits")
             class_logits = model_output.get("class_logits")
-            art_loss = model_output.get("artifact_loss")
+            art_loss = model_output.get(
+                "align_loss",
+                model_output.get("xs_xr_loss", model_output.get("artifact_loss")),
+            )
             multiscale_logits = model_output.get("multiscale_logits")
         else:
             mask_logits = model_output
@@ -160,7 +163,10 @@ class SIDTotalLoss(nn.Module):
             if torch.is_tensor(art_loss) and art_loss.numel() > 1:
                 art_loss = art_loss.mean()
             total_loss = total_loss + self.artifact_weight * art_loss
-            loss_metrics["artifact_loss"] = float(art_loss.item() if hasattr(art_loss, "item") else art_loss)
+            art_val = float(art_loss.item() if hasattr(art_loss, "item") else art_loss)
+            loss_metrics["artifact_loss"] = art_val
+            loss_metrics["align_loss"] = art_val
+            loss_metrics["xs_xr_loss"] = art_val
 
         loss_metrics["total_loss"] = total_loss.item()
         return total_loss, loss_metrics
@@ -181,7 +187,18 @@ def build_loss(config: Any) -> SIDTotalLoss:
         aux_classifier=bool(model_cfg.get("aux_classifier", True)),
         aux_loss_type=loss_cfg.get("aux_loss_type", "cross_entropy"),
         aux_weight=float(loss_cfg.get("aux_weight", 0.2)),
-        artifact_weight=float(loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", 1.0))),
+        artifact_weight=float(
+            loss_cfg.get(
+                "align_weight",
+                loss_cfg.get(
+                    "align_loss_weight",
+                    loss_cfg.get(
+                        "xs_xr_weight",
+                        loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", 0.2)),
+                    ),
+                ),
+            )
+        ),
         edge_weight=float(loss_cfg.get("edge_weight", loss_cfg.get("edge_lambda", 0.0))),
         edge_mask_width=int(loss_cfg.get("edge_mask_width", model_cfg.get("edge_mask_width", 7))),
         multiscale_weight=float(loss_cfg.get("multiscale_weight", loss_cfg.get("multiscale_loss_weight", 0.0))),
