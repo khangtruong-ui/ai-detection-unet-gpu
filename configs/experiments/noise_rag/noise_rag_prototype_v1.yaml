@@ -19,7 +19,7 @@ data:
   streaming: true
   image_size: [512, 512]
   batch_size: 4
-  num_workers: 4
+  num_workers: -1
   pin_memory: true
   prefetch_batches: 16
   train_split: "train"
