@@ -5,9 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-09
+## [Unreleased] - 2026-11-11
 
 ### Added
+- **XS-to-XR MSE Alignment Loss in `NoiseRAGPrototypeV1`**:
+  - Implemented explicit MSE alignment loss enforcing surrogate representations (XS) and visual encoder tokens (XT) to align with retrieved forensic memory priors (XR) via detached targets (`XR.detach()`).
+  - Added `"align_loss"` and `"xs_xr_loss"` to `NoiseRAGPrototypeV1` output dictionary and wired loss extraction into `SIDTotalLoss.forward()` and `build_loss()`.
+  - Added `test_xs_to_xr_mse_loss` in `tests/test_noise_rag.py` verifying gradient propagation to visual encoder tokens and surrogate representations.
 - **Vector Database Auto-Routing in `sid-train` (`--cached-hf-repo`)**:
   - Automatically detect when `--cached-hf-repo` points to a vector database repository (e.g. `KhangTruong/mask-clip-db-mae-cache`) or when training retrieval models like `noise-rag-prototype-v1`.
   - Resolve and download the vector database directly into `config.model.memory_path` via Hugging Face Hub (`hf_hub_download`), preventing accidental assignment to `config.data.cached_hf_repo` which previously generated 84-channel mock latent shards and triggered input shape mismatch crashes (`RuntimeError: Given groups=1, expected input to have 3 channels, but got 84 channels instead`).
@@ -33,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added comprehensive integration tests in `tests/test_noise_rag.py` (22 tests) verifying vector DB extraction with encoded PNG mask bytes, `ForensicVectorMemory` continuous patch label storage and consolidation, `ForensicVectorDBRetrieval` fallback and loaded modes, chunked token querying, HF Hub download resolution, `UNet.from_checkpoint` roundtrip restoration, combined `mse+entropy` alignment loss gradient flow, full `MaskCLIP.extract_pre_tvca_features` tap, configurable cross-attention modes, `sid-train` vector DB routing, rejection of vector DB in `create_cached_dataloaders`, `sid-eval` and `sid-cross-eval` with dict outputs, and `sid-cache` vector DB CLI execution.
 
 ### Fixed
+- **Learning Rate Parsing Bug in `Trainer`**:
+  - Fixed `Trainer.__init__` and `Trainer.resume_from_checkpoint` which only checked `config.training.get("learning_rate")`, silently ignoring `config.training.lr` and falling back to default `0.001` (10x higher than configured `lr: 0.0001`). Both `learning_rate` and `lr` keys are now checked with proper precedence.
+- **Model Collapse & Class Imbalance in `noise_rag_prototype_v1.yaml`**:
+  - Replaced unweighted `"combined"` loss with `"bce_dice"` (`pos_weight: 3.0`, `bce_weight: 0.2`, `dice_weight: 0.8`), resolving prediction collapse where the model predicted all-negative logits (IoU = 0.0000) on datasets like CASIA v2.0 with sparse tampered regions (< 5% of pixels).
+  - Scaled base batch size to 2 with `gradient_accumulation_steps: 2` to eliminate initial CUDA OOM candidate probing on 22 GB GPUs.
 - **`RuntimeError` Input Channel Mismatch When Passing `--cached-hf-repo` to `sid-train`**:
   - Fixed bug in `.logs.txt` where passing `--cached-hf-repo KhangTruong/mask-clip-db-mae-cache` caused `create_cached_dataloaders` to synthesize 84-channel mock latent shards for `NoisePrint++` (17-layer DnCNN expecting 3-channel RGB). The vector DB repo is now cleanly routed to download into `config.model.memory_path` while retaining standard RGB image loading.
 - **`UnboundLocalError` on `logger` in `train_single_run`**:

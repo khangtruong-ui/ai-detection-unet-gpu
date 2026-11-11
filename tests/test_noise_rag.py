@@ -210,6 +210,37 @@ def test_alignment_loss_gradient_flow():
     assert x_t_ent.grad.norm() > 0.0
 
 
+def test_xs_to_xr_mse_loss():
+    """Verify MSE loss enforcing XS to get close to XR."""
+    model = NoiseRAGPrototypeV1(
+        freeze_noiseprint=True,
+        align_loss_type="mse",
+        align_loss_weight=0.5,
+    )
+
+    x_t = torch.randn(2, 256, 16, 16, requires_grad=True)
+    x_r = torch.randn(2, 256, 16, 16)
+    x_s = stop_gradient_query_replacement(original_query=x_t, retrieved_query=x_r)
+
+    # Compute MSE loss enforcing XS to get close to XR
+    loss = model.compute_alignment_loss(x_s=x_s, x_r=x_r, x_t=x_t)
+    assert loss.ndim == 0
+    assert loss.item() > 0.0
+
+    # Backpropagate: gradient must flow to x_t (which generates x_s)
+    loss.backward()
+    assert x_t.grad is not None
+    assert x_t.grad.norm() > 0.0
+
+    # Test direct compute_alignment_loss(x_s=x_s, x_r=x_r)
+    x_s_grad = torch.randn(2, 256, 16, 16, requires_grad=True)
+    loss_direct = model.compute_alignment_loss(x_s=x_s_grad, x_r=x_r)
+    assert loss_direct.item() > 0.0
+    loss_direct.backward()
+    assert x_s_grad.grad is not None
+    assert x_s_grad.grad.norm() > 0.0
+
+
 def test_noise_rag_end_to_end_forward_and_loss():
     """Verify complete NoiseRAGPrototypeV1 forward pass and integration with SIDTotalLoss."""
     # Create temporary vector DB
@@ -242,6 +273,8 @@ def test_noise_rag_end_to_end_forward_and_loss():
         assert "mask_logits" in out
         assert "multiscale_logits" in out
         assert "artifact_loss" in out
+        assert "align_loss" in out
+        assert "xs_xr_loss" in out
         assert "class_logits" in out
 
         # 4 scales: O_1 (base) + 3 stages = 4
@@ -272,6 +305,8 @@ def test_noise_rag_end_to_end_forward_and_loss():
         assert total_loss.item() > 0.0
         assert "multiscale_loss" in metrics
         assert "artifact_loss" in metrics
+        assert "align_loss" in metrics
+        assert "xs_xr_loss" in metrics
         assert "aux_loss" in metrics
 
         # Test full backprop
