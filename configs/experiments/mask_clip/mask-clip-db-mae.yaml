@@ -66,11 +66,11 @@ loss:
 cache:
   mode: "vector_db"
   vector_db_filename: "mask_clip_db_mae.pt"
-  target_entries: 100000
+  target_entries: 1000000
   forged_ratio: 0.9
   authentic_ratio: 0.1
   dtype: "float16"
-  max_entries: 100000
+  max_entries: 1000000
   tap_point: "linear_fuse_pre_tvca"
   max_patches_per_image_forged: 32
   max_patches_per_image_authentic: 4
