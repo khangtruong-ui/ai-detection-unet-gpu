@@ -1325,6 +1325,8 @@ def main(args: Optional[List[str]] = None):
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
 
+        start_offset = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
+
         log_fp = open(log_path, "a", encoding="utf-8")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_fp.write(
@@ -1357,11 +1359,26 @@ def main(args: Optional[List[str]] = None):
         )
         log_fp.close()
 
+        # Register in process ledger
+        try:
+            from sid_unet.process_manager import get_process_registry
+            get_process_registry().register_process(
+                pid=proc.pid,
+                name="sid-cross-eval",
+                cmdline=" ".join(cmd),
+                log_file=log_path,
+                ppid=os.getpid(),
+                log_offset_start=start_offset,
+            )
+        except Exception:
+            pass
+
         print("\n" + "=" * 70)
         print(f"🚀 [DETACHED] sid-cross-eval running in background (PID: {proc.pid})")
         print(f"📄 Logging output to: {log_path}")
-        print(f"🔍 To monitor logs live: tail -f {getattr(parsed_args, 'log_file', '.logs.txt')}")
-        print("🛑 To stop evaluation: sid-kill")
+        print(f"🖥️ To manage processes & view live output: sid-tui")
+        print(f"🔍 Or tail logs directly: tail -f {getattr(parsed_args, 'log_file', '.logs.txt')}")
+        print("🛑 To stop evaluation: sid-kill (or 'k' in sid-tui)")
         print("=" * 70 + "\n")
         sys.stdout.flush()
         return {"status": "detached", "pid": proc.pid, "log_file": log_path}

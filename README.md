@@ -59,6 +59,8 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [3. Random Sample Visual Illustration (`sid-illu`)](#3-random-sample-visual-illustration-sid-illu)
   - [4. Inference & Mask Prediction](#4-inference--mask-prediction)
   - [5. Dataset Feature Caching & High-Speed Training (`sid-cache`)](#5-dataset-feature-caching--high-speed-training-sid-cache)
+  - [6. Interactive Process Management & TUI (`sid-tui` / `sid-top`)](#6-interactive-process-management--tui-sid-tui--sid-top)
+- [Cross-Evaluation Audit & Findings](#cross-evaluation-audit--findings)
 - [Loss Functions & Metrics](#loss-functions--metrics)
 - [Running Tests](#running-tests)
 - [License](#license)
@@ -2496,8 +2498,8 @@ data:
 
 > [!NOTE]
 > **Detached Background Execution by Default**: `sid-train`, `sid-cross-eval`, and `sid-cache` default to detaching from the terminal session (`--detach`, default `true`), spawning execution in the background and redirecting output in real-time into `.logs.txt`.
-> - **Live Monitoring**: Inspect progress and logs with `tail -f .logs.txt`.
-> - **Process Termination**: Terminate running or background tasks anytime via `sid-kill`.
+> - **Interactive Monitoring & Management**: Manage jobs, stream real-time log output, inspect error tracebacks, and terminate processes using **`sid-tui`** (or **`sid-top`**).
+> - **Process Termination**: Terminate running or background tasks interactively in `sid-tui` or from the CLI via `sid-kill` / `sid-tui --kill <pid>`.
 > - **Foreground Execution**: To run attached to the terminal instead, pass `--no-detach`, `--foreground`, or `-f`.
 > - **Custom Log File**: Pass `--log-file <path>` to log to an alternate file instead of `.logs.txt`.
 
@@ -2890,6 +2892,82 @@ sid-train \
   The memory probe (`find_optimal_batch_size`) supports multi-resolution models by reconciling input latent dimensions ($Z \in \mathbb{R}^{C \times H/8 \times W/8}$) with decoded ground-truth mask targets ($Y \in \mathbb{R}^{1 \times H \times W}$), preventing loss function shape mismatch warnings and enabling reliable automatic batch size scaling.
 - **GAP-SAM 1D Descriptor Caching & Image Serialization (`--store-images`)**:
   Supports caching models that output 1D global descriptors (e.g. GAP-SAM's 256-dimensional $\mathbf{gap}_r$ vector). Parquet shards dynamically record $1 \times 1$ latent dimensions instead of forcing spatial dimensions, and store compressed RGB image bytes via the `image` column to supply the trainable LoRA segmentation backbone. Zero-copy `decode_cached_tensor()` safeguards automatically reconcile 1D descriptors without shape mismatch crashes, even when loading legacy shards with legacy spatial metadata.
+
+### 6. Interactive Process Management & TUI (`sid-tui` / `sid-top`)
+
+Background tasks (`sid-train`, `sid-cross-eval`, `sid-cache`) automatically register in the process ledger (`.sid_processes/registry.json`), recording command arguments, process ID, execution timestamps, log file location, and log start byte offsets.
+
+Instead of running raw `tail -f .logs.txt`, the interactive TUI **`sid-tui`** (or **`sid-top`**) provides a live, curses-based process control center.
+
+```bash
+# Launch interactive TUI
+sid-tui
+# Or alias
+sid-top
+```
+
+#### A. Interactive Controls & Keybindings
+| Key | Action | Description |
+|---|---|---|
+| `↑` / `k`, `↓` / `j` | **Navigate** | Move process selection up or down |
+| `PageUp` / `PageDown` | **Page Scroll** | Scroll process selection by a page |
+| `Enter` / `l` | **View Logs** | Open fullscreen log viewer with scrollback history |
+| `f` | **Auto-Follow** | Toggle live auto-follow streaming of selected process log |
+| `e` | **Traceback Inspector** | View extracted Python stack trace and exception details |
+| `k` | **Kill Process** | Safely terminate selected process (SIGINT -> SIGTERM -> SIGKILL) |
+| `K` | **Kill All** | Terminate all active running background processes |
+| `Tab` | **Cycle Filters** | Filter processes by `ALL`, `RUNNING`, `EXCEPTION`, `TERMINATED` |
+| `c` | **Clear History** | Clear terminated and completed records from the registry |
+| `r` | **Refresh** | Force immediate OS and log reconciliation |
+| `q` / `Esc` | **Back / Quit** | Return to process list or exit the TUI |
+
+#### B. Terminated Process Tracking & Statuses
+The TUI continuously inspects log output from the initial spawn offset to detect:
+- **`RUNNING`**: Process is active, consuming CPU/GPU and updating logs.
+- **`COMPLETED`**: Process finished cleanly (e.g., reached target epoch or evaluation banner).
+- **`KILLED`**: Process received SIGINT / SIGTERM / SIGKILL or was terminated by `sid-kill`.
+- **`EXCEPTION`**: Process encountered an unhandled Python exception; the TUI automatically extracts the exception type, message, and full traceback for immediate debugging via `e`.
+
+#### C. Non-Interactive CLI Mode
+`sid-tui` also supports headless operation in scriptable or non-TTY environments:
+```bash
+# List all registered processes and their status
+sid-tui --list
+
+# Filter by status
+sid-tui --list --filter running
+sid-tui --list --filter exception
+
+# Tail live output of a specific PID
+sid-tui --tail <pid>
+
+# Dump full log of a specific PID
+sid-tui --logs <pid>
+
+# Inspect detailed status and error summary
+sid-tui --status <pid>
+
+# Terminate a background process
+sid-tui --kill <pid>
+
+# Clean up finished/killed processes from the ledger
+sid-tui --clear-history
+```
+
+---
+
+## Cross-Evaluation Audit & Findings
+
+A comprehensive investigation was conducted regarding score discrepancies between reported cross-evaluation numbers on [Hugging Face PIM Master Report](https://huggingface.co/KhangTruong/PIM/blob/main/cross_evaluation/master_cross_evaluation_report.md) and published scores for `FOCAL` (`sid_focal_hrnet`) and `PIM` (`sid_pim`).
+
+Full audit details, mathematical analysis, and empirical findings are documented in [docs/cross_evaluation_focal_pim_mismatch_investigation.md](file:///content/ai-detection-unet-gpu/docs/cross_evaluation_focal_pim_mismatch_investigation.md).
+
+Key findings include:
+1. **FOCAL Inference Head Saturation**: FOCAL is an unsupervised contrastive model without a classification head. The arbitrary convolution head in `sid_unet/models/focal.py` produces channel 1 > channel 0 unconditionally, causing 100% positive pixel predictions (0.9969 Recall, 0.0069 Specificity).
+2. **Resolution & Preprocessing Disparities**: FOCAL was designed for unnormalized $[0, 1]$ inputs at $1024 \times 1024$; PIM requires $512 \times 512$ for Swin window partitioning. Downscaling to $256 \times 256$ with ImageNet normalization $[-2.1, 2.6]$ damaged high-frequency tampering artifacts.
+3. **Metric Definitions**: FOCAL upstream reports Macro F1 (including background pristine F1), whereas `sid_unet` reports binary foreground Dice; PIM upstream awards 1.0 IoU/F1 for pristine images correctly predicted clean, while `sid_unet` excludes zero-positive images (`filter_zero_positive=True`).
+4. **Catalog Metric Meaning**: PIM's cataloged `0.852` corresponds to AutoSplice 90 **AUC** (from arXiv:2310.00234 Table IX), not IoU/F1; FOCAL's `0.824` corresponds to publication Macro F1 (~0.830) mislabeled as `val_iou`.
+5. **Dataset Distribution**: `eval_mvss_v1_protocol` contains >10,000 generative diffusion images (OpenSDID_Flux, OpenSDID_SDXL, CocoGlide) whereas models were trained strictly on traditional copy-move/splicing (CASIA, SP-COCO).
 
 ---
 

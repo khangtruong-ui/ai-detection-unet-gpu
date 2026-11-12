@@ -60,6 +60,13 @@ def from_pretrained(
 
 
 from sid_unet.kill import kill_all_background_tasks
+from sid_unet.process_manager import (
+    ProcessRecord,
+    ProcessRegistry,
+    get_process_registry,
+    terminate_process,
+)
+from sid_unet.tui import SIDTerminalUI
 
 __all__ = [
     "__version__",
@@ -75,5 +82,10 @@ __all__ = [
     "resolve_checkpoint_source",
     "verify_hf_repo_checkpointable",
     "kill_all_background_tasks",
+    "ProcessRecord",
+    "ProcessRegistry",
+    "get_process_registry",
+    "terminate_process",
+    "SIDTerminalUI",
 ]
 

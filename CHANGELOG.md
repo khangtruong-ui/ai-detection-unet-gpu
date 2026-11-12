@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-11-12
 
 ### Added
+- **TUI Process Manager (`sid-tui` & `sid-top`)**:
+  - Implemented a complete Terminal User Interface (`SIDTerminalUI`) built on standard Python `curses`, replacing static `tail -f .logs.txt` monitoring.
+  - Interactive split-screen dashboard displaying real-time process list (PID, Command, Status, Elapsed Duration, RSS RAM) alongside live streaming log tail.
+  - Real-time auto-follow mode (`f` key) for continuous streaming output of active processes.
+  - Fullscreen log view (`Enter` or `l` key) with scrollback navigation (`Up`, `Down`, `PageUp`, `PageDown`, `Home`, `End`).
+  - Terminated process lifecycle tracking: tracks `RUNNING`, `COMPLETED`, `KILLED`, and `EXCEPTION` states.
+  - Exception & Traceback Inspector (`e` key): automatically scans log files from initial spawn offset, extracts Python unhandled tracebacks and error messages, and presents an interactive traceback view.
+  - Process termination controls: kill targeted process (`k` key) with confirmation and graceful SIGINT/SIGTERM escalation to SIGKILL; kill all active background processes (`K` key).
+  - Status filter cycling (`Tab` key): toggle between `ALL`, `RUNNING`, `EXCEPTION`, and `TERMINATED` views.
+  - Terminated history cleanup (`c` key) to clear finished records from the registry.
+  - CLI and non-interactive headless support: `sid-tui --list`, `sid-tui --status`, `sid-tui --logs <pid>`, `sid-tui --tail <pid>`, `sid-tui --kill <pid>`, `sid-tui --clear-history`, and `--no-tui` fallback for non-TTY environments.
+- **Process Registry & Tracking Subsystem (`sid_unet.process_manager`)**:
+  - Designed `ProcessRecord` dataclass tracking process metadata, arguments, status, exit codes, start offsets, and failure summaries.
+  - Designed `ProcessRegistry` with thread-safe and process-safe file locking via `filelock.FileLock` on `.sid_processes/registry.lock`.
+  - Implemented `inspect_log_for_termination` scanning process log streams for clean completion banners, SIGINT/KeyboardInterrupt, unhandled Python exceptions, and abnormal terminations.
+  - Integrated automatic process registration in `sid-train`, `sid-cross-eval`, and `sid-cache` upon background detachment (`--detach`), storing process startup markers and printing navigation tips for `sid-tui`.
+  - Integrated `sid-kill` process termination state synchronization with `ProcessRegistry`.
+- **Focal & PIM Cross-Evaluation Mismatch Audit (`docs/cross_evaluation_focal_pim_mismatch_investigation.md`)**:
+  - Investigated root causes of score mismatches on `master_cross_evaluation_report.md` between reported cross-eval scores and cataloged scores for `sid_focal_hrnet` and `sid_pim`.
+  - Proved FOCAL inference head saturation: untrained 2D convolution head in `sid_unet/models/focal.py` produces unconditionally positive differences (`diff > 0.12`), driving sigmoid to 1.0 across 100% of pixels and explaining 0.9969 recall with 0.0069 specificity.
+  - Proved input resolution and normalization mismatches: FOCAL expects $[0, 1]$ unnormalized inputs at $1024 \times 1024$; PIM expects $512 \times 512$ inputs for Swin window partitioning ($7 \times 7$), while cross-eval downscaled to $256 \times 256$ with ImageNet normalization $[-2.1, 2.6]$.
+  - Proved evaluation metric discrepancies: FOCAL upstream evaluates macro-averaged F1 (including background pristine F1), while `sid_unet` evaluates binary foreground Dice; PIM upstream rewards pristine images with 1.0 IoU/F1 when clean, while `sid_unet` excludes zero-positive images (`filter_zero_positive=True`).
+  - Identified catalog score semantic confusion: PIM `best_score: 0.852` represents AutoSplice 90 AUC (not IoU, not CASIA/MVSS); FOCAL `best_score: 0.824` represents validation Macro F1 mislabeled under `"val_iou"`.
+  - Documented dataset domain shift (>55% generative diffusion images in `eval_mvss_v1_protocol` vs traditional splicing pretraining) and ground truth polarity inversion in NIST16.
 - **FOCAL Model Integration (HRNet & SAM ViT Backbones)**:
   - Integrated the complete FOCAL framework (Forensic Contrastive Clustering for Image Forgery Detection and Localization, ICCV 2023) from official repository `HighwayWu/FOCAL`.
   - Implemented self-contained `HRNet-W32` and `SAM ViT-Large` backbones with pure PyTorch `SAMBlock`, `MLPBlock`, and decomposed relative position embeddings.
