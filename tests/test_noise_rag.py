@@ -353,7 +353,7 @@ def test_build_model_from_configs():
     # 2. MaskCLIP DB config
     cfg_clip = load_config("configs/experiments/mask_clip/mask-clip-db-mae.yaml")
     assert cfg_clip.cache.mode == "vector_db"
-    assert cfg_clip.cache.target_entries == 100000
+    assert cfg_clip.cache.target_entries in (100000, 1000000)
     assert cfg_clip.cache.forged_ratio == 0.9
     assert cfg_clip.cache.authentic_ratio == 0.1
 
@@ -904,4 +904,95 @@ data:
             assert cross_res is not None
             assert "overall_metrics" in cross_res
             assert "iou" in cross_res["overall_metrics"]
+
+
+def test_noise_rag_database_buffers_and_labels_no_grad():
+    """Verify that NoiseRAG database keys and labels strictly enforce no_grad and requires_grad=False."""
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        keys = torch.randn(100, 256, dtype=torch.float16, requires_grad=False)
+        labels = (torch.rand(100, 1) > 0.5).float().to(dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels, "entry_count": 100}, db_path)
+
+        model = NoiseRAGPrototypeV1(
+            memory_path=db_path,
+            memory_dtype="float16",
+            embed_dim=256,
+            num_cross_stages=2,
+            retrieval_k=4,
+        )
+        model.train()
+
+        # 1. Assert database buffers have requires_grad=False
+        assert not model.retrieval.db_keys.requires_grad
+        assert not model.retrieval.db_labels.requires_grad
+        assert not model.retrieval.db_keys_norm.requires_grad
+
+        # 2. Forward and backward pass
+        x = torch.rand(2, 3, 64, 64)
+        out = model(x, return_dict=True)
+        loss = out["mask_logits"].sum() + out["artifact_loss"]
+        loss.backward()
+
+        # Database buffers must not accumulate any gradients
+        assert model.retrieval.db_keys.grad is None
+        assert model.retrieval.db_labels.grad is None
+        assert model.retrieval.db_keys_norm.grad is None
+
+        # 3. Direct verification of compute_alignment_loss detach
+        x_t = torch.randn(2, 256, 8, 8, requires_grad=True)
+        x_r = torch.randn(2, 256, 8, 8, requires_grad=True)
+        align_loss = model.compute_alignment_loss(x_r=x_r, x_t=x_t)
+        align_loss.backward()
+
+        assert x_t.grad is not None
+        assert x_r.grad is None  # Target must remain detached with zero gradient
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+@pytest.mark.timeout(120)
+def test_noise_rag_bounded_vram_and_attention_efficiency():
+    """Verify memory-bounded retrieval chunking and FlashAttention/SDPA efficiency (need_weights=False)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available for VRAM benchmark test")
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        # Create 100k entries vector DB
+        n_entries = 100000
+        keys = torch.randn(n_entries, 256, dtype=torch.float16)
+        labels = (torch.rand(n_entries, 1) > 0.5).float().to(dtype=torch.float16)
+        torch.save({"keys": keys, "labels": labels, "entry_count": n_entries}, db_path)
+
+        model = NoiseRAGPrototypeV1(
+            memory_path=db_path,
+            memory_dtype="float16",
+            embed_dim=256,
+            num_cross_stages=2,
+            retrieval_k=4,
+        ).cuda()
+
+        x = torch.rand(2, 3, 256, 256, device="cuda")
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            out = model(x, return_dict=True)
+            loss = out["mask_logits"].sum() + out["artifact_loss"]
+
+        loss.backward()
+
+        peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        # Peak VRAM must be well bounded under 3.5 GB
+        assert peak_vram_mb < 3500.0, f"Peak VRAM {peak_vram_mb:.1f} MB exceeds 3.5 GB threshold"
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
 

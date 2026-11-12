@@ -1,0 +1,41 @@
+# Configuration: FOCAL with SAM ViT-Large Backbone
+# Forensic Contrastive Clustering for Image Forgery Detection and Localization
+# Official Weights: KhangTruong/FOCAL (FOCAL_ViT_weights.pth)
+
+project:
+  name: "sid_focal_vit"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_vit"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  image_size: [256, 256]
+  batch_size: 4
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "focal"
+  backbone: "vit"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 0.00005
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true

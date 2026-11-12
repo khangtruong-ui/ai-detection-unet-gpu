@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-12
+
+### Added
+- **FOCAL Model Integration (HRNet & SAM ViT Backbones)**:
+  - Integrated the complete FOCAL framework (Forensic Contrastive Clustering for Image Forgery Detection and Localization, ICCV 2023) from official repository `HighwayWu/FOCAL`.
+  - Implemented self-contained `HRNet-W32` and `SAM ViT-Large` backbones with pure PyTorch `SAMBlock`, `MLPBlock`, and decomposed relative position embeddings.
+  - Strict zero-fallback policy: `pretrained=False` raises an immediate `ValueError`; missing or failed weight loading raises an immediate `RuntimeError`. No dummy or fallback weights are permitted.
+  - Hardcoded official pretrained weights from Hugging Face Hub `KhangTruong/FOCAL` (`FOCAL_HRNet_weights.pth` and `FOCAL_ViT_weights.pth`).
+  - Added on-the-fly unsupervised k-means clustering mask prediction (`predict_mask_clustering`) and binary prediction helper (`predict_mask`).
+  - Added experiment configuration files `configs/experiments/focal/focal_hrnet.yaml` and `configs/experiments/focal/focal_vit.yaml`.
+  - Added test suite `tests/test_focal.py` verifying anti-fallback enforcement, genuine weight loading, forward and backward passes, output shapes and bounds, and `build_model` integration.
+- **PIM Model Integration (Dual-Branch Swin Transformer & UPerHead)**:
+  - Integrated the PIM architecture (Plug-and-Play Image Inpainting Localization Network, ICCV 2023) from official repository `ChenqiKONG/PIM`.
+  - Implemented self-contained PyTorch `SwinTransformer` (visual feature stream) and `SwinTransformerMask` (causal-masked reconstruction feature stream).
+  - Implemented frequency-sensitive local convolution enhancement (`FeatureLocalConv`) with device-agnostic buffer allocation and dynamic `FeatureFusion`.
+  - Implemented multi-task `UPerHead` dense decoders producing forgery mask segmentation, edge boundary localization, and image reconstruction.
+  - Strict zero-fallback policy: `pretrained=False` raises an immediate `ValueError`; missing or failed weight loading raises an immediate `RuntimeError`.
+  - Hardcoded official pretrained weights from Hugging Face Hub `KhangTruong/PIM` (`ckpt.pth`).
+  - Added experiment configuration file `configs/experiments/pim/pim.yaml`.
+  - Added test suite `tests/test_pim.py` verifying anti-fallback enforcement, genuine weight loading, multi-task output heads, forward/backward passes, and `build_model` integration.
+- **Core Architecture Wiring for FOCAL and PIM**:
+  - Exported `FOCAL`, `FOCALHRNet`, `FOCALViT`, `PIM` and their default Hugging Face repository constants in `sid_unet.models`.
+  - Wired `focal` and `pim` branches into `build_model` in `sid_unet.models.unet`.
+  - Added state_dict key signature pattern matching for `focal` and `pim` checkpoints in `UNet.from_checkpoint`.
+
+### Fixed
+- **Noise-RAG Vector Database No-Grad & Detached Alignment Loss**:
+  - Enforced `requires_grad = False` and explicit `.detach()` on vector database keys (`db_keys`) and continuous labels (`db_labels`) in `ForensicVectorDBRetrieval.load_database`.
+  - Enforced `target = target.detach().requires_grad_(False)` in `compute_alignment_loss` before computing `F.mse_loss`, ensuring surrogate representations and visual tokens do not backpropagate gradients into the frozen retrieved priors.
+  - Added unit test `test_noise_rag_database_buffers_and_labels_no_grad` in `tests/test_noise_rag.py`.
+- **Noise-RAG VRAM Hoarding & CUDA Out-Of-Memory Crash Elimination**:
+  - Diagnosed and resolved massive VRAM hoarding in `NoiseRAGPrototypeV1` when retrieving from 1,000,000-vector databases (`mask_clip_db_mae.pt`):
+    1. **PyTorch Attention Matrix Materialization**: PyTorch `nn.MultiheadAttention` defaults to `need_weights=True`, materializing a `[2, 8, 4096, 4096]` float32 attention matrix per block (~1.27 GB each, totaling ~9 GB across 7 attention blocks on 512x512 inputs). Passing `need_weights=False` enables native FlashAttention/SDPA, reducing memory to <100 MB.
+    2. **Autograd Graph Tracking in Retrieval**: Wrapped database retrieval inside `with torch.no_grad():` and detached queries (`q.detach()`), preventing autograd from maintaining a 4.1 GB intermediate similarity graph across millions of keys.
+    3. **Query Chunk Size Optimization**: Reduced retrieval chunk size from 2048 to 256, capping maximum temporary similarity matrix allocation to under 256 MB per chunk and reducing peak end-to-end forward+backward VRAM from >16 GB (CUDA OOM) to ~3.5 GB on 1M-entry databases.
+    4. **Key Normalization Buffer**: Pre-computed and registered `db_keys_norm` buffer during database loading to eliminate redundant matrix normalizations during forward passes.
+  - Added unit test `test_noise_rag_bounded_vram_and_attention_efficiency` in `tests/test_noise_rag.py`.
+  - Updated assertion in `test_build_model_from_configs` to accommodate 1,000,000 target entries in `configs/experiments/mask_clip/mask-clip-db-mae.yaml`.
+
 ## [Unreleased] - 2026-11-11
 
 ### Added

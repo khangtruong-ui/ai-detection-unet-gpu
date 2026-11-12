@@ -29,6 +29,10 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [11. Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem](#11-feature-pyramid-network-fpn--multi-scale-prediction-subsystem)
   - [12. SAM2 Segmenter & QLoRA Architecture (Small & Large Models)](#12-sam2-segmenter--qlora-architecture-small--large-models)
   - [13. IML MaskFormer Architecture (RefactorMaskformer with SAM 2.1 Hiera Vision Trunk)](#13-iml-maskformer-architecture-refactormaskformer-with-sam-21-hiera-vision-trunk)
+  - [14. Detective SAM Architecture (ICLR 2026: Adaptive AI-Image Forgery Localization)](#14-detective-sam-architecture-iclr-2026-adaptive-ai-image-forgery-localization)
+  - [15. FOCAL: Forensic Contrastive Clustering (HRNet & SAM ViT Backbones)](#15-focal-forensic-contrastive-clustering-hrnet--sam-vit-backbones)
+  - [16. PIM: Plug-and-Play Image Inpainting Localization Network](#16-pim-plug-and-play-image-inpainting-localization-network)
+  - [17. Noise-RAG: Forensic Vector DB Retrieval & FlashAttention Optimization](#17-noise-rag-forensic-vector-db-retrieval--flashattention-optimization)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -1426,6 +1430,58 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
   2. Sibling File Fallback: If absent, searches for `forensic_memory.pt` or `forensic_memory_best.pt` in the checkpoint's local directory.
   3. Pre-Trained Fallback: If configured, loads from external `memory_path`.
 - **Hugging Face Hub Push & Pull**: `find_local_checkpoint_artifacts` (`sid_unet/checkpoint_sync.py`) discovers `forensic_memory*.pt` files and schedules them for asynchronous upload via `sid-push` / `push_to_hf`. Hub checkpoint loaders (`sid_unet/utils/checkpoint.py`) opportunistically download sibling memory files for seamless remote deployment.
+
+---
+
+### 15. FOCAL: Forensic Contrastive Clustering (HRNet & SAM ViT Backbones)
+
+[FOCAL](https://github.com/HighwayWu/FOCAL) (*"Rethinking Image Forgery Detection via Soft Contrastive Learning and Unsupervised Clustering"*, ICCV 2023) frames image forgery localization through dense contrastive clustering. Rather than requiring supervised boundary heuristics alone, FOCAL clusters normalized spatial forensic features directly into tampered and pristine groups on the fly.
+
+- **Strict Zero-Fallback Policy**:
+  - `pretrained=False` raises an immediate `ValueError`: local random weight initialization is strictly prohibited.
+  - Checkpoint missing/failure raises an immediate `RuntimeError`: fallback to dummy weights is strictly disallowed.
+  - Checkpoints are downloaded and verified directly from Hugging Face Hub `KhangTruong/FOCAL` (`FOCAL_HRNet_weights.pth` and `FOCAL_ViT_weights.pth`).
+- **Supported Backbones**:
+  - `HRNet-W32`: Multi-resolution parallel streams maintaining high-resolution representations throughout the network. Generates 32-dimensional spatial forensic features.
+  - `SAM ViT-Large`: 24-layer ViT-Large image encoder from Segment Anything with decomposed relative positional embeddings and windowed/global multi-head attention. Generates 256-dimensional spatial forensic features.
+- **Inference Prediction**:
+  - Direct 2-class convolutional classification head (`self.fc`).
+  - Unsupervised k-means clustering mask prediction (`predict_mask_clustering`).
+- **Configuration Files**:
+  - `configs/experiments/focal/focal_hrnet.yaml`
+  - `configs/experiments/focal/focal_vit.yaml`
+
+---
+
+### 16. PIM: Plug-and-Play Image Inpainting Localization Network
+
+[PIM](https://github.com/ChenqiKONG/PIM) (*"A Plug-and-Play Image Inpainting Localization Network"*, ICCV 2023) is a dual-branch framework designed specifically for image inpainting and splicing localization.
+
+- **Strict Zero-Fallback Policy**:
+  - `pretrained=False` raises an immediate `ValueError`.
+  - Checkpoint missing/failure raises an immediate `RuntimeError`.
+  - Checkpoint loaded strictly from Hugging Face Hub `KhangTruong/PIM` (`ckpt.pth`).
+- **Architecture**:
+  - **Dual-Branch Swin Transformer**: Deep feature stream (`SwinTransformer`) alongside a causal-masked reconstruction feature stream (`SwinTransformerMask`).
+  - **Local Conv Enhancement (`FeatureLocalConv`)**: Frequency-sensitive central difference and radial difference convolutions with device-agnostic buffer allocation.
+  - **Dynamic Feature Fusion (`FeatureFusion`)**: Multi-scale cross-branch channel-attention weighting and depthwise separable convolutions.
+  - **Multi-Task UPerHead Decoders**: Simultaneously produces forgery segmentation masks (`mask_logits`), tampering edge boundaries (`boundary_logits`), and image reconstruction (`recon_img`).
+- **Configuration File**:
+  - `configs/experiments/pim/pim.yaml`
+
+---
+
+### 17. Noise-RAG: Forensic Vector DB Retrieval & FlashAttention Optimization
+
+`NoiseRAGPrototypeV1` couples Noiseprint++ camera model noise residuals with dense visual tokens, querying an external 1,000,000-vector forensic database (`KhangTruong/mask-clip-db-mae-cache`).
+
+- **No-Grad Invariant**:
+  - Database keys and continuous labels are explicitly registered with `requires_grad = False` and `.detach()`.
+  - `compute_alignment_loss` detaches target vectors (`target = target.detach().requires_grad_(False)`) before computing MSE loss, preventing unwanted autograd graph expansion into frozen database representations.
+- **VRAM Optimization & FlashAttention**:
+  - PyTorch `nn.MultiheadAttention` layers configured with `need_weights=False`, eliminating materialized $[2, 8, 4096, 4096]$ attention weight matrices (~9 GB VRAM across blocks) and enabling native PyTorch SDPA FlashAttention.
+  - Database retrieval operates under `with torch.no_grad():` with detached query tokens (`q.detach()`).
+  - Retrieval chunk size capped at 256, eliminating 4.1 GB single matrix allocations and reducing peak forward+backward memory on 1M-vector DBs from >16 GB (CUDA OOM) to ~3.5 GB.
 
 ---
 

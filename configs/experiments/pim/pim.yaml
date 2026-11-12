@@ -1,0 +1,39 @@
+# Configuration: PIM (Plug-and-Play Image Inpainting Localization Network)
+# Dual-Stream Swin Transformer with Local Frequency Enhancement & UPerHead
+# Official Weights: KhangTruong/PIM (ckpt.pth)
+
+project:
+  name: "sid_pim_swin"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/pim_swin"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  image_size: [256, 256]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "pim"
+  pretrained: true
+  hf_repo: "KhangTruong/PIM"
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true

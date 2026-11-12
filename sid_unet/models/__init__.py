@@ -75,6 +75,16 @@ from sid_unet.models.mask_clip import (
     DEFAULT_MAE_PRETRAIN_URL,
     DEFAULT_CLIP_VIT_L14_URL,
 )
+from sid_unet.models.focal import (
+    FOCAL,
+    FOCALHRNet,
+    FOCALViT,
+    DEFAULT_FOCAL_HF_REPO,
+)
+from sid_unet.models.pim import (
+    PIM,
+    DEFAULT_PIM_HF_REPO,
+)
 
 __all__ = [
     "UNet",
@@ -143,6 +153,12 @@ __all__ = [
     "FeatureAdapter",
     "MaskAdapter",
     "DetectiveSAMLoss",
+    "FOCAL",
+    "FOCALHRNet",
+    "FOCALViT",
+    "DEFAULT_FOCAL_HF_REPO",
+    "PIM",
+    "DEFAULT_PIM_HF_REPO",
 ]
 
 
