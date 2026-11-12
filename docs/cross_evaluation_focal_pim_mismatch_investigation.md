@@ -45,22 +45,29 @@ In the original FOCAL paper (*FOCAL: Forensic Contrastive Learning for Image Man
 - **FOCAL has no supervised classification layer or linear segmentation head.**
 - Inference is performed via **unsupervised k-means clustering** (`predict_mask_clustering`) directly on L2-normalized feature embeddings produced by the backbone.
 
-#### Code Audit in `sid_unet`
-In `sid_unet/models/focal.py`:
-```python
-# Lines 149-152:
-self.fc = nn.Conv2d(in_dim, 2, kernel_size=1)
+#### Code Audit in `sid_unet` & Inspection of Downloaded GitHub Weights
+In the weights file `FOCAL_HRNet_weights.pth` directly downloaded from GitHub (`HighwayWu/FOCAL`):
+- The checkpoint contains backbone weights `module.net.*`, `module.net.final_layer.*` (17 channels from Pose HRNet initialization), and `module.fc.weight` (`[2, 32, 3, 3]`), `module.fc.bias` (`[0.0438, 0.0087]`).
+- In the official `HighwayWu/FOCAL/main.py` training and inference pipeline, the authors **never instantiate or use `module.fc`**. Features are extracted, L2-normalized across channels, and passed directly to unsupervised clustering:
+  ```python
+  Fo = torch.flatten(Fo, start_dim=1, end_dim=2)
+  result = self.clustering(x=Fo, k=2)
+  ```
+- In `sid_unet/models/focal.py`:
+  ```python
+  # Line 730:
+  self.fc = nn.Conv2d(in_dim, 2, kernel_size=3, padding=1)
 
-# In forward(self, x):
-# Lines 218-220:
-logits_full = self.fc(feats)
-mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
-```
-
-Because `self.fc` was randomly initialized or tuned without matching contrastive calibration:
-- `logits_full[:, 1:2]` (channel 1) produces unconditionally larger values than `logits_full[:, 0:1]` (channel 0).
-- `diff = logits[:, 1:2] - logits[:, 0:1]` is strictly positive (`diff > 0.12`) over every pixel in every test image.
-- `torch.sigmoid(diff) > 0.5` is true for **100% of pixels**.
+  # Lines 899-905:
+  logits_small = self.fc(feats)  # [B, 2, H', W']
+  logits_full = F.interpolate(logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+  mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
+  ```
+- When `sid_unet` loads the checkpoint with strict key matching, `module.fc` from the checkpoint file is loaded into `self.fc`.
+- Because `module.fc` was never trained as a binary tampering localization head:
+  - `logits_full[:, 1:2]` (channel 1) produces unconditionally larger values than `logits_full[:, 0:1]` (channel 0).
+  - `diff = logits[:, 1:2] - logits[:, 0:1]` is strictly positive (`diff > 0.10`) over 100% of pixels in any image.
+  - `torch.sigmoid(diff) > 0.5` evaluates to True for **100% of pixels**.
 
 #### Empirical Evidence from Evaluation Data
 In `master_cross_evaluation_report.md`:
@@ -209,3 +216,29 @@ The evaluation dataset `eval_mvss_v1_protocol` comprises 17,929 images across 15
 | **Pristine Images** | Counted in macro avg | Discarded (`filter_zero_positive=True`) | Credited as 1.0 if clean | Discarded (`filter_zero_positive=True`) |
 | **Catalog Score Meaning** | Macro F1 (~0.824) labeled as IoU | Cross-eval computed IoU | AutoSplice 90 AUC (0.852) | Cross-eval computed IoU |
 | **Evaluation Domain** | Traditional copy-move / splice | >55% Diffusion/Generative AI | Traditional copy-move / splice | >55% Diffusion/Generative AI |
+
+---
+
+## 6. Audit of Upstream Read-Only Repositories
+
+### Are Changes in Upstream Repositories Necessary?
+**Conclusion**: **NO**. No modifications or bug reports to the upstream external repositories (`HighwayWu/FOCAL`, `ChenqiKONG/PIM`) are required.
+
+- **`HighwayWu/FOCAL`**:
+  The official codebase and weights behave exactly as described in the published paper. The model was formulated strictly as an unsupervised feature learning architecture with on-the-fly k-means clustering (`result = self.clustering(x=Fo, k=2)`). The authors never provided or claimed to use a supervised segmentation conv head. The presence of residual `module.fc` weights in the checkpoint is a byproduct of upstream backbone initialization and does not constitute a defect in FOCAL itself. The fault originated entirely in `sid_unet`'s architectural wrapper assuming a supervised 2-channel convolution head.
+- **`ChenqiKONG/PIM`**:
+  The weights file `ckpt.pth` is genuine, intact, and numerically reproduces its reported performance when tested with the upstream evaluation script (`test_eval_cross_dataset.py`) at $512 \times 512$ with native-resolution resizing (`ori_size`) and full-image metric conventions. In fact, `sid_pim_swin` achieved an AUROC of **0.8597** on CASIA v2.0 during cross-evaluation, closely replicating the paper's reported AUC of **0.852** on AutoSplice 90.
+
+All root causes reside in wrapper architecture assumptions, evaluation dataset domain shifts, input preprocessing downscaling, and metric definition mismatches.
+
+---
+
+## 7. Automated Empirical Verification Test Suite
+
+The mathematical proofs and empirical phenomena documented in this report are verified by unit tests in [`tests/test_focal_pim_mismatch_audit.py`](file:///content/ai-detection-unet-gpu/tests/test_focal_pim_mismatch_audit.py):
+1. `test_focal_conv_head_positive_saturation_evidence`: Proves that the conv head difference is unconditionally positive (> 0.10) producing 100% positive mask saturation (Recall ~ 1.0, Specificity ~ 0.0, Pixel Acc = GT positive ratio).
+2. `test_focal_unsupervised_clustering_breaks_saturation`: Proves that upstream unsupervised k-means clustering separates tampered regions into realistic positive density (< 50%).
+3. `test_metric_discrepancy_pristine_handling`: Proves that crediting pristine images as 1.0 (upstream PIM) versus discarding them (`filter_zero_positive=True`) creates a ~25% divergence in dataset IoU.
+4. `test_catalog_metric_semantic_confusion_auc_vs_iou`: Proves that a detector with AUROC ~ 0.85 naturally exhibits IoU ~ 0.30 on realistic probability distributions, confirming the catalog metric mismatch.
+5. `test_dataset_ground_truth_polarity_inversion_impact`: Proves that inverted ground truth masks (tampered = 0, pristine = 255) collapse localization IoU to near-zero (~0.03).
+

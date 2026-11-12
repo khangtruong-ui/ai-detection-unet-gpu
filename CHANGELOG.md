@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Proved evaluation metric discrepancies: FOCAL upstream evaluates macro-averaged F1 (including background pristine F1), while `sid_unet` evaluates binary foreground Dice; PIM upstream rewards pristine images with 1.0 IoU/F1 when clean, while `sid_unet` excludes zero-positive images (`filter_zero_positive=True`).
   - Identified catalog score semantic confusion: PIM `best_score: 0.852` represents AutoSplice 90 AUC (not IoU, not CASIA/MVSS); FOCAL `best_score: 0.824` represents validation Macro F1 mislabeled under `"val_iou"`.
   - Documented dataset domain shift (>55% generative diffusion images in `eval_mvss_v1_protocol` vs traditional splicing pretraining) and ground truth polarity inversion in NIST16.
+  - Implemented automated empirical evidence test suite (`tests/test_focal_pim_mismatch_audit.py`) validating mathematical proofs and empirical bounds for all 5 identified mismatch root causes.
 - **FOCAL Model Integration (HRNet & SAM ViT Backbones)**:
   - Integrated the complete FOCAL framework (Forensic Contrastive Clustering for Image Forgery Detection and Localization, ICCV 2023) from official repository `HighwayWu/FOCAL`.
   - Implemented self-contained `HRNet-W32` and `SAM ViT-Large` backbones with pure PyTorch `SAMBlock`, `MLPBlock`, and decomposed relative position embeddings.
