@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Exported `FOCAL`, `FOCALHRNet`, `FOCALViT`, `PIM` and their default Hugging Face repository constants in `sid_unet.models`.
   - Wired `focal` and `pim` branches into `build_model` in `sid_unet.models.unet`.
   - Added state_dict key signature pattern matching for `focal` and `pim` checkpoints in `UNet.from_checkpoint`.
+- **Hugging Face Hub Checkpoint Formatting & Cross-Evaluation**:
+  - Reformatted Hugging Face repositories `KhangTruong/PIM` and `KhangTruong/FOCAL` to standard SID-UNet multi-version layouts containing `checkpoints/checkpoint_best.pt`, `checkpoints/checkpoint_latest.pt`, `config.yaml`, `manifest.json`, and versioned trees under `versions/v1/`, while preserving original `.pth` weights for backwards compatibility.
+  - Upgraded weight loading modules in `FOCAL` and `PIM` to automatically unpack embedded `model_state_dict` dictionaries, handle `net.` and `module.` prefix variations, and resolve candidate checkpoint paths on Hugging Face Hub.
+  - Upgraded `UNet.from_checkpoint` to auto-detect and instantiate `focal` (HRNet or ViT) and `pim` models directly from Hugging Face Hub IDs (`KhangTruong/FOCAL`, `KhangTruong/PIM`) or local checkpoint paths.
+  - Upgraded `sid-pull` with automated experiment directory resolution matching `configs/experiments/<model>/<model>.yaml` destinations.
+  - Verified end-to-end `sid-pull` and `sid-cross-eval` matrix evaluation across CASIA v2.0 benchmarks and synchronized master cross-evaluation reports and illustrations to remote model cards.
 
 ### Fixed
 - **Noise-RAG Vector Database No-Grad & Detached Alignment Loss**:

@@ -760,9 +760,10 @@ class FOCAL(nn.Module):
 
         # 2. Local candidate directories
         if resolved_path is None:
-            filename = os.path.basename(source) if source.endswith(".pth") else default_filename
+            filename = os.path.basename(source) if source.endswith((".pth", ".pt")) else default_filename
             candidates = [
                 filename,
+                os.path.join("checkpoints", filename),
                 os.path.join("weights", filename),
                 os.path.join("/tmp/focal_repo/weights", filename),
                 os.path.join("pretrained_models", filename),
@@ -775,20 +776,39 @@ class FOCAL(nn.Module):
         # 3. Download from Hugging Face Hub
         if resolved_path is None:
             repo_id = self.hf_repo
-            filename = os.path.basename(source) if source.endswith(".pth") else default_filename
-            try:
-                from huggingface_hub import hf_hub_download
-                resolved_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    cache_dir=cache_dir,
-                )
-                logger.info(f"Downloaded FOCAL pretrained weights from HF '{repo_id}/{filename}': {resolved_path}")
-            except Exception as hf_err:
+            filename = os.path.basename(source) if source.endswith((".pth", ".pt")) else default_filename
+            # Priority candidates on Hugging Face Hub (handles both legacy and reformatted SID-UNet layouts)
+            hf_candidates = [filename]
+            if self.backbone_name == "hrnet":
+                for c in ["checkpoints/checkpoint_best.pt", "checkpoint_best.pt", "FOCAL_HRNet_weights.pth", "checkpoints/FOCAL_HRNet_weights.pth"]:
+                    if c not in hf_candidates:
+                        hf_candidates.append(c)
+            else:
+                for c in ["checkpoints/focal_vit.pt", "focal_vit.pt", "checkpoints/checkpoint_best.pt", "FOCAL_ViT_weights.pth", "checkpoints/FOCAL_ViT_weights.pth"]:
+                    if c not in hf_candidates:
+                        hf_candidates.append(c)
+
+            from huggingface_hub import hf_hub_download
+            last_err = None
+            for c_fn in hf_candidates:
+                try:
+                    resolved_path = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=c_fn,
+                        cache_dir=cache_dir,
+                    )
+                    if resolved_path and os.path.isfile(resolved_path):
+                        logger.info(f"Downloaded FOCAL pretrained weights from HF '{repo_id}/{c_fn}': {resolved_path}")
+                        break
+                except Exception as hf_err:
+                    last_err = hf_err
+                    continue
+
+            if resolved_path is None and last_err is not None:
                 raise RuntimeError(
-                    f"Failed to download/load FOCAL weights from Hugging Face repo '{repo_id}/{filename}': {hf_err}. "
+                    f"Failed to download/load FOCAL weights from Hugging Face repo '{repo_id}' (tried {hf_candidates}): {last_err}. "
                     f"Strict zero-fallback policy: aborting initialization."
-                ) from hf_err
+                ) from last_err
 
         if resolved_path is None or not os.path.isfile(resolved_path):
             raise RuntimeError(
@@ -806,16 +826,29 @@ class FOCAL(nn.Module):
         if not isinstance(ckpt, dict):
             raise ValueError(f"Invalid FOCAL checkpoint payload from '{resolved_path}': expected state_dict dict.")
 
+        if "model_state_dict" in ckpt:
+            raw_sd = ckpt["model_state_dict"]
+        elif "model" in ckpt and isinstance(ckpt["model"], dict):
+            raw_sd = ckpt["model"]
+        elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            raw_sd = ckpt["state_dict"]
+        else:
+            raw_sd = ckpt
+
         # Strip module. prefix (e.g. from DataParallel save)
         clean_sd = {}
-        for k, v in ckpt.items():
+        expected_keys = set(self.state_dict().keys())
+        if self.class_head is not None:
+            expected_keys = {k for k in expected_keys if not k.startswith("class_head.")}
+
+        for k, v in raw_sd.items():
             clean_k = k[7:] if k.startswith("module.") else k
             clean_sd[clean_k] = v
+            # If standalone backbone was saved without 'net.' prefix, support matching to 'net.<k>'
+            if not clean_k.startswith("net.") and f"net.{clean_k}" in expected_keys:
+                clean_sd[f"net.{clean_k}"] = v
 
         try:
-            expected_keys = set(self.state_dict().keys())
-            if self.class_head is not None:
-                expected_keys = {k for k in expected_keys if not k.startswith("class_head.")}
             missing_keys = [k for k in expected_keys if k not in clean_sd]
             if missing_keys:
                 raise RuntimeError(f"FOCAL missing required pretrained weights: {missing_keys[:10]}")

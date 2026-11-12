@@ -180,6 +180,7 @@ def download_hf_checkpoint(
             for rf in repo_files:
                 if rf.endswith((".pt", ".pth")) and (
                     "checkpoint" in rf.lower() or "model" in rf.lower() or "maskclip" in rf.lower()
+                    or "focal" in rf.lower() or "ckpt" in rf.lower() or "pim" in rf.lower()
                 ) and rf not in dynamic_cands:
                     dynamic_cands.append(rf)
             if dynamic_cands:

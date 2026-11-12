@@ -748,7 +748,7 @@ def pull_checkpoint(
         else:
             print("No version subdirectories found; repository uses root/legacy layout.")
 
-        pt_files = [f for f in remote_files if f.endswith(".pt")]
+        pt_files = [f for f in remote_files if f.endswith((".pt", ".pth"))]
         print(f"\nAvailable Checkpoint Files ({len(pt_files)}):")
         for f in pt_files:
             print(f"  - {f}")
@@ -770,17 +770,24 @@ def pull_checkpoint(
 
     if not target_dir:
         # Check standard destinations
-        short_name = repo_id.split("/")[-1]
-        matching_config = f"configs/experiments/{short_name.replace('-', '_')}/default.yaml"
-        if os.path.isfile(matching_config):
-            try:
-                with open(matching_config, "r", encoding="utf-8") as f:
-                    raw_cfg = yaml.safe_load(f) or {}
-                out = raw_cfg.get("project", {}).get("output_dir")
-                if out:
-                    target_dir = os.path.abspath(out)
-            except Exception:
-                pass
+        short_name = repo_id.split("/")[-1].lower()
+        clean_name = short_name.replace("-", "_")
+        candidates = [
+            f"configs/experiments/{clean_name}/default.yaml",
+            f"configs/experiments/{clean_name}/{clean_name}.yaml",
+            f"configs/experiments/{clean_name}/{clean_name}_hrnet.yaml",
+        ]
+        for matching_config in candidates:
+            if os.path.isfile(matching_config):
+                try:
+                    with open(matching_config, "r", encoding="utf-8") as f:
+                        raw_cfg = yaml.safe_load(f) or {}
+                    out = raw_cfg.get("project", {}).get("output_dir")
+                    if out:
+                        target_dir = os.path.abspath(out)
+                        break
+                except Exception:
+                    pass
 
     if not target_dir:
         target_dir = os.path.abspath(os.path.join("outputs", "RUN", "default"))
@@ -843,8 +850,8 @@ def pull_checkpoint(
                 break
 
     if not files_to_download:
-        # Fall back to downloading any *.pt file
-        pts = [f for f in remote_files if f.endswith(".pt")]
+        # Fall back to downloading any *.pt or *.pth file
+        pts = [f for f in remote_files if f.endswith((".pt", ".pth"))]
         if pts:
             files_to_download.append(pts[0])
         else:

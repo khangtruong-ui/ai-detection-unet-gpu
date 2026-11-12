@@ -1214,9 +1214,10 @@ class PIM(nn.Module):
 
         # 2. Local candidate directories
         if resolved_path is None:
-            filename = os.path.basename(source) if source.endswith(".pth") else default_filename
+            filename = os.path.basename(source) if source.endswith((".pth", ".pt")) else default_filename
             candidates = [
                 filename,
+                os.path.join("checkpoints", filename),
                 os.path.join("weights", filename),
                 os.path.join("pretrained_models", filename),
                 os.path.join("/tmp/pim_repo", filename),
@@ -1229,20 +1230,34 @@ class PIM(nn.Module):
         # 3. Download from Hugging Face Hub
         if resolved_path is None:
             repo_id = self.hf_repo
-            filename = os.path.basename(source) if source.endswith(".pth") else default_filename
-            try:
-                from huggingface_hub import hf_hub_download
-                resolved_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    cache_dir=cache_dir,
-                )
-                logger.info(f"Downloaded PIM pretrained weights from HF '{repo_id}/{filename}': {resolved_path}")
-            except Exception as hf_err:
+            filename = os.path.basename(source) if source.endswith((".pth", ".pt")) else default_filename
+            # Priority candidates on Hugging Face Hub (handles both legacy and reformatted SID-UNet layouts)
+            hf_candidates = [filename]
+            for c in ["checkpoints/checkpoint_best.pt", "checkpoint_best.pt", "checkpoints/checkpoint_latest.pt", "ckpt.pth", "checkpoints/ckpt.pth"]:
+                if c not in hf_candidates:
+                    hf_candidates.append(c)
+
+            from huggingface_hub import hf_hub_download
+            last_err = None
+            for c_fn in hf_candidates:
+                try:
+                    resolved_path = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=c_fn,
+                        cache_dir=cache_dir,
+                    )
+                    if resolved_path and os.path.isfile(resolved_path):
+                        logger.info(f"Downloaded PIM pretrained weights from HF '{repo_id}/{c_fn}': {resolved_path}")
+                        break
+                except Exception as hf_err:
+                    last_err = hf_err
+                    continue
+
+            if resolved_path is None and last_err is not None:
                 raise RuntimeError(
-                    f"Failed to download/load PIM weights from Hugging Face repo '{repo_id}/{filename}': {hf_err}. "
+                    f"Failed to download/load PIM weights from Hugging Face repo '{repo_id}' (tried {hf_candidates}): {last_err}. "
                     f"Strict zero-fallback policy: aborting initialization."
-                ) from hf_err
+                ) from last_err
 
         if resolved_path is None or not os.path.isfile(resolved_path):
             raise RuntimeError(
@@ -1260,15 +1275,21 @@ class PIM(nn.Module):
         if not isinstance(ckpt, dict):
             raise ValueError(f"Invalid PIM checkpoint payload from '{resolved_path}': expected state_dict dict.")
 
-        if "state_dict" in ckpt:
+        if "model_state_dict" in ckpt:
+            raw_sd = ckpt["model_state_dict"]
+        elif "model" in ckpt and isinstance(ckpt["model"], dict):
+            raw_sd = ckpt["model"]
+        elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
             raw_sd = ckpt["state_dict"]
         else:
             raw_sd = ckpt
 
-        # Strip module. prefix (e.g. from DataParallel save)
+        # Strip module. and net. prefixes (e.g. from DataParallel save or top-level wrapper)
         clean_sd = {}
         for k, v in raw_sd.items():
             clean_k = k[7:] if k.startswith("module.") else k
+            if clean_k.startswith("net."):
+                clean_k = clean_k[4:]
             clean_sd[clean_k] = v
 
         try:

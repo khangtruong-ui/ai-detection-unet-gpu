@@ -137,3 +137,28 @@ class TestFOCALModel:
         # Direct shortcuts
         m_hr = FOCALHRNet(pretrained=True)
         assert isinstance(m_hr, FOCAL)
+
+    def test_focal_from_checkpoint_and_reformatted_loading(self, tmp_path):
+        """Verifies UNet.from_checkpoint loads FOCAL correctly with embedded config and model_state_dict."""
+        from sid_unet.models.unet import UNet
+        model = FOCAL(backbone="hrnet", pretrained=True)
+        ckpt_path = tmp_path / "checkpoint_best.pt"
+        payload = {
+            "epoch": 5,
+            "step": 500,
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "model": {
+                    "name": "focal",
+                    "backbone": "hrnet",
+                    "pretrained": True,
+                }
+            },
+            "best_score": 0.82,
+        }
+        torch.save(payload, str(ckpt_path))
+
+        loaded_model, ckpt_cfg = UNet.from_checkpoint(str(ckpt_path), return_config=True)
+        assert isinstance(loaded_model, FOCAL)
+        assert ckpt_cfg.model.name == "focal"
+        assert ckpt_cfg.model.backbone == "hrnet"

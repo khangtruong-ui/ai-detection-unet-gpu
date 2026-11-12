@@ -117,3 +117,26 @@ class TestPIMModel:
         }
         model = build_model(cfg_pim)
         assert isinstance(model, PIM)
+
+    def test_pim_from_checkpoint_and_reformatted_loading(self, tmp_path):
+        """Verifies UNet.from_checkpoint loads PIM correctly with embedded config and model_state_dict."""
+        from sid_unet.models.unet import UNet
+        model = PIM(pretrained=True)
+        ckpt_path = tmp_path / "checkpoint_best.pt"
+        payload = {
+            "epoch": 5,
+            "step": 500,
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "model": {
+                    "name": "pim",
+                    "pretrained": True,
+                }
+            },
+            "best_score": 0.85,
+        }
+        torch.save(payload, str(ckpt_path))
+
+        loaded_model, ckpt_cfg = UNet.from_checkpoint(str(ckpt_path), return_config=True)
+        assert isinstance(loaded_model, PIM)
+        assert ckpt_cfg.model.name == "pim"

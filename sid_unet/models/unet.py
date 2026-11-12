@@ -271,9 +271,16 @@ class UNet(nn.Module):
         elif isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
             state_dict = ckpt["model"]
             saved_cfg = ckpt.get("config", {})
-        elif isinstance(ckpt, dict) and any(
-            k.startswith(("inc.", "downs.", "bottleneck.", "stage1.", "linear.", "stage5.", "aggregator.", "prompt_learner.", "cls_aggregator."))
-            for k in ckpt.keys()
+        elif isinstance(ckpt, dict) and (
+            any(
+                k.startswith((
+                    "inc.", "downs.", "bottleneck.", "stage1.", "linear.", "stage5.",
+                    "aggregator.", "prompt_learner.", "cls_aggregator.",
+                    "net.", "module.net.", "backbone_swin.", "module.backbone_swin.",
+                    "uperhead.", "module.uperhead.", "fc.", "module.fc."
+                ))
+                for k in ckpt.keys()
+            ) or any("backbone_swin" in k or "image_encoder" in k for k in ckpt.keys())
         ):
             state_dict = ckpt
             saved_cfg = {}
@@ -325,10 +332,20 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "noise-rag-prototype-v1"
             elif any(k.startswith(("pixel_module.", "transformer_decoder.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "iml"
-            elif any("backbone_swin" in k or k.startswith(("backbone_swin.", "backbone_recon.", "local_conv_enhancement.")) for k in state_dict.keys()):
+            elif any("backbone_swin" in k or "uperhead" in k for k in state_dict.keys()):
                 merged["model"]["name"] = "pim"
-            elif any(k.startswith(("net.stage1.", "net.stage2.", "net.stage3.", "net.stage4.", "net.image_encoder.")) for k in state_dict.keys()) or ("fc.weight" in state_dict and any("stage" in k or "image_encoder" in k for k in state_dict.keys())):
+            elif any(
+                k.startswith((
+                    "net.stage1.", "net.stage2.", "net.stage3.", "net.stage4.", "net.image_encoder.",
+                    "module.net.stage1.", "module.net.stage2.", "module.net.stage3.", "module.net.stage4.", "module.net.image_encoder."
+                ))
+                for k in state_dict.keys()
+            ) or ("fc.weight" in state_dict or "module.fc.weight" in state_dict) or any("SAMBlock" in k or "HRNet" in k for k in state_dict.keys()):
                 merged["model"]["name"] = "focal"
+                if any("image_encoder" in k or "SAMBlock" in k for k in state_dict.keys()):
+                    merged["model"]["backbone"] = "vit"
+                else:
+                    merged["model"]["backbone"] = "hrnet"
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config

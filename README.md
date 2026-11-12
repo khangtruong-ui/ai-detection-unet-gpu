@@ -1440,7 +1440,7 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
 - **Strict Zero-Fallback Policy**:
   - `pretrained=False` raises an immediate `ValueError`: local random weight initialization is strictly prohibited.
   - Checkpoint missing/failure raises an immediate `RuntimeError`: fallback to dummy weights is strictly disallowed.
-  - Checkpoints are downloaded and verified directly from Hugging Face Hub `KhangTruong/FOCAL` (`FOCAL_HRNet_weights.pth` and `FOCAL_ViT_weights.pth`).
+  - Checkpoints are downloaded and verified directly from Hugging Face Hub [**`KhangTruong/FOCAL`**](https://huggingface.co/KhangTruong/FOCAL) (`checkpoints/checkpoint_best.pt`, `FOCAL_HRNet_weights.pth`, and `FOCAL_ViT_weights.pth`).
 - **Supported Backbones**:
   - `HRNet-W32`: Multi-resolution parallel streams maintaining high-resolution representations throughout the network. Generates 32-dimensional spatial forensic features.
   - `SAM ViT-Large`: 24-layer ViT-Large image encoder from Segment Anything with decomposed relative positional embeddings and windowed/global multi-head attention. Generates 256-dimensional spatial forensic features.
@@ -1451,6 +1451,30 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
   - `configs/experiments/focal/focal_hrnet.yaml`
   - `configs/experiments/focal/focal_vit.yaml`
 
+#### Checkpoint Synchronization (`sid-pull`)
+```bash
+# Pull official FOCAL HRNet checkpoints from Hugging Face Hub
+sid-pull --name KhangTruong/FOCAL
+
+# Pull specific version or checkpoint
+sid-pull --name KhangTruong/FOCAL --version v1 --checkpoint checkpoint_best.pt
+```
+
+#### Cross-Evaluation (`sid-cross-eval`)
+```bash
+# Cross-evaluate FOCAL on benchmark datasets (e.g. CASIA v2.0)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints outputs/RUN/focal_hrnet/checkpoints/checkpoint_best.pt \
+  --no-detach
+
+# Or cross-evaluate directly from Hugging Face Hub ID
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints KhangTruong/FOCAL \
+  --no-detach
+```
+
 ---
 
 ### 16. PIM: Plug-and-Play Image Inpainting Localization Network
@@ -1460,7 +1484,7 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
 - **Strict Zero-Fallback Policy**:
   - `pretrained=False` raises an immediate `ValueError`.
   - Checkpoint missing/failure raises an immediate `RuntimeError`.
-  - Checkpoint loaded strictly from Hugging Face Hub `KhangTruong/PIM` (`ckpt.pth`).
+  - Checkpoint loaded strictly from Hugging Face Hub [**`KhangTruong/PIM`**](https://huggingface.co/KhangTruong/PIM) (`checkpoints/checkpoint_best.pt` and `ckpt.pth`).
 - **Architecture**:
   - **Dual-Branch Swin Transformer**: Deep feature stream (`SwinTransformer`) alongside a causal-masked reconstruction feature stream (`SwinTransformerMask`).
   - **Local Conv Enhancement (`FeatureLocalConv`)**: Frequency-sensitive central difference and radial difference convolutions with device-agnostic buffer allocation.
@@ -1468,6 +1492,30 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
   - **Multi-Task UPerHead Decoders**: Simultaneously produces forgery segmentation masks (`mask_logits`), tampering edge boundaries (`boundary_logits`), and image reconstruction (`recon_img`).
 - **Configuration File**:
   - `configs/experiments/pim/pim.yaml`
+
+#### Checkpoint Synchronization (`sid-pull`)
+```bash
+# Pull official PIM Swin checkpoints from Hugging Face Hub
+sid-pull --name KhangTruong/PIM
+
+# Pull specific version
+sid-pull --name KhangTruong/PIM --version v1
+```
+
+#### Cross-Evaluation (`sid-cross-eval`)
+```bash
+# Cross-evaluate PIM on benchmark datasets (e.g. CASIA v2.0)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints outputs/RUN/pim_swin/checkpoints/checkpoint_best.pt \
+  --no-detach
+
+# Or cross-evaluate directly from Hugging Face Hub ID
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints KhangTruong/PIM \
+  --no-detach
+```
 
 ---
 
@@ -2667,6 +2715,20 @@ sid-cross-eval \
   --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
   --data-parallel \
   --device-ids 0 1
+
+# Cross-evaluate FOCAL and PIM across benchmark configurations
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml configs/cross-eval/coco-inpainted.yaml \
+  --checkpoints outputs/RUN/focal_hrnet/checkpoints/checkpoint_best.pt \
+                outputs/RUN/pim_swin/checkpoints/checkpoint_best.pt \
+  --samples 100 \
+  --no-detach
+
+# Cross-evaluate FOCAL and PIM directly referenced from Hugging Face Hub IDs
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints KhangTruong/FOCAL KhangTruong/PIM \
+  --no-detach
 ```
 
 > [!TIP]
