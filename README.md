@@ -29,6 +29,10 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [11. Feature Pyramid Network (FPN) & Multi-Scale Prediction Subsystem](#11-feature-pyramid-network-fpn--multi-scale-prediction-subsystem)
   - [12. SAM2 Segmenter & QLoRA Architecture (Small & Large Models)](#12-sam2-segmenter--qlora-architecture-small--large-models)
   - [13. IML MaskFormer Architecture (RefactorMaskformer with SAM 2.1 Hiera Vision Trunk)](#13-iml-maskformer-architecture-refactormaskformer-with-sam-21-hiera-vision-trunk)
+  - [14. Detective SAM Architecture (ICLR 2026: Adaptive AI-Image Forgery Localization)](#14-detective-sam-architecture-iclr-2026-adaptive-ai-image-forgery-localization)
+  - [15. FOCAL: Forensic Contrastive Clustering (HRNet & SAM ViT Backbones)](#15-focal-forensic-contrastive-clustering-hrnet--sam-vit-backbones)
+  - [16. PIM: Plug-and-Play Image Inpainting Localization Network](#16-pim-plug-and-play-image-inpainting-localization-network)
+  - [17. Noise-RAG: Forensic Vector DB Retrieval & FlashAttention Optimization](#17-noise-rag-forensic-vector-db-retrieval--flashattention-optimization)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -1429,6 +1433,106 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
 
 ---
 
+### 15. FOCAL: Forensic Contrastive Clustering (HRNet & SAM ViT Backbones)
+
+[FOCAL](https://github.com/HighwayWu/FOCAL) (*"Rethinking Image Forgery Detection via Soft Contrastive Learning and Unsupervised Clustering"*, ICCV 2023) frames image forgery localization through dense contrastive clustering. Rather than requiring supervised boundary heuristics alone, FOCAL clusters normalized spatial forensic features directly into tampered and pristine groups on the fly.
+
+- **Strict Zero-Fallback Policy**:
+  - `pretrained=False` raises an immediate `ValueError`: local random weight initialization is strictly prohibited.
+  - Checkpoint missing/failure raises an immediate `RuntimeError`: fallback to dummy weights is strictly disallowed.
+  - Checkpoints are downloaded and verified directly from Hugging Face Hub [**`KhangTruong/FOCAL`**](https://huggingface.co/KhangTruong/FOCAL) (`checkpoints/checkpoint_best.pt`, `FOCAL_HRNet_weights.pth`, and `FOCAL_ViT_weights.pth`).
+- **Supported Backbones**:
+  - `HRNet-W32`: Multi-resolution parallel streams maintaining high-resolution representations throughout the network. Generates 32-dimensional spatial forensic features.
+  - `SAM ViT-Large`: 24-layer ViT-Large image encoder from Segment Anything with decomposed relative positional embeddings and windowed/global multi-head attention. Generates 256-dimensional spatial forensic features.
+- **Inference Prediction**:
+  - Direct 2-class convolutional classification head (`self.fc`).
+  - Unsupervised k-means clustering mask prediction (`predict_mask_clustering`).
+- **Configuration Files**:
+  - `configs/experiments/focal/focal_hrnet.yaml`
+  - `configs/experiments/focal/focal_vit.yaml`
+
+#### Checkpoint Synchronization (`sid-pull`)
+```bash
+# Pull official FOCAL HRNet checkpoints from Hugging Face Hub
+sid-pull --name KhangTruong/FOCAL
+
+# Pull specific version or checkpoint
+sid-pull --name KhangTruong/FOCAL --version v1 --checkpoint checkpoint_best.pt
+```
+
+#### Cross-Evaluation (`sid-cross-eval`)
+```bash
+# Cross-evaluate FOCAL on benchmark datasets (e.g. CASIA v2.0)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints outputs/RUN/focal_hrnet/checkpoints/checkpoint_best.pt \
+  --no-detach
+
+# Or cross-evaluate directly from Hugging Face Hub ID
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints KhangTruong/FOCAL \
+  --no-detach
+```
+
+---
+
+### 16. PIM: Plug-and-Play Image Inpainting Localization Network
+
+[PIM](https://github.com/ChenqiKONG/PIM) (*"A Plug-and-Play Image Inpainting Localization Network"*, ICCV 2023) is a dual-branch framework designed specifically for image inpainting and splicing localization.
+
+- **Strict Zero-Fallback Policy**:
+  - `pretrained=False` raises an immediate `ValueError`.
+  - Checkpoint missing/failure raises an immediate `RuntimeError`.
+  - Checkpoint loaded strictly from Hugging Face Hub [**`KhangTruong/PIM`**](https://huggingface.co/KhangTruong/PIM) (`checkpoints/checkpoint_best.pt` and `ckpt.pth`).
+- **Architecture**:
+  - **Dual-Branch Swin Transformer**: Deep feature stream (`SwinTransformer`) alongside a causal-masked reconstruction feature stream (`SwinTransformerMask`).
+  - **Local Conv Enhancement (`FeatureLocalConv`)**: Frequency-sensitive central difference and radial difference convolutions with device-agnostic buffer allocation.
+  - **Dynamic Feature Fusion (`FeatureFusion`)**: Multi-scale cross-branch channel-attention weighting and depthwise separable convolutions.
+  - **Multi-Task UPerHead Decoders**: Simultaneously produces forgery segmentation masks (`mask_logits`), tampering edge boundaries (`boundary_logits`), and image reconstruction (`recon_img`).
+- **Configuration File**:
+  - `configs/experiments/pim/pim.yaml`
+
+#### Checkpoint Synchronization (`sid-pull`)
+```bash
+# Pull official PIM Swin checkpoints from Hugging Face Hub
+sid-pull --name KhangTruong/PIM
+
+# Pull specific version
+sid-pull --name KhangTruong/PIM --version v1
+```
+
+#### Cross-Evaluation (`sid-cross-eval`)
+```bash
+# Cross-evaluate PIM on benchmark datasets (e.g. CASIA v2.0)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints outputs/RUN/pim_swin/checkpoints/checkpoint_best.pt \
+  --no-detach
+
+# Or cross-evaluate directly from Hugging Face Hub ID
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints KhangTruong/PIM \
+  --no-detach
+```
+
+---
+
+### 17. Noise-RAG: Forensic Vector DB Retrieval & FlashAttention Optimization
+
+`NoiseRAGPrototypeV1` couples Noiseprint++ camera model noise residuals with dense visual tokens, querying an external 1,000,000-vector forensic database (`KhangTruong/mask-clip-db-mae-cache`).
+
+- **No-Grad Invariant**:
+  - Database keys and continuous labels are explicitly registered with `requires_grad = False` and `.detach()`.
+  - `compute_alignment_loss` detaches target vectors (`target = target.detach().requires_grad_(False)`) before computing MSE loss, preventing unwanted autograd graph expansion into frozen database representations.
+- **VRAM Optimization & FlashAttention**:
+  - PyTorch `nn.MultiheadAttention` layers configured with `need_weights=False`, eliminating materialized $[2, 8, 4096, 4096]$ attention weight matrices (~9 GB VRAM across blocks) and enabling native PyTorch SDPA FlashAttention.
+  - Database retrieval operates under `with torch.no_grad():` with detached query tokens (`q.detach()`).
+  - Retrieval chunk size capped at 256, eliminating 4.1 GB single matrix allocations and reducing peak forward+backward memory on 1M-vector DBs from >16 GB (CUDA OOM) to ~3.5 GB.
+
+---
+
 ## Mechanisms & Architectural Principles
 
 ### 1. Problem Formulation & Task Definition
@@ -2611,6 +2715,20 @@ sid-cross-eval \
   --checkpoints "outputs/RUN/*/checkpoints/checkpoint_best.pt" \
   --data-parallel \
   --device-ids 0 1
+
+# Cross-evaluate FOCAL and PIM across benchmark configurations
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml configs/cross-eval/coco-inpainted.yaml \
+  --checkpoints outputs/RUN/focal_hrnet/checkpoints/checkpoint_best.pt \
+                outputs/RUN/pim_swin/checkpoints/checkpoint_best.pt \
+  --samples 100 \
+  --no-detach
+
+# Cross-evaluate FOCAL and PIM directly referenced from Hugging Face Hub IDs
+sid-cross-eval \
+  --cross-configs configs/cross-eval/casia_v2.0.yaml \
+  --checkpoints KhangTruong/FOCAL KhangTruong/PIM \
+  --no-detach
 ```
 
 > [!TIP]

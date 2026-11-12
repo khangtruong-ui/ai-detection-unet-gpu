@@ -198,9 +198,9 @@ class LightTransformerBlock(nn.Module):
         b, c, h, w = x.shape
         tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)  # [B, HW, C]
 
-        # Self-Attention with Pre-LN
+        # Self-Attention with Pre-LN (need_weights=False avoids massive [B, heads, HW, HW] memory allocation)
         normed = self.norm1(tokens)
-        attn_out, _ = self.attn(normed, normed, normed)
+        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
         tokens = tokens + attn_out
 
         # MLP with Pre-LN
@@ -255,10 +255,10 @@ class LightCrossAttentionBlock(nn.Module):
         q_tokens = q_map.permute(0, 2, 3, 1).reshape(b, h * w, c)
         kv_tokens = kv_map.permute(0, 2, 3, 1).reshape(b, h * w, c)
 
-        # Cross Attention: Q from NT, K and V from O_i
+        # Cross Attention: Q from NT, K and V from O_i (need_weights=False avoids massive memory allocation)
         q_norm = self.norm_q(q_tokens)
         kv_norm = self.norm_kv(kv_tokens)
-        attn_out, _ = self.cross_attn(query=q_norm, key=kv_norm, value=kv_norm)
+        attn_out, _ = self.cross_attn(query=q_norm, key=kv_norm, value=kv_norm, need_weights=False)
 
         # Residual connection onto kv_tokens (updating O_i with noise guidance)
         tokens = kv_tokens + attn_out
@@ -424,9 +424,10 @@ class ForensicVectorDBRetrieval(nn.Module):
             nn.GELU(),
         )
 
-        # Database buffer registration
+        # Database buffer registration (strict requires_grad=False)
         self.register_buffer("db_keys", torch.empty((0, embed_dim), dtype=self.storage_dtype), persistent=False)
         self.register_buffer("db_labels", torch.empty((0, 1), dtype=self.storage_dtype), persistent=False)
+        self.register_buffer("db_keys_norm", torch.empty((0, embed_dim), dtype=self.storage_dtype), persistent=False)
 
         if memory_path:
             try:
@@ -442,6 +443,7 @@ class ForensicVectorDBRetrieval(nn.Module):
         """
         Load vector database from a standalone PyTorch file (.pt) or Hugging Face repository.
         Supports local file paths, candidate resolution paths, and Hugging Face Hub dataset repo IDs.
+        Enforces requires_grad=False and detach() on all stored keys and labels.
         """
         resolved_path = None
 
@@ -494,25 +496,26 @@ class ForensicVectorDBRetrieval(nn.Module):
         if not isinstance(ckpt, dict) or "keys" not in ckpt:
             raise ValueError(f"Invalid vector DB payload from {resolved_path}: missing 'keys'")
 
-        keys = ckpt["keys"].to(dtype=self.storage_dtype)
+        keys = ckpt["keys"].to(dtype=self.storage_dtype).detach().requires_grad_(False)
         if "labels" in ckpt and ckpt["labels"] is not None:
-            labels = ckpt["labels"].to(dtype=self.storage_dtype)
+            labels = ckpt["labels"].to(dtype=self.storage_dtype).detach().requires_grad_(False)
             if labels.ndim == 1:
                 labels = labels.unsqueeze(1)
         else:
             labels = torch.zeros((keys.shape[0], 1), dtype=self.storage_dtype)
 
-        self.db_keys = keys
-        self.db_labels = labels
+        self.db_keys = keys.detach().requires_grad_(False)
+        self.db_labels = labels.detach().requires_grad_(False)
+        self.db_keys_norm = F.normalize(self.db_keys, p=2, dim=-1).detach().requires_grad_(False)
         self.memory_path = resolved_path
         logger.info(
             f"✅ Loaded {keys.shape[0]} MaskCLIP pre-TVCA vectors into retrieval buffer "
-            f"({keys.shape[1]} dim, {self.storage_dtype}) from: {resolved_path}"
+            f"({keys.shape[1]} dim, {self.storage_dtype}, requires_grad=False) from: {resolved_path}"
         )
 
     def forward(self, x_t: torch.Tensor) -> torch.Tensor:
         """
-        Query vector database using visual tokens x_t.
+        Query vector database using visual tokens x_t with memory-bounded chunking and no-grad.
 
         Args:
             x_t: Visual tokens `[B, C, H', W']`.
@@ -529,30 +532,26 @@ class ForensicVectorDBRetrieval(nn.Module):
 
         orig_dtype = x_t.dtype
         device = x_t.device
-        k_entries = self.db_keys.to(device=device, dtype=self.storage_dtype)
-        l_entries = self.db_labels.to(device=device, dtype=self.storage_dtype)
+        k_entries = self.db_keys.to(device=device, dtype=self.storage_dtype).detach().requires_grad_(False)
+        l_entries = self.db_labels.to(device=device, dtype=self.storage_dtype).detach().requires_grad_(False)
 
         tokens = x_t.permute(0, 2, 3, 1).reshape(-1, c)  # [B * H' * W', C]
         q_dtype = self.query_proj[0].weight.dtype
         q = self.query_proj(tokens.to(dtype=q_dtype)).to(dtype=self.storage_dtype)
 
-        # L2-normalize for fast cosine similarity via matrix multiplication
-        q_norm = F.normalize(q, p=2, dim=-1)
-        k_norm = F.normalize(k_entries, p=2, dim=-1)
-
         k_actual = min(self.retrieval_k, k_entries.shape[0])
-        chunk_size = 2048
-        num_tokens = q_norm.shape[0]
+        # Chunk size 256 keeps intermediate sim matrices bounded to ~128-512 MB even for 1M DB
+        chunk_size = 256
+        num_tokens = q.shape[0]
 
-        if num_tokens <= chunk_size:
-            sim = torch.matmul(q_norm, k_norm.t())
-            topk_sims, topk_indices = torch.topk(sim, k=k_actual, dim=-1, largest=True, sorted=True)
-            attn_weights = F.softmax(topk_sims / max(self.temperature, 1e-4), dim=-1).unsqueeze(-1)
-            ret_k = k_entries[topk_indices]
-            ret_l = l_entries[topk_indices]
-            agg_k = (attn_weights * ret_k).sum(dim=1)
-            agg_l = (attn_weights * ret_l).sum(dim=1)
-        else:
+        with torch.no_grad():
+            if self.db_keys_norm.shape == self.db_keys.shape:
+                k_norm = self.db_keys_norm.to(device=device, dtype=self.storage_dtype).detach().requires_grad_(False)
+            else:
+                k_norm = F.normalize(k_entries, p=2, dim=-1).detach().requires_grad_(False)
+
+            q_norm = F.normalize(q.detach(), p=2, dim=-1)
+
             agg_k_list = []
             agg_l_list = []
             for start_idx in range(0, num_tokens, chunk_size):
@@ -565,8 +564,8 @@ class ForensicVectorDBRetrieval(nn.Module):
                 ret_l = l_entries[topk_indices]
                 agg_k_list.append((attn_weights * ret_k).sum(dim=1))
                 agg_l_list.append((attn_weights * ret_l).sum(dim=1))
-            agg_k = torch.cat(agg_k_list, dim=0)
-            agg_l = torch.cat(agg_l_list, dim=0)
+            agg_k = torch.cat(agg_k_list, dim=0).detach().requires_grad_(False)
+            agg_l = torch.cat(agg_l_list, dim=0).detach().requires_grad_(False)
 
         fuse_dtype = self.fuse_proj[0].weight.dtype
         fused_in = torch.cat([agg_k, agg_l], dim=-1).to(dtype=fuse_dtype)
@@ -737,18 +736,20 @@ class NoiseRAGPrototypeV1(nn.Module):
         # Backward compatibility: if called as compute_alignment_loss(x_t=..., x_s=...)
         # x_s was passed as target, x_t as source.
         if x_r is not None:
-            target = x_r.detach()
+            target = x_r.detach().requires_grad_(False)
             source = x_t if x_t is not None else x_s
         elif x_s is not None and x_t is not None:
-            target = x_s.detach()
+            target = x_s.detach().requires_grad_(False)
             source = x_t
         elif x_s is not None:
-            target = x_s.detach()
+            target = x_s.detach().requires_grad_(False)
             source = x_s
         else:
             dev = x_t.device if x_t is not None else "cpu"
             return torch.tensor(0.0, device=dev)
 
+        # Strictly ensure target is detached and requires_grad=False
+        target = target.detach().requires_grad_(False)
         mse_loss = F.mse_loss(source, target)
         if self.align_loss_type == "mse":
             return mse_loss * self.align_loss_weight
