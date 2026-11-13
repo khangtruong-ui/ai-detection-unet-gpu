@@ -142,6 +142,11 @@ def compute_binary_metrics(
 
     pixel_f1 = dice
 
+    # Pristine background F1 and Macro F1 (macro-averaged over foreground and pristine background)
+    denom_pristine = 2 * tn + fn + fp
+    f1_pristine = (2.0 * float(tn)) / float(denom_pristine) if denom_pristine > 0 else 1.0
+    macro_f1 = (dice + f1_pristine) / 2.0
+
     # Precision, Recall, Specificity
     precision = float(tp) / float(tp + fp) if (tp + fp) > 0 else (1.0 if fn == 0 else 0.0)
     recall = float(tp) / float(tp + fn) if (tp + fn) > 0 else (1.0 if fp == 0 else 0.0)
@@ -155,6 +160,8 @@ def compute_binary_metrics(
         "dice": float(dice),
         "f1": float(pixel_f1),
         "pixel_f1": float(pixel_f1),
+        "macro_f1": float(macro_f1),
+        "f1_pristine": float(f1_pristine),
         "auroc": float(auroc),
         "pixel_auroc": float(auroc),
         "pixel_acc": float(pixel_acc),
@@ -308,6 +315,11 @@ def compute_binary_metrics_batch(
     dice = torch.where(union == 0, torch.ones_like(union), (2.0 * tp) / (2.0 * tp + fp + fn).clamp(min=1e-7))
     pixel_f1 = dice
 
+    # Pristine background F1 and Macro F1 (macro-averaged over foreground and pristine background)
+    denom_pristine = 2.0 * tn + fn + fp
+    f1_pristine = torch.where(denom_pristine > 0, (2.0 * tn) / denom_pristine.clamp(min=1e-7), torch.ones_like(tn))
+    macro_f1 = (dice + f1_pristine) / 2.0
+
     prec_denom = tp + fp
     precision = torch.where(prec_denom > 0, tp / prec_denom.clamp(min=1e-7), torch.where(fn == 0, torch.ones_like(tp), torch.zeros_like(tp)))
 
@@ -327,6 +339,8 @@ def compute_binary_metrics_batch(
         "dice": dice,
         "f1": pixel_f1,
         "pixel_f1": pixel_f1,
+        "macro_f1": macro_f1,
+        "f1_pristine": f1_pristine,
         "auroc": auroc,
         "pixel_auroc": auroc,
         "pixel_acc": pixel_acc,
@@ -362,6 +376,7 @@ class SegmentationMetricTracker:
             "dice": 0.0,
             "f1": 0.0,
             "pixel_f1": 0.0,
+            "macro_f1": 0.0,
             "auroc": 0.0,
             "pixel_auroc": 0.0,
             "pixel_acc": 0.0,
@@ -374,14 +389,15 @@ class SegmentationMetricTracker:
             "dice": 0.0,
             "f1": 0.0,
             "pixel_f1": 0.0,
+            "macro_f1": 0.0,
             "precision": 0.0,
             "recall": 0.0,
         }
         # Per-label accumulator (0: Real, 1: Fully AI, 2: Partially AI, plus dynamic labels)
         self.per_label_stats: Dict[int, Dict[str, Union[float, int]]] = {
-            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
-            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
-            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
+            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
+            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
+            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
         }
         self.per_dataset_stats: Dict[str, Dict[str, Union[float, int]]] = {}
 
@@ -441,10 +457,10 @@ class SegmentationMetricTracker:
                 lbl = int(lbl_t.item())
                 if lbl not in self.per_label_stats:
                     self.per_label_stats[lbl] = {
-                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0,
+                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0,
                         "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0,
                         "specificity_sum": 0.0, "count": 0, "pos_count": 0,
-                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0,
+                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0,
                         "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
                     }
                 mask_lbl = (labels_flat == lbl_t)
@@ -458,6 +474,7 @@ class SegmentationMetricTracker:
                 l_stat["iou_sum"] += float(batch_metrics["iou"][mask_lbl].sum().item())
                 l_stat["dice_sum"] += float(batch_metrics["dice"][mask_lbl].sum().item())
                 l_stat["f1_sum"] += float(batch_metrics["f1"][mask_lbl].sum().item())
+                l_stat["macro_f1_sum"] += float(batch_metrics["macro_f1"][mask_lbl].sum().item())
                 l_stat["auroc_sum"] += float(batch_metrics["auroc"][mask_lbl].sum().item())
                 l_stat["pixel_acc_sum"] += float(batch_metrics["pixel_acc"][mask_lbl].sum().item())
                 l_stat["precision_sum"] += float(batch_metrics["precision"][mask_lbl].sum().item())
@@ -468,6 +485,7 @@ class SegmentationMetricTracker:
                     l_stat["iou_pos_sum"] += float(batch_metrics["iou"][pos_mask_lbl].sum().item())
                     l_stat["dice_pos_sum"] += float(batch_metrics["dice"][pos_mask_lbl].sum().item())
                     l_stat["f1_pos_sum"] += float(batch_metrics["f1"][pos_mask_lbl].sum().item())
+                    l_stat["macro_f1_pos_sum"] += float(batch_metrics["macro_f1"][pos_mask_lbl].sum().item())
                     l_stat["precision_pos_sum"] += float(batch_metrics["precision"][pos_mask_lbl].sum().item())
                     l_stat["recall_pos_sum"] += float(batch_metrics["recall"][pos_mask_lbl].sum().item())
 
@@ -481,10 +499,10 @@ class SegmentationMetricTracker:
                 ds_name = str(raw_ds).strip()
                 if ds_name not in self.per_dataset_stats:
                     self.per_dataset_stats[ds_name] = {
-                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "auroc_sum": 0.0,
+                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0,
                         "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0,
                         "specificity_sum": 0.0, "count": 0, "pos_count": 0,
-                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0,
+                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0,
                         "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
                     }
                 ds_stat = self.per_dataset_stats[ds_name]
@@ -492,6 +510,7 @@ class SegmentationMetricTracker:
                 ds_stat["iou_sum"] += float(batch_metrics["iou"][i].item())
                 ds_stat["dice_sum"] += float(batch_metrics["dice"][i].item())
                 ds_stat["f1_sum"] += float(batch_metrics["f1"][i].item())
+                ds_stat["macro_f1_sum"] += float(batch_metrics["macro_f1"][i].item())
                 ds_stat["auroc_sum"] += float(batch_metrics["auroc"][i].item())
                 ds_stat["pixel_acc_sum"] += float(batch_metrics["pixel_acc"][i].item())
                 ds_stat["precision_sum"] += float(batch_metrics["precision"][i].item())
@@ -503,6 +522,7 @@ class SegmentationMetricTracker:
                     ds_stat["iou_pos_sum"] += float(batch_metrics["iou"][i].item())
                     ds_stat["dice_pos_sum"] += float(batch_metrics["dice"][i].item())
                     ds_stat["f1_pos_sum"] += float(batch_metrics["f1"][i].item())
+                    ds_stat["macro_f1_pos_sum"] += float(batch_metrics["macro_f1"][i].item())
                     ds_stat["precision_pos_sum"] += float(batch_metrics["precision"][i].item())
                     ds_stat["recall_pos_sum"] += float(batch_metrics["recall"][i].item())
 
@@ -526,6 +546,8 @@ class SegmentationMetricTracker:
                 "iou_all": stats["iou_sum"] / cnt,
                 "dice_all": stats["dice_sum"] / cnt,
                 "f1_all": stats["f1_sum"] / cnt,
+                "macro_f1": stats.get("macro_f1_sum", 0.0) / cnt,
+                "macro_f1_all": stats.get("macro_f1_sum", 0.0) / cnt,
                 "pixel_acc": stats["pixel_acc_sum"] / cnt,
                 "auroc": stats["auroc_sum"] / cnt,
                 "pixel_auroc": stats["auroc_sum"] / cnt,
@@ -589,6 +611,8 @@ class SegmentationMetricTracker:
         overall["iou_all"] = self.metrics_sum["iou"] / self.total_samples
         overall["dice_all"] = self.metrics_sum["dice"] / self.total_samples
         overall["f1_all"] = self.metrics_sum["f1"] / self.total_samples
+        overall["macro_f1"] = self.metrics_sum.get("macro_f1", 0.0) / self.total_samples
+        overall["macro_f1_all"] = self.metrics_sum.get("macro_f1", 0.0) / self.total_samples
         overall["positive_samples"] = self.positive_samples
         overall["zero_positive_samples"] = self.zero_positive_samples
 
@@ -642,6 +666,8 @@ class SegmentationMetricTracker:
                     "f1_all": stats["f1_sum"] / cnt,
                     "f1_positive": stats.get("f1_pos_sum", stats["f1_sum"]) / pos_cnt if pos_cnt > 0 else (stats["f1_sum"] / cnt),
                     "pixel_f1": lbl_f1,
+                    "macro_f1": stats.get("macro_f1_sum", 0.0) / cnt,
+                    "macro_f1_all": stats.get("macro_f1_sum", 0.0) / cnt,
                     "auroc": stats["auroc_sum"] / cnt,
                     "pixel_auroc": stats["auroc_sum"] / cnt,
                     "pixel_acc": stats["pixel_acc_sum"] / cnt,
@@ -667,6 +693,8 @@ class SegmentationMetricTracker:
                     "f1_all": 0.0,
                     "f1_positive": 0.0,
                     "pixel_f1": 0.0,
+                    "macro_f1": 0.0,
+                    "macro_f1_all": 0.0,
                     "auroc": 0.0,
                     "pixel_auroc": 0.0,
                     "pixel_acc": 0.0,

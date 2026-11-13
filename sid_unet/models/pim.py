@@ -1334,7 +1334,13 @@ class PIM(nn.Module):
         """
         orig_h, orig_w = x.shape[2], x.shape[3]
 
-        seg_small, boundary_small, recon_small = self.net(x)
+        # Swin-B dual-branch backbone uses 7x7 window partitioning calibrated for 512x512
+        if orig_h != 512 or orig_w != 512:
+            x_in = F.interpolate(x, size=(512, 512), mode="bilinear", align_corners=False)
+        else:
+            x_in = x
+
+        seg_small, boundary_small, recon_small = self.net(x_in)
 
         # Interpolate outputs to input resolution
         seg_full = F.interpolate(seg_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)

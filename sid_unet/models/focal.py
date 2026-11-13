@@ -693,6 +693,8 @@ class FOCAL(nn.Module):
         cache_dir: Optional[str] = None,
         aux_classifier: bool = False,
         num_classes: int = 2,
+        use_clustering: bool = True,
+        cluster_temperature: float = 0.1,
         **kwargs: Any,
     ):
         super().__init__()
@@ -700,6 +702,8 @@ class FOCAL(nn.Module):
         self.aux_classifier = bool(aux_classifier)
         self.num_classes = int(num_classes)
         self.hf_repo = hf_repo
+        self.use_clustering = bool(use_clustering)
+        self.cluster_temperature = float(cluster_temperature)
 
         if not pretrained:
             raise ValueError(
@@ -864,13 +868,87 @@ class FOCAL(nn.Module):
                 f"Zero-fallback policy enforced."
             ) from sd_err
 
+    def _ensure_raw_rgb(self, x: torch.Tensor) -> torch.Tensor:
+        """Ensure input tensor is in raw [0, 1] range as expected by FOCAL."""
+        if x.min() < -0.05 or x.max() > 1.05:
+            # Shifted / ImageNet standardized (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+            return torch.clamp(x * std + mean, 0.0, 1.0)
+        return x
+
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract spatial forensic features from input images."""
+        x = self._ensure_raw_rgb(x)
         orig_h, orig_w = x.shape[2], x.shape[3]
         if self.backbone_name in ("vit", "vit-l", "sam_vit") and (orig_h != 1024 or orig_w != 1024):
             x_in = F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
             return self.net(x_in)
         return self.net(x)
+
+    def _cluster_features(
+        self, feats: torch.Tensor, orig_h: int, orig_w: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        On-the-fly unsupervised k-means clustering mask and logit prediction as proposed in FOCAL.
+        Clusters L2-normalized forensic embeddings into tampered and pristine groups per image.
+        Returns:
+            mask_logits: [B, 1, H, W]
+            pred_mask: [B, 1, H, W] in [0, 1]
+        """
+        b, c, h_f, w_f = feats.shape
+        feats_norm = F.normalize(feats, p=2, dim=1)
+
+        batch_logits = []
+        batch_probs = []
+
+        for b_idx in range(b):
+            f_img = feats_norm[b_idx].permute(1, 2, 0).reshape(-1, c)  # [N, C]
+            n_px = f_img.shape[0]
+
+            # Double farthest-point initialization (k-means++ style)
+            c1 = f_img[0]
+            dists1 = 1.0 - torch.matmul(f_img, c1)
+            c2 = f_img[torch.argmax(dists1)]
+            dists2 = 1.0 - torch.matmul(f_img, c2)
+            c1 = f_img[torch.argmax(dists2)]
+            centroids = torch.stack([c1, c2], dim=0)  # [2, C]
+
+            # EM iterations with cosine similarity
+            for _ in range(8):
+                sims = torch.matmul(f_img, centroids.t())  # [N, 2]
+                assign = torch.argmax(sims, dim=-1)  # [N]
+                m0 = f_img[assign == 0]
+                m1 = f_img[assign == 1]
+                if len(m0) > 0:
+                    centroids[0] = F.normalize(m0.mean(dim=0), p=2, dim=-1)
+                if len(m1) > 0:
+                    centroids[1] = F.normalize(m1.mean(dim=0), p=2, dim=-1)
+
+            sims = torch.matmul(f_img, centroids.t())  # [N, 2]
+            labels = torch.argmax(sims, dim=-1)  # [N]
+            c1_count = labels.sum()
+            c0_count = n_px - c1_count
+
+            # As proposed in the FOCAL paper:
+            # Tampered regions typically occupy the minority portion of an image.
+            if c1_count > c0_count:
+                sim_tampered = sims[:, 0]
+                sim_pristine = sims[:, 1]
+            else:
+                sim_tampered = sims[:, 1]
+                sim_pristine = sims[:, 0]
+
+            # Continuous difference scaled by temperature for smooth, calibrated logits
+            diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [N]
+            logit_grid = diff.view(1, 1, h_f, w_f)
+            logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+            prob_full = torch.sigmoid(logit_full)
+
+            batch_logits.append(logit_full)
+            batch_probs.append(prob_full)
+
+        return torch.cat(batch_logits, dim=0), torch.cat(batch_probs, dim=0)
 
     def forward(
         self,
@@ -896,13 +974,15 @@ class FOCAL(nn.Module):
         orig_h, orig_w = x.shape[2], x.shape[3]
 
         feats = self.extract_features(x)  # [B, C, H', W']
-        logits_small = self.fc(feats)  # [B, 2, H', W']
 
-        # Interpolate to input resolution
-        logits_full = F.interpolate(logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-
-        # Single binary channel logit (forged class 1 minus pristine class 0)
-        mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
+        if not self.training and self.use_clustering:
+            mask_logits, pred_mask = self._cluster_features(feats, orig_h, orig_w)
+            logits_full = mask_logits
+        else:
+            logits_small = self.fc(feats)  # [B, 2, H', W']
+            logits_full = F.interpolate(logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+            mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
+            pred_mask = torch.sigmoid(mask_logits)
 
         class_logits = self.class_head(feats) if self.class_head is not None else None
 
@@ -910,7 +990,7 @@ class FOCAL(nn.Module):
             res: Dict[str, Any] = {
                 "mask_logits": mask_logits,
                 "raw_logits": logits_full,
-                "pred_mask": torch.sigmoid(mask_logits),
+                "pred_mask": pred_mask,
                 "features": feats,
             }
             if class_logits is not None:
@@ -939,44 +1019,9 @@ class FOCAL(nn.Module):
         self.eval()
         with torch.no_grad():
             orig_h, orig_w = x.shape[2], x.shape[3]
-            feats = self.extract_features(x)  # [B, C, H', W']
-            b, c, h_f, w_f = feats.shape
-
-            # L2-normalize feature vectors across channel dimension
-            feats_norm = F.normalize(feats, p=2, dim=1)
-
-            masks = []
-            for b_idx in range(b):
-                f_img = feats_norm[b_idx].permute(1, 2, 0).reshape(-1, c)  # [HW, C]
-                # Mini-batch k-means (k=2) via simple EM iterations
-                # Initialize centroids from farthest points
-                c1 = f_img[0]
-                dists = 1.0 - torch.matmul(f_img, c1)
-                c2 = f_img[torch.argmax(dists)]
-                centroids = torch.stack([c1, c2], dim=0)  # [2, C]
-
-                for _ in range(5):
-                    # Cosine distance
-                    sims = torch.matmul(f_img, centroids.t())  # [HW, 2]
-                    assign = torch.argmax(sims, dim=-1)  # [HW]
-                    m0 = f_img[assign == 0]
-                    m1 = f_img[assign == 1]
-                    if len(m0) > 0:
-                        centroids[0] = F.normalize(m0.mean(dim=0), p=2, dim=-1)
-                    if len(m1) > 0:
-                        centroids[1] = F.normalize(m1.mean(dim=0), p=2, dim=-1)
-
-                sims = torch.matmul(f_img, centroids.t())
-                labels = torch.argmax(sims, dim=-1).float()  # [HW]
-                # In forgery detection, tampered region is typically smaller than pristine
-                if labels.sum() > (len(labels) / 2.0):
-                    labels = 1.0 - labels
-
-                mask_grid = labels.reshape(1, 1, h_f, w_f)
-                mask_full = F.interpolate(mask_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-                masks.append(mask_full)
-
-            return torch.cat(masks, dim=0)
+            feats = self.extract_features(x)
+            _, pred_mask = self._cluster_features(feats, orig_h, orig_w)
+            return (pred_mask > 0.5).float()
 
 
 class FOCALHRNet(FOCAL):

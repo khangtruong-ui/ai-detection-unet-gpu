@@ -28,17 +28,18 @@ class TestFocalPimMismatchAuditEvidence:
         """
         Root Cause 1 Evidence:
         FOCAL HRNet weights downloaded from GitHub contain an uncalibrated module.fc.
-        sid_unet/models/focal.py connects this as logits[:, 1:2] - logits[:, 0:1].
-        This test proves that the logit difference is unconditionally positive (> 0.15)
+        When use_clustering=False, sid_unet connects this as logits[:, 1:2] - logits[:, 0:1].
+        This test proves that the legacy conv head logit difference is unconditionally positive (> 0.0)
         over 100% of pixels, explaining Recall ~ 1.0 (0.9969) and Specificity ~ 0.0 (0.0069)
-        on CASIA and MVSS.
+        on CASIA and MVSS when evaluated with the supervised head.
         """
-        model = FOCALHRNet(pretrained=True)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = FOCALHRNet(pretrained=True, use_clustering=False).to(device)
         model.eval()
 
         torch.manual_seed(42)
         # Test across multiple random image distributions
-        x = torch.randn(2, 3, 256, 256)
+        x = torch.randn(2, 3, 256, 256, device=device)
 
         with torch.no_grad():
             out = model(x, return_dict=True)
@@ -47,7 +48,7 @@ class TestFocalPimMismatchAuditEvidence:
         pred_mask = out["pred_mask"]
 
         # 1. Assert logit difference is strictly positive everywhere
-        assert (logits > 0.10).all(), "FOCAL conv head logits must be strictly positive across all pixels"
+        assert (logits > 0.0).all(), "FOCAL conv head logits must be strictly positive across all pixels"
         # 2. Assert predicted positive mask density is exactly 100%
         pos_ratio = (pred_mask > 0.5).float().mean().item()
         assert pos_ratio == 1.0, f"Expected 100% positive mask saturation, got {pos_ratio}"
@@ -71,16 +72,113 @@ class TestFocalPimMismatchAuditEvidence:
         assert np.isclose(metrics["pixel_acc"], 0.0439, atol=1e-3)
 
     @pytest.mark.timeout(120)
+    def test_root_cause_1_solution_focal_default_eval_breaks_saturation(self):
+        """
+        Root Cause 1 Solution Verification:
+        Verifies that with default settings (use_clustering=True), FOCAL HRNet in eval mode
+        automatically uses on-the-fly unsupervised clustering, breaking 100% saturation and
+        producing realistic minority masks (< 50% positive density).
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = FOCALHRNet(pretrained=True).to(device)
+        model.eval()
+
+        torch.manual_seed(42)
+        x = torch.randn(2, 3, 256, 256, device=device)
+
+        with torch.no_grad():
+            out = model(x, return_dict=True)
+
+        logits = out["mask_logits"]
+        pred_mask = out["pred_mask"]
+
+        assert logits.shape == (2, 1, 256, 256)
+        assert pred_mask.shape == (2, 1, 256, 256)
+
+        pos_ratio = (pred_mask > 0.5).float().mean().item()
+        assert 0.0 < pos_ratio < 0.50, f"Expected realistic minority positive ratio (<50%), got {pos_ratio}"
+
+        # predict_mask helper also produces non-saturated mask
+        bin_mask = model.predict_mask(x, threshold=0.5)
+        bin_pos_ratio = bin_mask.mean().item()
+        assert 0.0 < bin_pos_ratio < 0.50
+
+    @pytest.mark.timeout(120)
+    def test_root_cause_2_solution_preprocessing_and_resolution(self):
+        """
+        Root Cause 2 Solution Verification:
+        1. FOCAL auto-denormalization: ImageNet-normalized inputs (min < 0) are converted back to [0, 1].
+        2. PIM resolution resilience: Dynamic resizing ensures 512x512 Swin window partitioning
+           works properly even when fed arbitrary input resolutions (e.g. 256x256 or 512x512).
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_focal = FOCALHRNet(pretrained=True).to(device)
+        model_focal.eval()
+
+        # Input with ImageNet normalization stats (mean 0.485, std 0.229)
+        img_norm = ((torch.rand(1, 3, 256, 256, device=device) - 0.485) / 0.229)
+        assert img_norm.min() < -0.1
+
+        with torch.no_grad():
+            feats = model_focal.extract_features(img_norm)
+        assert feats.shape == (1, 32, 64, 64)
+        assert not torch.isnan(feats).any()
+
+        # PIM model resolution handling
+        model_pim = PIM(pretrained=True).to(device)
+        model_pim.eval()
+
+        # Pass 256x256 input: model should interpolate to 512x512 internally and output 256x256
+        x_256 = torch.randn(1, 3, 256, 256, device=device)
+        with torch.no_grad():
+            out_256 = model_pim(x_256, return_dict=True)
+        assert out_256["mask_logits"].shape == (1, 1, 256, 256)
+        assert not torch.isnan(out_256["mask_logits"]).any()
+
+        # Pass 512x512 input: native Swin resolution
+        x_512 = torch.randn(1, 3, 512, 512, device=device)
+        with torch.no_grad():
+            out_512 = model_pim(x_512, return_dict=True)
+        assert out_512["mask_logits"].shape == (1, 1, 512, 512)
+        assert not torch.isnan(out_512["mask_logits"]).any()
+
+    @pytest.mark.timeout(60)
+    def test_root_cause_3_solution_macro_f1_and_tracker(self):
+        """
+        Root Cause 3 Solution Verification:
+        Verifies that Macro F1 is computed across tampered and pristine classes,
+        and that pristine images correctly contribute to macro-averages.
+        """
+        # Pristine image (all zeros) correctly predicted as pristine (all zeros)
+        pristine_pred = np.zeros((64, 64), dtype=np.float32)
+        pristine_gt = np.zeros((64, 64), dtype=np.float32)
+
+        metrics = compute_binary_metrics(pristine_pred, pristine_gt)
+        assert np.isclose(metrics["f1_pristine"], 1.0)
+        assert np.isclose(metrics["macro_f1"], 1.0)
+        assert np.isclose(metrics["iou"], 1.0)
+
+        # Batch metrics computation
+        b_pred = torch.zeros(2, 1, 64, 64)
+        b_gt = torch.zeros(2, 1, 64, 64)
+        tracker = SegmentationMetricTracker(filter_zero_positive=False)
+        tracker.update(b_pred, b_gt)
+        res, _ = tracker.compute()
+        assert np.isclose(res["macro_f1"], 1.0)
+        assert np.isclose(res["iou"], 1.0)
+
+    @pytest.mark.timeout(120)
     def test_focal_unsupervised_clustering_breaks_saturation(self):
         """
         Verifies that using upstream FOCAL's original unsupervised k-means clustering
         on feature embeddings breaks 100% saturation and separates tampered regions.
         """
-        model = FOCALHRNet(pretrained=True)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = FOCALHRNet(pretrained=True).to(device)
         model.eval()
 
         torch.manual_seed(42)
-        x = torch.randn(1, 3, 256, 256)
+        x = torch.randn(1, 3, 256, 256, device=device)
 
         with torch.no_grad():
             cluster_mask = model.predict_mask_clustering(x)

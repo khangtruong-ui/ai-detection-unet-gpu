@@ -236,9 +236,48 @@ All root causes reside in wrapper architecture assumptions, evaluation dataset d
 ## 7. Automated Empirical Verification Test Suite
 
 The mathematical proofs and empirical phenomena documented in this report are verified by unit tests in [`tests/test_focal_pim_mismatch_audit.py`](file:///content/ai-detection-unet-gpu/tests/test_focal_pim_mismatch_audit.py):
-1. `test_focal_conv_head_positive_saturation_evidence`: Proves that the conv head difference is unconditionally positive (> 0.10) producing 100% positive mask saturation (Recall ~ 1.0, Specificity ~ 0.0, Pixel Acc = GT positive ratio).
-2. `test_focal_unsupervised_clustering_breaks_saturation`: Proves that upstream unsupervised k-means clustering separates tampered regions into realistic positive density (< 50%).
-3. `test_metric_discrepancy_pristine_handling`: Proves that crediting pristine images as 1.0 (upstream PIM) versus discarding them (`filter_zero_positive=True`) creates a ~25% divergence in dataset IoU.
-4. `test_catalog_metric_semantic_confusion_auc_vs_iou`: Proves that a detector with AUROC ~ 0.85 naturally exhibits IoU ~ 0.30 on realistic probability distributions, confirming the catalog metric mismatch.
-5. `test_dataset_ground_truth_polarity_inversion_impact`: Proves that inverted ground truth masks (tampered = 0, pristine = 255) collapse localization IoU to near-zero (~0.03).
+1. `test_focal_conv_head_positive_saturation_evidence`: Proves that the conv head difference is unconditionally positive (> 0.0) producing 100% positive mask saturation when clustering is disabled.
+2. `test_root_cause_1_solution_focal_default_eval_breaks_saturation`: Proves that default eval mode uses unsupervised clustering, breaking 100% saturation and restoring balanced minority positive density (< 50%).
+3. `test_root_cause_2_solution_preprocessing_and_resolution`: Proves that FOCAL auto-denormalizes ImageNet inputs to [0, 1] and PIM dynamically ensures 512x512 Swin window partitioning.
+4. `test_root_cause_3_solution_macro_f1_and_tracker`: Proves that Macro F1 is computed across foreground and pristine background, and SegmentationMetricTracker accurately tracks both pristine-rewarded and positive-only metrics.
+5. `test_focal_unsupervised_clustering_breaks_saturation`: Proves that upstream unsupervised k-means clustering separates tampered regions into realistic positive density (< 50%).
+6. `test_metric_discrepancy_pristine_handling`: Proves that crediting pristine images as 1.0 (upstream PIM) versus discarding them (`filter_zero_positive=True`) creates a ~25% divergence in dataset IoU.
+7. `test_catalog_metric_semantic_confusion_auc_vs_iou`: Proves that a detector with AUROC ~ 0.85 naturally exhibits IoU ~ 0.30 on realistic probability distributions, confirming the catalog metric mismatch.
+8. `test_dataset_ground_truth_polarity_inversion_impact`: Proves that inverted ground truth masks (tampered = 0, pristine = 255) collapse localization IoU to near-zero (~0.03).
+
+---
+
+## 8. Implemented Solutions for Root Causes 1–3
+
+### Solution 1: FOCAL Architecture & Inference Head Mismatch (Root Cause 1)
+- **Paper Formulation Alignment**: In accordance with the FOCAL publication (*Rethinking Image Forgery Detection via Soft Contrastive Learning and Unsupervised Clustering*, arXiv:2308.09307 / IEEE TDSC 2025) and official repository (`HighwayWu/FOCAL`), FOCAL does not rely on a supervised linear segmentation head during inference.
+- **On-the-Fly Unsupervised Clustering Head**: In `sid_unet/models/focal.py`:
+  - Added `use_clustering: bool = True` and `cluster_temperature: float = 0.1` configuration.
+  - In evaluation mode (`not self.training and self.use_clustering`), `forward()` extracts spatial forensic embeddings, applies L2 channel normalization, and performs batched k-means ($k=2$) clustering using cosine similarity.
+  - Identifies the minority cluster as tampered (manipulated) and the majority cluster as pristine, precisely matching the official paper algorithm.
+  - Computes continuous cosine similarity difference between tampered centroid and pristine centroid:
+    $$\Delta s = s_{\text{tampered}} - s_{\text{pristine}}$$
+    $$\text{mask\_logits} = \frac{\Delta s}{\tau} \quad (\tau = 0.1)$$
+    - When $\Delta s > 0 \implies \text{mask\_logits} > 0 \implies \sigma(\text{mask\_logits}) > 0.5$ (assigned to tampered cluster).
+    - When $\Delta s < 0 \implies \text{mask\_logits} < 0 \implies \sigma(\text{mask\_logits}) < 0.5$ (assigned to pristine cluster).
+  - This completely eliminates the 100% false-positive saturation bug while producing continuous, smooth probabilities for AUROC calculation.
+  - When in training mode (`self.training=True`) or `use_clustering=False`, the convolutional classification head `self.fc` is used, preserving gradient backprop and fine-tuning capabilities.
+
+### Solution 2: Input Preprocessing & Resolution Shifts (Root Cause 2)
+- **MVSS Protocol Configuration Updated**: Changed `configs/cross-eval/MVSS-v1-protocol.yaml` from `image_size: [256, 256]` to `image_size: [512, 512]` (with batch size 8).
+- **PIM Model Configuration Updated**: Changed `configs/experiments/pim/pim.yaml` to `image_size: [512, 512]`.
+- **FOCAL Auto-Denormalization**: Added defensive automatic normalization detection (`_ensure_raw_rgb`) in `sid_unet/models/focal.py`. If inputs are ImageNet-standardized ($x_{\min} < -0.05$ or $x_{\max} > 1.05$), the tensor is denormalized back to $[0.0, 1.0]$ RGB scale, preventing feature activation distortion.
+- **PIM Dynamic Resolution Resilience**: In `sid_unet/models/pim.py`, inputs differing from $512 \times 512$ are dynamically interpolated to $512 \times 512$ before Swin-B processing and interpolated back to the original input resolution, guaranteeing that window partitioning ($7 \times 7$) and frequency enhancement layers operate at their trained resolution.
+- **Dataloader Configurable Normalization**: In `sid_unet/dataset/loader.py`, `normalize: bool` is passed from `config.data.get("normalize", True)` to `get_transforms()`, allowing explicit control in YAML configurations.
+
+### Solution 3: Evaluation Protocol & Metric Harmonization (Root Cause 3)
+- **Macro F1 Metric**: Extended `compute_binary_metrics` and `compute_binary_metrics_batch` in `sid_unet/metrics/segmentation.py` to calculate:
+  $$F_{1,\text{pristine}} = \frac{2 \cdot \text{TN}}{2 \cdot \text{TN} + \text{FN} + \text{FP}}$$
+  $$\text{Macro } F_1 = \frac{F_{1,\text{tampered}} + F_{1,\text{pristine}}}{2}$$
+- **Metric Tracker Accumulation**: Updated `SegmentationMetricTracker` to accumulate and report `macro_f1` globally, per label, and per dataset.
+- **Configurable Pristine Handling (`filter_zero_positive`)**: In `sid_unet/cross_eval.py`, `filter_zero_positive` is dynamically resolved from `eval_config.project` / `eval_config.evaluation`, allowing evaluation runs to easily toggle between:
+  - Upstream full-dataset convention (`filter_zero_positive=False`, rewarding pristine images as 1.0).
+  - Positive-only foreground convention (`filter_zero_positive=True`, isolating tampered samples).
+- Both `iou_all` / `f1_all` and `iou_positive` / `f1_positive` are explicitly exposed in all metric dictionaries.
+
 

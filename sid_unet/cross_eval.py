@@ -612,6 +612,10 @@ def evaluate_checkpoint_on_config(
         overrides.append(f"data.batch_size={batch_size}")
 
     eval_config = load_config(config_path, overrides=overrides)
+    if "filter_zero_positive" in eval_config.project:
+        filter_zero_positive = bool(eval_config.project.filter_zero_positive)
+    elif "filter_zero_positive" in eval_config.get("evaluation", {}):
+        filter_zero_positive = bool(eval_config.evaluation.filter_zero_positive)
     if dataset_filter is None:
         dataset_filter = eval_config.data.get("dataset_filter", eval_config.data.get("sub_dataset", None))
 

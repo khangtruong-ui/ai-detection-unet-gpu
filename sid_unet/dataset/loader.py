@@ -1462,7 +1462,8 @@ def create_eval_dataloader(
             default_samples=None,
         )
 
-    transform = get_transforms(image_size=image_size, is_train=False)
+    normalize = bool(config.data.get("normalize", True))
+    transform = get_transforms(image_size=image_size, is_train=False, normalize=normalize)
     mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
     use_parquet_loader = bool(config.data.get("use_parquet_loader", True))
@@ -2167,9 +2168,10 @@ def create_dataloaders(
     )
 
     augment_config = config.data.get("augmentations", {})
+    normalize = bool(config.data.get("normalize", True))
 
-    train_transform = get_transforms(image_size=image_size, is_train=True, augment_config=augment_config)
-    val_transform = get_transforms(image_size=image_size, is_train=False)
+    train_transform = get_transforms(image_size=image_size, is_train=True, augment_config=augment_config, normalize=normalize)
+    val_transform = get_transforms(image_size=image_size, is_train=False, normalize=normalize)
 
     mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
