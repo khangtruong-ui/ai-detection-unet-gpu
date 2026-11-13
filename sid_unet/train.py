@@ -902,7 +902,7 @@ def main():
         print(f"🚀 [DETACHED] sid-train running in background (PID: {proc.pid})")
         print(f"📄 Logging output to: {log_path}")
         print(f"🖥️ To manage processes & view live output: sid-tui")
-        print(f"🔍 Or tail logs directly: tail -f {getattr(args, 'log_file', '.logs.txt')}")
+        print(f"🔍 Or tail logs directly (auto-halts on completion): sid-tail {getattr(args, 'log_file', '.logs.txt')}")
         print("🛑 To stop training: sid-kill (or 'k' in sid-tui)")
         print("=" * 70 + "\n")
         sys.stdout.flush()

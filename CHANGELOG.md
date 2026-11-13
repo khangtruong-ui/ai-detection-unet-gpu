@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-11-13
 
+### Added
+- **Automated Task-Aware Log Tail Utility (`sid-tail`)**:
+  - Implemented `sid-tail` (`sid_unet.tail`) CLI tool for streaming log output with automatic termination detection upon task completion, unhandled exceptions, or process termination (replacing open-ended `tail -f`).
+  - Automatic target resolution: inspects `.sid_processes/registry.json` to automatically resolve active tasks, log file paths, start offsets, and monitored PIDs.
+  - Supports `--pid`, `--file`, `--lines` (`-n`), `--timeout`, `--poll-interval`, and `--quiet` flags.
+  - Automatically handles tqdm carriage return (`\r`) progress bars.
+  - Exits with status code 0 on clean completion and 1 on error/kill.
+  - Added unit test suite in `tests/test_tail.py`.
+
+### Changed
+- **Cross-Evaluation Batch Size Optimization (`configs/cross-eval/MVSS-v1-protocol.yaml`)**:
+  - Doubled evaluation batch size from 8 to 16 for `MVSS-v1-protocol.yaml`, improving GPU utilization and tensor parallelism across Tesla T4 while staying within the 15GB VRAM limit (PIM Swin uses ~7.6GB peak VRAM; FOCAL HRNet uses ~0.8GB peak VRAM).
+- Updated detached process launch messages across `sid-cross-eval`, `sid-train`, and `sid-cache` to recommend `sid-tail` instead of `tail -f`.
+
 ### Fixed
 - **Cross-Evaluation GPU Utilization Stabilization & Pipeline Optimization**:
   - **Asynchronous Background Prefetching (`sid_unet.dataset.loader.CUDAPrefetcher`)**: Upgraded prefetcher to use an asynchronous feeder thread and bounded `queue.Queue(maxsize=3)`. Concurrently decodes batches and transfers tensors across dedicated CUDA streams, eliminating Parquet streaming I/O stalls and dropping DataLoader wait latency from 0.18s–9.0s to 0.00s.

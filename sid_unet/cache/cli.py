@@ -282,7 +282,7 @@ def cli_main(args: Optional[list] = None) -> Any:
         print(f"🚀 [DETACHED] sid-cache running in background (PID: {proc.pid})")
         print(f"📄 Logging output to: {log_path}")
         print(f"🖥️ To manage processes & view live output: sid-tui")
-        print(f"🔍 Or tail logs directly: tail -f {getattr(parsed_args, 'log_file', '.logs.txt')}")
+        print(f"🔍 Or tail logs directly (auto-halts on completion): sid-tail {getattr(parsed_args, 'log_file', '.logs.txt')}")
         print("🛑 To stop caching: sid-kill (or 'k' in sid-tui)")
         print("=" * 70 + "\n")
         sys.stdout.flush()

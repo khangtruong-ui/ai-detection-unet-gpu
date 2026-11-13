@@ -7,7 +7,7 @@ data:
   dataset_name: "KhangTruong/Tampered-Images-Combined-Dataset-Fake"
   streaming: false
   image_size: [512, 512]
-  batch_size: 8
+  batch_size: 16
   num_workers: 4
   pin_memory: true
   eval_split: "cross_test"

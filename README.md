@@ -2954,6 +2954,28 @@ sid-tui --kill <pid>
 sid-tui --clear-history
 ```
 
+#### D. Live Output Tail with Auto-Halt (`sid-tail`)
+
+Unlike traditional Unix `tail -f` which runs indefinitely until manually interrupted with `Ctrl+C`, **`sid-tail`** streams task log output in real-time and **automatically halts** as soon as the background task finishes (clean completion, unhandled exception, or termination).
+
+```bash
+# Tail latest running background task (auto-detects active PID and halts on completion)
+sid-tail
+
+# Tail a specific log file
+sid-tail .logs.txt
+
+# Tail a specific PID
+sid-tail 3096
+sid-tail --pid 3096
+
+# Display last 50 lines first, then follow live until complete
+sid-tail -n 50 .logs.txt
+
+# Quiet mode: suppress banners, display only raw log output
+sid-tail -q
+```
+
 ---
 
 ## Cross-Evaluation Audit & Findings
