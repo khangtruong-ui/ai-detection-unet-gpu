@@ -24,7 +24,13 @@ from sid_unet.process_manager import (
     inspect_log_for_termination,
     terminate_process,
 )
-from sid_unet.tui import SIDTerminalUI, cli_main, print_process_table, read_process_logs
+from sid_unet.tui import (
+    SIDTerminalUI,
+    cli_main,
+    collapse_line_carriage_returns,
+    print_process_table,
+    read_process_logs,
+)
 
 
 def test_process_record_lifecycle():
@@ -268,6 +274,42 @@ def test_read_process_logs(tmp_path):
     assert len(lines) == 2
     assert lines[0] == "New process line 1"
     assert lines[1] == "New process line 2"
+
+
+def test_read_process_logs_tqdm_carriage_returns(tmp_path):
+    """Verify that multiple TQDM progress bar updates with carriage returns (\\r) collapse into single lines."""
+    log_file = tmp_path / "tqdm_eval.log"
+    content = (
+        "Starting Cross-Evaluation Matrix\n"
+        "\rCross-Eval:   0%|          | 0/100 [00:00<?, ?it/s]"
+        "\rCross-Eval:  25%|██▌       | 25/100 [00:02<00:06, 12.0it/s]"
+        "\rCross-Eval:  50%|█████     | 50/100 [00:04<00:04, 12.1it/s]"
+        "\rCross-Eval: 100%|██████████| 100/100 [00:08<00:00, 12.0it/s]\n"
+        "Evaluation finished successfully.\n"
+    )
+    with open(log_file, "wb") as f:
+        f.write(content.encode("utf-8"))
+
+    rec = ProcessRecord(
+        pid=5555,
+        name="sid-cross-eval",
+        cmdline="sid-cross-eval",
+        cwd=str(tmp_path),
+        log_file=str(log_file),
+        start_time="2026-11-13T00:00:00",
+    )
+
+    lines = read_process_logs(rec)
+    assert len(lines) == 3
+    assert lines[0] == "Starting Cross-Evaluation Matrix"
+    assert "Cross-Eval: 100%" in lines[1]
+    assert " 0/100" not in lines[1]
+    assert " 0%" not in lines[1]
+    assert lines[2] == "Evaluation finished successfully."
+
+    # Test direct unit function collapse_line_carriage_returns
+    line_raw = "\rStep 1\rStep 2\rFinal Step"
+    assert collapse_line_carriage_returns(line_raw) == "Final Step"
 
 
 def test_tui_keyboard_navigation_and_actions(tmp_path):

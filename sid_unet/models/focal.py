@@ -892,63 +892,65 @@ class FOCAL(nn.Module):
         """
         On-the-fly unsupervised k-means clustering mask and logit prediction as proposed in FOCAL.
         Clusters L2-normalized forensic embeddings into tampered and pristine groups per image.
+        Fully vectorized across batch B without CPU-GPU synchronization barriers.
+
         Returns:
             mask_logits: [B, 1, H, W]
             pred_mask: [B, 1, H, W] in [0, 1]
         """
         b, c, h_f, w_f = feats.shape
+        n_px = h_f * w_f
         feats_norm = F.normalize(feats, p=2, dim=1)
+        f_img = feats_norm.permute(0, 2, 3, 1).reshape(b, n_px, c)
 
-        batch_logits = []
-        batch_probs = []
+        # Double farthest-point initialization (k-means++ style) across entire batch
+        c1 = f_img[:, 0:1, :]
+        dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
+        idx_max1 = torch.argmax(dists1, dim=-1, keepdim=True)
+        idx_max1_expanded = idx_max1.unsqueeze(-1).expand(-1, 1, c)
+        c2 = torch.gather(f_img, dim=1, index=idx_max1_expanded)
 
-        for b_idx in range(b):
-            f_img = feats_norm[b_idx].permute(1, 2, 0).reshape(-1, c)  # [N, C]
-            n_px = f_img.shape[0]
+        dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
+        idx_max2 = torch.argmax(dists2, dim=-1, keepdim=True)
+        idx_max2_expanded = idx_max2.unsqueeze(-1).expand(-1, 1, c)
+        c1 = torch.gather(f_img, dim=1, index=idx_max2_expanded)
 
-            # Double farthest-point initialization (k-means++ style)
-            c1 = f_img[0]
-            dists1 = 1.0 - torch.matmul(f_img, c1)
-            c2 = f_img[torch.argmax(dists1)]
-            dists2 = 1.0 - torch.matmul(f_img, c2)
-            c1 = f_img[torch.argmax(dists2)]
-            centroids = torch.stack([c1, c2], dim=0)  # [2, C]
+        centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
 
-            # EM iterations with cosine similarity
-            for _ in range(8):
-                sims = torch.matmul(f_img, centroids.t())  # [N, 2]
-                assign = torch.argmax(sims, dim=-1)  # [N]
-                m0 = f_img[assign == 0]
-                m1 = f_img[assign == 1]
-                if len(m0) > 0:
-                    centroids[0] = F.normalize(m0.mean(dim=0), p=2, dim=-1)
-                if len(m1) > 0:
-                    centroids[1] = F.normalize(m1.mean(dim=0), p=2, dim=-1)
+        # EM iterations with cosine similarity (vectorized without CPU synchronization)
+        for _ in range(8):
+            sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
+            assign = torch.argmax(sims, dim=-1)  # [B, N]
+            w0 = (assign == 0).unsqueeze(-1).to(f_img.dtype)
+            w1 = (assign == 1).unsqueeze(-1).to(f_img.dtype)
+            count0 = w0.sum(dim=1, keepdim=True)
+            count1 = w1.sum(dim=1, keepdim=True)
+            sum0 = torch.bmm(w0.transpose(1, 2), f_img)
+            sum1 = torch.bmm(w1.transpose(1, 2), f_img)
+            new_c0 = torch.where(count0 > 0, sum0 / count0.clamp(min=1.0), centroids[:, 0:1, :])
+            new_c0 = F.normalize(new_c0, p=2, dim=-1)
+            new_c1 = torch.where(count1 > 0, sum1 / count1.clamp(min=1.0), centroids[:, 1:2, :])
+            new_c1 = F.normalize(new_c1, p=2, dim=-1)
+            centroids = torch.cat([new_c0, new_c1], dim=1)
 
-            sims = torch.matmul(f_img, centroids.t())  # [N, 2]
-            labels = torch.argmax(sims, dim=-1)  # [N]
-            c1_count = labels.sum()
-            c0_count = n_px - c1_count
+        sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
+        labels = torch.argmax(sims, dim=-1)  # [B, N]
+        c1_count = labels.sum(dim=-1, keepdim=True)  # [B, 1]
+        c0_count = n_px - c1_count  # [B, 1]
 
-            # As proposed in the FOCAL paper:
-            # Tampered regions typically occupy the minority portion of an image.
-            if c1_count > c0_count:
-                sim_tampered = sims[:, 0]
-                sim_pristine = sims[:, 1]
-            else:
-                sim_tampered = sims[:, 1]
-                sim_pristine = sims[:, 0]
+        # As proposed in the FOCAL paper:
+        # Tampered regions typically occupy the minority portion of an image.
+        cond = (c1_count > c0_count)  # [B, 1]
+        sim_tampered = torch.where(cond, sims[:, :, 0], sims[:, :, 1])  # [B, N]
+        sim_pristine = torch.where(cond, sims[:, :, 1], sims[:, :, 0])  # [B, N]
 
-            # Continuous difference scaled by temperature for smooth, calibrated logits
-            diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [N]
-            logit_grid = diff.view(1, 1, h_f, w_f)
-            logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-            prob_full = torch.sigmoid(logit_full)
+        # Continuous difference scaled by temperature for smooth, calibrated logits
+        diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [B, N]
+        logit_grid = diff.view(b, 1, h_f, w_f)
+        logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        prob_full = torch.sigmoid(logit_full)
 
-            batch_logits.append(logit_full)
-            batch_probs.append(prob_full)
-
-        return torch.cat(batch_logits, dim=0), torch.cat(batch_probs, dim=0)
+        return logit_full, prob_full
 
     def forward(
         self,

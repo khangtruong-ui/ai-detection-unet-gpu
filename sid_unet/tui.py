@@ -55,22 +55,54 @@ def format_bytes(num_bytes: float) -> str:
     return f"{num_bytes:.1f} PB"
 
 
+def collapse_line_carriage_returns(text: str) -> str:
+    """
+    Simulate terminal cursor carriage return ('\\r') overwriting within a single physical line.
+    Collapses multiple TQDM progress updates (or carriage-return-separated chunks)
+    into the final visible text on the row, preventing multiple screen lines per update.
+    """
+    if "\r" not in text:
+        return text
+    parts = text.split("\r")
+    buf: List[str] = []
+    pos = 0
+    for i, part in enumerate(parts):
+        if i == 0:
+            buf.extend(list(part))
+            pos = len(buf)
+        else:
+            pos = 0
+            for ch in part:
+                if pos < len(buf):
+                    buf[pos] = ch
+                else:
+                    buf.append(ch)
+                pos += 1
+    return "".join(buf)
+
+
 def read_process_logs(
     record: ProcessRecord,
     max_lines: int = 5000,
 ) -> List[str]:
-    """Read log file lines belonging to a specific process record."""
+    """Read log file lines belonging to a specific process record with TQDM carriage return collapsing."""
     if not os.path.isfile(record.log_file):
         return [f"[No log file found at {record.log_file}]"]
 
     try:
-        with open(record.log_file, "r", encoding="utf-8", errors="replace") as f:
+        with open(record.log_file, "r", newline="", encoding="utf-8", errors="replace") as f:
             if record.log_offset_start > 0:
                 f.seek(record.log_offset_start)
-            lines = f.readlines()
+            raw_text = f.read()
+
+        raw_lines = raw_text.replace("\r\n", "\n").split("\n")
+        if raw_lines and raw_lines[-1] == "" and raw_text.endswith(("\n", "\r\n")):
+            raw_lines.pop()
+
+        lines = [collapse_line_carriage_returns(line) for line in raw_lines]
         if len(lines) > max_lines:
             lines = lines[-max_lines:]
-        return [line.rstrip("\r\n") for line in lines]
+        return lines
     except Exception as e:
         return [f"[Error reading log file: {e}]"]
 
@@ -612,12 +644,12 @@ def print_process_logs(
     if tail and proc.status == STATUS_RUNNING:
         print("\n🔄 Following log output in real-time (Press Ctrl+C to stop)...")
         try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            with open(log_file, "r", newline="", encoding="utf-8", errors="replace") as f:
                 f.seek(0, os.SEEK_END)
                 while True:
-                    line = f.readline()
-                    if line:
-                        sys.stdout.write(line)
+                    chunk = f.read(4096)
+                    if chunk:
+                        sys.stdout.write(chunk)
                         sys.stdout.flush()
                     else:
                         time.sleep(0.5)

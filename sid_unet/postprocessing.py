@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
@@ -185,6 +186,32 @@ class MaskPostProcessor:
         self.morphology = morphology
         self.morph_kernel_size = morph_kernel_size
         self.threshold = threshold
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def _get_executor(self, max_workers: int = 4) -> concurrent.futures.ThreadPoolExecutor:
+        """Lazily initialize and reuse thread pool for parallel mask post-processing across batches."""
+        if self._executor is None:
+            workers = min(max(1, max_workers), os.cpu_count() or 4)
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="mask_postproc",
+            )
+        return self._executor
+
+    def close(self) -> None:
+        """Shutdown background worker pool if allocated."""
+        if getattr(self, "_executor", None) is not None:
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
+            self._executor = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def process_single(
         self,
@@ -309,10 +336,10 @@ class MaskPostProcessor:
         stats_list = []
 
         if b_sz > 1:
-            # Multi-threaded execution across CPU cores for morphological operations
+            # Multi-threaded execution across CPU cores for morphological operations with pooled executor
             prob_slices = [probs[i].detach().cpu().float().numpy() for i in range(b_sz)]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, b_sz)) as executor:
-                results = list(executor.map(self.process_single, prob_slices))
+            executor = self._get_executor(max_workers=min(4, b_sz))
+            results = list(executor.map(self.process_single, prob_slices))
             for proc_np, stats in results:
                 stats_list.append(stats)
                 proc_t = torch.from_numpy(proc_np).to(device=device, dtype=dtype)

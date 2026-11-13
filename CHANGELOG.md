@@ -62,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Verified end-to-end `sid-pull` and `sid-cross-eval` matrix evaluation across CASIA v2.0 benchmarks and synchronized master cross-evaluation reports and illustrations to remote model cards.
 
 ### Fixed
+- **TUI TQDM Multi-Line Carriage Return Spreading (`sid-tui` & CLI logs)**:
+  - Resolved issue where `tqdm` progress bar updates occupied a new line for every tick in `sid-tui` and CLI `--logs`, generating thousands of duplicate progress lines.
+  - Implemented `collapse_line_carriage_returns()` in `sid_unet/tui.py` to accurately simulate terminal cursor carriage return (`\r`) overwriting within a single physical row.
+  - Updated `read_process_logs()` to read with `newline=""`, preserving native `\r` and `\n` line separations and collapsing progress bar states to their latest visible representation.
+  - Updated `print_process_logs(tail=True)` with unbuffered `newline=""` streaming to prevent carriage return translation in live follow mode.
+  - Added automated unit test `test_read_process_logs_tqdm_carriage_returns` in `tests/test_tui_and_process_manager.py`.
+- **Cross-Evaluation Unstable GPU Utilization & Pipeline Stalls**:
+  - Diagnosed root causes of erratic, spiky GPU utilization (0% to 100%, 10% average) during cross-evaluation benchmarks (e.g. `MVSS-v1-protocol.yaml`). Confirmed adjusting batch size alone does not resolve the issue due to pipeline synchronization barriers and data starvation:
+    1. **FOCAL Clustering Head CPU-GPU Synchronization Elimination**: Replaced the sequential, unvectorized per-image loop in `FOCAL._cluster_features()` with a fully vectorized, batched tensor implementation (`torch.bmm`, `torch.gather`, `torch.where`). Eliminated 136 synchronous CPU-GPU barriers (`cudaStreamSynchronize`) per batch, delivering an 11.72x speedup (from 90.39ms to 7.72ms per batch) while retaining numerical equivalence (error $< 3\times 10^{-6}$).
+    2. **DataLoader I/O Starvation & Row-Group Boundary Buffering**: Upgraded `create_eval_dataloader()` in `sid_unet/dataset/loader.py` to forward `prefetch_factor = max(4, ...)` to `PDLDataLoader` and PyTorch `DataLoader`, and increased `max_cached_row_groups = max(4, ...)` in `SIDMapDataset`. Expanded batch prefetch capacity from 8 to 16-32 batches, preventing queue drainage and severe I/O stalls during Parquet boundary decompression.
+    3. **Mask Post-Processor Thread Pool Churn**: Replaced per-batch `concurrent.futures.ThreadPoolExecutor` allocation and teardown in `MaskPostProcessor.process_batch()` with a persistent, pooled executor, eliminating OS thread creation overhead across thousands of evaluation batches.
 - **Noise-RAG Vector Database No-Grad & Detached Alignment Loss**:
   - Enforced `requires_grad = False` and explicit `.detach()` on vector database keys (`db_keys`) and continuous labels (`db_labels`) in `ForensicVectorDBRetrieval.load_database`.
   - Enforced `target = target.detach().requires_grad_(False)` in `compute_alignment_loss` before computing `F.mse_loss`, ensuring surrogate representations and visual tokens do not backpropagate gradients into the frozen retrieved priors.

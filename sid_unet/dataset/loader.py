@@ -1472,7 +1472,8 @@ def create_eval_dataloader(
     columns = config.data.get("columns", None)
     token = config.data.get("token", None)
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
-    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 2))
+    max_cached_row_groups = max(4, int(config.data.get("max_cached_row_groups", 4)))
+    eval_prefetch_factor = max(4, int(config.data.get("prefetch_factor", 4)))
 
     if use_parquet_loader and _HAS_PARQUET_LOADER and PDLDataLoader is not None:
         eval_dataset = SIDMapDataset(
@@ -1504,6 +1505,7 @@ def create_eval_dataloader(
             world_size=world_size,
             rank=rank,
             worker_type="thread",
+            prefetch_factor=eval_prefetch_factor,
             timeout=dataloader_timeout,
         )
 
@@ -1568,7 +1570,7 @@ def create_eval_dataloader(
         }
         if num_workers > 0:
             eval_loader_kwargs["persistent_workers"] = True
-            eval_loader_kwargs["prefetch_factor"] = int(config.data.get("prefetch_factor", 2))
+            eval_loader_kwargs["prefetch_factor"] = eval_prefetch_factor
         return DataLoader(eval_dataset, **eval_loader_kwargs)
 
 
