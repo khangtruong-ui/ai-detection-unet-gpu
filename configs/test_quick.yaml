@@ -9,7 +9,7 @@ data:
   streaming: false
   image_size: [128, 128]
   batch_size: 16
-  num_workers: 0
+  num_workers: -1
   pin_memory: false
   train_split: "train"
   val_split: "validation"

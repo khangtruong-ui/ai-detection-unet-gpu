@@ -16,7 +16,7 @@ data:
   streaming: true
   image_size: [512, 512]
   batch_size: 4
-  num_workers: 4
+  num_workers: -1
   splits: ["train"]
   train_split: "train"
   val_split: "validation"
