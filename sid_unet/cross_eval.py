@@ -723,7 +723,7 @@ def evaluate_checkpoint_on_config(
     )
 
     with torch.inference_mode():
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             b_sz = len(batch["image"])
             try:
                 loss_contrib, count, change_met = eval_single_batch(
@@ -804,6 +804,10 @@ def evaluate_checkpoint_on_config(
                                 raise sub_exc
                 else:
                     raise exc
+            finally:
+                del batch
+                if (batch_idx + 1) % 50 == 0:
+                    clear_memory_cache(device)
 
     clear_memory_cache(device)
 

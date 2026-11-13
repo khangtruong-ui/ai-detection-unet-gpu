@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated detached process launch messages across `sid-cross-eval`, `sid-train`, and `sid-cache` to recommend `sid-tail` instead of `tail -f`.
 
 ### Fixed
+- **Cross-Evaluation Evaluation Loop Memory Leaks & Host OOM Prevention**:
+  - Bound system memory footprint in `sid_unet.cross_eval.evaluate_checkpoint_on_config()` by explicitly deleting `batch` references and calling `clear_memory_cache(device)` every 50 batches. Prevents unbounded PyTorch CUDA cache and Python heap accumulation during 1,000+ batch runs on memory-constrained environments.
+  - Adjusted `configs/cross-eval/MVSS-v1-protocol.yaml` to set `pin_memory: false` and `num_workers: 2`, matching Colab 2-vCPU hardware limits and eliminating 2.5 GB of shared memory (`shmem-rss`) consumption.
 - **Cross-Evaluation GPU Utilization Stabilization & Pipeline Optimization**:
   - **Asynchronous Background Prefetching (`sid_unet.dataset.loader.CUDAPrefetcher`)**: Upgraded prefetcher to use an asynchronous feeder thread and bounded `queue.Queue(maxsize=3)`. Concurrently decodes batches and transfers tensors across dedicated CUDA streams, eliminating Parquet streaming I/O stalls and dropping DataLoader wait latency from 0.18s–9.0s to 0.00s.
   - **OpenCV SIMD-Accelerated Post-Processing (`sid_unet.postprocessing`)**: Replaced Python SciPy morphology routines with SIMD-accelerated OpenCV equivalents (`cv2.connectedComponentsWithStats`, `cv2.floodFill`, and `cv2.morphologyEx` with `cv2.BORDER_CONSTANT`). Accelerated 8-sample 512x512 post-processing by 11.3x (from 0.586s down to 0.052s per batch), eliminating CPU-bound GPU starvation.
