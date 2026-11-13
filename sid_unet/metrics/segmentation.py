@@ -222,12 +222,14 @@ def compute_binary_auroc_batch(
     sorted_t = torch.gather(t_bin, dim=-1, index=sort_idx)
 
     diff = sorted_p[:, 1:] != sorted_p[:, :-1]
-    has_ties = diff.sum(dim=-1) < (n - 1)
+    diff_count = diff.sum(dim=-1)
+    is_binary = diff_count <= 1
+    has_ties = diff_count < (n - 1)
 
     ranks = torch.arange(1, n + 1, device=device, dtype=torch.float64).unsqueeze(0).expand(b, n)
     pos_rank_sum = (ranks * sorted_t.double()).sum(dim=-1)
     u_stat = pos_rank_sum - (n_pos * (n_pos + 1.0)) / 2.0
-    auroc_no_ties = u_stat / (n_pos * n_neg).clamp(min=1e-7)
+    auroc_no_ties = (u_stat / (n_pos * n_neg).clamp(min=1e-7)).float()
 
     aurocs = torch.empty(b, dtype=torch.float32, device=device)
     for i in range(b):
@@ -239,8 +241,18 @@ def compute_binary_auroc_batch(
         elif nn_i == 0:
             mp = float(p[i].mean().item())
             aurocs[i] = 1.0 if mp >= 0.5 else max(0.0, mp)
+        elif is_binary[i]:
+            if diff_count[i] == 0:
+                aurocs[i] = 0.5
+            else:
+                p_bin = p[i] >= 0.5
+                tp = float((p_bin & (t_bin[i] == 1)).sum().item())
+                tn = float(((~p_bin) & (t_bin[i] == 0)).sum().item())
+                rec = tp / np_i
+                spec = tn / nn_i
+                aurocs[i] = (rec + spec) / 2.0
         elif not has_ties[i].item():
-            aurocs[i] = float(auroc_no_ties[i].item())
+            aurocs[i] = auroc_no_ties[i]
         else:
             diff_i = diff[i]
             if not diff_i.any():
@@ -329,7 +341,11 @@ def compute_binary_metrics_batch(
     spec_denom = tn + fp
     specificity = torch.where(spec_denom > 0, tn / spec_denom.clamp(min=1e-7), torch.ones_like(tn))
 
-    auroc = compute_binary_auroc_batch(p_probs, t_raw, is_logit=False)
+    if is_logit is False and ((p_raw == 0.0) | (p_raw == 1.0)).all():
+        # Fast exact analytical AUROC for binary masks (equals Balanced Accuracy: (recall + specificity) / 2)
+        auroc = (recall + specificity) / 2.0
+    else:
+        auroc = compute_binary_auroc_batch(p_probs, t_raw, is_logit=False)
 
     num_pos = (tp + fn).long()
     has_pos = (tp + fn) > 0
@@ -441,20 +457,27 @@ class SegmentationMetricTracker:
         self.positive_samples += num_pos
         self.zero_positive_samples += (b - num_pos)
 
-        # Global sums
-        for k in self.metrics_sum:
-            self.metrics_sum[k] += float(batch_metrics[k].sum().item())
+        # Global sums (batched GPU-to-CPU reduction in a single tensor transfer)
+        keys_list = list(self.metrics_sum.keys())
+        stacked_sums = torch.stack([batch_metrics[k].sum() for k in keys_list])
+        sums_list = stacked_sums.detach().cpu().tolist()
+        for k, v in zip(keys_list, sums_list):
+            self.metrics_sum[k] += v
 
         if num_pos > 0:
-            for k in self.positive_metrics_sum:
-                self.positive_metrics_sum[k] += float(batch_metrics[k][has_pos].sum().item())
+            pos_keys_list = list(self.positive_metrics_sum.keys())
+            pos_stacked_sums = torch.stack([batch_metrics[k][has_pos].sum() for k in pos_keys_list])
+            pos_sums_list = pos_stacked_sums.detach().cpu().tolist()
+            for k, v in zip(pos_keys_list, pos_sums_list):
+                self.positive_metrics_sum[k] += v
 
         # Per-label stats
         if labels is not None:
             labels_flat = labels.view(-1)
             unique_labels = torch.unique(labels_flat)
-            for lbl_t in unique_labels:
-                lbl = int(lbl_t.item())
+            lbl_list = unique_labels.detach().cpu().tolist()
+            for lbl_val, lbl_t in zip(lbl_list, unique_labels):
+                lbl = int(lbl_val)
                 if lbl not in self.per_label_stats:
                     self.per_label_stats[lbl] = {
                         "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0,
@@ -471,23 +494,17 @@ class SegmentationMetricTracker:
                 l_stat = self.per_label_stats[lbl]
                 l_stat["count"] += cnt_lbl
                 l_stat["pos_count"] += pos_cnt_lbl
-                l_stat["iou_sum"] += float(batch_metrics["iou"][mask_lbl].sum().item())
-                l_stat["dice_sum"] += float(batch_metrics["dice"][mask_lbl].sum().item())
-                l_stat["f1_sum"] += float(batch_metrics["f1"][mask_lbl].sum().item())
-                l_stat["macro_f1_sum"] += float(batch_metrics["macro_f1"][mask_lbl].sum().item())
-                l_stat["auroc_sum"] += float(batch_metrics["auroc"][mask_lbl].sum().item())
-                l_stat["pixel_acc_sum"] += float(batch_metrics["pixel_acc"][mask_lbl].sum().item())
-                l_stat["precision_sum"] += float(batch_metrics["precision"][mask_lbl].sum().item())
-                l_stat["recall_sum"] += float(batch_metrics["recall"][mask_lbl].sum().item())
-                l_stat["specificity_sum"] += float(batch_metrics["specificity"][mask_lbl].sum().item())
+
+                lbl_keys = ["iou", "dice", "f1", "macro_f1", "auroc", "pixel_acc", "precision", "recall", "specificity"]
+                lbl_sums = torch.stack([batch_metrics[k][mask_lbl].sum() for k in lbl_keys]).detach().cpu().tolist()
+                for k, s in zip(lbl_keys, lbl_sums):
+                    l_stat[f"{k}_sum"] += s
 
                 if pos_cnt_lbl > 0:
-                    l_stat["iou_pos_sum"] += float(batch_metrics["iou"][pos_mask_lbl].sum().item())
-                    l_stat["dice_pos_sum"] += float(batch_metrics["dice"][pos_mask_lbl].sum().item())
-                    l_stat["f1_pos_sum"] += float(batch_metrics["f1"][pos_mask_lbl].sum().item())
-                    l_stat["macro_f1_pos_sum"] += float(batch_metrics["macro_f1"][pos_mask_lbl].sum().item())
-                    l_stat["precision_pos_sum"] += float(batch_metrics["precision"][pos_mask_lbl].sum().item())
-                    l_stat["recall_pos_sum"] += float(batch_metrics["recall"][pos_mask_lbl].sum().item())
+                    pos_lbl_keys = ["iou", "dice", "f1", "macro_f1", "precision", "recall"]
+                    pos_lbl_sums = torch.stack([batch_metrics[k][pos_mask_lbl].sum() for k in pos_lbl_keys]).detach().cpu().tolist()
+                    for k, s in zip(pos_lbl_keys, pos_lbl_sums):
+                        l_stat[f"{k}_pos_sum"] += s
 
         # Per-dataset stats
         if datasets is not None:

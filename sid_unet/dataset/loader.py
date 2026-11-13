@@ -345,12 +345,18 @@ class BackgroundPrefetcher:
 
 class CUDAPrefetcher:
     """
-    Asynchronous CUDA memory prefetcher that overlaps host-to-device transfers
-    with GPU compute on a dedicated CUDA stream.
+    Asynchronous CUDA memory prefetcher that overlaps host DataLoader extraction
+    and host-to-device transfers on a dedicated CUDA stream with GPU compute.
+    Uses a background worker thread and prefetch queue to ensure the GPU is never starved.
     Works seamlessly with any DataLoader or iterable yielding dictionaries/tuples/tensors.
     """
 
-    def __init__(self, loader: Any, device: Optional[Union[str, torch.device]] = None):
+    def __init__(
+        self,
+        loader: Any,
+        device: Optional[Union[str, torch.device]] = None,
+        queue_size: int = 3,
+    ):
         self.loader = loader
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -360,14 +366,10 @@ class CUDAPrefetcher:
             self.device = device
         self.is_cuda = (self.device.type == "cuda") and torch.cuda.is_available()
         self.stream = torch.cuda.Stream(device=self.device) if self.is_cuda else None
-        self._iterator: Optional[Iterator[Any]] = None
-        self.next_batch: Any = None
-
-    def __iter__(self) -> CUDAPrefetcher:
-        self._iterator = iter(self.loader)
-        if self.is_cuda:
-            self._preload()
-        return self
+        self.queue_size = max(2, queue_size)
+        self.queue: queue.Queue = queue.Queue(maxsize=self.queue_size)
+        self._stop_event = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
 
     def _to_device(self, item: Any) -> Any:
         if isinstance(item, torch.Tensor):
@@ -393,28 +395,93 @@ class CUDAPrefetcher:
             for v in item:
                 self._record_stream(v)
 
-    def _preload(self) -> None:
+    def _feeder_loop(self, iterator: Iterator[Any]) -> None:
         try:
-            raw_batch = next(self._iterator)
-        except StopIteration:
-            self.next_batch = None
-            return
+            for raw_batch in iterator:
+                if self._stop_event.is_set():
+                    break
+                if self.is_cuda and self.stream is not None:
+                    with torch.cuda.stream(self.stream):
+                        device_batch = self._to_device(raw_batch)
+                else:
+                    device_batch = self._to_device(raw_batch)
 
-        with torch.cuda.stream(self.stream):
-            self.next_batch = self._to_device(raw_batch)
+                while not self._stop_event.is_set():
+                    try:
+                        self.queue.put(device_batch, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                if self._stop_event.is_set():
+                    break
+        except Exception as e:
+            if not self._stop_event.is_set():
+                try:
+                    self.queue.put(_ExceptionWrapper(e), timeout=0.2)
+                except Exception:
+                    pass
+        finally:
+            while not self._stop_event.is_set():
+                try:
+                    self.queue.put(_SENTINEL, timeout=0.1)
+                    break
+                except Exception:
+                    continue
+
+    def __iter__(self) -> CUDAPrefetcher:
+        self.close()
+        self._stop_event.clear()
+        self.queue = queue.Queue(maxsize=self.queue_size)
+        iterator = iter(self.loader)
+        self._worker_thread = threading.Thread(target=self._feeder_loop, args=(iterator,), daemon=True)
+        self._worker_thread.start()
+        return self
 
     def __next__(self) -> Any:
-        if not self.is_cuda:
-            return self._to_device(next(self._iterator))
+        while not self._stop_event.is_set():
+            try:
+                batch = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                if self._worker_thread is not None and not self._worker_thread.is_alive() and self.queue.empty():
+                    self.close()
+                    raise StopIteration
+                continue
 
-        if self.next_batch is None:
-            raise StopIteration
+            if batch is _SENTINEL:
+                self.close()
+                raise StopIteration
+            if isinstance(batch, _ExceptionWrapper):
+                self.close()
+                batch.reraise()
 
-        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
-        batch = self.next_batch
-        self._record_stream(batch)
-        self._preload()
-        return batch
+            if self.is_cuda and self.stream is not None:
+                torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+                self._record_stream(batch)
+            return batch
+
+        raise StopIteration
+
+    def close(self) -> None:
+        """Signal worker to stop, drain queue, and clean up worker thread."""
+        if getattr(self, "_stop_event", None) is not None:
+            self._stop_event.set()
+        q = getattr(self, "queue", None)
+        if q is not None:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+        thread = getattr(self, "_worker_thread", None)
+        if thread is not None and thread.is_alive() and thread != threading.current_thread():
+            thread.join(timeout=1.0)
+            self._worker_thread = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __len__(self) -> int:
         return len(self.loader)

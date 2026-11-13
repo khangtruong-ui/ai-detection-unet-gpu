@@ -211,7 +211,15 @@ class SIDTerminalUI:
 
         time_str = datetime.now().strftime("%H:%M:%S")
         title = f" 🖥️  SID-UNet Process Manager [Filter: {self.filter_mode}] ({len(filtered)} shown) "
-        stats = f"🟢 Running: {n_running} | 🔴 Exceptions: {n_exc} | ⚪ Terminated: {n_term} | 🕒 {time_str} "
+        gpu_str = ""
+        try:
+            from sid_unet.utils.network import get_gpu_utilization
+            g_u = get_gpu_utilization()
+            if g_u is not None:
+                gpu_str = f" | ⚡ GPU: {g_u:.0f}%"
+        except Exception:
+            pass
+        stats = f"🟢 Running: {n_running} | 🔴 Exceptions: {n_exc} | ⚪ Terminated: {n_term}{gpu_str} | 🕒 {time_str} "
 
         pad_len = max(0, width - len(title) - len(stats))
         header_text = title + (" " * pad_len) + stats

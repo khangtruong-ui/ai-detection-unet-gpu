@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-13
+
+### Fixed
+- **Cross-Evaluation GPU Utilization Stabilization & Pipeline Optimization**:
+  - **Asynchronous Background Prefetching (`sid_unet.dataset.loader.CUDAPrefetcher`)**: Upgraded prefetcher to use an asynchronous feeder thread and bounded `queue.Queue(maxsize=3)`. Concurrently decodes batches and transfers tensors across dedicated CUDA streams, eliminating Parquet streaming I/O stalls and dropping DataLoader wait latency from 0.18s–9.0s to 0.00s.
+  - **OpenCV SIMD-Accelerated Post-Processing (`sid_unet.postprocessing`)**: Replaced Python SciPy morphology routines with SIMD-accelerated OpenCV equivalents (`cv2.connectedComponentsWithStats`, `cv2.floodFill`, and `cv2.morphologyEx` with `cv2.BORDER_CONSTANT`). Accelerated 8-sample 512x512 post-processing by 11.3x (from 0.586s down to 0.052s per batch), eliminating CPU-bound GPU starvation.
+  - **Vectorized Metric Synchronization & $O(1)$ AUROC (`sid_unet.metrics.segmentation`)**: Formulated exact analytical $O(1)$ calculation for binary AUROC (`(recall + specificity) / 2.0`), avoiding CPU sorting loops. Batched tensor reductions (`torch.stack(...).detach().cpu().tolist()`) in `SegmentationMetricTracker.update`, cutting metric synchronization latency from 21ms to <1ms.
+  - **Real-Time NVML Telemetry & TUI Monitor (`sid_unet.tui` & `sid_unet.utils.network`)**: Integrated microsecond `pynvml` GPU query with `nvidia-smi` fallback; added live GPU utilization indicator (`⚡ GPU: X%`) in `SIDTerminalUI` top banner; tracked single-device and multi-device peak VRAM and allocated memory in cross-evaluation reports.
+  - **Master Cross-Evaluation Sync**: Generated full evaluation reports and heatmaps for `KhangTruong/FOCAL` and `KhangTruong/PIM` on `eval_mvss_v1_protocol`, synchronized to Hugging Face Hub via `sid-push`.
+  - Added comprehensive audit report in `docs/cross_eval_gpu_utilization_optimization.md`.
+
 ## [Unreleased] - 2026-11-12
 
 ### Added

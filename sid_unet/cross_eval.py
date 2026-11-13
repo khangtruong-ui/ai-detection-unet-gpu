@@ -903,6 +903,22 @@ def evaluate_checkpoint_on_config(
         overall_metrics["num_devices"] = len(target_device_ids)
         overall_metrics["devices"] = [f"cuda:{d}" for d in target_device_ids]
         overall_metrics["gpu_utilization"] = gpu_utilization
+    elif device.type == "cuda":
+        d_id = device.index if device.index is not None else 0
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+        alloc_mb = torch.cuda.memory_allocated(device) / (1024 * 1024)
+        gpu_utilization[f"cuda:{d_id}"] = {
+            "device_name": torch.cuda.get_device_name(device),
+            "peak_memory_mb": round(peak_mb, 2),
+            "allocated_memory_mb": round(alloc_mb, 2),
+        }
+        eval_logger.info(
+            f"   [GPU Utilization] GPU {d_id} ({torch.cuda.get_device_name(device)}): "
+            f"Peak: {peak_mb:.1f} MB | Allocated: {alloc_mb:.1f} MB"
+        )
+        overall_metrics["num_devices"] = 1
+        overall_metrics["devices"] = [f"cuda:{d_id}"]
+        overall_metrics["gpu_utilization"] = gpu_utilization
 
     # Generate dataset-specific visual illustration grid
     dataset_illustration_path = None

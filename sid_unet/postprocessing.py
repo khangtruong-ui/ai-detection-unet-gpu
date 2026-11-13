@@ -24,6 +24,12 @@ from scipy.ndimage import (
     sum_labels,
 )
 
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
 logger = logging.getLogger("sid_unet.postprocessing")
 
 
@@ -44,8 +50,23 @@ def remove_small_components(
         Tuple of (filtered_binary_mask, number_of_components_removed).
     """
     binary = (mask > 0.5).astype(np.uint8)
-    if min_area <= 1 or np.sum(binary) == 0:
+    if min_area <= 1 or not np.any(binary):
         return binary.astype(np.float32), 0
+
+    if _HAS_CV2:
+        cv_conn = 8 if connectivity == 2 else 4
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=cv_conn)
+        if num_labels <= 1:
+            return binary.astype(np.float32), 0
+        areas = stats[:, cv2.CC_STAT_AREA]
+        keep_indices = np.where(areas[1:] >= min_area)[0] + 1
+        removed_count = (num_labels - 1) - len(keep_indices)
+        if removed_count == 0:
+            return binary.astype(np.float32), 0
+        lut = np.zeros(num_labels, dtype=np.uint8)
+        lut[keep_indices] = 1
+        filtered = lut[labels].astype(np.float32)
+        return filtered, int(removed_count)
 
     structure = generate_binary_structure(2, connectivity)
     labeled, num_features = label(binary, structure=structure)
@@ -82,19 +103,45 @@ def fill_mask_holes(
     Returns:
         Tuple of (hole_filled_binary_mask, number_of_pixels_filled).
     """
-    binary = (mask > 0.5).astype(bool)
+    binary = (mask > 0.5).astype(np.uint8)
     if not np.any(binary) or np.all(binary):
         return binary.astype(np.float32), 0
 
+    if _HAS_CV2:
+        h, w = binary.shape
+        padded = np.pad(binary, 1, mode="constant", constant_values=0)
+        ff_mask = np.zeros((h + 4, w + 4), dtype=np.uint8)
+        cv2.floodFill(padded, ff_mask, (0, 0), 2)
+        all_holes = (padded[1:-1, 1:-1] == 0)
+        if not np.any(all_holes):
+            return binary.astype(np.float32), 0
+        if max_hole_size is None:
+            filled = binary | all_holes.astype(np.uint8)
+            diff_pixels = int(np.sum(all_holes))
+            return filled.astype(np.float32), diff_pixels
+
+        cv_conn = 8 if connectivity == 2 else 4
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(all_holes.astype(np.uint8), connectivity=cv_conn)
+        if num_labels <= 1:
+            return binary.astype(np.float32), 0
+        areas = stats[:, cv2.CC_STAT_AREA]
+        valid_hole_idx = np.where(areas[1:] <= max_hole_size)[0] + 1
+        lut = np.zeros(num_labels, dtype=np.uint8)
+        lut[valid_hole_idx] = 1
+        valid_holes = lut[labels]
+        result = binary | valid_holes
+        diff_pixels = int(np.sum(valid_holes))
+        return result.astype(np.float32), diff_pixels
+
     structure = generate_binary_structure(2, connectivity)
-    filled = binary_fill_holes(binary, structure=structure)
+    filled = binary_fill_holes(binary.astype(bool), structure=structure)
 
     if max_hole_size is None:
         diff_pixels = int(np.sum(filled.astype(np.int32) - binary.astype(np.int32)))
         return filled.astype(np.float32), diff_pixels
 
     # If max_hole_size is set, only fill holes smaller than or equal to max_hole_size
-    added_mask = filled & (~binary)
+    added_mask = filled & (~binary.astype(bool))
     if not np.any(added_mask):
         return binary.astype(np.float32), 0
 
@@ -106,7 +153,7 @@ def fill_mask_holes(
     valid_hole_indices = np.where(hole_sizes <= max_hole_size)[0] + 1
 
     valid_holes = np.isin(labeled_holes, valid_hole_indices)
-    result = binary | valid_holes
+    result = binary.astype(bool) | valid_holes
     diff_pixels = int(np.sum(valid_holes))
     return result.astype(np.float32), diff_pixels
 
@@ -135,7 +182,7 @@ def apply_morphology(
     if operation is None or operation.lower() in ("none", "null", ""):
         return (mask > 0.5).astype(np.float32)
 
-    binary = (mask > 0.5).astype(bool)
+    binary = (mask > 0.5).astype(np.uint8)
     if not np.any(binary) or np.all(binary):
         return binary.astype(np.float32)
 
@@ -143,22 +190,41 @@ def apply_morphology(
     if kernel_size % 2 == 0:
         kernel_size += 1
 
-    structure = np.ones((kernel_size, kernel_size), dtype=bool)
     op = operation.lower().strip()
 
+    if _HAS_CV2:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        b_type = cv2.BORDER_CONSTANT
+        if op == "open":
+            res = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, borderType=b_type, borderValue=0)
+        elif op == "close":
+            res = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, borderType=b_type, borderValue=0)
+        elif op in ("open_close", "open-close"):
+            opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, borderType=b_type, borderValue=0)
+            res = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, borderType=b_type, borderValue=0)
+        elif op in ("close_open", "close-open"):
+            closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, borderType=b_type, borderValue=0)
+            res = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, borderType=b_type, borderValue=0)
+        else:
+            logger.warning(f"Unknown morphology operation '{operation}', skipping.")
+            res = binary
+        return res.astype(np.float32)
+
+    structure = np.ones((kernel_size, kernel_size), dtype=bool)
+
     if op == "open":
-        processed = binary_opening(binary, structure=structure)
+        processed = binary_opening(binary.astype(bool), structure=structure)
     elif op == "close":
-        processed = binary_closing(binary, structure=structure)
+        processed = binary_closing(binary.astype(bool), structure=structure)
     elif op in ("open_close", "open-close"):
-        opened = binary_opening(binary, structure=structure)
+        opened = binary_opening(binary.astype(bool), structure=structure)
         processed = binary_closing(opened, structure=structure)
     elif op in ("close_open", "close-open"):
-        closed = binary_closing(binary, structure=structure)
+        closed = binary_closing(binary.astype(bool), structure=structure)
         processed = binary_opening(closed, structure=structure)
     else:
         logger.warning(f"Unknown morphology operation '{operation}', skipping.")
-        processed = binary
+        processed = binary.astype(bool)
 
     return processed.astype(np.float32)
 
@@ -338,7 +404,7 @@ class MaskPostProcessor:
         if b_sz > 1:
             # Multi-threaded execution across CPU cores for morphological operations with pooled executor
             prob_slices = [probs[i].detach().cpu().float().numpy() for i in range(b_sz)]
-            executor = self._get_executor(max_workers=min(4, b_sz))
+            executor = self._get_executor(max_workers=min(max(4, os.cpu_count() or 4), b_sz))
             results = list(executor.map(self.process_single, prob_slices))
             for proc_np, stats in results:
                 stats_list.append(stats)
