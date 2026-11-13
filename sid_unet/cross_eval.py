@@ -612,6 +612,10 @@ def evaluate_checkpoint_on_config(
         overrides.append(f"data.batch_size={batch_size}")
 
     eval_config = load_config(config_path, overrides=overrides)
+    if "filter_zero_positive" in eval_config.project:
+        filter_zero_positive = bool(eval_config.project.filter_zero_positive)
+    elif "filter_zero_positive" in eval_config.get("evaluation", {}):
+        filter_zero_positive = bool(eval_config.evaluation.filter_zero_positive)
     if dataset_filter is None:
         dataset_filter = eval_config.data.get("dataset_filter", eval_config.data.get("sub_dataset", None))
 
@@ -719,7 +723,7 @@ def evaluate_checkpoint_on_config(
     )
 
     with torch.inference_mode():
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             b_sz = len(batch["image"])
             try:
                 loss_contrib, count, change_met = eval_single_batch(
@@ -800,6 +804,10 @@ def evaluate_checkpoint_on_config(
                                 raise sub_exc
                 else:
                     raise exc
+            finally:
+                del batch
+                if (batch_idx + 1) % 50 == 0:
+                    clear_memory_cache(device)
 
     clear_memory_cache(device)
 
@@ -898,6 +906,22 @@ def evaluate_checkpoint_on_config(
             )
         overall_metrics["num_devices"] = len(target_device_ids)
         overall_metrics["devices"] = [f"cuda:{d}" for d in target_device_ids]
+        overall_metrics["gpu_utilization"] = gpu_utilization
+    elif device.type == "cuda":
+        d_id = device.index if device.index is not None else 0
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+        alloc_mb = torch.cuda.memory_allocated(device) / (1024 * 1024)
+        gpu_utilization[f"cuda:{d_id}"] = {
+            "device_name": torch.cuda.get_device_name(device),
+            "peak_memory_mb": round(peak_mb, 2),
+            "allocated_memory_mb": round(alloc_mb, 2),
+        }
+        eval_logger.info(
+            f"   [GPU Utilization] GPU {d_id} ({torch.cuda.get_device_name(device)}): "
+            f"Peak: {peak_mb:.1f} MB | Allocated: {alloc_mb:.1f} MB"
+        )
+        overall_metrics["num_devices"] = 1
+        overall_metrics["devices"] = [f"cuda:{d_id}"]
         overall_metrics["gpu_utilization"] = gpu_utilization
 
     # Generate dataset-specific visual illustration grid
@@ -1325,6 +1349,8 @@ def main(args: Optional[List[str]] = None):
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
 
+        start_offset = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
+
         log_fp = open(log_path, "a", encoding="utf-8")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_fp.write(
@@ -1357,11 +1383,26 @@ def main(args: Optional[List[str]] = None):
         )
         log_fp.close()
 
+        # Register in process ledger
+        try:
+            from sid_unet.process_manager import get_process_registry
+            get_process_registry().register_process(
+                pid=proc.pid,
+                name="sid-cross-eval",
+                cmdline=" ".join(cmd),
+                log_file=log_path,
+                ppid=os.getpid(),
+                log_offset_start=start_offset,
+            )
+        except Exception:
+            pass
+
         print("\n" + "=" * 70)
         print(f"🚀 [DETACHED] sid-cross-eval running in background (PID: {proc.pid})")
         print(f"📄 Logging output to: {log_path}")
-        print(f"🔍 To monitor logs live: tail -f {getattr(parsed_args, 'log_file', '.logs.txt')}")
-        print("🛑 To stop evaluation: sid-kill")
+        print(f"🖥️ To manage processes & view live output: sid-tui")
+        print(f"🔍 Or tail logs directly (auto-halts on completion): sid-tail {getattr(parsed_args, 'log_file', '.logs.txt')}")
+        print("🛑 To stop evaluation: sid-kill (or 'k' in sid-tui)")
         print("=" * 70 + "\n")
         sys.stdout.flush()
         return {"status": "detached", "pid": proc.pid, "log_file": log_path}

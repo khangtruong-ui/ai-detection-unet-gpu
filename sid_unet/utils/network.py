@@ -92,7 +92,16 @@ def measure_active_download_speed(
 
 
 def get_gpu_utilization() -> Optional[float]:
-    """Query GPU utilization percentage via nvidia-smi if available."""
+    """Query GPU utilization percentage via pynvml (fast path) or nvidia-smi if available."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        return float(rates.gpu)
+    except Exception:
+        pass
+
     try:
         res = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],

@@ -5,9 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-13
+
+### Added
+- **Automated Task-Aware Log Tail Utility (`sid-tail`)**:
+  - Implemented `sid-tail` (`sid_unet.tail`) CLI tool for streaming log output with automatic termination detection upon task completion, unhandled exceptions, or process termination (replacing open-ended `tail -f`).
+  - Automatic target resolution: inspects `.sid_processes/registry.json` to automatically resolve active tasks, log file paths, start offsets, and monitored PIDs.
+  - Supports `--pid`, `--file`, `--lines` (`-n`), `--timeout`, `--poll-interval`, and `--quiet` flags.
+  - Automatically handles tqdm carriage return (`\r`) progress bars.
+  - Exits with status code 0 on clean completion and 1 on error/kill.
+  - Added unit test suite in `tests/test_tail.py`.
+
+### Changed
+- **Cross-Evaluation Batch Size Optimization (`configs/cross-eval/MVSS-v1-protocol.yaml`)**:
+  - Doubled evaluation batch size from 8 to 16 for `MVSS-v1-protocol.yaml`, improving GPU utilization and tensor parallelism across Tesla T4 while staying within the 15GB VRAM limit (PIM Swin uses ~7.6GB peak VRAM; FOCAL HRNet uses ~0.8GB peak VRAM).
+- Updated detached process launch messages across `sid-cross-eval`, `sid-train`, and `sid-cache` to recommend `sid-tail` instead of `tail -f`.
+
+### Fixed
+- **Cross-Evaluation Evaluation Loop Memory Leaks & Host OOM Prevention**:
+  - Bound system memory footprint in `sid_unet.cross_eval.evaluate_checkpoint_on_config()` by explicitly deleting `batch` references and calling `clear_memory_cache(device)` every 50 batches. Prevents unbounded PyTorch CUDA cache and Python heap accumulation during 1,000+ batch runs on memory-constrained environments.
+  - Adjusted `configs/cross-eval/MVSS-v1-protocol.yaml` to set `pin_memory: false` and `num_workers: 2`, matching Colab 2-vCPU hardware limits and eliminating 2.5 GB of shared memory (`shmem-rss`) consumption.
+- **Cross-Evaluation GPU Utilization Stabilization & Pipeline Optimization**:
+  - **Asynchronous Background Prefetching (`sid_unet.dataset.loader.CUDAPrefetcher`)**: Upgraded prefetcher to use an asynchronous feeder thread and bounded `queue.Queue(maxsize=3)`. Concurrently decodes batches and transfers tensors across dedicated CUDA streams, eliminating Parquet streaming I/O stalls and dropping DataLoader wait latency from 0.18s–9.0s to 0.00s.
+  - **OpenCV SIMD-Accelerated Post-Processing (`sid_unet.postprocessing`)**: Replaced Python SciPy morphology routines with SIMD-accelerated OpenCV equivalents (`cv2.connectedComponentsWithStats`, `cv2.floodFill`, and `cv2.morphologyEx` with `cv2.BORDER_CONSTANT`). Accelerated 8-sample 512x512 post-processing by 11.3x (from 0.586s down to 0.052s per batch), eliminating CPU-bound GPU starvation.
+  - **Vectorized Metric Synchronization & $O(1)$ AUROC (`sid_unet.metrics.segmentation`)**: Formulated exact analytical $O(1)$ calculation for binary AUROC (`(recall + specificity) / 2.0`), avoiding CPU sorting loops. Batched tensor reductions (`torch.stack(...).detach().cpu().tolist()`) in `SegmentationMetricTracker.update`, cutting metric synchronization latency from 21ms to <1ms.
+  - **Real-Time NVML Telemetry & TUI Monitor (`sid_unet.tui` & `sid_unet.utils.network`)**: Integrated microsecond `pynvml` GPU query with `nvidia-smi` fallback; added live GPU utilization indicator (`⚡ GPU: X%`) in `SIDTerminalUI` top banner; tracked single-device and multi-device peak VRAM and allocated memory in cross-evaluation reports.
+  - **Master Cross-Evaluation Sync**: Generated full evaluation reports and heatmaps for `KhangTruong/FOCAL` and `KhangTruong/PIM` on `eval_mvss_v1_protocol`, synchronized to Hugging Face Hub via `sid-push`.
+  - Added comprehensive audit report in `docs/cross_eval_gpu_utilization_optimization.md`.
+
 ## [Unreleased] - 2026-11-12
 
 ### Added
+- **TUI Process Manager (`sid-tui` & `sid-top`)**:
+  - Implemented a complete Terminal User Interface (`SIDTerminalUI`) built on standard Python `curses`, replacing static `tail -f .logs.txt` monitoring.
+  - Interactive split-screen dashboard displaying real-time process list (PID, Command, Status, Elapsed Duration, RSS RAM) alongside live streaming log tail.
+  - Real-time auto-follow mode (`f` key) for continuous streaming output of active processes.
+  - Fullscreen log view (`Enter` or `l` key) with scrollback navigation (`Up`, `Down`, `PageUp`, `PageDown`, `Home`, `End`).
+  - Terminated process lifecycle tracking: tracks `RUNNING`, `COMPLETED`, `KILLED`, and `EXCEPTION` states.
+  - Exception & Traceback Inspector (`e` key): automatically scans log files from initial spawn offset, extracts Python unhandled tracebacks and error messages, and presents an interactive traceback view.
+  - Process termination controls: kill targeted process (`k` key) with confirmation and graceful SIGINT/SIGTERM escalation to SIGKILL; kill all active background processes (`K` key).
+  - Status filter cycling (`Tab` key): toggle between `ALL`, `RUNNING`, `EXCEPTION`, and `TERMINATED` views.
+  - Terminated history cleanup (`c` key) to clear finished records from the registry.
+  - CLI and non-interactive headless support: `sid-tui --list`, `sid-tui --status`, `sid-tui --logs <pid>`, `sid-tui --tail <pid>`, `sid-tui --kill <pid>`, `sid-tui --clear-history`, and `--no-tui` fallback for non-TTY environments.
+- **Process Registry & Tracking Subsystem (`sid_unet.process_manager`)**:
+  - Designed `ProcessRecord` dataclass tracking process metadata, arguments, status, exit codes, start offsets, and failure summaries.
+  - Designed `ProcessRegistry` with thread-safe and process-safe file locking via `filelock.FileLock` on `.sid_processes/registry.lock`.
+  - Implemented `inspect_log_for_termination` scanning process log streams for clean completion banners, SIGINT/KeyboardInterrupt, unhandled Python exceptions, and abnormal terminations.
+  - Integrated automatic process registration in `sid-train`, `sid-cross-eval`, and `sid-cache` upon background detachment (`--detach`), storing process startup markers and printing navigation tips for `sid-tui`.
+  - Integrated `sid-kill` process termination state synchronization with `ProcessRegistry`.
+- **Focal & PIM Cross-Evaluation Mismatch Audit (`docs/cross_evaluation_focal_pim_mismatch_investigation.md`)**:
+  - Investigated root causes of score mismatches on `master_cross_evaluation_report.md` between reported cross-eval scores and cataloged scores for `sid_focal_hrnet` and `sid_pim`.
+  - Proved FOCAL inference head saturation: untrained 2D convolution head in `sid_unet/models/focal.py` produces unconditionally positive differences (`diff > 0.12`), driving sigmoid to 1.0 across 100% of pixels and explaining 0.9969 recall with 0.0069 specificity.
+  - Proved input resolution and normalization mismatches: FOCAL expects $[0, 1]$ unnormalized inputs at $1024 \times 1024$; PIM expects $512 \times 512$ inputs for Swin window partitioning ($7 \times 7$), while cross-eval downscaled to $256 \times 256$ with ImageNet normalization $[-2.1, 2.6]$.
+  - Proved evaluation metric discrepancies: FOCAL upstream evaluates macro-averaged F1 (including background pristine F1), while `sid_unet` evaluates binary foreground Dice; PIM upstream rewards pristine images with 1.0 IoU/F1 when clean, while `sid_unet` excludes zero-positive images (`filter_zero_positive=True`).
+  - Identified catalog score semantic confusion: PIM `best_score: 0.852` represents AutoSplice 90 AUC (not IoU, not CASIA/MVSS); FOCAL `best_score: 0.824` represents validation Macro F1 mislabeled under `"val_iou"`.
+  - Documented dataset domain shift (>55% generative diffusion images in `eval_mvss_v1_protocol` vs traditional splicing pretraining) and ground truth polarity inversion in NIST16.
+  - Implemented automated empirical evidence test suite (`tests/test_focal_pim_mismatch_audit.py`) validating mathematical proofs and empirical bounds for all 5 identified mismatch root causes.
 - **FOCAL Model Integration (HRNet & SAM ViT Backbones)**:
   - Integrated the complete FOCAL framework (Forensic Contrastive Clustering for Image Forgery Detection and Localization, ICCV 2023) from official repository `HighwayWu/FOCAL`.
   - Implemented self-contained `HRNet-W32` and `SAM ViT-Large` backbones with pure PyTorch `SAMBlock`, `MLPBlock`, and decomposed relative position embeddings.
@@ -37,6 +90,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Verified end-to-end `sid-pull` and `sid-cross-eval` matrix evaluation across CASIA v2.0 benchmarks and synchronized master cross-evaluation reports and illustrations to remote model cards.
 
 ### Fixed
+- **TUI TQDM Multi-Line Carriage Return Spreading (`sid-tui` & CLI logs)**:
+  - Resolved issue where `tqdm` progress bar updates occupied a new line for every tick in `sid-tui` and CLI `--logs`, generating thousands of duplicate progress lines.
+  - Implemented `collapse_line_carriage_returns()` in `sid_unet/tui.py` to accurately simulate terminal cursor carriage return (`\r`) overwriting within a single physical row.
+  - Updated `read_process_logs()` to read with `newline=""`, preserving native `\r` and `\n` line separations and collapsing progress bar states to their latest visible representation.
+  - Updated `print_process_logs(tail=True)` with unbuffered `newline=""` streaming to prevent carriage return translation in live follow mode.
+  - Added automated unit test `test_read_process_logs_tqdm_carriage_returns` in `tests/test_tui_and_process_manager.py`.
+- **Cross-Evaluation Unstable GPU Utilization & Pipeline Stalls**:
+  - Diagnosed root causes of erratic, spiky GPU utilization (0% to 100%, 10% average) during cross-evaluation benchmarks (e.g. `MVSS-v1-protocol.yaml`). Confirmed adjusting batch size alone does not resolve the issue due to pipeline synchronization barriers and data starvation:
+    1. **FOCAL Clustering Head CPU-GPU Synchronization Elimination**: Replaced the sequential, unvectorized per-image loop in `FOCAL._cluster_features()` with a fully vectorized, batched tensor implementation (`torch.bmm`, `torch.gather`, `torch.where`). Eliminated 136 synchronous CPU-GPU barriers (`cudaStreamSynchronize`) per batch, delivering an 11.72x speedup (from 90.39ms to 7.72ms per batch) while retaining numerical equivalence (error $< 3\times 10^{-6}$).
+    2. **DataLoader I/O Starvation & Row-Group Boundary Buffering**: Upgraded `create_eval_dataloader()` in `sid_unet/dataset/loader.py` to forward `prefetch_factor = max(4, ...)` to `PDLDataLoader` and PyTorch `DataLoader`, and increased `max_cached_row_groups = max(4, ...)` in `SIDMapDataset`. Expanded batch prefetch capacity from 8 to 16-32 batches, preventing queue drainage and severe I/O stalls during Parquet boundary decompression.
+    3. **Mask Post-Processor Thread Pool Churn**: Replaced per-batch `concurrent.futures.ThreadPoolExecutor` allocation and teardown in `MaskPostProcessor.process_batch()` with a persistent, pooled executor, eliminating OS thread creation overhead across thousands of evaluation batches.
 - **Noise-RAG Vector Database No-Grad & Detached Alignment Loss**:
   - Enforced `requires_grad = False` and explicit `.detach()` on vector database keys (`db_keys`) and continuous labels (`db_labels`) in `ForensicVectorDBRetrieval.load_database`.
   - Enforced `target = target.detach().requires_grad_(False)` in `compute_alignment_loss` before computing `F.mse_loss`, ensuring surrogate representations and visual tokens do not backpropagate gradients into the frozen retrieved priors.

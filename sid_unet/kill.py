@@ -372,6 +372,20 @@ def kill_all_background_tasks(
     # Step 4: Cleanup library memory & dataset threads
     _cleanup_libraries(quiet=quiet)
 
+    # Step 4.5: Update ProcessRegistry ledger
+    try:
+        from sid_unet.process_manager import STATUS_KILLED, get_process_registry
+        reg = get_process_registry()
+        for pid in pids_to_kill:
+            if not _is_pid_alive(pid):
+                reg.mark_process_terminated(
+                    pid,
+                    status=STATUS_KILLED,
+                    reason="Terminated by sid-kill",
+                )
+    except Exception:
+        pass
+
     # Step 5: Report status and GPU memory
     time.sleep(0.2)
     final_alive = [p for p in pids_to_kill if _is_pid_alive(p)]

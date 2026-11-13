@@ -146,6 +146,9 @@ sid-cache = "sid_unet.cache.cli:cli_main"
 sid-dataset-cache = "sid_unet.cache.cli:cli_main"
 sid-copy-config = "sid_unet.config_copy:cli_main"
 sid-kill = "sid_unet.kill:cli_main"
+sid-tui = "sid_unet.tui:cli_main"
+sid-top = "sid_unet.tui:cli_main"
+sid-tail = "sid_unet.tail:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["."]

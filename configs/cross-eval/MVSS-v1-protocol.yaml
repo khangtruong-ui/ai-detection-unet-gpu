@@ -6,10 +6,10 @@ project:
 data:
   dataset_name: "KhangTruong/Tampered-Images-Combined-Dataset-Fake"
   streaming: false
-  image_size: [256, 256]
+  image_size: [512, 512]
   batch_size: 16
-  num_workers: 4
-  pin_memory: true
+  num_workers: -1
+  pin_memory: false
   eval_split: "cross_test"
   test_split: "cross_test"
   test_samples: -1
