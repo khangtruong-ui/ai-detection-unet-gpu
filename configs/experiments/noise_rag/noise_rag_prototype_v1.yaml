@@ -18,7 +18,7 @@ data:
   dataset_name: "KhangTruong/Casia-v2.0-Fake"
   streaming: true
   image_size: [512, 512]
-  batch_size: 2
+  batch_size: 8
   num_workers: -1
   pin_memory: true
   prefetch_batches: 16
