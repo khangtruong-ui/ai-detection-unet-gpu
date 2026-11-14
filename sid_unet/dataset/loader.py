@@ -20,6 +20,7 @@ from PIL import Image, ImageFile
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from datasets import load_dataset as hf_load_dataset
+from datasets import IterableDataset as HFIterableDataset
 
 from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_rank, get_world_size
 
@@ -754,12 +755,15 @@ def load_hf_dataset_robust(
     """
     candidates = get_split_candidates(requested_split)
     last_error: Optional[Exception] = None
+    primary_error: Optional[Exception] = None
 
-    for cand in candidates:
+    for i, cand in enumerate(candidates):
         try:
             ds = hf_load_dataset(dataset_name, split=cand, streaming=streaming)
             return ds, cand
         except Exception as e:
+            if i == 0:
+                primary_error = e
             last_error = e
             continue
 
@@ -774,6 +778,8 @@ def load_hf_dataset_robust(
             return raw[first_key], first_key
         return raw, requested_split
     except Exception as e:
+        if primary_error is not None:
+            raise primary_error
         if last_error is not None:
             raise last_error
         raise e
@@ -807,8 +813,9 @@ def load_parquet_dataset(
 
     candidates = get_split_candidates(requested_split)
     last_error: Optional[Exception] = None
+    primary_error: Optional[Exception] = None
 
-    for cand in candidates:
+    for i, cand in enumerate(candidates):
         try:
             ds = pdl.load_dataset(
                 path=dataset_name,
@@ -826,10 +833,18 @@ def load_parquet_dataset(
                 **kwargs,
             )
             return ds, cand
+        except (ImportError, ModuleNotFoundError):
+            # Missing dependency (e.g. aiohttp for HTTPFileSystem) must fail fast,
+            # never get masked by fallback candidates
+            raise
         except Exception as e:
+            if i == 0:
+                primary_error = e
             last_error = e
             continue
 
+    if primary_error is not None:
+        raise primary_error
     if last_error is not None:
         raise last_error
     raise RuntimeError(
@@ -875,6 +890,12 @@ def load_parquet_or_hf_dataset(
                 max_cached_row_groups=max_cached_row_groups,
                 **kwargs,
             )
+        except (ImportError, ModuleNotFoundError) as e:
+            logger.error(
+                f"parquet-dataset-loader encountered an import dependency error: {e}. "
+                "Ensure all required dependencies (e.g. aiohttp) are installed."
+            )
+            raise
         except Exception as e:
             logger.info(
                 f"parquet-dataset-loader could not load '{dataset_name}' ({type(e).__name__}: {e}); "
@@ -1322,7 +1343,7 @@ class SIDMapDataset(Dataset):
 
         # If fallback loaded an IterableDataset from HuggingFace (not indexable),
         # reload using HF non-streaming so it becomes an indexable Dataset:
-        if not hasattr(ds, "__getitem__"):
+        if isinstance(ds, (IterableDataset, HFIterableDataset)) or not hasattr(ds, "__len__"):
             ds, resolved = load_hf_dataset_robust(dataset_name, requested_split=split, streaming=False)
             self.resolved_split = resolved
             self.split = resolved
@@ -1340,7 +1361,16 @@ class SIDMapDataset(Dataset):
     def __len__(self) -> int:
         if getattr(self, "_is_mock", False):
             return self._mock_len
-        return len(self.data)
+        if self.data is None:
+            return 0
+        try:
+            return len(self.data)
+        except (TypeError, AttributeError):
+            if hasattr(self.data, "num_rows"):
+                return int(self.data.num_rows)
+            if self.max_samples is not None and self.max_samples > 0:
+                return self.max_samples
+            raise
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if getattr(self, "_is_mock", False):

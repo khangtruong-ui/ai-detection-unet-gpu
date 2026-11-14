@@ -383,4 +383,112 @@ def test_pdl_dataloader_timeout_configuration(temp_parquet_dataset):
     assert eval_custom.timeout == 600.0
 
 
+def test_load_parquet_dataset_fail_fast_on_import_error(monkeypatch):
+    """
+    Verify that when pdl.load_dataset raises an ImportError (e.g. missing aiohttp),
+    load_parquet_dataset immediately raises the ImportError rather than swallowing it
+    and masking it with a downstream SplitNotFoundError on 'train'.
+    """
+    import parquet_dataset_loader as pdl
+
+    calls = []
+    def mock_load_dataset(*args, **kwargs):
+        split = kwargs.get("split")
+        calls.append(split)
+        raise ImportError('HTTPFileSystem requires "requests" and "aiohttp" to be installed')
+
+    monkeypatch.setattr(pdl, "load_dataset", mock_load_dataset)
+
+    with pytest.raises(ImportError, match='HTTPFileSystem requires'):
+        load_parquet_dataset("mock/dataset", requested_split="cross_test")
+
+    # Must fail on the first split attempt and NOT iterate down to 'train'
+    assert calls == ["cross_test"]
+
+
+def test_load_parquet_dataset_preserves_requested_split_primary_error(monkeypatch):
+    """
+    Verify that when all candidate splits fail with SplitNotFoundError,
+    the primary error for the requested split ('cross_test') is raised,
+    rather than a confusing error referring to the fallback candidate ('train').
+    """
+    import parquet_dataset_loader as pdl
+    from parquet_dataset_loader import SplitNotFoundError
+
+    def mock_load_dataset(*args, **kwargs):
+        split = kwargs.get("split")
+        raise SplitNotFoundError(split, ["available_split_only"])
+
+    monkeypatch.setattr(pdl, "load_dataset", mock_load_dataset)
+
+    with pytest.raises(SplitNotFoundError) as exc_info:
+        load_parquet_dataset("mock/dataset", requested_split="cross_test")
+
+    # The exception must reference 'cross_test', NOT 'train'
+    assert "cross_test" in str(exc_info.value)
+    assert "train" not in str(exc_info.value)
+
+
+def test_sid_map_dataset_hf_iterable_fallback_handling(monkeypatch):
+    """
+    Verify that SIDMapDataset correctly detects when Hugging Face fallback
+    returns an IterableDataset (which defines __getitem__ in datasets v2+ but lacks __len__),
+    and safely reloads it non-streaming so it becomes an indexable MapDataset with valid len().
+    """
+    import datasets
+    from datasets import IterableDataset
+
+    class MockHFIterableDataset:
+        def __init__(self):
+            self._samples = [
+                {"image": Image.new("RGB", (32, 32), (10, 20, 30)), "mask": Image.new("L", (32, 32), 0), "label": 0, "img_id": f"s_{i}"}
+                for i in range(5)
+            ]
+
+        def __iter__(self):
+            return iter(self._samples)
+
+        def __getitem__(self, idx):
+            return self._samples[idx]
+
+    class MockHFMapDataset:
+        def __init__(self):
+            self._samples = [
+                {"image": Image.new("RGB", (32, 32), (10, 20, 30)), "mask": Image.new("L", (32, 32), 0), "label": 0, "img_id": f"s_{i}"}
+                for i in range(5)
+            ]
+
+        def __len__(self):
+            return len(self._samples)
+
+        def __getitem__(self, idx):
+            return self._samples[idx]
+
+        def select(self, indices):
+            return [self._samples[i] for i in indices]
+
+    # When streaming=True, return MockHFIterableDataset; when streaming=False, return MockHFMapDataset
+    def mock_hf_load(dataset_name, split=None, streaming=False, **kwargs):
+        if streaming:
+            return MockHFIterableDataset()
+        return MockHFMapDataset()
+
+    monkeypatch.setattr("sid_unet.dataset.loader._HAS_PARQUET_LOADER", False)
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", mock_hf_load)
+
+    # Initialize SIDMapDataset with use_parquet_loader=False to force HF fallback
+    ds = SIDMapDataset(
+        dataset_name="dummy/test_repo",
+        split="cross_test",
+        use_parquet_loader=False,
+    )
+
+    # Verify length and indexing work cleanly without TypeError
+    assert len(ds) == 5
+    sample = ds[0]
+    assert "image" in sample
+    assert "mask" in sample
+
+
+
 
