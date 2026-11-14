@@ -28,6 +28,7 @@ dependencies = [
     "omegaconf>=2.3.0",
     "iopath>=0.1.10",
     "filelock>=3.8.0",
+    "aiohttp>=3.9.0",
     "parquet-dataset-loader @ git+https://github.com/khangtruong-ui/parquet-dataset-loader.git",
 ]
 

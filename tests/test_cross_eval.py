@@ -710,4 +710,29 @@ def test_per_dataset_report_formatting():
     assert "CocoGlide" in master_report["markdown"]
 
 
+def test_cross_eval_cross_test_split_resolution_and_loader():
+    """
+    Verify that cross-eval config with cross_test split (such as MVSS-v1-protocol.yaml)
+    creates an indexable evaluation DataLoader with valid length and does not raise
+    IterableDataset TypeError.
+    """
+    from sid_unet.dataset.loader import create_eval_dataloader, safe_dataloader_len
+    from sid_unet.utils.config import load_config
+
+    cfg = load_config("configs/cross-eval/MVSS-v1-protocol.yaml", overrides=[
+        "data.dataset_name=mock",
+        "data.eval_split=cross_test",
+        "data.batch_size=2",
+        "data.num_workers=0",
+    ])
+    eval_loader = create_eval_dataloader(cfg, split="cross_test", max_samples=4)
+    total_len = safe_dataloader_len(eval_loader)
+    assert total_len is not None
+    assert total_len > 0
+    batch = next(iter(eval_loader))
+    assert "image" in batch
+    assert "mask" in batch
+
+
+
 

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-14
+
+### Fixed
+- **Cross-Evaluation Split Resolution & Preserved Error Reporting (`sid_unet.dataset.loader`)**:
+  - Fixed candidate split fallback in `load_parquet_dataset` and `load_hf_dataset_robust`: when candidate splits are evaluated, the primary error from the requested split (e.g. `cross_test`) is preserved and re-raised upon failure, preventing misleading reports of `Split 'train' not found` when the requested split fails.
+  - Implemented fail-fast re-raising for `ImportError` / `ModuleNotFoundError` during `load_parquet_dataset` and `load_parquet_or_hf_dataset`, ensuring missing dependencies (such as `aiohttp` for HTTP range streaming) are reported directly rather than swallowed and masked by subsequent split candidate attempts.
+- **Hugging Face Streaming `IterableDataset` Fallback Detection in `SIDMapDataset`**:
+  - Replaced flawed `if not hasattr(ds, "__getitem__"):` check with `if isinstance(ds, (IterableDataset, HFIterableDataset)) or not hasattr(ds, "__len__"):`. In modern Hugging Face `datasets` versions, `IterableDataset` implements `__getitem__` for slicing/taking, which prevented map-style dataset initialization from reloading in non-streaming mode and resulted in `TypeError: object of type 'IterableDataset' has no len()`.
+  - Added robust `__len__` fallback in `SIDMapDataset` to handle `num_rows` and `max_samples` gracefully.
+- **Added `aiohttp>=3.9.0` Dependency**:
+  - Added `aiohttp>=3.9.0` to `dependencies` in `pyproject.toml` to satisfy `fsspec` HTTPFileSystem requirements when streaming remote Parquet datasets via `parquet-dataset-loader`.
+
 ## [Unreleased] - 2026-11-13
 
 ### Added
