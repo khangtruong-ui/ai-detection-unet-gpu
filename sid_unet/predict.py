@@ -27,6 +27,7 @@ from tabulate import tabulate
 from sid_unet.models.unet import UNet, build_model
 from sid_unet.utils.config import load_config, DEFAULT_CONFIG, deep_merge, ConfigDict, apply_overrides
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error
+from sid_unet.utils.precision import PrecisionSpec, resolve_precision_spec, prepare_model_for_fp8_inference
 
 
 def parse_args():
@@ -91,6 +92,14 @@ def parse_args():
         default=None,
         help="Morphological operation for post-processing ('open_close', 'open', 'close', 'none').",
     )
+    parser.add_argument(
+        "--precision",
+        "--mixed-precision",
+        dest="precision",
+        type=str,
+        default=None,
+        help="Execution precision: 'auto' (default: fp8 e4m3 on supported GPU), 'fp8'/'bf8'/'e4m3', 'bf16', 'fp16', or 'fp32'.",
+    )
     return parser.parse_args()
 
 
@@ -140,10 +149,16 @@ def create_overlay(orig_pil: Image.Image, mask_2d: np.ndarray, alpha: float = 0.
     return Image.fromarray(np.clip(overlay_arr, 0, 255).astype(np.uint8))
 
 
-def _predict_chunk(model, chunk_tensors, device):
+def _predict_chunk(model, chunk_tensors, device, precision_spec: Optional[PrecisionSpec] = None):
     """Run model prediction on a batch of tensors with OOM handling."""
+    spec = precision_spec or resolve_precision_spec(device=device)
     chunk_inp = torch.cat(chunk_tensors, dim=0).to(device)
-    outputs = model(chunk_inp)
+    with torch.amp.autocast(
+        device_type=device.type,
+        dtype=spec.amp_dtype,
+        enabled=(spec.amp_enabled and device.type == "cuda"),
+    ):
+        outputs = model(chunk_inp)
     if isinstance(outputs, (tuple, list)):
         mask_logits = outputs[0]
         class_logits = outputs[1] if len(outputs) > 1 else None
@@ -176,6 +191,9 @@ def main():
         config_path=args.config,
         overrides=args.override,
     )
+    precision_spec = resolve_precision_spec(config, mode=getattr(args, "precision", None), device=device)
+    model, _fp8_info = prepare_model_for_fp8_inference(model, precision_spec)
+    print(f"Inference precision: {precision_spec.mode} (compute/amp dtype={precision_spec.amp_dtype_str})")
     target_size = (args.image_size[0], args.image_size[1])
 
     image_paths: List[str] = []
@@ -221,7 +239,7 @@ def main():
             orig_pils = [p for _, p in preprocessed]
 
             try:
-                mask_logits, class_logits = _predict_chunk(model, chunk_tensors, device)
+                mask_logits, class_logits = _predict_chunk(model, chunk_tensors, device, precision_spec=precision_spec)
             except Exception as exc:
                 if is_oom_error(exc):
                     print(f"⚠️ OOM during batch inference of {len(chunk_paths)} images. Falling back to single-image mode...")
@@ -230,7 +248,7 @@ def main():
                     mask_logits_list = []
                     class_logits_list = []
                     for t in chunk_tensors:
-                        m_l, c_l = _predict_chunk(model, [t], device)
+                        m_l, c_l = _predict_chunk(model, [t], device, precision_spec=precision_spec)
                         mask_logits_list.append(m_l)
                         if c_l is not None:
                             class_logits_list.append(c_l)

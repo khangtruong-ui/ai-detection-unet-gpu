@@ -3050,6 +3050,12 @@ $$
 \mathrm{Precision} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FP}}, \qquad \mathrm{Recall} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FN}}, \qquad \mathrm{Specificity} = \frac{\mathrm{TN}}{\mathrm{TN} + \mathrm{FP}}
 $$
 
+- **95% Confidence Intervals (`sid_unet.metrics.confidence`)**:
+  - Every tracked segmentation metric (`iou`, `dice`, `f1`, `auroc`, `pixel_acc`, `precision`, `recall`, `specificity`, `*_positive`, `per_label`, and `per_dataset`) reports two-sided **95% Student's-$t$ confidence intervals** (`[low, high] (±margin)`) accumulated via parallel Welford/Chan variance tracking.
+  - Auxiliary classification metrics report **Wilson score 95% CIs** (`aux_accuracy`) and **deterministic bootstrap 95% CIs** (`aux_macro_f1`, `aux_auroc`).
+- **Native FP8 / BF8 (`float8_e4m3fn` / `e4m3`) Precision (`sid_unet.utils.precision`)**:
+  - Enabled by default (`--precision auto` / `training.mixed_precision: "auto"` / `training.fp8_all_parameters: true`) on supported NVIDIA GPUs (SM >= 8.9), with automatic fallback to `bf16` / `fp16` on older GPUs. See [docs/fp8_and_ci_metrics.md](docs/fp8_and_ci_metrics.md) for architecture details and L4 benchmarks.
+
 ---
 
 ## Running Tests

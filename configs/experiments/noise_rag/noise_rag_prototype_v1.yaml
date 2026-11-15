@@ -34,7 +34,7 @@ model:
   name: "noise-rag-prototype-v1"
   freeze_noiseprint: true
   memory_path: "outputs/cache/mask_clip_db_mae/mask_clip_db_mae.pt"
-  memory_dtype: "float16"
+  memory_dtype: "auto"
   embed_dim: 256
   conv_backbone: "mobilenetv3_small_100"
   num_vit_blocks: 2
@@ -57,7 +57,8 @@ training:
   lr: 0.0001
   weight_decay: 0.0001
   amp: true
-  mixed_precision: "bf16"
+  mixed_precision: "auto" # Defaults to fp8 (float8_e4m3fn) when GPU >= SM 8.9 supports it
+  fp8_all_parameters: true
   gradient_clip: 1.0
   save_best: true
   save_latest: true

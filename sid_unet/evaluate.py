@@ -42,6 +42,7 @@ from sid_unet.models.unet import UNet
 from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
 from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
+from sid_unet.utils.precision import PrecisionSpec, resolve_precision_spec, prepare_model_for_fp8_inference
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.distributed import is_kaggle_environment
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
@@ -229,6 +230,14 @@ def parse_args():
         default=None,
         help="Specific CUDA device IDs to use for evaluation (e.g. --device-ids 0 1).",
     )
+    parser.add_argument(
+        "--precision",
+        "--mixed-precision",
+        dest="precision",
+        type=str,
+        default=None,
+        help="Execution precision: 'auto' (default: fp8 e4m3 on supported GPU), 'fp8'/'bf8'/'e4m3', 'bf16', 'fp16', or 'fp32'.",
+    )
     return parser.parse_args()
 
 
@@ -247,6 +256,7 @@ def eval_single_batch(
     refiner: Optional[Any] = None,
     collect_samples: Optional[List[Dict[str, Any]]] = None,
     max_collect: int = 8,
+    precision_spec: Optional[PrecisionSpec] = None,
 ) -> Tuple[float, int, List[Dict[str, Any]]]:
     """
     Execute forward evaluation for a single batch across all active pipeline stages:
@@ -279,8 +289,9 @@ def eval_single_batch(
         except Exception:
             pass
 
-    use_amp = (device.type == "cuda") and torch.cuda.is_available()
-    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    spec = precision_spec or resolve_precision_spec(device=device)
+    use_amp = spec.amp_enabled and (device.type == "cuda") and torch.cuda.is_available()
+    amp_dtype = spec.amp_dtype
     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(images, **model_kwargs) if model_kwargs else model(images)
         loss, _ = loss_fn(outputs, masks, labels)
@@ -421,6 +432,7 @@ def evaluate_single_checkpoint(
     filter_zero_positive: bool = True,
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
+    precision: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run full evaluation on a single checkpoint with ablation tracking and illustration generation."""
     if not os.path.exists(checkpoint_path):
@@ -573,8 +585,13 @@ def evaluate_single_checkpoint(
     else:
         logger.info("Mask Post-Processing is disabled.")
 
+    precision_spec = resolve_precision_spec(config, mode=precision, device=device, logger_instance=logger)
+    logger.info(f"Evaluation precision: {precision_spec.mode} (AMP/compute dtype={precision_spec.amp_dtype_str})")
+
     model.to(device)
     model.eval()
+
+    model, fp8_info = prepare_model_for_fp8_inference(model, precision_spec, logger_instance=logger)
 
     if use_data_parallel and target_device_ids:
         model = torch.nn.DataParallel(model, device_ids=target_device_ids)
@@ -622,6 +639,7 @@ def evaluate_single_checkpoint(
                     refiner=refiner,
                     collect_samples=collected_samples,
                     max_collect=max_illustrations,
+                    precision_spec=precision_spec,
                 )
                 total_loss_sum += loss_contrib
                 total_samples += count
@@ -651,6 +669,7 @@ def evaluate_single_checkpoint(
                                 refiner=refiner,
                                 collect_samples=collected_samples,
                                 max_collect=max_illustrations,
+                                precision_spec=precision_spec,
                             )
                             total_loss_sum += loss_contrib
                             total_samples += count
@@ -676,6 +695,7 @@ def evaluate_single_checkpoint(
                                         refiner=refiner,
                                         collect_samples=collected_samples,
                                         max_collect=max_illustrations,
+                                        precision_spec=precision_spec,
                                     )
                                     total_loss_sum += loss_contrib
                                     total_samples += count
@@ -741,6 +761,9 @@ def evaluate_single_checkpoint(
 
     overall_metrics = {
         "eval_split": resolved_split,
+        "precision_mode": precision_spec.mode,
+        "amp_dtype": precision_spec.amp_dtype_str,
+        "fp8_enabled": precision_spec.fp8_enabled,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
         **chosen_seg,
         **cls_metrics,
@@ -830,6 +853,7 @@ def evaluate_single_checkpoint(
             report_name="evaluation_report",
             ablation_results=ablation_dict if len(ablation_dict) > 1 else None,
             illustration_paths=local_illustration_paths if local_illustration_paths else None,
+            per_dataset_metrics=chosen_per_dataset,
         )
 
     logger.info("\n" + report_result["markdown"])
@@ -927,6 +951,7 @@ def main():
             filter_zero_positive=args.filter_zero_positive,
             data_parallel=args.data_parallel,
             device_ids=args.device_ids,
+            precision=getattr(args, "precision", None),
         )
         return res["report_result"]
 
@@ -961,6 +986,7 @@ def main():
             filter_zero_positive=args.filter_zero_positive,
             data_parallel=args.data_parallel,
             device_ids=args.device_ids,
+            precision=getattr(args, "precision", None),
         )
         all_results.append(res)
 

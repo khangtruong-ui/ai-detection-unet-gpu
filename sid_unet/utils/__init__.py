@@ -35,6 +35,15 @@ from sid_unet.utils.compatibility import (
     installation_check_8bit,
     cli_check_8bit,
 )
+from sid_unet.utils.precision import (
+    PrecisionSpec,
+    check_fp8_compatibility,
+    is_fp8_supported,
+    normalize_precision_mode,
+    resolve_precision_spec,
+    prepare_model_for_fp8_training,
+    prepare_model_for_fp8_inference,
+)
 
 from sid_unet.utils.signals import (
     shield_process_signals,
@@ -90,6 +99,13 @@ __all__ = [
     "validate_8bit_environment",
     "installation_check_8bit",
     "cli_check_8bit",
+    "PrecisionSpec",
+    "check_fp8_compatibility",
+    "is_fp8_supported",
+    "normalize_precision_mode",
+    "resolve_precision_spec",
+    "prepare_model_for_fp8_training",
+    "prepare_model_for_fp8_inference",
     "shield_process_signals",
     "shield_worker_signals",
     "SSH_DISCONNECT_SIGNALS",

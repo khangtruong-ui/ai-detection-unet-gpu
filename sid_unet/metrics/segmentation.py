@@ -378,12 +378,82 @@ class SegmentationMetricTracker:
             down the segmentation metric (default: False).
     """
 
-    def __init__(self, threshold: float = 0.5, filter_zero_positive: bool = False):
+    def __init__(self, threshold: float = 0.5, filter_zero_positive: bool = False, confidence_level: float = 0.95):
         self.threshold = threshold
         self.filter_zero_positive = filter_zero_positive
+        self.confidence_level = float(confidence_level)
         self.reset()
 
+    @staticmethod
+    def _new_subgroup_stat() -> Dict[str, Any]:
+        from sid_unet.metrics.confidence import OnlineVarianceTracker
+
+        all_keys = ["iou", "dice", "f1", "pixel_f1", "macro_f1", "auroc", "pixel_auroc", "pixel_acc", "precision", "recall", "specificity"]
+        pos_keys = ["iou", "dice", "f1", "pixel_f1", "macro_f1", "precision", "recall"]
+        return {
+            "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0,
+            "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0,
+            "count": 0, "pos_count": 0,
+            "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0,
+            "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
+            "_var_all": OnlineVarianceTracker(all_keys),
+            "_var_pos": OnlineVarianceTracker(pos_keys),
+        }
+
+    @staticmethod
+    def _compute_batch_sums_and_m2(
+        batch_metrics: Dict[str, torch.Tensor],
+        keys: Sequence[str],
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, Dict[str, float], Dict[str, float]]:
+        vals = torch.stack([batch_metrics[k][mask] if mask is not None else batch_metrics[k] for k in keys]).float()
+        n = int(vals.size(1))
+        if n == 0:
+            return 0, {k: 0.0 for k in keys}, {k: 0.0 for k in keys}
+        b_sums = vals.sum(dim=1)
+        b_means = b_sums / float(n)
+        b_m2s = ((vals - b_means.unsqueeze(1)) ** 2).sum(dim=1)
+        packed = torch.cat([b_sums, b_m2s]).detach().cpu().tolist()
+        k_len = len(keys)
+        return (
+            n,
+            {k: packed[idx] for idx, k in enumerate(keys)},
+            {k: packed[k_len + idx] for idx, k in enumerate(keys)},
+        )
+
+    def _build_ci_map(
+        self,
+        var_all: Any,
+        var_pos: Any,
+        pos_count: int,
+        use_positive_primary: bool,
+    ) -> Dict[str, Dict[str, float]]:
+        cl = self.confidence_level
+        all_keys = ["iou", "dice", "f1", "pixel_f1", "macro_f1", "auroc", "pixel_auroc", "pixel_acc", "precision", "recall", "specificity"]
+        pos_metric_keys = ["iou", "dice", "f1", "precision", "recall"]
+        ci_map: Dict[str, Dict[str, float]] = {}
+
+        for k in all_keys:
+            if use_positive_primary and k in pos_metric_keys and pos_count > 0:
+                ci_map[k] = var_pos.ci_for(k, confidence_level=cl)
+            elif use_positive_primary and k == "pixel_f1" and pos_count > 0:
+                ci_map[k] = var_pos.ci_for("f1", confidence_level=cl)
+            else:
+                ci_map[k] = var_all.ci_for(k, confidence_level=cl)
+
+        for k in ("iou", "dice", "f1", "macro_f1", "precision", "recall"):
+            ci_map[f"{k}_all"] = var_all.ci_for(k, confidence_level=cl)
+        for k in pos_metric_keys:
+            ci_map[f"{k}_positive"] = (
+                var_pos.ci_for(k, confidence_level=cl)
+                if pos_count > 0
+                else var_all.ci_for(k, confidence_level=cl)
+            )
+        return ci_map
+
     def reset(self):
+        from sid_unet.metrics.confidence import OnlineVarianceTracker
+
         self.total_samples = 0
         self.positive_samples = 0
         self.zero_positive_samples = 0
@@ -409,13 +479,15 @@ class SegmentationMetricTracker:
             "precision": 0.0,
             "recall": 0.0,
         }
+        self._var_all = OnlineVarianceTracker(list(self.metrics_sum.keys()))
+        self._var_pos = OnlineVarianceTracker(list(self.positive_metrics_sum.keys()))
         # Per-label accumulator (0: Real, 1: Fully AI, 2: Partially AI, plus dynamic labels)
-        self.per_label_stats: Dict[int, Dict[str, Union[float, int]]] = {
-            0: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
-            1: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
-            2: {"iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0, "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0, "specificity_sum": 0.0, "count": 0, "pos_count": 0, "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0, "precision_pos_sum": 0.0, "recall_pos_sum": 0.0},
+        self.per_label_stats: Dict[int, Dict[str, Any]] = {
+            0: self._new_subgroup_stat(),
+            1: self._new_subgroup_stat(),
+            2: self._new_subgroup_stat(),
         }
-        self.per_dataset_stats: Dict[str, Dict[str, Union[float, int]]] = {}
+        self.per_dataset_stats: Dict[str, Dict[str, Any]] = {}
 
     def update(
         self,
@@ -457,35 +529,31 @@ class SegmentationMetricTracker:
         self.positive_samples += num_pos
         self.zero_positive_samples += (b - num_pos)
 
-        # Global sums (batched GPU-to-CPU reduction in a single tensor transfer)
+        # Global sums & online variance (single batched GPU-to-CPU reduction)
         keys_list = list(self.metrics_sum.keys())
-        stacked_sums = torch.stack([batch_metrics[k].sum() for k in keys_list])
-        sums_list = stacked_sums.detach().cpu().tolist()
-        for k, v in zip(keys_list, sums_list):
-            self.metrics_sum[k] += v
+        n_all, sums_dict, m2s_dict = self._compute_batch_sums_and_m2(batch_metrics, keys_list)
+        for k in keys_list:
+            self.metrics_sum[k] += sums_dict[k]
+        self._var_all.merge_batch(n_all, sums_dict, m2s_dict)
 
         if num_pos > 0:
             pos_keys_list = list(self.positive_metrics_sum.keys())
-            pos_stacked_sums = torch.stack([batch_metrics[k][has_pos].sum() for k in pos_keys_list])
-            pos_sums_list = pos_stacked_sums.detach().cpu().tolist()
-            for k, v in zip(pos_keys_list, pos_sums_list):
-                self.positive_metrics_sum[k] += v
+            n_pos, pos_sums_dict, pos_m2s_dict = self._compute_batch_sums_and_m2(batch_metrics, pos_keys_list, mask=has_pos)
+            for k in pos_keys_list:
+                self.positive_metrics_sum[k] += pos_sums_dict[k]
+            self._var_pos.merge_batch(n_pos, pos_sums_dict, pos_m2s_dict)
 
         # Per-label stats
         if labels is not None:
             labels_flat = labels.view(-1)
             unique_labels = torch.unique(labels_flat)
             lbl_list = unique_labels.detach().cpu().tolist()
+            lbl_keys = ["iou", "dice", "f1", "pixel_f1", "macro_f1", "auroc", "pixel_auroc", "pixel_acc", "precision", "recall", "specificity"]
+            pos_lbl_keys = ["iou", "dice", "f1", "pixel_f1", "macro_f1", "precision", "recall"]
             for lbl_val, lbl_t in zip(lbl_list, unique_labels):
                 lbl = int(lbl_val)
                 if lbl not in self.per_label_stats:
-                    self.per_label_stats[lbl] = {
-                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0,
-                        "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0,
-                        "specificity_sum": 0.0, "count": 0, "pos_count": 0,
-                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0,
-                        "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
-                    }
+                    self.per_label_stats[lbl] = self._new_subgroup_stat()
                 mask_lbl = (labels_flat == lbl_t)
                 cnt_lbl = int(mask_lbl.sum().item())
                 pos_mask_lbl = mask_lbl & has_pos
@@ -495,19 +563,22 @@ class SegmentationMetricTracker:
                 l_stat["count"] += cnt_lbl
                 l_stat["pos_count"] += pos_cnt_lbl
 
-                lbl_keys = ["iou", "dice", "f1", "macro_f1", "auroc", "pixel_acc", "precision", "recall", "specificity"]
-                lbl_sums = torch.stack([batch_metrics[k][mask_lbl].sum() for k in lbl_keys]).detach().cpu().tolist()
-                for k, s in zip(lbl_keys, lbl_sums):
-                    l_stat[f"{k}_sum"] += s
+                n_l, l_sums, l_m2s = self._compute_batch_sums_and_m2(batch_metrics, lbl_keys, mask=mask_lbl)
+                for k in ("iou", "dice", "f1", "macro_f1", "auroc", "pixel_acc", "precision", "recall", "specificity"):
+                    l_stat[f"{k}_sum"] += l_sums[k]
+                l_stat["_var_all"].merge_batch(n_l, l_sums, l_m2s)
 
                 if pos_cnt_lbl > 0:
-                    pos_lbl_keys = ["iou", "dice", "f1", "macro_f1", "precision", "recall"]
-                    pos_lbl_sums = torch.stack([batch_metrics[k][pos_mask_lbl].sum() for k in pos_lbl_keys]).detach().cpu().tolist()
-                    for k, s in zip(pos_lbl_keys, pos_lbl_sums):
-                        l_stat[f"{k}_pos_sum"] += s
+                    n_lp, lp_sums, lp_m2s = self._compute_batch_sums_and_m2(batch_metrics, pos_lbl_keys, mask=pos_mask_lbl)
+                    for k in ("iou", "dice", "f1", "macro_f1", "precision", "recall"):
+                        l_stat[f"{k}_pos_sum"] += lp_sums[k]
+                    l_stat["_var_pos"].merge_batch(n_lp, lp_sums, lp_m2s)
 
         # Per-dataset stats
         if datasets is not None:
+            ds_sample_keys = ["iou", "dice", "f1", "pixel_f1", "macro_f1", "auroc", "pixel_auroc", "pixel_acc", "precision", "recall", "specificity"]
+            ds_cpu_rows = torch.stack([batch_metrics[k] for k in ds_sample_keys], dim=1).detach().cpu().tolist()
+            has_pos_cpu = has_pos.detach().cpu().tolist()
             for i, raw_ds in enumerate(datasets):
                 if i >= b:
                     break
@@ -515,33 +586,19 @@ class SegmentationMetricTracker:
                     continue
                 ds_name = str(raw_ds).strip()
                 if ds_name not in self.per_dataset_stats:
-                    self.per_dataset_stats[ds_name] = {
-                        "iou_sum": 0.0, "dice_sum": 0.0, "f1_sum": 0.0, "macro_f1_sum": 0.0, "auroc_sum": 0.0,
-                        "pixel_acc_sum": 0.0, "precision_sum": 0.0, "recall_sum": 0.0,
-                        "specificity_sum": 0.0, "count": 0, "pos_count": 0,
-                        "iou_pos_sum": 0.0, "dice_pos_sum": 0.0, "f1_pos_sum": 0.0, "macro_f1_pos_sum": 0.0,
-                        "precision_pos_sum": 0.0, "recall_pos_sum": 0.0,
-                    }
+                    self.per_dataset_stats[ds_name] = self._new_subgroup_stat()
                 ds_stat = self.per_dataset_stats[ds_name]
+                row_map = {k: float(ds_cpu_rows[i][j]) for j, k in enumerate(ds_sample_keys)}
                 ds_stat["count"] += 1
-                ds_stat["iou_sum"] += float(batch_metrics["iou"][i].item())
-                ds_stat["dice_sum"] += float(batch_metrics["dice"][i].item())
-                ds_stat["f1_sum"] += float(batch_metrics["f1"][i].item())
-                ds_stat["macro_f1_sum"] += float(batch_metrics["macro_f1"][i].item())
-                ds_stat["auroc_sum"] += float(batch_metrics["auroc"][i].item())
-                ds_stat["pixel_acc_sum"] += float(batch_metrics["pixel_acc"][i].item())
-                ds_stat["precision_sum"] += float(batch_metrics["precision"][i].item())
-                ds_stat["recall_sum"] += float(batch_metrics["recall"][i].item())
-                ds_stat["specificity_sum"] += float(batch_metrics["specificity"][i].item())
+                for k in ("iou", "dice", "f1", "macro_f1", "auroc", "pixel_acc", "precision", "recall", "specificity"):
+                    ds_stat[f"{k}_sum"] += row_map[k]
+                ds_stat["_var_all"].update_single(row_map)
 
-                if bool(has_pos[i].item()):
+                if bool(has_pos_cpu[i]):
                     ds_stat["pos_count"] += 1
-                    ds_stat["iou_pos_sum"] += float(batch_metrics["iou"][i].item())
-                    ds_stat["dice_pos_sum"] += float(batch_metrics["dice"][i].item())
-                    ds_stat["f1_pos_sum"] += float(batch_metrics["f1"][i].item())
-                    ds_stat["macro_f1_pos_sum"] += float(batch_metrics["macro_f1"][i].item())
-                    ds_stat["precision_pos_sum"] += float(batch_metrics["precision"][i].item())
-                    ds_stat["recall_pos_sum"] += float(batch_metrics["recall"][i].item())
+                    for k in ("iou", "dice", "f1", "macro_f1", "precision", "recall"):
+                        ds_stat[f"{k}_pos_sum"] += row_map[k]
+                    ds_stat["_var_pos"].update_single(row_map)
 
     def compute_per_dataset(self) -> Dict[str, Dict[str, float]]:
         """
@@ -586,7 +643,8 @@ class SegmentationMetricTracker:
                 ds_m["precision_positive"] = ds_m["precision_all"]
                 ds_m["recall_positive"] = ds_m["recall_all"]
 
-            if self.filter_zero_positive and pos_cnt > 0:
+            use_pos_ds = self.filter_zero_positive and pos_cnt > 0
+            if use_pos_ds:
                 ds_m["iou"] = ds_m["iou_positive"]
                 ds_m["dice"] = ds_m["dice_positive"]
                 ds_m["f1"] = ds_m["f1_positive"]
@@ -600,6 +658,15 @@ class SegmentationMetricTracker:
                 ds_m["pixel_f1"] = ds_m["f1_all"]
                 ds_m["precision"] = ds_m["precision_all"]
                 ds_m["recall"] = ds_m["recall_all"]
+
+            from sid_unet.metrics.confidence import attach_ci_fields
+            ds_ci = self._build_ci_map(
+                stats["_var_all"],
+                stats["_var_pos"],
+                pos_count=pos_cnt,
+                use_positive_primary=use_pos_ds,
+            )
+            attach_ci_fields(ds_m, ds_ci, confidence_level=self.confidence_level)
 
             per_dataset[ds_name] = ds_m
 
@@ -646,7 +713,8 @@ class SegmentationMetricTracker:
             overall["precision_positive"] = overall.get("precision", 0.0)
             overall["recall_positive"] = overall.get("recall", 0.0)
 
-        if self.filter_zero_positive and self.positive_samples > 0:
+        use_pos_overall = self.filter_zero_positive and self.positive_samples > 0
+        if use_pos_overall:
             overall["iou"] = overall["iou_positive"]
             overall["dice"] = overall["dice_positive"]
             overall["f1"] = overall["f1_positive"]
@@ -654,12 +722,22 @@ class SegmentationMetricTracker:
             overall["precision"] = overall["precision_positive"]
             overall["recall"] = overall["recall_positive"]
 
+        from sid_unet.metrics.confidence import attach_ci_fields
+        overall_ci = self._build_ci_map(
+            self._var_all,
+            self._var_pos,
+            pos_count=self.positive_samples,
+            use_positive_primary=use_pos_overall,
+        )
+        attach_ci_fields(overall, overall_ci, confidence_level=self.confidence_level)
+
         per_label = {}
         for lbl, stats in self.per_label_stats.items():
             cnt = int(stats["count"])
             pos_cnt = int(stats.get("pos_count", cnt))
             if cnt > 0:
-                if self.filter_zero_positive and pos_cnt > 0:
+                use_pos_lbl = self.filter_zero_positive and pos_cnt > 0
+                if use_pos_lbl:
                     lbl_iou = stats["iou_pos_sum"] / pos_cnt
                     lbl_dice = stats.get("dice_pos_sum", stats["dice_sum"]) / pos_cnt
                     lbl_f1 = stats.get("f1_pos_sum", stats["f1_sum"]) / pos_cnt
@@ -698,6 +776,13 @@ class SegmentationMetricTracker:
                     "samples": cnt,
                     "positive_samples": pos_cnt,
                 }
+                lbl_ci = self._build_ci_map(
+                    stats["_var_all"],
+                    stats["_var_pos"],
+                    pos_count=pos_cnt,
+                    use_positive_primary=use_pos_lbl,
+                )
+                attach_ci_fields(per_label[lbl], lbl_ci, confidence_level=self.confidence_level)
             else:
                 per_label[lbl] = {
                     "iou": 0.0,
