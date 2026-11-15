@@ -50,6 +50,7 @@ from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
 from sid_unet.utils.network import NetworkSpeedMonitor, BottleneckDetector
 from sid_unet.utils.compatibility import check_8bit_compatibility
+from sid_unet.utils.precision import resolve_precision_spec, prepare_model_for_fp8_training
 from sid_unet.utils.config import save_config
 
 def parse_checkpoint_period(training_cfg: Any) -> float:
@@ -176,12 +177,20 @@ class Trainer:
             import logging
             self.logger.setLevel(logging.WARNING)
 
-        # 3. Model, Loss, DataLoaders
+        # 3. Model, Precision Preparation, Loss, DataLoaders
+        self.precision_spec = resolve_precision_spec(config, device=self.device, logger_instance=self.logger)
+        self.fp8_info: Dict[str, Any] = {"enabled": False}
         loaded_model = model or build_model(config)
         is_quantized = getattr(loaded_model, "load_in_4bit", False) or getattr(loaded_model, "load_in_8bit", False)
         if not is_quantized:
             clear_memory_cache(self.device)
-            self.model = loaded_model.to(self.device)
+            loaded_model = loaded_model.to(self.device)
+            self.fp8_info = prepare_model_for_fp8_training(
+                loaded_model,
+                self.precision_spec,
+                logger_instance=self.logger,
+            )
+            self.model = loaded_model
             if self.is_distributed:
                 for buf in self.model.buffers():
                     if buf is not None and buf.device != self.device:
@@ -268,20 +277,20 @@ class Trainer:
         self.opt_name = str(config.training.get("optimizer", "adamw")).lower()
         use_8bit_opt = bool(config.training.get("use_8bit_optimizer", False))
 
-        # Determine native GPU 16-bit AMP dtype (bfloat16 if supported, else float16)
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            if torch.cuda.is_bf16_supported():
-                self.amp_dtype = torch.bfloat16
-                self.amp_dtype_str = "bfloat16"
-            else:
-                self.amp_dtype = torch.float16
-                self.amp_dtype_str = "float16"
-        else:
-            self.amp_dtype = torch.float32
-            self.amp_dtype_str = "float32"
+        # Determine execution AMP dtype (respects FP8 E4M3 default on SM >= 8.9 GPUs or explicit precision)
+        self.amp_dtype = self.precision_spec.amp_dtype
+        self.amp_dtype_str = self.precision_spec.amp_dtype_str
+        self.fp8_enabled = self.precision_spec.fp8_enabled
 
         # Default precision mode
-        self.precision_mode = "8bit" if (use_8bit_opt or "8bit" in self.opt_name) else "16bit"
+        if use_8bit_opt or "8bit" in self.opt_name:
+            self.precision_mode = "8bit"
+        elif self.fp8_enabled:
+            self.precision_mode = "fp8"
+        elif self.precision_spec.amp_enabled:
+            self.precision_mode = "16bit"
+        else:
+            self.precision_mode = "fp32"
 
         # Validate 8-bit model quantization if requested
         if getattr(loaded_model, "load_in_8bit", False):
@@ -293,6 +302,7 @@ class Trainer:
                 )
                 if fallback:
                     self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                    self._ensure_gpu_16bit_dtype()
                     self.logger.warning(
                         f"⚠️ 8-Bit Model Quantization Fallback: load_in_8bit is not supported "
                         f"({self.compatibility_8bit_details.get('message')}). "
@@ -314,14 +324,16 @@ class Trainer:
         self.scheduler = self._build_scheduler()
 
         # 5. Mixed Precision, Gradient Accumulation & Clipping
-        # When falling back to GPU 16-bit mode or amp is enabled, ensure AMP is active on CUDA
-        configured_amp = bool(config.training.get("amp", True))
+        # When falling back to GPU 16-bit mode or amp/fp8 is enabled, ensure AMP is active on CUDA
+        configured_amp = bool(self.precision_spec.amp_enabled)
         is_fallback_16bit = (self.precision_mode in ["gpu_16bit", "16bit"])
         self.use_amp = (configured_amp or is_fallback_16bit) and self.device.type == "cuda"
+        # GradScaler is needed only for float16 (bfloat16 / fp8 E4M3 do not use float16 loss scaling)
+        scaler_enabled = self.use_amp and (self.amp_dtype == torch.float16)
         if hasattr(torch.amp, "GradScaler"):
-            self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+            self.scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
         else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
         self.grad_clip = float(config.training.get("grad_clip_norm", 1.0))
         self.gradient_accumulation_steps = max(1, int(config.training.get("gradient_accumulation_steps", 1)))
         self.auto_batch_size = bool(config.training.get("auto_batch_size", True))
@@ -695,6 +707,15 @@ class Trainer:
         except Exception:
             pass
 
+    def _ensure_gpu_16bit_dtype(self) -> None:
+        if self.device.type == "cuda" and self.amp_dtype == torch.float32:
+            if torch.cuda.is_bf16_supported():
+                self.amp_dtype = torch.bfloat16
+                self.amp_dtype_str = "bfloat16"
+            else:
+                self.amp_dtype = torch.float16
+                self.amp_dtype_str = "float16"
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable_params:
@@ -733,6 +754,7 @@ class Trainer:
                     )
                     if fallback:
                         self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                        self._ensure_gpu_16bit_dtype()
                         self.logger.warning(
                             f"⚠️ 8-Bit Optimizer initialization failed ({opt_err}). "
                             f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
@@ -746,6 +768,7 @@ class Trainer:
                 )
                 if fallback:
                     self.precision_mode = "gpu_16bit" if self.device.type == "cuda" else "cpu_fp32"
+                    self._ensure_gpu_16bit_dtype()
                     self.logger.warning(
                         f"⚠️ 8-Bit Training Mode Fallback: 8-bit optimizer requested ('{self.opt_name}'), but "
                         f"{self.compatibility_8bit_details.get('message', 'environment is incompatible')}. "
@@ -1640,12 +1663,19 @@ class Trainer:
                     )
 
                     epoch_time = time.time() - epoch_start
+                    val_iou_ci_lo = val_summary.get("val_iou_ci_low")
+                    val_iou_ci_hi = val_summary.get("val_iou_ci_high")
+                    ci_str = (
+                        f" [95% CI: {val_iou_ci_lo:.4f}..{val_iou_ci_hi:.4f}]"
+                        if isinstance(val_iou_ci_lo, (int, float)) and isinstance(val_iou_ci_hi, (int, float))
+                        else ""
+                    )
                     self.logger.info(
                         f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:.1f}s] - "
                         f"Train Loss: {train_metrics.get('total_loss', 0.0):.4f} - "
                         f"Train IoU: {train_metrics.get('iou', 0.0):.4f} - "
                         f"Val Loss: {val_summary.get('val_total_loss', 0.0):.4f} - "
-                        f"Val IoU: {val_summary.get('val_iou', 0.0):.4f} - "
+                        f"Val IoU: {val_summary.get('val_iou', 0.0):.4f}{ci_str} - "
                         f"Val F1: {val_summary.get('val_f1', val_summary.get('val_dice', 0.0)):.4f} - "
                         f"Val AUROC: {val_summary.get('val_auroc', 0.0):.4f}"
                     )

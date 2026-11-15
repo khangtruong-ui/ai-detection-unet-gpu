@@ -267,11 +267,18 @@ def find_optimal_batch_size(
     model = model.to(device)
     model.train()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    amp_dtype = (
+        torch.bfloat16
+        if (device.type == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+        else torch.float16
+    )
+    use_scaler = bool(use_amp and device.type == "cuda" and amp_dtype == torch.float16)
+
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad] or list(model.parameters()), lr=1e-3)
     if hasattr(torch.amp, "GradScaler"):
-        scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     else:
-        scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     c, h, w = sample_shape
     safe_bs = min_batch_size
@@ -312,7 +319,7 @@ def find_optimal_batch_size(
                 if should_pass_f_r:
                     probe_kwargs["f_r"] = torch.zeros(bs, 256, device=device)
 
-                with torch.amp.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
                     outputs = model(images, **probe_kwargs) if probe_kwargs else model(images)
                     # Dynamically reconcile mask spatial dimensions if model outputs a different size
                     pred_tensor = outputs[0] if isinstance(outputs, (tuple, list)) else outputs

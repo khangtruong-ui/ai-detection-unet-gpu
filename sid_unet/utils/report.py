@@ -7,8 +7,46 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from tabulate import tabulate
+
+_CI_METADATA_KEY_RE = re.compile(r"^(?:confidence_level|.*_(?:confidence_level|ci\d*_(?:low|high|margin)|std))$")
+
+
+def _extract_metric_ci(metrics: Dict[str, Any], key: str, alt_keys: Tuple[str, ...] = ()) -> Optional[Dict[str, float]]:
+    """Resolve structured or flat confidence-interval dictionary for a given metric key."""
+    if not isinstance(metrics, dict):
+        return None
+    ci_map = metrics.get("confidence_intervals")
+    candidates = (key, *alt_keys)
+    if isinstance(ci_map, dict):
+        for cand in candidates:
+            entry = ci_map.get(cand)
+            if isinstance(entry, dict) and "low" in entry and "high" in entry:
+                return entry
+    for cand in candidates:
+        low = metrics.get(f"{cand}_ci_low")
+        high = metrics.get(f"{cand}_ci_high")
+        if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+            return {
+                "low": float(low),
+                "high": float(high),
+                "margin": float(metrics.get(f"{cand}_ci_margin", 0.5 * (float(high) - float(low)))),
+                "std": float(metrics.get(f"{cand}_std", 0.0)),
+            }
+    return None
+
+
+def _format_ci_interval(stats: Dict[str, Any], metric_key: str, alt_keys: Tuple[str, ...] = ()) -> str:
+    """Format confidence interval as '[low, high] (±margin)' or '—' when unavailable."""
+    entry = _extract_metric_ci(stats, metric_key, alt_keys=alt_keys)
+    if entry is None:
+        return "—"
+    low = float(entry["low"])
+    high = float(entry["high"])
+    margin = float(entry.get("margin", 0.5 * (high - low)))
+    return f"[{low:.4f}, {high:.4f}] (±{margin:.4f})"
 
 
 def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -76,6 +114,7 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
         "Scheduler": train_cfg.get("scheduler", "cosine"),
         "Epochs": train_cfg.get("epochs", 10),
         "AMP": train_cfg.get("amp", True),
+        "Precision": train_cfg.get("precision", train_cfg.get("mixed_precision", "auto")),
     }
 
 
@@ -115,21 +154,46 @@ def format_config_table(config: Dict[str, Any], title: str = "Configuration & Hy
 
 
 def format_metrics_table(metrics: Dict[str, Any], title: str = "Evaluation Metrics") -> str:
-    """Format dictionary metrics into a clean tabulated ASCII/Markdown table."""
-    headers = ["Metric", "Value"]
-    rows = []
+    """Format dictionary metrics (including confidence intervals when available) into Markdown."""
+    conf_level = float(metrics.get("confidence_level", 0.95)) if isinstance(metrics, dict) else 0.95
+    pct = int(round(conf_level * 100.0))
+
+    raw_items = []
+    has_any_ci = False
     for k, v in metrics.items():
+        if _CI_METADATA_KEY_RE.match(str(k)):
+            continue
         if isinstance(v, float):
             formatted_val = f"{v:.4f}"
         elif isinstance(v, (int, str)):
             formatted_val = str(v)
         else:
             continue
-        # Convert snake_case or prefix to readable title
-        metric_name = k.replace("_", " ").title()
-        rows.append([metric_name, formatted_val])
+        ci_entry = _extract_metric_ci(metrics, k)
+        if ci_entry is not None:
+            has_any_ci = True
+        raw_items.append((k, formatted_val, ci_entry))
 
-    table_str = tabulate(rows, headers=headers, tablefmt="github")
+    rows = []
+    for k, formatted_val, ci_entry in raw_items:
+        metric_name = k.replace("_", " ").title()
+        if has_any_ci:
+            if ci_entry is not None:
+                ci_str = (
+                    f"[{float(ci_entry['low']):.4f}, {float(ci_entry['high']):.4f}] "
+                    f"(±{float(ci_entry.get('margin', 0.0)):.4f})"
+                )
+                std_val = ci_entry.get("std")
+                std_str = f"{float(std_val):.4f}" if isinstance(std_val, (int, float)) else "—"
+            else:
+                ci_str = "—"
+                std_str = "—"
+            rows.append([metric_name, formatted_val, ci_str, std_str])
+        else:
+            rows.append([metric_name, formatted_val])
+
+    headers = ["Metric", "Value", f"{pct}% Confidence Interval", "Std Dev"] if has_any_ci else ["Metric", "Value"]
+    table_str = tabulate(rows, headers=headers, tablefmt="github", disable_numparse=True)
     title_str = f"### {title}\n\n" if title else ""
     return f"{title_str}{table_str}\n"
 
@@ -266,13 +330,15 @@ def generate_evaluation_report(
             row = [
                 name,
                 f"{stats.get('iou', 0.0):.4f}",
+                _format_ci_interval(stats, "iou"),
                 f"{stats.get('dice', 0.0):.4f}",
+                _format_ci_interval(stats, "dice", ("f1",)),
                 f"{stats.get('pixel_acc', 0.0):.4f}",
                 f"{stats.get('samples', 0)}",
             ]
             per_label_rows.append(row)
-        per_label_headers = ["Subset", "Mean IoU", "Dice / F1", "Pixel Accuracy", "Sample Count"]
-        md_lines.append(tabulate(per_label_rows, headers=per_label_headers, tablefmt="github"))
+        per_label_headers = ["Subset", "Mean IoU", "IoU 95% CI", "Dice / F1", "Dice / F1 95% CI", "Pixel Accuracy", "Sample Count"]
+        md_lines.append(tabulate(per_label_rows, headers=per_label_headers, tablefmt="github", disable_numparse=True))
         md_lines.append("\n")
 
     per_ds = per_dataset_metrics or overall_metrics.get("per_dataset_metrics")
@@ -284,8 +350,10 @@ def generate_evaluation_report(
             ds_rows.append([
                 str(ds_name),
                 f"{ds_stats.get('iou', 0.0):.4f}",
+                _format_ci_interval(ds_stats, "iou"),
                 f"{ds_stats.get('dice', ds_stats.get('f1', 0.0)):.4f}",
                 f"{ds_stats.get('auroc', 0.0):.4f}",
+                _format_ci_interval(ds_stats, "auroc", ("pixel_auroc",)),
                 f"{ds_stats.get('pixel_acc', 0.0):.4f}",
                 f"{ds_stats.get('precision', 0.0):.4f}",
                 f"{ds_stats.get('recall', 0.0):.4f}",
@@ -294,7 +362,7 @@ def generate_evaluation_report(
             ])
         md_lines.append(tabulate(
             ds_rows,
-            headers=["Sub-Dataset", "Mean IoU", "Dice / F1", "AUROC", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
+            headers=["Sub-Dataset", "Mean IoU", "IoU 95% CI", "Dice / F1", "AUROC", "AUROC 95% CI", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
             tablefmt="github",
             disable_numparse=True,
         ))
@@ -504,7 +572,9 @@ def generate_checkpoint_cross_eval_report(
             str(samples),
             f"{loss:.4f}" if isinstance(loss, (int, float)) else "N/A",
             f"{iou:.4f}" if isinstance(iou, (int, float)) else "N/A",
+            _format_ci_interval(m, "iou"),
             f"{f1:.4f}" if isinstance(f1, (int, float)) else "N/A",
+            _format_ci_interval(m, "f1", ("dice", "pixel_f1")),
             f"{auroc:.4f}" if isinstance(auroc, (int, float)) else "N/A",
             f"{pacc:.4f}" if isinstance(pacc, (int, float)) else "N/A",
             f"{cacc:.4f}" if isinstance(cacc, (int, float)) else "N/A",
@@ -517,7 +587,9 @@ def generate_checkpoint_cross_eval_report(
         "Samples",
         "Loss",
         "IoU",
+        "IoU 95% CI",
         "Dice / F1",
+        "F1 95% CI",
         "AUROC",
         "Pixel Acc",
         "Class Acc",
@@ -561,12 +633,14 @@ def generate_checkpoint_cross_eval_report(
                 pl_rows.append([
                     name,
                     f"{stats.get('iou', 0.0):.4f}",
+                    _format_ci_interval(stats, "iou"),
                     f"{stats.get('dice', stats.get('f1', 0.0)):.4f}",
+                    _format_ci_interval(stats, "dice", ("f1",)),
                     f"{stats.get('pixel_acc', 0.0):.4f}",
                     f"{stats.get('samples', 0)}",
                 ])
             md_lines.append("#### Per-Subset Breakdown\n")
-            md_lines.append(tabulate(pl_rows, headers=["Subset", "IoU", "Dice / F1", "Pixel Acc", "Samples"], tablefmt="github", disable_numparse=True))
+            md_lines.append(tabulate(pl_rows, headers=["Subset", "IoU", "IoU 95% CI", "Dice / F1", "Dice / F1 95% CI", "Pixel Acc", "Samples"], tablefmt="github", disable_numparse=True))
             md_lines.append("\n")
 
         per_dataset = res.get("per_dataset_metrics", {})
@@ -576,8 +650,10 @@ def generate_checkpoint_cross_eval_report(
                 ds_rows.append([
                     str(ds_k),
                     f"{ds_stats.get('iou', 0.0):.4f}",
+                    _format_ci_interval(ds_stats, "iou"),
                     f"{ds_stats.get('dice', ds_stats.get('f1', 0.0)):.4f}",
                     f"{ds_stats.get('auroc', 0.0):.4f}",
+                    _format_ci_interval(ds_stats, "auroc", ("pixel_auroc",)),
                     f"{ds_stats.get('pixel_acc', 0.0):.4f}",
                     f"{ds_stats.get('precision', 0.0):.4f}",
                     f"{ds_stats.get('recall', 0.0):.4f}",
@@ -587,7 +663,7 @@ def generate_checkpoint_cross_eval_report(
             md_lines.append("#### Per-Dataset Breakdown (Multi-Benchmark Slicing)\n")
             md_lines.append(tabulate(
                 ds_rows,
-                headers=["Sub-Dataset", "IoU", "Dice / F1", "AUROC", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
+                headers=["Sub-Dataset", "IoU", "IoU 95% CI", "Dice / F1", "AUROC", "AUROC 95% CI", "Pixel Acc", "Precision", "Recall", "Specificity", "Samples"],
                 tablefmt="github",
                 disable_numparse=True,
             ))
@@ -758,6 +834,7 @@ def generate_master_cross_evaluation_report(
             str(samples),
             f"{loss:.4f}" if isinstance(loss, (int, float)) else "N/A",
             f"{iou:.4f}" if isinstance(iou, (int, float)) else "N/A",
+            _format_ci_interval(m, "iou"),
             f"{f1:.4f}" if isinstance(f1, (int, float)) else "N/A",
             f"{auroc:.4f}" if isinstance(auroc, (int, float)) else "N/A",
             f"{pacc:.4f}" if isinstance(pacc, (int, float)) else "N/A",
@@ -767,7 +844,7 @@ def generate_master_cross_evaluation_report(
             f"{cacc:.4f}" if isinstance(cacc, (int, float)) else "N/A",
         ])
 
-    # Sort master summary rows by IoU descending
+    # Sort master summary rows by IoU descending (index 5 remains scalar IoU)
     def _safe_float(val):
         try:
             return float(val)
@@ -783,6 +860,7 @@ def generate_master_cross_evaluation_report(
         "Samples",
         "Loss",
         "IoU",
+        "IoU 95% CI",
         "Dice / F1",
         "AUROC",
         "Pixel Acc",

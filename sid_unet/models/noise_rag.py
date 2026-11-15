@@ -407,7 +407,15 @@ class ForensicVectorDBRetrieval(nn.Module):
         super().__init__()
         self.memory_path = memory_path
         self.memory_dtype_str = str(memory_dtype).lower().strip()
-        self.storage_dtype = torch.bfloat16 if "bf16" in self.memory_dtype_str or "bfloat16" in self.memory_dtype_str else torch.float16
+        if any(tok in self.memory_dtype_str for tok in ("bf16", "bfloat16")):
+            self.storage_dtype = torch.bfloat16
+        elif self.memory_dtype_str == "auto" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            self.storage_dtype = torch.bfloat16
+        else:
+            self.storage_dtype = torch.float16
+        self.fp8_retrieval_enabled = self.memory_dtype_str in (
+            "fp8", "bf8", "e4m3", "e4m3fn", "float8", "float8_e4m3", "float8_e4m3fn", "auto"
+        )
         self.retrieval_k = int(retrieval_k)
         self.temperature = float(temperature)
         self.embed_dim = int(embed_dim)
@@ -428,12 +436,23 @@ class ForensicVectorDBRetrieval(nn.Module):
         self.register_buffer("db_keys", torch.empty((0, embed_dim), dtype=self.storage_dtype), persistent=False)
         self.register_buffer("db_labels", torch.empty((0, 1), dtype=self.storage_dtype), persistent=False)
         self.register_buffer("db_keys_norm", torch.empty((0, embed_dim), dtype=self.storage_dtype), persistent=False)
+        self._fp8_k_t: Optional[torch.Tensor] = None
+        self._fp8_k_scale: Optional[torch.Tensor] = None
+        self._fp8_cache_key: Optional[Tuple[int, str]] = None
 
         if memory_path:
             try:
                 self.load_database(memory_path)
             except Exception as load_err:
                 logger.warning(f"Could not load vector database from memory_path '{memory_path}': {load_err}")
+
+    def set_fp8_retrieval(self, enabled: bool) -> None:
+        """Enable or disable FP8 (float8_e4m3fn) _scaled_mm similarity search."""
+        self.fp8_retrieval_enabled = bool(enabled)
+        if not self.fp8_retrieval_enabled:
+            self._fp8_k_t = None
+            self._fp8_k_scale = None
+            self._fp8_cache_key = None
 
     @property
     def has_database(self) -> bool:
@@ -507,6 +526,9 @@ class ForensicVectorDBRetrieval(nn.Module):
         self.db_keys = keys.detach().requires_grad_(False)
         self.db_labels = labels.detach().requires_grad_(False)
         self.db_keys_norm = F.normalize(self.db_keys, p=2, dim=-1).detach().requires_grad_(False)
+        self._fp8_k_t = None
+        self._fp8_k_scale = None
+        self._fp8_cache_key = None
         self.memory_path = resolved_path
         logger.info(
             f"✅ Loaded {keys.shape[0]} MaskCLIP pre-TVCA vectors into retrieval buffer "
@@ -536,13 +558,24 @@ class ForensicVectorDBRetrieval(nn.Module):
         l_entries = self.db_labels.to(device=device, dtype=self.storage_dtype).detach().requires_grad_(False)
 
         tokens = x_t.permute(0, 2, 3, 1).reshape(-1, c)  # [B * H' * W', C]
-        q_dtype = self.query_proj[0].weight.dtype
+        raw_q_dtype = getattr(self.query_proj[0].weight, "dtype", orig_dtype)
+        q_dtype = raw_q_dtype if raw_q_dtype in (torch.float16, torch.bfloat16, torch.float32) else orig_dtype
         q = self.query_proj(tokens.to(dtype=q_dtype)).to(dtype=self.storage_dtype)
 
         k_actual = min(self.retrieval_k, k_entries.shape[0])
-        # Chunk size 256 keeps intermediate sim matrices bounded to ~128-512 MB even for 1M DB
-        chunk_size = 256
         num_tokens = q.shape[0]
+        # Larger chunks reduce kernel launch overhead for 1M-vector DBs while keeping similarity buffers <= ~1 GiB
+        chunk_size = 512 if (device.type == "cuda" and k_entries.shape[0] >= 16384) else 256
+
+        use_fp8_mm = (
+            self.fp8_retrieval_enabled
+            and device.type == "cuda"
+            and hasattr(torch, "float8_e4m3fn")
+            and hasattr(torch, "_scaled_mm")
+            and (k_entries.shape[0] % 16 == 0)
+            and (c % 16 == 0)
+            and torch.cuda.get_device_capability(device if device.index is not None else 0) >= (8, 9)
+        )
 
         with torch.no_grad():
             if self.db_keys_norm.shape == self.db_keys.shape:
@@ -552,14 +585,47 @@ class ForensicVectorDBRetrieval(nn.Module):
 
             q_norm = F.normalize(q.detach(), p=2, dim=-1)
 
+            f8_k_t = None
+            f8_k_scale = None
+            f8_max = float(torch.finfo(torch.float8_e4m3fn).max) if hasattr(torch, "float8_e4m3fn") else 448.0
+            if use_fp8_mm:
+                cache_key = (int(k_norm.data_ptr()), str(device))
+                if (
+                    self._fp8_cache_key != cache_key
+                    or self._fp8_k_t is None
+                    or self._fp8_k_t.device != device
+                    or self._fp8_k_t.shape != (c, k_norm.shape[0])
+                ):
+                    k_f32 = k_norm.float()
+                    k_amax = k_f32.abs().max().clamp(min=1e-12)
+                    self._fp8_k_scale = (k_amax / f8_max).to(device=device, dtype=torch.float32)
+                    # Store transposed column-major view directly for torch._scaled_mm
+                    self._fp8_k_t = (k_f32 / self._fp8_k_scale).to(torch.float8_e4m3fn).t()
+                    self._fp8_cache_key = cache_key
+                f8_k_t = self._fp8_k_t
+                f8_k_scale = self._fp8_k_scale
+
             agg_k_list = []
             agg_l_list = []
             for start_idx in range(0, num_tokens, chunk_size):
                 end_idx = min(start_idx + chunk_size, num_tokens)
                 q_chunk = q_norm[start_idx:end_idx]
-                sim_chunk = torch.matmul(q_chunk, k_norm.t())
+                if f8_k_t is not None and f8_k_scale is not None and (q_chunk.shape[0] % 16 == 0):
+                    q_f32 = q_chunk.float()
+                    q_scale = (q_f32.abs().max().clamp(min=1e-12) / f8_max).to(device=device, dtype=torch.float32)
+                    q_fp8 = (q_f32 / q_scale).to(torch.float8_e4m3fn)
+                    sim_chunk = torch._scaled_mm(
+                        q_fp8,
+                        f8_k_t,
+                        scale_a=q_scale,
+                        scale_b=f8_k_scale,
+                        out_dtype=torch.float16,
+                        use_fast_accum=True,
+                    )
+                else:
+                    sim_chunk = torch.matmul(q_chunk, k_norm.t())
                 topk_sims, topk_indices = torch.topk(sim_chunk, k=k_actual, dim=-1, largest=True, sorted=True)
-                attn_weights = F.softmax(topk_sims / max(self.temperature, 1e-4), dim=-1).unsqueeze(-1)
+                attn_weights = F.softmax(topk_sims.float() / max(self.temperature, 1e-4), dim=-1).to(dtype=k_entries.dtype).unsqueeze(-1)
                 ret_k = k_entries[topk_indices]
                 ret_l = l_entries[topk_indices]
                 agg_k_list.append((attn_weights * ret_k).sum(dim=1))
@@ -567,7 +633,8 @@ class ForensicVectorDBRetrieval(nn.Module):
             agg_k = torch.cat(agg_k_list, dim=0).detach().requires_grad_(False)
             agg_l = torch.cat(agg_l_list, dim=0).detach().requires_grad_(False)
 
-        fuse_dtype = self.fuse_proj[0].weight.dtype
+        raw_fuse_dtype = getattr(self.fuse_proj[0].weight, "dtype", orig_dtype)
+        fuse_dtype = raw_fuse_dtype if raw_fuse_dtype in (torch.float16, torch.bfloat16, torch.float32) else orig_dtype
         fused_in = torch.cat([agg_k, agg_l], dim=-1).to(dtype=fuse_dtype)
         fused = self.fuse_proj(fused_in).to(dtype=orig_dtype)
         x_r = fused.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()

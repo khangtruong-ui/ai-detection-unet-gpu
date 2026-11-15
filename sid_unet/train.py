@@ -481,6 +481,14 @@ def parse_args():
         action="store_false",
         help="Disable multi-GPU DataParallel and train on single device",
     )
+    parser.add_argument(
+        "--precision",
+        "--mixed-precision",
+        dest="precision",
+        type=str,
+        default=None,
+        help="Training precision: 'auto' (default: fp8 e4m3 on SM >= 8.9 GPUs), 'fp8'/'bf8'/'e4m3', 'bf16', 'fp16', or 'fp32'.",
+    )
     return parser.parse_args()
 
 
@@ -914,6 +922,9 @@ def main():
     if getattr(args, "use_8bit_optimizer", False):
         overrides.append("training.use_8bit_optimizer=true")
         overrides.append("training.optimizer=adamw8bit")
+    if getattr(args, "precision", None) is not None:
+        overrides.append(f"training.mixed_precision={args.precision}")
+        overrides.append(f"training.precision={args.precision}")
     if args.batch_size is not None:
         overrides.append(f"data.batch_size={args.batch_size}")
     if args.auto_batch_size is True:

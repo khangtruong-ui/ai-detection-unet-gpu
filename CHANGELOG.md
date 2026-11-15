@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-15
+
+### Added
+- **Native FP8 / BF8 (`float8_e4m3fn` / `e4m3`) Precision Subsystem (`sid_unet.utils.precision`)**:
+  - Added `resolve_precision_spec`, `check_fp8_compatibility`, `is_fp8_supported`, `prepare_model_for_fp8_training`, and `prepare_model_for_fp8_inference`.
+  - Configured `training.mixed_precision: "auto"` and `training.fp8_all_parameters: true` by default in `DEFAULT_CONFIG` and `configs/experiments/noise_rag/noise_rag_prototype_v1.yaml` (resolving to native `float8_e4m3fn` when SM >= 8.9 GPU is available, cleanly falling back to `bf16` / `fp16` on older GPUs and `fp32` on CPU).
+  - Exposed `--precision` / `--mixed-precision` across `sid-train`, `sid-eval`, `sid-cross-eval`, and `sid-predict`.
+  - Added native `float8_e4m3fn` + `torch._scaled_mm` vector DB similarity search in `ForensicVectorDBRetrieval` (`sid_unet.models.noise_rag`) for `memory_dtype="auto" | "fp8" | "bf8" | "e4m3"`.
+  - Disabled `GradScaler` whenever active compute dtype is not `float16` (`bfloat16` / `fp8`).
+- **95% Confidence Interval (CI) Metrics (`sid_unet.metrics.confidence`)**:
+  - Added `OnlineVarianceTracker` (Welford/Chan parallel merge), `compute_mean_confidence_interval`, `compute_wilson_confidence_interval`, `compute_bootstrap_confidence_interval`, and `attach_ci_fields`.
+  - Extended `SegmentationMetricTracker` (global, `*_positive`, `per_label`, `per_dataset`) and `ClassificationMetricTracker` (`aux_accuracy`, `aux_macro_f1`, `aux_auroc`) to emit `<metric>_ci_low`, `<metric>_ci_high`, `<metric>_ci_margin`, `<metric>_ci95_*`, `<metric>_std`, and `confidence_intervals`.
+  - Updated `sid_unet.utils.report`, `Trainer`, and `cross_eval` summaries to render `[low, high] (±margin)` CI columns cleanly in Markdown/JSON reports.
+- **Tests & Documentation**:
+  - Added `tests/test_fp8_precision.py`, `tests/test_confidence_intervals.py`, and `docs/fp8_and_ci_metrics.md`.
+
 ## [Unreleased] - 2026-11-14
 
 ### Fixed

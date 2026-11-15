@@ -33,6 +33,7 @@ from sid_unet.models.sam3_refiner import get_sam_refiner
 from sid_unet.models.unet import UNet
 from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
+from sid_unet.utils.precision import PrecisionSpec, resolve_precision_spec, prepare_model_for_fp8_inference
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.distributed import is_kaggle_environment
 from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
@@ -275,6 +276,14 @@ def parse_args(args: Optional[List[str]] = None):
         default=None,
         help="Filter evaluation to only process samples matching a specific sub-dataset column value (e.g. 'CASIA_v2', 'CocoGlide').",
     )
+    parser.add_argument(
+        "--precision",
+        "--mixed-precision",
+        dest="precision",
+        type=str,
+        default=None,
+        help="Execution precision: 'auto' (default: fp8 e4m3 on supported GPU), 'fp8'/'bf8'/'e4m3', 'bf16', 'fp16', or 'fp32'.",
+    )
     return parser.parse_args(args)
 
 
@@ -418,6 +427,7 @@ def eval_single_batch(
     collect_samples: Optional[List[Dict[str, Any]]] = None,
     max_collect: int = 6,
     dataset_filter: Optional[str] = None,
+    precision_spec: Optional[PrecisionSpec] = None,
 ) -> Tuple[float, int, List[Dict[str, Any]]]:
     """Execute forward evaluation for a single batch across active pipeline variants."""
     batch_datasets = batch.get("dataset")
@@ -487,8 +497,9 @@ def eval_single_batch(
     else:
         filtered_kwargs = model_kwargs
 
-    use_amp = (device.type == "cuda") and torch.cuda.is_available()
-    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    spec = precision_spec or resolve_precision_spec(device=device)
+    use_amp = spec.amp_enabled and (device.type == "cuda") and torch.cuda.is_available()
+    amp_dtype = spec.amp_dtype
     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = forward_model(images, **filtered_kwargs) if filtered_kwargs else forward_model(images)
         loss, _ = loss_fn(outputs, masks, labels)
@@ -601,6 +612,7 @@ def evaluate_checkpoint_on_config(
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
     dataset_filter: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific checkpoint against a specific dataset / experiment cross-configuration.
@@ -672,10 +684,14 @@ def evaluate_checkpoint_on_config(
     if morphology is not None:
         postprocessor.morphology = morphology
 
+    eval_logger = logging.getLogger("SID_CrossEval")
+    precision_spec = resolve_precision_spec(eval_config, mode=precision, device=device, logger_instance=eval_logger)
+    eval_logger.info(f"Cross-eval precision: {precision_spec.mode} (AMP/compute dtype={precision_spec.amp_dtype_str})")
+
     model.to(device)
     model.eval()
 
-    eval_logger = logging.getLogger("SID_CrossEval")
+    model, _fp8_info = prepare_model_for_fp8_inference(model, precision_spec, logger_instance=eval_logger)
     if use_data_parallel and target_device_ids:
         # Reconcile all buffers and parameters to primary device before DataParallel wrapping
         for buf in model.buffers():
@@ -742,6 +758,7 @@ def evaluate_checkpoint_on_config(
                     collect_samples=collected_samples,
                     max_collect=max_illustrations,
                     dataset_filter=dataset_filter,
+                    precision_spec=precision_spec,
                 )
                 total_loss_sum += loss_contrib
                 total_samples += count
@@ -769,6 +786,7 @@ def evaluate_checkpoint_on_config(
                                 collect_samples=collected_samples,
                                 max_collect=max_illustrations,
                                 dataset_filter=dataset_filter,
+                                precision_spec=precision_spec,
                             )
                             total_loss_sum += loss_contrib
                             total_samples += count
@@ -795,6 +813,7 @@ def evaluate_checkpoint_on_config(
                                         collect_samples=collected_samples,
                                         max_collect=max_illustrations,
                                         dataset_filter=dataset_filter,
+                                        precision_spec=precision_spec,
                                     )
                                     total_loss_sum += loss_contrib
                                     total_samples += count
@@ -864,6 +883,9 @@ def evaluate_checkpoint_on_config(
 
     overall_metrics = {
         "eval_split": resolved_split,
+        "precision_mode": precision_spec.mode,
+        "amp_dtype": precision_spec.amp_dtype_str,
+        "fp8_enabled": precision_spec.fp8_enabled,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
         **chosen_seg,
         **cls_metrics,
@@ -996,6 +1018,7 @@ def run_cross_evaluation(
     data_parallel: Optional[bool] = None,
     device_ids: Optional[List[int]] = None,
     dataset_filter: Optional[str] = None,
+    precision: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run full cross-evaluation for all (checkpoint, config) pairs.
@@ -1168,16 +1191,24 @@ def run_cross_evaluation(
                 data_parallel=data_parallel,
                 device_ids=device_ids,
                 dataset_filter=dataset_filter,
+                precision=precision,
             )
 
             all_cross_results.append(res)
             checkpoint_to_results[ckpt_path].append(res)
 
             m = res["metrics"]
+            iou_lo = m.get("iou_ci_low")
+            iou_hi = m.get("iou_ci_high")
+            iou_ci_str = (
+                f" [95% CI: {iou_lo:.4f}..{iou_hi:.4f}]"
+                if isinstance(iou_lo, (int, float)) and isinstance(iou_hi, (int, float))
+                else ""
+            )
             logger.info(
                 f"   -> Dataset: '{res['dataset_name']}' ({res['eval_split']}) | "
                 f"Loss: {m.get('eval_total_loss', 0.0):.4f} | "
-                f"IoU: {m.get('iou', 0.0):.4f} | "
+                f"IoU: {m.get('iou', 0.0):.4f}{iou_ci_str} | "
                 f"F1: {m.get('f1', 0.0):.4f} | "
                 f"AUROC: {m.get('auroc', 0.0):.4f} | "
                 f"PixelAcc: {m.get('pixel_acc', 0.0):.4f}"
@@ -1224,6 +1255,7 @@ def run_cross_evaluation(
                 report_name=f"{report_stem}_report",
                 ablation_results=r.get("ablation_metrics"),
                 illustration_paths=r_ill,
+                per_dataset_metrics=r.get("per_dataset_metrics"),
             )
         logger.info(f"✅ Checkpoint neighbor report saved at: {os.path.join(neighbor_dir, 'cross_evaluation_report.md')}")
 
@@ -1443,6 +1475,7 @@ def main(args: Optional[List[str]] = None):
         data_parallel=parsed_args.data_parallel,
         device_ids=parsed_args.device_ids,
         dataset_filter=getattr(parsed_args, "dataset_filter", None),
+        precision=getattr(parsed_args, "precision", None),
     )
     return results
 

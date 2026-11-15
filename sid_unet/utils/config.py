@@ -170,6 +170,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_lr": 1e-6,
         "grad_clip_norm": 1.0,
         "amp": True,                  # Automatic mixed precision
+        "mixed_precision": "auto",    # Precision: "auto" (defaults to fp8 e4m3 on SM >= 8.9 GPUs, else bf16/fp16), "fp8"/"e4m3", "bf16", "fp16", "fp32"
+        "precision": "auto",          # Alias for mixed_precision
+        "fp8_all_parameters": True,   # Apply FP8 (e4m3) across all eligible model parameters & retrieval buffers
         "gradient_accumulation_steps": 1, # Number of micro-batches to accumulate before optimizer step
         "data_parallel": True,        # Automatically enable DataParallel across visible GPUs if > 1
         "use_hard_mining": False,     # Hard example mining starting from epoch 2
