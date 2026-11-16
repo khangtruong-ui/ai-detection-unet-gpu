@@ -30,6 +30,7 @@ from sid_unet.process_manager import (
     STATUS_RUNNING,
     ProcessRecord,
     ProcessRegistry,
+    collapse_line_carriage_returns,
     get_process_registry,
     terminate_process,
 )
@@ -53,32 +54,6 @@ def format_bytes(num_bytes: float) -> str:
             return f"{num_bytes:3.1f} {unit}"
         num_bytes /= 1024.0
     return f"{num_bytes:.1f} PB"
-
-
-def collapse_line_carriage_returns(text: str) -> str:
-    """
-    Simulate terminal cursor carriage return ('\\r') overwriting within a single physical line.
-    Collapses multiple TQDM progress updates (or carriage-return-separated chunks)
-    into the final visible text on the row, preventing multiple screen lines per update.
-    """
-    if "\r" not in text:
-        return text
-    parts = text.split("\r")
-    buf: List[str] = []
-    pos = 0
-    for i, part in enumerate(parts):
-        if i == 0:
-            buf.extend(list(part))
-            pos = len(buf)
-        else:
-            pos = 0
-            for ch in part:
-                if pos < len(buf):
-                    buf[pos] = ch
-                else:
-                    buf.append(ch)
-                pos += 1
-    return "".join(buf)
 
 
 def read_process_logs(

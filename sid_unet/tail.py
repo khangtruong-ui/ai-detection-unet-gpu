@@ -24,6 +24,7 @@ from sid_unet.process_manager import (
     STATUS_RUNNING,
     STATUS_UNKNOWN,
     ProcessRecord,
+    collapse_line_carriage_returns,
     get_process_registry,
     inspect_log_for_termination,
 )
@@ -90,6 +91,117 @@ def resolve_tail_target(
     return os.path.abspath(".logs.txt"), None, 0
 
 
+class _StreamLineRenderer:
+    """Renders streamed log chunks while collapsing TQDM carriage-return updates cleanly."""
+
+    def __init__(self, is_tty: Optional[bool] = None, allow_live_cr: Optional[bool] = None) -> None:
+        if is_tty is None:
+            try:
+                is_tty = bool(sys.stdout.isatty())
+            except Exception:
+                is_tty = False
+        self.is_tty = bool(is_tty)
+        if allow_live_cr is None:
+            allow_live_cr = self.is_tty or ("COLAB_RELEASE_TAG" in os.environ)
+        self.allow_live_cr = bool(allow_live_cr)
+        self.active_line = ""
+        self.line_has_cr = False
+        self._emitted_active_len = 0
+        self._pending_cr = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        if self._pending_cr:
+            chunk = "\r" + chunk
+            self._pending_cr = False
+        if chunk.endswith("\r"):
+            self._pending_cr = True
+            chunk = chunk[:-1]
+        if not chunk:
+            return ""
+
+        text = chunk.replace("\r\n", "\n")
+        segments = text.split("\n")
+        out_parts: List[str] = []
+
+        for seg in segments[:-1]:
+            had_cr = self.line_has_cr or ("\r" in seg)
+            combined = collapse_line_carriage_returns(self.active_line + seg)
+            if self.is_tty and had_cr:
+                out_parts.append(f"\r\x1b[K{combined}\n")
+            elif self.allow_live_cr and self._emitted_active_len > 0:
+                out_parts.append(f"\r{combined}\n")
+            elif not had_cr and self._emitted_active_len > 0 and self._emitted_active_len == len(self.active_line):
+                out_parts.append(f"{seg}\n")
+            else:
+                out_parts.append(f"{combined}\n")
+            self.active_line = ""
+            self.line_has_cr = False
+            self._emitted_active_len = 0
+
+        tail = segments[-1]
+        if tail:
+            had_cr_in_tail = "\r" in tail
+            self.active_line = collapse_line_carriage_returns(self.active_line + tail)
+            if had_cr_in_tail:
+                self.line_has_cr = True
+            if self.is_tty:
+                if self.line_has_cr:
+                    out_parts.append(f"\r\x1b[K{self.active_line}")
+                else:
+                    out_parts.append(tail)
+                self._emitted_active_len = len(self.active_line)
+            elif self.allow_live_cr and self.line_has_cr:
+                out_parts.append(f"\r{self.active_line}")
+                self._emitted_active_len = len(self.active_line)
+            elif not self.line_has_cr:
+                out_parts.append(tail)
+                self._emitted_active_len = len(self.active_line)
+
+        return "".join(out_parts)
+
+    def flush(self) -> str:
+        if self._pending_cr:
+            self._pending_cr = False
+        if not self.active_line:
+            return ""
+        if self._emitted_active_len > 0:
+            self.active_line = ""
+            self.line_has_cr = False
+            self._emitted_active_len = 0
+            return "\n"
+        line = self.active_line
+        self.active_line = ""
+        self.line_has_cr = False
+        self._emitted_active_len = 0
+        return f"{line}\n"
+
+
+def _collapse_log_lines(content: str, lines_count: int) -> Tuple[List[str], Optional[str]]:
+    """
+    Split log text on newlines (preserving raw '\\r' for per-line TQDM collapsing)
+    and return `(completed_lines, trailing_incomplete_raw_line)`.
+    """
+    normalized = content.replace("\r\n", "\n")
+    ended_with_newline = normalized.endswith("\n")
+    raw_lines = normalized.split("\n")
+    if ended_with_newline and raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
+
+    trailing_raw: Optional[str] = None
+    if not ended_with_newline and raw_lines:
+        trailing_raw = raw_lines.pop()
+
+    collapsed = [collapse_line_carriage_returns(line) for line in raw_lines]
+    if trailing_raw is not None:
+        max_completed = max(0, lines_count - 1)
+        completed = collapsed[-max_completed:] if (max_completed > 0 and len(collapsed) > max_completed) else ([] if max_completed == 0 else collapsed)
+    else:
+        completed = collapsed[-lines_count:] if len(collapsed) > lines_count else collapsed
+    return completed, trailing_raw
+
+
 def print_initial_lines(
     file_path: str,
     lines_count: int,
@@ -97,6 +209,7 @@ def print_initial_lines(
 ) -> int:
     """
     Print the last `lines_count` lines from the file, starting at or after start_offset.
+    Collapses TQDM carriage-return updates within each line.
     Returns the file byte offset after reading.
     """
     if not os.path.isfile(file_path) or lines_count <= 0:
@@ -107,14 +220,15 @@ def print_initial_lines(
         if file_size <= start_offset:
             return file_size
 
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(file_path, "r", newline="", encoding="utf-8", errors="replace") as f:
             f.seek(start_offset)
             content = f.read()
 
-        all_lines = content.splitlines(keepends=True)
-        to_print = all_lines[-lines_count:] if len(all_lines) > lines_count else all_lines
-        for line in to_print:
-            sys.stdout.write(line)
+        completed, trailing_raw = _collapse_log_lines(content, lines_count)
+        for line in completed:
+            sys.stdout.write(f"{line}\n")
+        if trailing_raw:
+            sys.stdout.write(f"{collapse_line_carriage_returns(trailing_raw)}\n")
         sys.stdout.flush()
         return file_size
     except Exception:
@@ -168,22 +282,27 @@ def tail_log_stream(
 
     # Print initial lines if requested
     try:
-        f = open(log_path, "r", encoding="utf-8", errors="replace")
+        f = open(log_path, "r", newline="", encoding="utf-8", errors="replace")
     except Exception as e:
         if not quiet:
             print(f"[sid-tail] Failed to open log file: {e}", file=sys.stderr)
         return 1
 
+    renderer = _StreamLineRenderer()
+
     try:
-        file_size = os.path.getsize(log_path)
+        content = ""
         if lines_count > 0:
             read_start = max(0, start_offset)
             f.seek(read_start)
             content = f.read()
-            lines = content.splitlines(keepends=True)
-            to_show = lines[-lines_count:] if len(lines) > lines_count else lines
-            for l in to_show:
-                sys.stdout.write(l)
+            completed, trailing_raw = _collapse_log_lines(content, lines_count)
+            for line in completed:
+                sys.stdout.write(f"{line}\n")
+            if trailing_raw is not None:
+                rendered_tail = renderer.feed(trailing_raw)
+                if rendered_tail:
+                    sys.stdout.write(rendered_tail)
             sys.stdout.flush()
         else:
             f.seek(0, os.SEEK_END)
@@ -192,16 +311,25 @@ def tail_log_stream(
         recent_chunks: List[str] = [content[-4096:]] if (lines_count > 0 and content) else []
         consecutive_empty = 0
 
+        def _emit_chunk(text: str) -> None:
+            rendered = renderer.feed(text)
+            if rendered:
+                sys.stdout.write(rendered)
+                sys.stdout.flush()
+
         while True:
             if timeout is not None and (time.time() - start_ts) >= timeout:
+                flushed = renderer.flush()
+                if flushed:
+                    sys.stdout.write(flushed)
+                    sys.stdout.flush()
                 if not quiet:
                     print(f"\n⚠️ [sid-tail] Timeout ({timeout:.1f}s) reached while following task.", file=sys.stderr)
                 return 1
 
             chunk = f.read(8192)
             if chunk:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
+                _emit_chunk(chunk)
                 recent_chunks.append(chunk)
                 if len(recent_chunks) > 20:
                     recent_chunks.pop(0)
@@ -215,8 +343,7 @@ def tail_log_stream(
                     time.sleep(0.3)
                     final_chunk = f.read()
                     if final_chunk:
-                        sys.stdout.write(final_chunk)
-                        sys.stdout.flush()
+                        _emit_chunk(final_chunk)
                         recent_chunks.append(final_chunk)
                     break
 
@@ -233,8 +360,7 @@ def tail_log_stream(
                         time.sleep(0.2)
                         final_chunk = f.read()
                         if final_chunk:
-                            sys.stdout.write(final_chunk)
-                            sys.stdout.flush()
+                            _emit_chunk(final_chunk)
                         break
 
                     if (
@@ -245,11 +371,15 @@ def tail_log_stream(
                         time.sleep(0.3)
                         final_chunk = f.read()
                         if final_chunk:
-                            sys.stdout.write(final_chunk)
-                            sys.stdout.flush()
+                            _emit_chunk(final_chunk)
                         break
 
                 time.sleep(poll_interval)
+
+        flushed = renderer.flush()
+        if flushed:
+            sys.stdout.write(flushed)
+            sys.stdout.flush()
 
     except KeyboardInterrupt:
         if not quiet:
