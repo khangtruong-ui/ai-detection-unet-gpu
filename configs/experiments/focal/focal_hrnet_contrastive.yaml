@@ -18,7 +18,7 @@ data:
   pin_memory: true
   train_split: "train"
   val_split: "validation"
-  test_split: "test"
+  test_split: "validation"
 
 model:
   name: "focal"
