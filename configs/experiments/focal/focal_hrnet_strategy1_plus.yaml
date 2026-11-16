@@ -33,11 +33,12 @@ model:
   llrd_enabled: true
   hrnet_stage_lr_multipliers:
     stage4: 1.0
-    transition3: 0.6
-    stage3: 0.4
-    transition2: 0.25
-    stage2: 0.15
-    transition1: 0.10
+    transition3: 0.8
+    stage3: 0.65
+    transition2: 0.5
+    stage2: 0.4
+    transition1: 0.3
+  contrastive_balance_classes: true
   prior_anchor_weight: 0.15
   prior_anchor_mode: "pristine_only"
   pristine_anchor_threshold: 0.05

@@ -31,11 +31,11 @@ DEFAULT_FOCAL_VIT_CKPT = "FOCAL_ViT_weights.pth"
 
 DEFAULT_HRNET_STAGE_LR_MULTIPLIERS: Dict[str, float] = {
     "stage4": 1.0,
-    "transition3": 0.6,
-    "stage3": 0.4,
-    "transition2": 0.25,
-    "stage2": 0.15,
-    "transition1": 0.10,
+    "transition3": 0.8,
+    "stage3": 0.65,
+    "transition2": 0.5,
+    "stage2": 0.4,
+    "transition1": 0.3,
 }
 
 
@@ -857,6 +857,7 @@ class FOCAL(nn.Module):
         cluster_separability_threshold: float = 0.0015,
         aux_pristine_gate: bool = False,
         contrastive_sample_size: int = 1024,
+        contrastive_balance_classes: bool = True,
         # Strategy B: Prior-Preserving PEFT Surgery parameters
         peft_enabled: bool = False,
         lora_r: int = 8,
@@ -905,6 +906,7 @@ class FOCAL(nn.Module):
         self.cluster_separability_threshold = max(0.0, float(cluster_separability_threshold))
         self.aux_pristine_gate = bool(aux_pristine_gate)
         self.contrastive_sample_size = max(16, int(contrastive_sample_size))
+        self.contrastive_balance_classes = bool(contrastive_balance_classes)
 
         # Strategy B configuration
         if "use_peft" in kwargs and not peft_enabled:
@@ -2291,6 +2293,16 @@ class FOCAL(nn.Module):
 
             pos_counts = same_label.sum(dim=-1).clamp(min=1).to(log_prob.dtype)
             loss_per_anchor = -(log_prob.masked_fill(~same_label, 0.0)).sum(dim=-1) / pos_counts
+            if self.contrastive_balance_classes:
+                pos_valid = valid_anchors & (y_sub == 1)
+                neg_valid = valid_anchors & (y_sub == 0)
+                if pos_valid.any() and neg_valid.any():
+                    # Equalize tampered vs pristine anchor contributions so sparse tampered regions
+                    # (e.g. ~1.3% on ViT 32x32) are not drowned out by majority pristine anchors.
+                    per_image_losses.append(
+                        0.5 * (loss_per_anchor[pos_valid].mean() + loss_per_anchor[neg_valid].mean())
+                    )
+                    continue
             per_image_losses.append(loss_per_anchor[valid_anchors].mean())
 
         if not per_image_losses:

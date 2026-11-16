@@ -32,10 +32,11 @@ model:
   freeze_vit_stem_and_pos: true
   freeze_vit_blocks_below: 0
   llrd_enabled: true
-  llrd_decay: 0.85
-  llrd_min_scale: 0.02
-  neck_lr_multiplier: 0.5
-  prior_anchor_weight: 0.1
+  llrd_decay: 0.94
+  llrd_min_scale: 0.15
+  neck_lr_multiplier: 0.8
+  contrastive_balance_classes: true
+  prior_anchor_weight: 0.02
   prior_anchor_mode: "pristine_only"
   pristine_anchor_threshold: 0.05
   anchor_half_precision: true
@@ -50,14 +51,14 @@ loss:
   dice_weight: 0.5
   edge_weight: 0.5
   edge_mask_width: 7
-  align_weight: 0.3
+  align_weight: 0.1
 
 training:
   epochs: 10
   learning_rate: 0.0001
-  backbone_lr_multiplier: 0.5
-  neck_lr_multiplier: 0.5
-  freeze_backbone_epochs: 1
+  backbone_lr_multiplier: 0.8
+  neck_lr_multiplier: 0.8
+  freeze_backbone_epochs: 0
   weight_decay: 0.0001
   optimizer: "adamw"
   scheduler: "cosine"

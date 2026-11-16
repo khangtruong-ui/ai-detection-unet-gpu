@@ -427,6 +427,7 @@ class TestFocalStrategy1PlusConfigs:
         assert cfg.model.backbone == expected_backbone
         assert cfg.model.finetune_mode == expected_mode
         assert bool(cfg.model.llrd_enabled) is True
+        assert bool(cfg.model.contrastive_balance_classes) is True
         assert str(cfg.model.prior_anchor_mode) == "pristine_only"
         assert float(cfg.model.l2_sp_weight) > 0.0
         assert cfg.training.precision == "auto"
@@ -435,6 +436,47 @@ class TestFocalStrategy1PlusConfigs:
             assert cfg.model.force_vit_1024 is False
             assert bool(cfg.model.freeze_vit_stem_and_pos) is True
             assert bool(cfg.model.gradient_checkpointing) is True
+            assert float(cfg.model.llrd_decay) >= 0.90
+            assert float(cfg.model.prior_anchor_weight) <= 0.05
         else:
             assert bool(cfg.model.hrnet_freeze_stem) is True
             assert bool(cfg.model.freeze_backbone_bn) is True
+            if expected_mode == "contrastive":
+                assert float(cfg.training.backbone_lr_multiplier) >= 1.0
+
+    @pytest.mark.timeout(120)
+    def test_contrastive_balance_classes_boosts_sparse_tampered_gradient(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_bal = FOCAL(
+            backbone="hrnet",
+            pretrained=True,
+            finetune_mode="contrastive",
+            contrastive_sample_size=1024,
+            contrastive_balance_classes=True,
+        ).to(device)
+        model_unbal = FOCAL(
+            backbone="hrnet",
+            pretrained=True,
+            finetune_mode="contrastive",
+            contrastive_sample_size=1024,
+            contrastive_balance_classes=False,
+        ).to(device)
+
+        torch.manual_seed(0)
+        # 32x32 feature grid with ~1.2% sparse tampered region (12 positive tokens vs 1012 pristine)
+        base_feats = torch.randn(1, 32, 32, 32, device=device)
+        gt = torch.zeros(1, 1, 512, 512, device=device)
+        gt[:, :, 64:112, 64:128] = 1.0  # ~1.17% tampered area
+
+        f_bal = base_feats.clone().detach().requires_grad_(True)
+        loss_bal = model_bal.compute_contrastive_loss(f_bal, gt)
+        loss_bal.backward()
+        pos_grad_bal = f_bal.grad[:, :, 4:7, 4:8].norm().item()
+
+        f_unbal = base_feats.clone().detach().requires_grad_(True)
+        loss_unbal = model_unbal.compute_contrastive_loss(f_unbal, gt)
+        loss_unbal.backward()
+        pos_grad_unbal = f_unbal.grad[:, :, 4:7, 4:8].norm().item()
+
+        assert torch.isfinite(loss_bal) and loss_bal.item() > 0.0
+        assert pos_grad_bal > pos_grad_unbal * 2.0

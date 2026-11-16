@@ -31,13 +31,14 @@ model:
   cluster_temperature: 0.1
   cluster_separability_threshold: 0.05
   contrastive_sample_size: 1024
+  contrastive_balance_classes: true
   freeze_vit_stem_and_pos: true
   freeze_vit_blocks_below: 0
   llrd_enabled: true
-  llrd_decay: 0.85
-  llrd_min_scale: 0.02
-  neck_lr_multiplier: 0.5
-  prior_anchor_weight: 0.15
+  llrd_decay: 0.94
+  llrd_min_scale: 0.15
+  neck_lr_multiplier: 1.0
+  prior_anchor_weight: 0.03
   prior_anchor_mode: "pristine_only"
   pristine_anchor_threshold: 0.05
   anchor_half_precision: true
@@ -55,8 +56,8 @@ loss:
 training:
   epochs: 10
   learning_rate: 0.00005
-  backbone_lr_multiplier: 0.5
-  neck_lr_multiplier: 0.5
+  backbone_lr_multiplier: 1.0
+  neck_lr_multiplier: 1.0
   freeze_backbone_epochs: 0
   weight_decay: 0.0001
   optimizer: "adamw"

@@ -224,3 +224,29 @@ New experiment configs should live alongside Strategy 1 configs in `configs/expe
 ## 10. Out of Scope
 - Post-hoc **WiSE-FT** weight-space interpolation ($\theta_{\text{merged}} = (1 - \alpha)\theta_0 + \alpha\theta_{\text{finetuned}}$) is excluded from this specification.
 - Multi-backbone fusion (`HRNet + ViT`), soft-EM clustering, and `ForensicVectorMemory` remain out of scope.
+
+---
+
+## 11. Empirical Learnability Investigation & Calibrated Fixes (250+ Step Ablation)
+
+Controlled `512×512` experiments on `KhangTruong/IMD2020` (where tampered regions average **1.29%** of pixels) comparing Strategy 1 (PR #24) vs initial Strategy 1+ (PR #26) across >200 optimizer steps identified the exact mechanisms blocking learning in initial Strategy 1+ and verified their fixes:
+
+### 11.1 Observed Bottlenecks in Initial Strategy 1+
+1. **HRNet Mode `1B+` (`focal_hrnet_contrastive_strategy1_plus.yaml`) — Over-Aggressive LLRD + `backbone_lr_multiplier: 0.5` (+ `batch_size: 64` step reduction)**:
+   - At 252 steps (`batch_size=32`, 63 steps/ep), Strategy 1 (`5e-5` flat) reached `Val IoU = 0.2132` (`bs=16`: `0.2132`; `bs=32`: `0.2788`), while initial Strategy 1+ lagged at `0.1817` (`bs=16`) / `0.2209` (`bs=32`), and `batch_size=64` halved optimizer updates per epoch (`32` vs `63`).
+   - Single-factor ablations at 252 steps (`bs=16`) proved:
+     - `freeze_backbone_bn: true` **helped** (unfreezing BN dropped Ep 2 `Val IoU` from `0.1217` to `0.0407`).
+     - `prior_anchor_weight: 0.15` had negligible slowdown on HRNet (`Val IoU = 0.1779` without anchor vs `0.1817` with anchor), because HRNet's `grad[align] = 3.24` exceeds `grad[anchor] = 0.25` by `12.7×`.
+     - Removing LLRD + `backbone_lr_multiplier: 0.5` (`5e-5` across `stage2..stage4` while keeping anchor + BN lock + stem lock + L2-SP) jumped `Val IoU` from **`0.1817` → `0.2408`** (`Val AUROC: 0.8912 → 0.9405`), beating Strategy 1 (`0.2132`).
+2. **ViT Mode `1A+` & `1B+` (`focal_vit_*_strategy1_plus.yaml`) — Unbalanced `MyInfoNCE` + Over-Strong Pristine Anchor + Severe 24-Block LLRD**:
+   - On ViT's `32×32` (`H/16`) grid, `IMD2020` area downsampling yields only **~13 positive tokens** vs **~1,004 pristine anchor tokens** (`98.0%`) per image.
+   - `compute_contrastive_loss` averaged uniformly across all `1,024` anchors (`~78:1` pristine-to-tampered ratio), stalling `align_loss` at `ln(1024) ≈ 6.93` (`6.9329 → 6.9383`).
+   - Simultaneously, on ViT, `grad[anchor] = 0.0447` (`3.5×` larger than `grad[mask] = 0.0128`) and `grad[align] = 0.0310` (`2.4×` larger) overpowered the segmentation head across ViT's global/windowed self-attention, while `llrd_decay: 0.85` + `backbone_lr_multiplier: 0.5` reduced `blocks[0..11]` LRs to `1.19e-6 .. 7.11e-6` (`5.95e-7 .. 3.56e-6` in `1B+`) and `freeze_backbone_epochs: 1` trained the head on frozen features first—resulting in `Val IoU = 0.0000` (`pred > 0.5 = 0.00000`) through step 250.
+
+### 11.2 Calibrated Strategy 1+ Updates & Post-Fix Verification
+- **Class-Balanced `MyInfoNCE` (`contrastive_balance_classes: true` in `FOCAL.compute_contrastive_loss`)**: Equalizes positive and negative anchor means (`0.5 * (loss_pos + loss_neg)`) when both classes exist in an image.
+- **Calibrated LLRD & Backbone Multipliers**: Gentler HRNet multipliers (`{stage4: 1.0, transition3: 0.8, stage3: 0.65, transition2: 0.5, stage2: 0.4, transition1: 0.3}`, `backbone_lr_multiplier: 1.0` & `batch_size: 32` for HRNet `1B+`) and ViT LLRD (`llrd_decay: 0.94`, `llrd_min_scale: 0.15`, `backbone_lr_multiplier: 0.8` hybrid / `1.0` contrastive).
+- **Balanced ViT Anchors & Warmup**: `prior_anchor_weight: 0.02` (`0.03` contrastive), `align_weight: 0.1`, `freeze_backbone_epochs: 0` in `focal_vit_strategy1_plus.yaml`.
+- **Verified Post-Fix 250-Step Results**:
+  - **HRNet `1B+`**: `Val IoU` jumped from `0.1817` → **`0.2551`** (`Val F1: 0.2784 → 0.3735`, `Val AUROC: 0.8912 → 0.9338`, `Cluster Sep: 0.1519 → 0.3005`), beating Strategy 1 (`0.2132`).
+  - **ViT `1A+`**: Broke the `6.93` `Align` plateau (`6.54 → 5.85`) and jumped from `0.0000` → **`0.0913` Val IoU** at step 200 (`0.0793` / `0.8223` AUROC at step 250).

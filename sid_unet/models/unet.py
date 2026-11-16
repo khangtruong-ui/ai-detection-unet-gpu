@@ -979,6 +979,7 @@ def build_model(config: Any) -> nn.Module:
             cluster_separability_threshold=float(model_cfg.get("cluster_separability_threshold", 0.0015)),
             aux_pristine_gate=bool(model_cfg.get("aux_pristine_gate", False)),
             contrastive_sample_size=int(model_cfg.get("contrastive_sample_size", 1024)),
+            contrastive_balance_classes=bool(model_cfg.get("contrastive_balance_classes", True)),
             peft_enabled=bool(model_cfg.get("peft_enabled", model_cfg.get("use_peft", False))),
             lora_r=int(model_cfg.get("lora_r", 8)),
             lora_alpha=float(model_cfg.get("lora_alpha", 16.0)),
