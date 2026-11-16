@@ -69,6 +69,8 @@ class SIDTotalLoss(nn.Module):
         target_labels: (B,)
         """
         art_loss = None
+        prior_anchor_penalty = None
+        raw_prior_anchor = None
         multiscale_logits = None
         skip_mask_loss = False
         if isinstance(model_output, (tuple, list)):
@@ -115,11 +117,15 @@ class SIDTotalLoss(nn.Module):
                 "align_loss",
                 model_output.get("xs_xr_loss", model_output.get("artifact_loss")),
             )
+            prior_anchor_penalty = model_output.get("prior_anchor_penalty")
+            raw_prior_anchor = model_output.get("prior_anchor_loss")
             multiscale_logits = model_output.get("multiscale_logits")
             skip_mask_loss = bool(model_output.get("skip_mask_loss", False)) or (mask_logits is None)
         else:
             mask_logits = model_output
             class_logits = None
+            prior_anchor_penalty = None
+            raw_prior_anchor = None
             skip_mask_loss = mask_logits is None
 
         if skip_mask_loss:
@@ -174,6 +180,23 @@ class SIDTotalLoss(nn.Module):
             loss_metrics["artifact_loss"] = art_val
             loss_metrics["align_loss"] = art_val
             loss_metrics["xs_xr_loss"] = art_val
+
+        if prior_anchor_penalty is not None:
+            if torch.is_tensor(prior_anchor_penalty) and prior_anchor_penalty.numel() > 1:
+                prior_anchor_penalty = prior_anchor_penalty.mean()
+            total_loss = total_loss + prior_anchor_penalty
+            if raw_prior_anchor is not None:
+                loss_metrics["prior_anchor_loss"] = float(
+                    raw_prior_anchor.item() if hasattr(raw_prior_anchor, "item") else raw_prior_anchor
+                )
+            else:
+                loss_metrics["prior_anchor_loss"] = float(
+                    prior_anchor_penalty.item() if hasattr(prior_anchor_penalty, "item") else prior_anchor_penalty
+                )
+        elif raw_prior_anchor is not None:
+            loss_metrics["prior_anchor_loss"] = float(
+                raw_prior_anchor.item() if hasattr(raw_prior_anchor, "item") else raw_prior_anchor
+            )
 
         loss_metrics["total_loss"] = total_loss.item()
         return total_loss, loss_metrics

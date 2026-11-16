@@ -1,4 +1,4 @@
-# Configuration: FOCAL with SAM ViT-Large Backbone (Strategy 1 Mode 1A: Supervised Finetuning)
+# Configuration: FOCAL with SAM ViT-Large Backbone (Strategy B Mode 1A: Prior-Preserving PEFT Surgery)
 # Forensic Contrastive Clustering for Image Forgery Detection and Localization
 # Official Pretrained Weights: KhangTruong/FOCAL (FOCAL_ViT_weights.pth)
 
@@ -13,7 +13,7 @@ data:
   streaming: false
   normalize: false
   image_size: [512, 512]
-  batch_size: 4
+  batch_size: 8
   num_workers: -1
   pin_memory: true
   train_split: "train"
@@ -29,6 +29,16 @@ model:
   use_clustering: false
   head_type: "decoder"
   force_vit_1024: false
+  peft_enabled: true
+  lora_r: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  use_dora: true
+  lora_block_scope: "late_and_global"
+  lora_target_modules: ["qkv", "proj"]
+  train_neck: true
+  train_vit_norms: false
+  prior_anchor_weight: 0.0
   aux_classifier: false
   num_classes: 2
 
@@ -42,12 +52,14 @@ loss:
 training:
   epochs: 10
   learning_rate: 0.0001
-  backbone_lr_multiplier: 0.1
+  neck_lr_multiplier: 0.25
+  lora_lr_multiplier: 1.0
+  lora_weight_decay: 0.01
   freeze_backbone_epochs: 1
   weight_decay: 0.0001
   optimizer: "adamw"
   scheduler: "cosine"
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 2
   amp: true
   mixed_precision: "auto"
   precision: "auto"

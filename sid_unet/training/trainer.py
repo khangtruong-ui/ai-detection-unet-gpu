@@ -726,11 +726,12 @@ class Trainer:
         raw_target = getattr(self.model, "module", self.model)
         bb_lr_val = getattr(self, "backbone_lr", None)
         bb_mult_val = getattr(self, "backbone_lr_multiplier", None)
-        if bb_lr_val is not None or bb_mult_val is not None:
+        is_surgery_active = bool(getattr(raw_target, "_surgery_active", False))
+        if bb_lr_val is not None or bb_mult_val is not None or is_surgery_active:
             resolved_bb_lr = (
                 float(bb_lr_val)
                 if bb_lr_val is not None
-                else float(self.lr) * float(bb_mult_val)
+                else (float(self.lr) * float(bb_mult_val) if bb_mult_val is not None else None)
             )
             if hasattr(raw_target, "get_param_groups"):
                 groups = raw_target.get_param_groups(self.lr, resolved_bb_lr)
@@ -748,14 +749,13 @@ class Trainer:
                 groups = []
                 if head_params:
                     groups.append({"params": head_params, "lr": float(self.lr), "name": "head"})
-                if backbone_params:
+                if backbone_params and resolved_bb_lr is not None:
                     groups.append({"params": backbone_params, "lr": resolved_bb_lr, "name": "backbone"})
             if groups:
                 for g in groups:
                     g["lr_scale"] = float(g.get("lr", self.lr)) / max(1e-12, float(self.lr))
-                self.logger.info(
-                    f"🎯 Differential LR Active: head_lr={self.lr:.2e}, backbone_lr={resolved_bb_lr:.2e}"
-                )
+                group_desc = ", ".join(f"{g.get('name', 'group')}={g.get('lr', self.lr):.2e}" for g in groups)
+                self.logger.info(f"🎯 Differential LR Active: {group_desc}")
                 return groups
 
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
@@ -1500,6 +1500,9 @@ class Trainer:
         if isinstance(outputs, dict):
             mask_logits = outputs.get("mask_logits", outputs.get("pred_masks", outputs.get("masks", outputs.get("logits"))))
             class_logits = outputs.get("class_logits", outputs.get("pred_logits"))
+            sep = outputs.get("cluster_separability")
+            if sep is not None and torch.is_tensor(sep):
+                metric_logger.update("cluster_separability", float(sep.mean().item()), n=images.size(0))
         elif isinstance(outputs, (tuple, list)):
             mask_logits = outputs[0]
             class_logits = outputs[1] if len(outputs) > 1 else None
@@ -1747,6 +1750,11 @@ class Trainer:
                         if isinstance(val_iou_ci_lo, (int, float)) and isinstance(val_iou_ci_hi, (int, float))
                         else ""
                     )
+                    extra_diag = ""
+                    if "prior_anchor_loss" in train_metrics:
+                        extra_diag += f" - Anchor Drift: {train_metrics['prior_anchor_loss']:.4f}"
+                    if "val_cluster_separability" in val_summary:
+                        extra_diag += f" - Cluster Sep: {val_summary['val_cluster_separability']:.4f}"
                     self.logger.info(
                         f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:.1f}s] - "
                         f"Train Loss: {train_metrics.get('total_loss', 0.0):.4f} - "
@@ -1754,7 +1762,7 @@ class Trainer:
                         f"Val Loss: {val_summary.get('val_total_loss', 0.0):.4f} - "
                         f"Val IoU: {val_summary.get('val_iou', 0.0):.4f}{ci_str} - "
                         f"Val F1: {val_summary.get('val_f1', val_summary.get('val_dice', 0.0)):.4f} - "
-                        f"Val AUROC: {val_summary.get('val_auroc', 0.0):.4f}"
+                        f"Val AUROC: {val_summary.get('val_auroc', 0.0):.4f}{extra_diag}"
                     )
 
                     if "best" in saved_paths:

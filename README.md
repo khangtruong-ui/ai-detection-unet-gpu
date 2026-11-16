@@ -1446,16 +1446,18 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
 - **Supported Backbones**:
   - `HRNet-W32`: Multi-resolution parallel streams maintaining high-resolution representations throughout the network. Generates 32-dimensional spatial forensic features.
   - `SAM ViT-Large`: 24-layer ViT-Large image encoder from Segment Anything with decomposed relative positional embeddings and windowed/global multi-head attention. Generates 256-dimensional spatial forensic features.
-- **Inference Prediction & Strategy 1 Finetuning Modes**:
-  - **Mode 1A (`finetune_mode: "supervised"`, `use_clustering: false`)**: Strict train/eval parity using the lightweight progressive residual upsampling decoder (`FOCALSupervisedHead`) with differential backbone LR (`backbone_lr_multiplier: 0.1`), backbone freeze warmup (`freeze_backbone_epochs: 1`), and edge-aware supervision (`loss.edge_weight: 0.5`).
+- **Inference Prediction, Strategy 1 & Strategy B (Prior-Preserving PEFT Surgery) Finetuning Modes**:
+  - **Mode 1A (`finetune_mode: "supervised"`, `use_clustering: false`)**: Strict train/eval parity using the lightweight progressive residual upsampling decoder (`FOCALSupervisedHead`) with differential LR (`backbone_lr_multiplier` / `neck_lr_multiplier`), backbone freeze warmup (`freeze_backbone_epochs: 1`), and edge-aware supervision (`loss.edge_weight: 0.5`).
   - **Mode 1B (`finetune_mode: "contrastive"`, `use_clustering: true`)**: Paper-aligned per-image Soft Contrastive Learning (`MyInfoNCE`) with `self.fc` decoupled, bounded spatial token subsampling (`contrastive_sample_size`), and on-the-fly k-means clustering (`_cluster_features`) with pristine-image separability gating (`cluster_separability_threshold`).
+  - **Strategy B Prior-Preserving Surgery (`peft_enabled: true`, `use_dora: true`)**: Freezes `patch_embed`, `pos_embed`, `rel_pos_h/w`, `SAMBlock` norms, and early ViT blocks, applying `SurgicalLoRALinear` (LoRA / DoRA) to `late_and_global` blocks (`[5, 11, 17, 18..23]`) + selective `neck` tuning (<1% backbone trainable params), HRNet stage-wise & `BatchNorm2d` running-stat freezing (`hrnet_trainable_stages`, `freeze_backbone_bn`), optional zero-init residual `FeatureAdapter`, prior-anchoring (`prior_anchor_weight`), TorchAO FP8 `.base_linear` guard, and lossless `merge_peft_weights()` export.
   - **Preprocessing & Resolution**: Explicit raw `[0, 1]` input (`data.normalize: false`), forensic-preserving `[512, 512]` resolution, and native ViT resolution support (`force_vit_1024: false`).
   - **Auto Precision**: Supports `precision: "auto"` (FP8 E4M3 on SM >= 8.9 GPUs, BF16/FP16 fallback).
-- **Configuration Files**:
-  - `configs/experiments/focal/focal_hrnet.yaml` (Mode 1A Supervised, HRNet-W32)
-  - `configs/experiments/focal/focal_vit.yaml` (Mode 1A Supervised, SAM ViT-Large)
-  - `configs/experiments/focal/focal_hrnet_contrastive.yaml` (Mode 1B Contrastive, HRNet-W32)
-  - `configs/experiments/focal/focal_vit_contrastive.yaml` (Mode 1B Contrastive, SAM ViT-Large)
+- **Configuration Files (L4 22.5 GB GPU-tuned `512x512` batch sizes)**:
+  - `configs/experiments/focal/focal_vit.yaml` / `focal_vit_peft.yaml` (Strategy B Mode 1A DoRA PEFT, SAM ViT-Large, `batch_size: 8`)
+  - `configs/experiments/focal/focal_vit_contrastive.yaml` / `focal_vit_contrastive_peft.yaml` (Strategy B Mode 1B DoRA PEFT + Prior Anchor, SAM ViT-Large, `batch_size: 8`)
+  - `configs/experiments/focal/focal_hrnet.yaml` (Strategy 1 Mode 1A Supervised, HRNet-W32, `batch_size: 32`)
+  - `configs/experiments/focal/focal_hrnet_peft.yaml` (Strategy B Mode 1A Stage-4 + BN-Locked + FeatureAdapter, HRNet-W32, `batch_size: 32`)
+  - `configs/experiments/focal/focal_hrnet_contrastive.yaml` / `focal_hrnet_contrastive_peft.yaml` (Strategy B Mode 1B Stage-4 + BN-Locked + Prior Anchor, HRNet-W32, `batch_size: 128`)
 
 #### Checkpoint Synchronization (`sid-pull`)
 ```bash
@@ -2960,7 +2962,7 @@ sid-tui --clear-history
 
 #### D. Live Output Tail with Auto-Halt (`sid-tail`)
 
-Unlike traditional Unix `tail -f` which runs indefinitely until manually interrupted with `Ctrl+C`, **`sid-tail`** streams task log output in real-time and **automatically halts** as soon as the background task finishes (clean completion, unhandled exception, or termination).
+Unlike traditional Unix `tail -f` which runs indefinitely until manually interrupted with `Ctrl+C`, **`sid-tail`** streams task log output in real-time (cleanly collapsing TQDM `\r` progress bar updates without vertical line spam) and **automatically halts** as soon as the background task finishes (clean completion, unhandled exception, or termination).
 
 ```bash
 # Tail latest running background task (auto-detects active PID and halts on completion)

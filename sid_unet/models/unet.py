@@ -346,6 +346,31 @@ class UNet(nn.Module):
                     merged["model"]["backbone"] = "vit"
                 else:
                     merged["model"]["backbone"] = "hrnet"
+                if any(".lora_A" in k for k in state_dict.keys()):
+                    merged["model"].setdefault("peft_enabled", True)
+                    if not saved_cfg_dict.get("model", {}):
+                        merged["model"]["peft_enabled"] = True
+                        merged["model"]["use_dora"] = any(".dora_m" in k for k in state_dict.keys())
+                        for k, v in state_dict.items():
+                            if k.endswith(".lora_A") and hasattr(v, "shape"):
+                                merged["model"]["lora_r"] = int(v.shape[0])
+                                break
+                        block_idxs = set()
+                        targets = set()
+                        for k in state_dict.keys():
+                            if "blocks." in k and ".lora_A" in k:
+                                parts = k.split(".")
+                                for idx_i, part in enumerate(parts):
+                                    if part == "blocks" and idx_i + 1 < len(parts) and parts[idx_i + 1].isdigit():
+                                        block_idxs.add(int(parts[idx_i + 1]))
+                                    if part in ("qkv", "proj", "lin1", "lin2"):
+                                        targets.add(part)
+                        if block_idxs:
+                            merged["model"]["lora_block_scope"] = sorted(block_idxs)
+                        if targets:
+                            merged["model"]["lora_target_modules"] = sorted(targets)
+                if any(k.startswith(("feature_adapter.", "module.feature_adapter.")) for k in state_dict.keys()):
+                    merged["model"]["use_feature_adapter"] = True
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
@@ -448,6 +473,7 @@ def build_model(config: Any) -> nn.Module:
     else:
         model_cfg = {}
     training_cfg = config.get("training", {}) if hasattr(config, "get") else {}
+    loss_cfg = config.get("loss", {}) if hasattr(config, "get") else {}
     ckpt_flag = bool(
         model_cfg.get(
             "gradient_checkpointing",
@@ -948,6 +974,25 @@ def build_model(config: Any) -> nn.Module:
             cluster_separability_threshold=float(model_cfg.get("cluster_separability_threshold", 0.0015)),
             aux_pristine_gate=bool(model_cfg.get("aux_pristine_gate", False)),
             contrastive_sample_size=int(model_cfg.get("contrastive_sample_size", 1024)),
+            peft_enabled=bool(model_cfg.get("peft_enabled", model_cfg.get("use_peft", False))),
+            lora_r=int(model_cfg.get("lora_r", 8)),
+            lora_alpha=float(model_cfg.get("lora_alpha", 16.0)),
+            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
+            use_dora=bool(model_cfg.get("use_dora", True)),
+            lora_block_scope=model_cfg.get("lora_block_scope", "late_and_global"),
+            lora_last_k_blocks=int(model_cfg.get("lora_last_k_blocks", 6)),
+            lora_target_modules=model_cfg.get("lora_target_modules", None),
+            train_neck=bool(model_cfg.get("train_neck", True)),
+            train_vit_norms=bool(model_cfg.get("train_vit_norms", False)),
+            hrnet_trainable_stages=model_cfg.get("hrnet_trainable_stages", None),
+            freeze_backbone_bn=model_cfg.get("freeze_backbone_bn", None),
+            freeze_stage4_bn=bool(model_cfg.get("freeze_stage4_bn", False)),
+            use_feature_adapter=bool(model_cfg.get("use_feature_adapter", False)),
+            prior_anchor_weight=float(model_cfg.get("prior_anchor_weight", loss_cfg.get("prior_anchor_weight", 0.0))),
+            neck_l2_anchor_weight=float(model_cfg.get("neck_l2_anchor_weight", loss_cfg.get("neck_l2_anchor_weight", 0.0))),
+            neck_lr_multiplier=float(model_cfg.get("neck_lr_multiplier", training_cfg.get("neck_lr_multiplier", 0.25))),
+            lora_lr_multiplier=float(model_cfg.get("lora_lr_multiplier", training_cfg.get("lora_lr_multiplier", 1.0))),
+            lora_weight_decay=float(model_cfg.get("lora_weight_decay", training_cfg.get("lora_weight_decay", 0.01))),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(

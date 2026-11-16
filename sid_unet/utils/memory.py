@@ -311,6 +311,8 @@ def find_optimal_batch_size(
                 # Generate dummy batch
                 images = torch.randn(bs, c, h, w, device=device)
                 masks = torch.zeros(bs, 1, mask_h, mask_w, device=device)
+                if getattr(model, "requires_gt_masks", False):
+                    masks[:, :, : max(1, mask_h // 2), :] = 1.0
                 labels = torch.randint(0, num_classes, (bs,), device=device) if aux_classifier else None
 
                 optimizer.zero_grad(set_to_none=True)
@@ -318,6 +320,8 @@ def find_optimal_batch_size(
                 probe_kwargs: Dict[str, Any] = {}
                 if should_pass_f_r:
                     probe_kwargs["f_r"] = torch.zeros(bs, 256, device=device)
+                if getattr(model, "requires_gt_masks", False):
+                    probe_kwargs["gt_masks"] = masks
 
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
                     outputs = model(images, **probe_kwargs) if probe_kwargs else model(images)
