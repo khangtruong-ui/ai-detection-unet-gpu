@@ -1446,12 +1446,16 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
 - **Supported Backbones**:
   - `HRNet-W32`: Multi-resolution parallel streams maintaining high-resolution representations throughout the network. Generates 32-dimensional spatial forensic features.
   - `SAM ViT-Large`: 24-layer ViT-Large image encoder from Segment Anything with decomposed relative positional embeddings and windowed/global multi-head attention. Generates 256-dimensional spatial forensic features.
-- **Inference Prediction**:
-  - Direct 2-class convolutional classification head (`self.fc`).
-  - Unsupervised k-means clustering mask prediction (`predict_mask_clustering`).
+- **Inference Prediction & Strategy 1 Finetuning Modes**:
+  - **Mode 1A (`finetune_mode: "supervised"`, `use_clustering: false`)**: Strict train/eval parity using the lightweight progressive residual upsampling decoder (`FOCALSupervisedHead`) with differential backbone LR (`backbone_lr_multiplier: 0.1`), backbone freeze warmup (`freeze_backbone_epochs: 1`), and edge-aware supervision (`loss.edge_weight: 0.5`).
+  - **Mode 1B (`finetune_mode: "contrastive"`, `use_clustering: true`)**: Paper-aligned per-image Soft Contrastive Learning (`MyInfoNCE`) with `self.fc` decoupled, bounded spatial token subsampling (`contrastive_sample_size`), and on-the-fly k-means clustering (`_cluster_features`) with pristine-image separability gating (`cluster_separability_threshold`).
+  - **Preprocessing & Resolution**: Explicit raw `[0, 1]` input (`data.normalize: false`), forensic-preserving `[512, 512]` resolution, and native ViT resolution support (`force_vit_1024: false`).
+  - **Auto Precision**: Supports `precision: "auto"` (FP8 E4M3 on SM >= 8.9 GPUs, BF16/FP16 fallback).
 - **Configuration Files**:
-  - `configs/experiments/focal/focal_hrnet.yaml`
-  - `configs/experiments/focal/focal_vit.yaml`
+  - `configs/experiments/focal/focal_hrnet.yaml` (Mode 1A Supervised, HRNet-W32)
+  - `configs/experiments/focal/focal_vit.yaml` (Mode 1A Supervised, SAM ViT-Large)
+  - `configs/experiments/focal/focal_hrnet_contrastive.yaml` (Mode 1B Contrastive, HRNet-W32)
+  - `configs/experiments/focal/focal_vit_contrastive.yaml` (Mode 1B Contrastive, SAM ViT-Large)
 
 #### Checkpoint Synchronization (`sid-pull`)
 ```bash

@@ -13,6 +13,7 @@ Directory Layout:
 - **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
 - **`diffusion_diff_minimized/`**: Minimized ultra-fast diffusion-diff architecture using Segmind Tiny-SD (`segmind/tiny-sd`) in FP16 on CUDA with only 2 lines of computation (1 real latent, 1 chosen noisy latent from the diffusion model).
 - **`mask_clip/`**: OpenSDI MaskCLIP (Synergizing Pretrained Models: CLIP ViT-L/14 + MAE ViT-B/16) with VCA cross-attention, FPN + TVCA mask decoder, VSA CLS aggregator, PromptLearner, edge-weighted loss, and Model Surgery hooks.
+- **`focal/`**: FOCAL (HRNet-W32 & SAM ViT-Large) Strategy 1 finetuning configs supporting Mode 1A supervised residual decoder finetuning (`focal_hrnet.yaml`, `focal_vit.yaml`) and Mode 1B image-relative `MyInfoNCE` contrastive finetuning (`focal_hrnet_contrastive.yaml`, `focal_vit_contrastive.yaml`) with `data.normalize: false` and `precision: "auto"`.
 
 
 ---

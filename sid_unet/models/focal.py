@@ -462,18 +462,20 @@ class SAMAttention(nn.Module):
     def _get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
         max_rel_dist = int(2 * max(q_size, k_size) - 1)
         if rel_pos.shape[0] != max_rel_dist:
+            # F.interpolate(..., mode="linear") requires a 3D [N, C, L] tensor
             rel_pos_resized = F.interpolate(
-                rel_pos.reshape(1, 1, -1, rel_pos.shape[-1]).permute(0, 3, 1, 2),
-                size=(1, max_rel_dist),
+                rel_pos.t().unsqueeze(0).float(),
+                size=max_rel_dist,
                 mode="linear",
+                align_corners=False,
             )
-            rel_pos_resized = rel_pos_resized.reshape(-1, max_rel_dist).permute(1, 0)
+            rel_pos_resized = rel_pos_resized.squeeze(0).t().to(dtype=rel_pos.dtype)
         else:
             rel_pos_resized = rel_pos
 
-        q_coords = torch.arange(q_size)[:, None]
-        k_coords = torch.arange(k_size)[None, :]
-        rel_coords = (q_coords - k_coords) + (k_size - 1)
+        q_coords = torch.arange(q_size, device=rel_pos.device)[:, None] * max(k_size / q_size, 1.0)
+        k_coords = torch.arange(k_size, device=rel_pos.device)[None, :] * max(q_size / k_size, 1.0)
+        rel_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
         return rel_pos_resized[rel_coords.long()]
 
 
@@ -662,6 +664,83 @@ class FOCALViTNet(nn.Module):
 
 
 # ------------------------------------------------------------------------------
+# Lightweight Residual Upsampling Decoder Head (Strategy 1 Mode 1A)
+# ------------------------------------------------------------------------------
+
+def _select_num_groups(channels: int, max_groups: int = 16) -> int:
+    """Return the largest group count <= max_groups that evenly divides channels."""
+    for g in range(min(max_groups, channels), 0, -1):
+        if channels % g == 0:
+            return g
+    return 1
+
+
+class _ResidualConvBlock(nn.Module):
+    """Residual Conv -> GroupNorm -> GELU -> Conv -> GroupNorm refinement block."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        groups = _select_num_groups(channels)
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.block(x))
+
+
+class FOCALSupervisedHead(nn.Module):
+    """
+    Lightweight residual progressive upsampling decoder for Strategy 1 Mode 1A.
+
+    Refines H/4 (HRNet) or H/16 (ViT) dense forensic features through residual blocks
+    and progressive 2x bilinear upsampling stages before projecting to mask logits.
+    """
+
+    def __init__(self, in_dim: int, num_upsample_stages: int = 2, mid_dim: Optional[int] = None):
+        super().__init__()
+        base_dim = mid_dim if mid_dim is not None else (64 if in_dim <= 64 else 128)
+        groups_base = _select_num_groups(base_dim)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_dim, base_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups_base, base_dim),
+            nn.GELU(),
+        )
+        self.res_block = _ResidualConvBlock(base_dim)
+
+        stages = []
+        cur_dim = base_dim
+        for _ in range(max(1, num_upsample_stages)):
+            next_dim = max(32, cur_dim // 2)
+            groups_next = _select_num_groups(next_dim)
+            stages.append(
+                nn.Sequential(
+                    nn.Conv2d(cur_dim, next_dim, kernel_size=3, padding=1, bias=False),
+                    nn.GroupNorm(groups_next, next_dim),
+                    nn.GELU(),
+                )
+            )
+            cur_dim = next_dim
+        self.upsample_stages = nn.ModuleList(stages)
+        self.out_conv = nn.Conv2d(cur_dim, 1, kernel_size=1)
+
+    def forward(self, feats: torch.Tensor, orig_h: int, orig_w: int) -> torch.Tensor:
+        x = self.res_block(self.stem(feats))
+        for stage in self.upsample_stages:
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            x = stage(x)
+        logits = self.out_conv(x)
+        if logits.shape[2] != orig_h or logits.shape[3] != orig_w:
+            logits = F.interpolate(logits, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        return logits
+
+
+# ------------------------------------------------------------------------------
 # Unified FOCAL Model
 # ------------------------------------------------------------------------------
 
@@ -673,6 +752,11 @@ class FOCAL(nn.Module):
     - Backbone: "hrnet" (default, lightweight 32-dim features) or "vit" (SAM ViT-L, 256-dim features).
     - Pretrained weights loaded from Hugging Face repository `KhangTruong/FOCAL` with strict verification.
     - Zero fallback to random/dummy weights: missing weights raise an immediate RuntimeError.
+    - Strategy 1 Finetuning Modes:
+      - `"supervised"` (Mode 1A): Strict train/eval parity using a lightweight residual upsampling
+        decoder (`FOCALSupervisedHead`) or legacy `fc` head (`use_clustering=False`).
+      - `"contrastive"` (Mode 1B): Image-relative Soft Contrastive Learning (`MyInfoNCE`) during
+        training with on-the-fly clustering (`_cluster_features`) and pristine-safety gating in eval.
 
     Args:
         backbone (str): "hrnet" or "vit" (default: "hrnet").
@@ -682,6 +766,14 @@ class FOCAL(nn.Module):
         cache_dir (Optional[str]): Local cache directory for weights.
         aux_classifier (bool): Whether to enable auxiliary class logits (default: False).
         num_classes (int): Auxiliary class count (default: 2).
+        use_clustering (bool): Enable unsupervised clustering inference (default: True).
+        cluster_temperature (float): Temperature scaling for clustering and MyInfoNCE (default: 0.1).
+        finetune_mode (Optional[str]): Strategy 1 mode: `"supervised"`, `"contrastive"`, or `None` (legacy).
+        head_type (str): Supervised head variant: `"auto"`, `"decoder"`, or `"legacy"`.
+        force_vit_1024 (bool): If True, upsamples ViT inputs to 1024x1024; otherwise uses native size.
+        cluster_separability_threshold (float): Pristine-safety threshold on `1 - cos(c0, c1)`.
+        aux_pristine_gate (bool): If True and `aux_classifier=True`, gates eval clustering by `class_head`.
+        contrastive_sample_size (int): Max spatial tokens per image in `MyInfoNCE` (default: 1024).
     """
 
     def __init__(
@@ -695,6 +787,12 @@ class FOCAL(nn.Module):
         num_classes: int = 2,
         use_clustering: bool = True,
         cluster_temperature: float = 0.1,
+        finetune_mode: Optional[str] = None,
+        head_type: str = "auto",
+        force_vit_1024: bool = False,
+        cluster_separability_threshold: float = 0.0015,
+        aux_pristine_gate: bool = False,
+        contrastive_sample_size: int = 1024,
         **kwargs: Any,
     ):
         super().__init__()
@@ -702,8 +800,38 @@ class FOCAL(nn.Module):
         self.aux_classifier = bool(aux_classifier)
         self.num_classes = int(num_classes)
         self.hf_repo = hf_repo
-        self.use_clustering = bool(use_clustering)
-        self.cluster_temperature = float(cluster_temperature)
+        self.cluster_temperature = max(1e-4, float(cluster_temperature))
+        self.force_vit_1024 = bool(force_vit_1024)
+        self.cluster_separability_threshold = max(0.0, float(cluster_separability_threshold))
+        self.aux_pristine_gate = bool(aux_pristine_gate)
+        self.contrastive_sample_size = max(16, int(contrastive_sample_size))
+
+        # Normalize Strategy 1 finetuning mode
+        raw_mode = None if finetune_mode is None else str(finetune_mode).lower().strip()
+        if raw_mode in (None, "", "legacy", "default", "none"):
+            self.finetune_mode: Optional[str] = None
+            self.use_clustering = bool(use_clustering)
+        elif raw_mode in ("supervised", "mode_1a", "1a"):
+            self.finetune_mode = "supervised"
+            self.use_clustering = False
+        elif raw_mode in ("contrastive", "mode_1b", "1b", "scl"):
+            self.finetune_mode = "contrastive"
+            self.use_clustering = True
+        else:
+            raise ValueError(
+                f"Unsupported FOCAL finetune_mode '{finetune_mode}'. "
+                "Supported: 'supervised', 'contrastive', or None."
+            )
+
+        raw_head = str(head_type).lower().strip()
+        if raw_head in ("auto", ""):
+            self.head_type = "decoder" if self.finetune_mode == "supervised" else "legacy"
+        elif raw_head in ("decoder", "upsample", "residual", "residual_upsample"):
+            self.head_type = "decoder"
+        elif raw_head in ("legacy", "fc", "conv"):
+            self.head_type = "legacy"
+        else:
+            raise ValueError(f"Unsupported FOCAL head_type '{head_type}'. Supported: 'auto', 'decoder', 'legacy'.")
 
         if not pretrained:
             raise ValueError(
@@ -714,6 +842,7 @@ class FOCAL(nn.Module):
         if self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
             self.net = HRNet()
             in_dim = 32
+            num_upsample_stages = 2
             default_filename = DEFAULT_FOCAL_HRNET_CKPT
         elif self.backbone_name in ("vit", "vit-l", "sam_vit"):
             # ImageEncoderViT matching SAM ViT-L in FOCAL
@@ -726,12 +855,25 @@ class FOCAL(nn.Module):
                 out_chans=256,
             )
             in_dim = 256
+            num_upsample_stages = 4
             default_filename = DEFAULT_FOCAL_VIT_CKPT
         else:
             raise ValueError(f"Unsupported FOCAL backbone '{backbone}'. Supported: 'hrnet', 'vit'.")
 
         # 2-class Convolutional classification head (as stored in genuine checkpoint)
         self.fc = nn.Conv2d(in_dim, 2, kernel_size=3, padding=1)
+
+        # Optional upgraded supervised decoder (Mode 1A)
+        self.decoder: Optional[FOCALSupervisedHead] = (
+            FOCALSupervisedHead(in_dim=in_dim, num_upsample_stages=num_upsample_stages)
+            if self.head_type == "decoder"
+            else None
+        )
+
+        # Freeze unused self.fc so DDP never complains about unused parameters
+        if self.head_type == "decoder" or self.finetune_mode == "contrastive":
+            for p in self.fc.parameters():
+                p.requires_grad_(False)
 
         # Optional auxiliary classifier
         if self.aux_classifier:
@@ -751,6 +893,36 @@ class FOCAL(nn.Module):
             default_filename=default_filename,
             cache_dir=cache_dir,
         )
+
+    @property
+    def requires_gt_masks(self) -> bool:
+        """True when Mode 1B contrastive training requires ground-truth masks in forward()."""
+        return self.finetune_mode == "contrastive"
+
+    def set_backbone_trainable(self, trainable: bool) -> None:
+        """Freeze or unfreeze backbone (`self.net`) parameters and BatchNorm tracking."""
+        for p in self.net.parameters():
+            p.requires_grad_(bool(trainable))
+        if trainable:
+            self.net.train(self.training)
+        else:
+            self.net.eval()
+
+    def get_param_groups(self, lr: float, backbone_lr: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Build differential learning-rate parameter groups separating head and backbone."""
+        if backbone_lr is None:
+            return [{"params": [p for p in self.parameters() if p.requires_grad], "lr": float(lr)}]
+
+        backbone_param_ids = {id(p) for p in self.net.parameters()}
+        head_params = [p for p in self.parameters() if id(p) not in backbone_param_ids and p.requires_grad]
+        backbone_params = [p for p in self.net.parameters()]
+
+        groups: List[Dict[str, Any]] = []
+        if head_params:
+            groups.append({"params": head_params, "lr": float(lr), "name": "head"})
+        if backbone_params:
+            groups.append({"params": backbone_params, "lr": float(backbone_lr), "name": "backbone"})
+        return groups
 
     def _load_pretrained(
         self, source: str, default_filename: str, cache_dir: Optional[str] = None
@@ -844,6 +1016,8 @@ class FOCAL(nn.Module):
         expected_keys = set(self.state_dict().keys())
         if self.class_head is not None:
             expected_keys = {k for k in expected_keys if not k.startswith("class_head.")}
+        if self.decoder is not None:
+            expected_keys = {k for k in expected_keys if not k.startswith("decoder.")}
 
         for k, v in raw_sd.items():
             clean_k = k[7:] if k.startswith("module.") else k
@@ -880,40 +1054,51 @@ class FOCAL(nn.Module):
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract spatial forensic features from input images."""
         x = self._ensure_raw_rgb(x)
-        orig_h, orig_w = x.shape[2], x.shape[3]
-        if self.backbone_name in ("vit", "vit-l", "sam_vit") and (orig_h != 1024 or orig_w != 1024):
-            x_in = F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
-            return self.net(x_in)
+        if self.backbone_name in ("vit", "vit-l", "sam_vit") and self.force_vit_1024:
+            orig_h, orig_w = x.shape[2], x.shape[3]
+            if orig_h != 1024 or orig_w != 1024:
+                x_in = F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
+                return self.net(x_in)
         return self.net(x)
 
-    def _cluster_features(
-        self, feats: torch.Tensor, orig_h: int, orig_w: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_pristine_gate(
+        self,
+        diff: torch.Tensor,
+        pristine_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shift clustering logits negative for images flagged as pristine/unimodal."""
+        if not pristine_mask.any():
+            return diff
+        max_pos = diff.max(dim=-1, keepdim=True).values.clamp(min=0.0)
+        shifted = diff - (max_pos + 2.0)
+        return torch.where(pristine_mask.view(-1, 1), shifted, diff)
+
+    def _cluster_features_with_stats(
+        self,
+        feats: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+        aux_pristine_flags: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         On-the-fly unsupervised k-means clustering mask and logit prediction as proposed in FOCAL.
-        Clusters L2-normalized forensic embeddings into tampered and pristine groups per image.
-        Fully vectorized across batch B without CPU-GPU synchronization barriers.
-
-        Returns:
-            mask_logits: [B, 1, H, W]
-            pred_mask: [B, 1, H, W] in [0, 1]
+        Clusters L2-normalized forensic embeddings into tampered and pristine groups per image,
+        and returns `(logit_full, prob_full, cluster_separability)`.
         """
         b, c, h_f, w_f = feats.shape
         n_px = h_f * w_f
-        feats_norm = F.normalize(feats, p=2, dim=1)
+        feats_norm = F.normalize(feats.float(), p=2, dim=1)
         f_img = feats_norm.permute(0, 2, 3, 1).reshape(b, n_px, c)
 
         # Double farthest-point initialization (k-means++ style) across entire batch
         c1 = f_img[:, 0:1, :]
         dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
         idx_max1 = torch.argmax(dists1, dim=-1, keepdim=True)
-        idx_max1_expanded = idx_max1.unsqueeze(-1).expand(-1, 1, c)
-        c2 = torch.gather(f_img, dim=1, index=idx_max1_expanded)
+        c2 = torch.gather(f_img, dim=1, index=idx_max1.unsqueeze(-1).expand(-1, 1, c))
 
         dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
         idx_max2 = torch.argmax(dists2, dim=-1, keepdim=True)
-        idx_max2_expanded = idx_max2.unsqueeze(-1).expand(-1, 1, c)
-        c1 = torch.gather(f_img, dim=1, index=idx_max2_expanded)
+        c1 = torch.gather(f_img, dim=1, index=idx_max2.unsqueeze(-1).expand(-1, 1, c))
 
         centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
 
@@ -933,38 +1118,164 @@ class FOCAL(nn.Module):
             new_c1 = F.normalize(new_c1, p=2, dim=-1)
             centroids = torch.cat([new_c0, new_c1], dim=1)
 
+        cos_sim = (centroids[:, 0] * centroids[:, 1]).sum(dim=-1)  # [B]
+        separability = (1.0 - cos_sim).clamp(min=0.0)
+
         sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
         labels = torch.argmax(sims, dim=-1)  # [B, N]
         c1_count = labels.sum(dim=-1, keepdim=True)  # [B, 1]
         c0_count = n_px - c1_count  # [B, 1]
 
-        # As proposed in the FOCAL paper:
         # Tampered regions typically occupy the minority portion of an image.
         cond = (c1_count > c0_count)  # [B, 1]
         sim_tampered = torch.where(cond, sims[:, :, 0], sims[:, :, 1])  # [B, N]
         sim_pristine = torch.where(cond, sims[:, :, 1], sims[:, :, 0])  # [B, N]
 
-        # Continuous difference scaled by temperature for smooth, calibrated logits
         diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [B, N]
+
+        pristine_mask = separability < self.cluster_separability_threshold
+        if aux_pristine_flags is not None:
+            pristine_mask = pristine_mask | aux_pristine_flags.to(device=separability.device, dtype=torch.bool)
+        diff = self._apply_pristine_gate(diff, pristine_mask)
+
         logit_grid = diff.view(b, 1, h_f, w_f)
         logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
         prob_full = torch.sigmoid(logit_full)
 
+        return logit_full, prob_full, separability
+
+    def _cluster_features(
+        self, feats: torch.Tensor, orig_h: int, orig_w: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        On-the-fly unsupervised k-means clustering mask and logit prediction as proposed in FOCAL.
+        Clusters L2-normalized forensic embeddings into tampered and pristine groups per image.
+        Fully vectorized across batch B without CPU-GPU synchronization barriers.
+
+        Returns:
+            mask_logits: [B, 1, H, W]
+            pred_mask: [B, 1, H, W] in [0, 1]
+        """
+        logit_full, prob_full, _ = self._cluster_features_with_stats(feats, orig_h, orig_w)
         return logit_full, prob_full
+
+    @staticmethod
+    def _sample_contrastive_tokens(
+        emb_flat: torch.Tensor,
+        label_flat: torch.Tensor,
+        max_tokens: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stratified-balanced spatial token subsampling to bound MyInfoNCE memory to O(K^2)."""
+        n_total = emb_flat.shape[0]
+        if n_total <= max_tokens:
+            return emb_flat, label_flat
+
+        pos_idx = torch.nonzero(label_flat == 1, as_tuple=False).squeeze(-1)
+        neg_idx = torch.nonzero(label_flat == 0, as_tuple=False).squeeze(-1)
+        half = max_tokens // 2
+        n_pos = min(pos_idx.numel(), half)
+        n_neg = min(neg_idx.numel(), max_tokens - n_pos)
+        if n_pos + n_neg < max_tokens and pos_idx.numel() > n_pos:
+            n_pos = min(pos_idx.numel(), max_tokens - n_neg)
+
+        selected = []
+        if n_pos > 0:
+            perm_p = torch.randperm(pos_idx.numel(), device=emb_flat.device)[:n_pos]
+            selected.append(pos_idx[perm_p])
+        if n_neg > 0:
+            perm_n = torch.randperm(neg_idx.numel(), device=emb_flat.device)[:n_neg]
+            selected.append(neg_idx[perm_n])
+        idx = torch.cat(selected, dim=0)
+        return emb_flat[idx], label_flat[idx]
+
+    def compute_contrastive_loss(
+        self, feats: torch.Tensor, gt_masks: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute image-relative Soft Contrastive Learning loss (`MyInfoNCE`, FOCAL Strategy 1 Mode 1B).
+
+        Contrasts L2-normalized dense embeddings strictly within each image against downsampled
+        ground-truth masks. Pure-pristine and pure-tampered images safely contribute 0.0 without NaN/Inf.
+        """
+        zero_anchor = feats.sum() * 0.0
+        if gt_masks is None:
+            return zero_anchor
+
+        b, c, h_f, w_f = feats.shape
+        gt_f = gt_masks.float()
+        if gt_f.ndim == 3:
+            gt_f = gt_f.unsqueeze(1)
+        if gt_f.shape[2] != h_f or gt_f.shape[3] != w_f:
+            gt_small = F.interpolate(gt_f, size=(h_f, w_f), mode="area")
+        else:
+            gt_small = gt_f
+        labels_grid = (gt_small >= 0.5).long().view(b, h_f * w_f)
+
+        feats_norm = F.normalize(feats.float(), p=2, dim=1)
+        emb_all = feats_norm.permute(0, 2, 3, 1).reshape(b, h_f * w_f, c)
+
+        per_image_losses: List[torch.Tensor] = []
+        for i in range(b):
+            y_i = labels_grid[i]
+            has_pos = bool((y_i == 1).any())
+            has_neg = bool((y_i == 0).any())
+            if not (has_pos and has_neg):
+                continue
+
+            z_i, y_sub = self._sample_contrastive_tokens(emb_all[i], y_i, self.contrastive_sample_size)
+            k_i = z_i.shape[0]
+            if k_i < 2 or not (y_sub == 1).any() or not (y_sub == 0).any():
+                continue
+
+            logits = torch.matmul(z_i, z_i.t()) / self.cluster_temperature  # [K, K]
+            self_mask = torch.eye(k_i, dtype=torch.bool, device=z_i.device)
+            same_label = (y_sub.unsqueeze(0) == y_sub.unsqueeze(1)) & (~self_mask)
+            valid_anchors = same_label.any(dim=1)
+            if not valid_anchors.any():
+                continue
+
+            logits_masked = logits.masked_fill(self_mask, float("-inf"))
+            # Numerical stabilization per anchor row
+            row_max = logits_masked.max(dim=-1, keepdim=True).values.detach()
+            logits_stable = logits_masked - row_max
+            log_denom = torch.logsumexp(logits_stable, dim=-1, keepdim=True)
+            log_prob = logits_stable - log_denom
+
+            pos_counts = same_label.sum(dim=-1).clamp(min=1).to(log_prob.dtype)
+            loss_per_anchor = -(log_prob.masked_fill(~same_label, 0.0)).sum(dim=-1) / pos_counts
+            per_image_losses.append(loss_per_anchor[valid_anchors].mean())
+
+        if not per_image_losses:
+            return zero_anchor
+        return torch.stack(per_image_losses).mean()
+
+    def _run_supervised_head(
+        self, feats: torch.Tensor, orig_h: int, orig_w: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Execute active supervised segmentation head (`decoder` or legacy `fc`)."""
+        if self.decoder is not None:
+            mask_logits = self.decoder(feats, orig_h, orig_w)
+            return mask_logits, mask_logits
+        logits_small = self.fc(feats)
+        logits_full = F.interpolate(logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
+        return mask_logits, logits_full
 
     def forward(
         self,
         x: torch.Tensor,
         return_dict: bool = True,
+        gt_masks: Optional[torch.Tensor] = None,
         *args: Any,
         **kwargs: Any,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
+    ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
         """
         Forward pass of FOCAL.
 
         Args:
             x: Input RGB tensor `[B, 3, H, W]`.
             return_dict: If True, returns dictionary with standard keys.
+            gt_masks: Optional ground-truth binary masks `[B, 1, H, W]` for Mode 1B (`contrastive`).
 
         Returns:
             Dictionary with:
@@ -972,21 +1283,51 @@ class FOCAL(nn.Module):
                 - `pred_mask`: Sigmoid probability `[B, 1, H, W]`
                 - `features`: Dense feature map `[B, C, H', W']`
                 - `class_logits`: `[B, num_classes]` (if aux_classifier)
+                - `align_loss`: Per-image Soft Contrastive Loss (if Mode 1B training)
+                - `cluster_separability`: Inter-centroid distance `1 - cos(c0, c1)` (if clustering)
         """
         orig_h, orig_w = x.shape[2], x.shape[3]
-
         feats = self.extract_features(x)  # [B, C, H', W']
-
-        if not self.training and self.use_clustering:
-            mask_logits, pred_mask = self._cluster_features(feats, orig_h, orig_w)
-            logits_full = mask_logits
-        else:
-            logits_small = self.fc(feats)  # [B, 2, H', W']
-            logits_full = F.interpolate(logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-            mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
-            pred_mask = torch.sigmoid(mask_logits)
-
         class_logits = self.class_head(feats) if self.class_head is not None else None
+        aux_pristine_flags = (
+            (class_logits[:, 1] < class_logits[:, 0])
+            if (self.aux_pristine_gate and class_logits is not None and class_logits.shape[-1] >= 2)
+            else None
+        )
+
+        align_loss: Optional[torch.Tensor] = None
+        skip_mask_loss = False
+        separability: Optional[torch.Tensor] = None
+
+        if self.finetune_mode == "supervised":
+            # Mode 1A: strict train/eval parity via supervised head
+            mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
+            pred_mask = torch.sigmoid(mask_logits)
+        elif self.finetune_mode == "contrastive":
+            # Mode 1B: image-relative contrastive training + clustering eval
+            if self.training:
+                align_loss = self.compute_contrastive_loss(feats, gt_masks)
+                skip_mask_loss = True
+                with torch.no_grad():
+                    mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                        feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                logits_full = mask_logits
+            else:
+                mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                    feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                )
+                logits_full = mask_logits
+        else:
+            # Legacy mode: preserves backward compatibility with existing zero-shot / audit tests
+            if not self.training and self.use_clustering:
+                mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                    feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                )
+                logits_full = mask_logits
+            else:
+                mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
+                pred_mask = torch.sigmoid(mask_logits)
 
         if return_dict:
             res: Dict[str, Any] = {
@@ -998,8 +1339,17 @@ class FOCAL(nn.Module):
             if class_logits is not None:
                 res["class_logits"] = class_logits
                 res["pred_label"] = torch.argmax(class_logits, dim=1)
+            if align_loss is not None:
+                res["align_loss"] = align_loss
+                res["skip_mask_loss"] = skip_mask_loss
+            if separability is not None:
+                res["cluster_separability"] = separability
             return res
 
+        if align_loss is not None:
+            if self.aux_classifier and class_logits is not None:
+                return mask_logits, class_logits, align_loss
+            return mask_logits, align_loss
         if self.aux_classifier and class_logits is not None:
             return mask_logits, class_logits
         return mask_logits

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-16
+
+### Added & Fixed
+- **FOCAL Strategy 1 Finetuning Alignment (`sid_unet.models.focal`, `sid_unet.losses.auxiliary`, `sid_unet.training.trainer`, `configs/experiments/focal/*.yaml`)**:
+  - **Preprocessing & Resolution Alignment**: Added explicit `data.normalize: false` and `[512, 512]` forensic resolution across all `configs/experiments/focal/*.yaml` configs; added `force_vit_1024` flag (default `False`) to eliminate wasted `256->1024` ViT upsampling and fixed 3D `F.interpolate(..., mode="linear")` in `SAMAttention._get_rel_pos` for native non-1024 ViT resolutions.
+  - **Mode 1A (Supervised Finetuning)**: Implemented `FOCALSupervisedHead` (residual progressive upsampling decoder) with strict train/eval parity (`finetune_mode: "supervised"`, `use_clustering: false`), strict `self.net` pretrained loading (`decoder.*` exempted), differential backbone LR (`backbone_lr` / `backbone_lr_multiplier`), backbone freeze warmup (`freeze_backbone_epochs`), and edge-aware supervision (`edge_weight: 0.5`).
+  - **Mode 1B (Image-Relative Contrastive Finetuning)**: Implemented per-image Soft Contrastive Learning (`MyInfoNCE` via `FOCAL.compute_contrastive_loss`) with stratified spatial token subsampling (`contrastive_sample_size`), zero-loss safe handling for pure-pristine / pure-tampered images, `self.fc` decoupling, and `SIDTotalLoss` `skip_mask_loss` support alongside `Trainer` `gt_masks` forwarding.
+  - **Pristine-Image Safety & Reporting Consistency**: Added `cluster_separability_threshold` (`1 - cos(c0, c1)`) and optional `aux_pristine_gate` in `FOCAL._cluster_features_with_stats`, and surfaced `filter_zero_positive`, `macro_f1`, and `auroc` consistently across `Trainer.validate`, `evaluate`, `cross_eval`, and `sid_unet.utils.report`.
+  - **Auto Precision & Configs**: Enabled `mixed_precision: "auto"` / `precision: "auto"` across `focal_hrnet.yaml`, `focal_vit.yaml`, `focal_hrnet_contrastive.yaml`, and `focal_vit_contrastive.yaml`.
+  - **Tests**: Added `tests/test_focal_strategy1.py` and updated `tests/test_config.py` for dict-returning models (`FOCAL`, `PIM`, `NoiseRAGPrototypeV1`).
+
 ## [Unreleased] - 2026-11-15
 
 ### Added

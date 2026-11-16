@@ -883,6 +883,12 @@ def evaluate_checkpoint_on_config(
 
     overall_metrics = {
         "eval_split": resolved_split,
+        "filter_zero_positive": bool(filter_zero_positive),
+        "filter_zero_positive_mode": (
+            "tampered-only foreground metrics"
+            if filter_zero_positive
+            else "full-dataset including pristine images"
+        ),
         "precision_mode": precision_spec.mode,
         "amp_dtype": precision_spec.amp_dtype_str,
         "fp8_enabled": precision_spec.fp8_enabled,
