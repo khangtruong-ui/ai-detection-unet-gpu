@@ -273,6 +273,11 @@ class Trainer:
 
         # 3.2 Precision mode and GPU 16-bit configuration
         self.lr = float(config.training.get("learning_rate", config.training.get("lr", 1e-3)))
+        self.backbone_lr = config.training.get("backbone_lr", None)
+        self.backbone_lr_multiplier = config.training.get("backbone_lr_multiplier", None)
+        self.freeze_backbone_epochs = int(
+            config.training.get("freeze_backbone_epochs", config.model.get("freeze_backbone_epochs", 0))
+        )
         self.weight_decay = float(config.training.get("weight_decay", 1e-4))
         self.opt_name = str(config.training.get("optimizer", "adamw")).lower()
         use_8bit_opt = bool(config.training.get("use_8bit_optimizer", False))
@@ -716,10 +721,50 @@ class Trainer:
                 self.amp_dtype = torch.float16
                 self.amp_dtype_str = "float16"
 
-    def _build_optimizer(self) -> torch.optim.Optimizer:
+    def _resolve_optimizer_param_groups(self) -> Any:
+        """Build optimizer parameter groups supporting optional differential backbone LR."""
+        raw_target = getattr(self.model, "module", self.model)
+        bb_lr_val = getattr(self, "backbone_lr", None)
+        bb_mult_val = getattr(self, "backbone_lr_multiplier", None)
+        if bb_lr_val is not None or bb_mult_val is not None:
+            resolved_bb_lr = (
+                float(bb_lr_val)
+                if bb_lr_val is not None
+                else float(self.lr) * float(bb_mult_val)
+            )
+            if hasattr(raw_target, "get_param_groups"):
+                groups = raw_target.get_param_groups(self.lr, resolved_bb_lr)
+            else:
+                backbone_prefixes = ("net.", "backbone.", "encoder.", "image_encoder.")
+                head_params = []
+                backbone_params = []
+                for name, p in raw_target.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if name.startswith(backbone_prefixes):
+                        backbone_params.append(p)
+                    else:
+                        head_params.append(p)
+                groups = []
+                if head_params:
+                    groups.append({"params": head_params, "lr": float(self.lr), "name": "head"})
+                if backbone_params:
+                    groups.append({"params": backbone_params, "lr": resolved_bb_lr, "name": "backbone"})
+            if groups:
+                for g in groups:
+                    g["lr_scale"] = float(g.get("lr", self.lr)) / max(1e-12, float(self.lr))
+                self.logger.info(
+                    f"🎯 Differential LR Active: head_lr={self.lr:.2e}, backbone_lr={resolved_bb_lr:.2e}"
+                )
+                return groups
+
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable_params:
             trainable_params = list(self.model.parameters())
+        return trainable_params
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        opt_params = self._resolve_optimizer_param_groups()
 
         use_8bit_opt = getattr(self, "use_8bit_opt", False) or bool(self.config.training.get("use_8bit_optimizer", False))
         is_8bit_opt_requested = use_8bit_opt or self.opt_name in [
@@ -734,12 +779,12 @@ class Trainer:
                     import bitsandbytes as bnb
                     if "paged" in self.opt_name:
                         opt = bnb.optim.PagedAdamW8bit(
-                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                            opt_params, lr=self.lr, weight_decay=self.weight_decay
                         )
                         opt_label = "PagedAdamW8bit (with CPU paging)"
                     else:
                         opt = bnb.optim.AdamW8bit(
-                            trainable_params, lr=self.lr, weight_decay=self.weight_decay
+                            opt_params, lr=self.lr, weight_decay=self.weight_decay
                         )
                         opt_label = "AdamW8bit"
                     self.precision_mode = "8bit"
@@ -759,7 +804,7 @@ class Trainer:
                             f"⚠️ 8-Bit Optimizer initialization failed ({opt_err}). "
                             f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
                         )
-                        return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                        return torch.optim.AdamW(opt_params, lr=self.lr, weight_decay=self.weight_decay)
                     else:
                         raise opt_err
             else:
@@ -774,18 +819,18 @@ class Trainer:
                         f"{self.compatibility_8bit_details.get('message', 'environment is incompatible')}. "
                         f"Falling back to GPU 16-bit mode (AMP {self.amp_dtype_str} + torch.optim.AdamW on {self.device})."
                     )
-                    return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                    return torch.optim.AdamW(opt_params, lr=self.lr, weight_decay=self.weight_decay)
                 else:
                     raise RuntimeError(
                         f"8-bit optimizer '{self.opt_name}' requested but environment is incompatible: "
                         f"{self.compatibility_8bit_details.get('message')}"
                     )
         elif self.opt_name == "adam":
-            return torch.optim.Adam(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+            return torch.optim.Adam(opt_params, lr=self.lr, weight_decay=self.weight_decay)
         elif self.opt_name == "sgd":
-            return torch.optim.SGD(trainable_params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
+            return torch.optim.SGD(opt_params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         else:
-            return torch.optim.AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+            return torch.optim.AdamW(opt_params, lr=self.lr, weight_decay=self.weight_decay)
 
     def _build_scheduler(
         self,
@@ -799,8 +844,12 @@ class Trainer:
         min_lr = float(self.config.training.get("min_lr", 1e-6))
 
         if self.scheduler_name == "cosine":
+            group_base_lrs = []
             for g in self.optimizer.param_groups:
-                g["initial_lr"] = b_lr
+                lr_scale = float(g.get("lr_scale", 1.0))
+                g_init_lr = float(b_lr) * lr_scale
+                g["initial_lr"] = g_init_lr
+                group_base_lrs.append(g_init_lr)
 
             if mode in ("restart", "cycle", "warm_restart"):
                 remaining_epochs = max(1, epochs - start_epoch + 1)
@@ -824,7 +873,7 @@ class Trainer:
             )
             scheduler.T_max = epochs
             scheduler.eta_min = min_lr
-            scheduler.base_lrs = [b_lr] * len(self.optimizer.param_groups)
+            scheduler.base_lrs = group_base_lrs
             return scheduler
         elif self.scheduler_name == "step":
             return torch.optim.lr_scheduler.StepLR(
@@ -1059,7 +1108,7 @@ class Trainer:
         if "img_id" in batch and not (self.is_distributed or self.is_data_parallel):
             model_kwargs["img_ids"] = batch["img_id"]
         raw_target = getattr(self.model, "module", self.model)
-        if getattr(raw_target, "memory_enabled", False):
+        if getattr(raw_target, "memory_enabled", False) or getattr(raw_target, "requires_gt_masks", False):
             model_kwargs["gt_masks"] = masks
         model_kwargs = self._filter_model_kwargs(model_kwargs)
 
@@ -1139,6 +1188,21 @@ class Trainer:
             clear_memory_cache(self.device)
 
         self.model.train()
+        if getattr(self, "freeze_backbone_epochs", 0) > 0:
+            raw_target = getattr(self.model, "module", self.model)
+            backbone_trainable = epoch > self.freeze_backbone_epochs
+            if hasattr(raw_target, "set_backbone_trainable"):
+                raw_target.set_backbone_trainable(backbone_trainable)
+            else:
+                for attr_name in ("net", "backbone", "encoder", "image_encoder"):
+                    sub = getattr(raw_target, attr_name, None)
+                    if isinstance(sub, nn.Module):
+                        for p in sub.parameters():
+                            p.requires_grad_(backbone_trainable)
+                        sub.train(backbone_trainable)
+            if self.is_main_process:
+                state_str = "UNFROZEN (joint finetuning)" if backbone_trainable else f"FROZEN (head warmup {epoch}/{self.freeze_backbone_epochs})"
+                self.logger.info(f"🧊 Backbone Warmup Policy [Epoch {epoch}]: backbone is {state_str}.")
         metric_logger = MetricLogger()
 
         # Hard Mining: configure epoch and wrap dataloader if active
@@ -1462,7 +1526,13 @@ class Trainer:
         if self.empty_cache_per_epoch:
             clear_memory_cache(self.device)
 
-        seg_tracker = SegmentationMetricTracker(threshold=0.5)
+        filter_zero_positive = bool(
+            self.config.training.get(
+                "filter_zero_positive",
+                self.config.project.get("filter_zero_positive", False),
+            )
+        )
+        seg_tracker = SegmentationMetricTracker(threshold=0.5, filter_zero_positive=filter_zero_positive)
         cls_tracker = ClassificationMetricTracker(num_classes=self.config.model.get("num_classes", 3))
         metric_logger = MetricLogger()
 
@@ -1527,6 +1597,12 @@ class Trainer:
             summary[f"{prefix}{k}"] = v
         for k, v in cls_metrics.items():
             summary[f"{prefix}{k}"] = v
+        summary["filter_zero_positive"] = filter_zero_positive
+        summary["filter_zero_positive_mode"] = (
+            "tampered-only foreground metrics"
+            if filter_zero_positive
+            else "full-dataset including pristine images"
+        )
 
         if self.is_distributed:
             summary = reduce_dict(summary)
@@ -1620,6 +1696,7 @@ class Trainer:
                         "val_dice": float(val_summary.get("val_dice", 0.0)),
                         "val_f1": float(val_summary.get("val_f1", val_summary.get("val_dice", 0.0))),
                         "val_pixel_f1": float(val_summary.get("val_pixel_f1", val_summary.get("val_dice", 0.0))),
+                        "val_macro_f1": float(val_summary.get("val_macro_f1", 0.0)),
                         "val_auroc": float(val_summary.get("val_auroc", val_summary.get("val_pixel_auroc", 0.0))),
                         "val_pixel_auroc": float(val_summary.get("val_pixel_auroc", val_summary.get("val_auroc", 0.0))),
                         "val_pixel_acc": float(val_summary.get("val_pixel_acc", 0.0)),

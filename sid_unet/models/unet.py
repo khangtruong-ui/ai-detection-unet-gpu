@@ -940,6 +940,14 @@ def build_model(config: Any) -> nn.Module:
             cache_dir=model_cfg.get("cache_dir", None),
             aux_classifier=bool(model_cfg.get("aux_classifier", False)),
             num_classes=int(model_cfg.get("num_classes", 2)),
+            use_clustering=bool(model_cfg.get("use_clustering", True)),
+            cluster_temperature=float(model_cfg.get("cluster_temperature", 0.1)),
+            finetune_mode=model_cfg.get("finetune_mode", None),
+            head_type=str(model_cfg.get("head_type", "auto")),
+            force_vit_1024=bool(model_cfg.get("force_vit_1024", False)),
+            cluster_separability_threshold=float(model_cfg.get("cluster_separability_threshold", 0.0015)),
+            aux_pristine_gate=bool(model_cfg.get("aux_pristine_gate", False)),
+            contrastive_sample_size=int(model_cfg.get("contrastive_sample_size", 1024)),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(

@@ -70,6 +70,7 @@ class SIDTotalLoss(nn.Module):
         """
         art_loss = None
         multiscale_logits = None
+        skip_mask_loss = False
         if isinstance(model_output, (tuple, list)):
             mask_logits = model_output[0]
             if len(model_output) >= 3:
@@ -115,36 +116,42 @@ class SIDTotalLoss(nn.Module):
                 model_output.get("xs_xr_loss", model_output.get("artifact_loss")),
             )
             multiscale_logits = model_output.get("multiscale_logits")
+            skip_mask_loss = bool(model_output.get("skip_mask_loss", False)) or (mask_logits is None)
         else:
             mask_logits = model_output
             class_logits = None
+            skip_mask_loss = mask_logits is None
 
-        mask_loss, loss_metrics = self.mask_loss_fn(mask_logits, target_masks)
-        total_loss = mask_loss
+        if skip_mask_loss:
+            loss_metrics = {"mask_loss": 0.0}
+            total_loss = torch.zeros((), device=target_masks.device, dtype=torch.float32)
+        else:
+            mask_loss, loss_metrics = self.mask_loss_fn(mask_logits, target_masks)
+            total_loss = mask_loss
 
-        if multiscale_logits is not None and self.multiscale_weight > 0.0:
-            scale_losses = []
-            for s_idx, m_scale in enumerate(multiscale_logits):
-                t_scale = F.interpolate(target_masks.float(), size=m_scale.shape[2:], mode="nearest")
-                s_l, _ = self.mask_loss_fn(m_scale, t_scale)
-                scale_losses.append(s_l)
-            if scale_losses:
-                ms_loss = torch.stack(scale_losses).mean()
-                total_loss = total_loss + self.multiscale_weight * ms_loss
-                loss_metrics["multiscale_loss"] = float(ms_loss.item())
+            if multiscale_logits is not None and self.multiscale_weight > 0.0:
+                scale_losses = []
+                for s_idx, m_scale in enumerate(multiscale_logits):
+                    t_scale = F.interpolate(target_masks.float(), size=m_scale.shape[2:], mode="nearest")
+                    s_l, _ = self.mask_loss_fn(m_scale, t_scale)
+                    scale_losses.append(s_l)
+                if scale_losses:
+                    ms_loss = torch.stack(scale_losses).mean()
+                    total_loss = total_loss + self.multiscale_weight * ms_loss
+                    loss_metrics["multiscale_loss"] = float(ms_loss.item())
 
-        if self.edge_weight > 0.0 and self._edge_generator is not None and mask_logits is not None:
-            t_mask = target_masks.float()
-            if t_mask.ndim == 3:
-                t_mask = t_mask.unsqueeze(1)
-            edge_mask = self._edge_generator(t_mask)
-            edge_loss = F.binary_cross_entropy_with_logits(
-                input=mask_logits.float(),
-                target=t_mask,
-                weight=edge_mask,
-            )
-            total_loss = total_loss + self.edge_weight * edge_loss
-            loss_metrics["edge_loss"] = float(edge_loss.item())
+            if self.edge_weight > 0.0 and self._edge_generator is not None and mask_logits is not None:
+                t_mask = target_masks.float()
+                if t_mask.ndim == 3:
+                    t_mask = t_mask.unsqueeze(1)
+                edge_mask = self._edge_generator(t_mask)
+                edge_loss = F.binary_cross_entropy_with_logits(
+                    input=mask_logits.float(),
+                    target=t_mask,
+                    weight=edge_mask,
+                )
+                total_loss = total_loss + self.edge_weight * edge_loss
+                loss_metrics["edge_loss"] = float(edge_loss.item())
 
         if (
             self.aux_classifier
@@ -176,6 +183,7 @@ def build_loss(config: Any) -> SIDTotalLoss:
     """Build total loss module from config dictionary."""
     loss_cfg = config.get("loss", {})
     model_cfg = config.get("model", {})
+    default_art_wt = 1.0 if str(model_cfg.get("finetune_mode", "")).lower().strip() == "contrastive" else 0.2
     return SIDTotalLoss(
         mask_loss_type=loss_cfg.get("mask_loss_type", "combined"),
         bce_weight=float(loss_cfg.get("bce_weight", 0.5)),
@@ -194,7 +202,7 @@ def build_loss(config: Any) -> SIDTotalLoss:
                     "align_loss_weight",
                     loss_cfg.get(
                         "xs_xr_weight",
-                        loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", 0.2)),
+                        loss_cfg.get("artifact_weight", model_cfg.get("artifact_weight", default_art_wt)),
                     ),
                 ),
             )

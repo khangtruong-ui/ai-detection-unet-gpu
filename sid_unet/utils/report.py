@@ -561,20 +561,24 @@ def generate_checkpoint_cross_eval_report(
         loss = m.get("eval_total_loss", m.get("total_loss", m.get("loss")))
         iou = m.get("iou", 0.0)
         f1 = m.get("f1", m.get("pixel_f1", m.get("dice", 0.0)))
+        macro_f1 = m.get("macro_f1", m.get("macro_f1_all"))
         auroc = m.get("auroc", m.get("pixel_auroc", 0.0))
         pacc = m.get("pixel_acc", 0.0)
         cacc = m.get("aux_accuracy", m.get("accuracy"))
+        fzp = m.get("filter_zero_positive", res.get("filter_zero_positive"))
 
         summary_rows.append([
             cfg_name,
             ds_name,
             str(split),
             str(samples),
+            "tampered-only" if fzp is True else ("full-dataset" if fzp is False else "N/A"),
             f"{loss:.4f}" if isinstance(loss, (int, float)) else "N/A",
             f"{iou:.4f}" if isinstance(iou, (int, float)) else "N/A",
             _format_ci_interval(m, "iou"),
             f"{f1:.4f}" if isinstance(f1, (int, float)) else "N/A",
             _format_ci_interval(m, "f1", ("dice", "pixel_f1")),
+            f"{macro_f1:.4f}" if isinstance(macro_f1, (int, float)) else "N/A",
             f"{auroc:.4f}" if isinstance(auroc, (int, float)) else "N/A",
             f"{pacc:.4f}" if isinstance(pacc, (int, float)) else "N/A",
             f"{cacc:.4f}" if isinstance(cacc, (int, float)) else "N/A",
@@ -585,11 +589,13 @@ def generate_checkpoint_cross_eval_report(
         "Dataset",
         "Split",
         "Samples",
+        "Filter Zero Pos",
         "Loss",
         "IoU",
         "IoU 95% CI",
         "Dice / F1",
         "F1 95% CI",
+        "Macro F1",
         "AUROC",
         "Pixel Acc",
         "Class Acc",

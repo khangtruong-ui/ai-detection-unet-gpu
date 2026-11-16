@@ -127,7 +127,12 @@ def test_all_experiment_configs_validity():
         with torch.no_grad():
             x = torch.randn(1, 3, test_h, test_w, device=dev)
             out = model(x)
-        if cfg.model.aux_classifier:
+        if isinstance(out, dict):
+            mask_out = out["mask_logits"]
+            assert mask_out.shape == (1, 1, test_h, test_w)
+            if cfg.model.aux_classifier and "class_logits" in out:
+                assert out["class_logits"].shape == (1, cfg.model.num_classes)
+        elif cfg.model.aux_classifier:
             assert isinstance(out, tuple)
             mask_out = out[0]
             cls_out = out[1]
