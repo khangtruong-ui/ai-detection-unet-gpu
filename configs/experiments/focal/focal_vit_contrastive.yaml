@@ -13,12 +13,12 @@ data:
   streaming: false
   normalize: false
   image_size: [512, 512]
-  batch_size: 4
+  batch_size: 32
   num_workers: -1
   pin_memory: true
   train_split: "train"
   val_split: "validation"
-  test_split: "test"
+  test_split: "validation"
 
 model:
   name: "focal"
