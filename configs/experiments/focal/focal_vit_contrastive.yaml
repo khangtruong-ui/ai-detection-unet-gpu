@@ -1,5 +1,5 @@
-# Configuration: FOCAL with SAM ViT-Large Backbone (Strategy 1 Mode 1B: Contrastive Finetuning)
-# Paper-Aligned Image-Relative Soft Contrastive Learning (MyInfoNCE) + Unsupervised Clustering Eval
+# Configuration: FOCAL with SAM ViT-Large Backbone (Strategy B Mode 1B: Prior-Preserving Contrastive PEFT)
+# Paper-Aligned Image-Relative Soft Contrastive Learning (MyInfoNCE) + Prior Anchoring + Unsupervised Clustering Eval
 # Official Pretrained Weights: KhangTruong/FOCAL (FOCAL_ViT_weights.pth)
 
 project:
@@ -13,7 +13,7 @@ data:
   streaming: false
   normalize: false
   image_size: [512, 512]
-  batch_size: 32
+  batch_size: 8
   num_workers: -1
   pin_memory: true
   train_split: "train"
@@ -31,6 +31,16 @@ model:
   cluster_temperature: 0.1
   cluster_separability_threshold: 0.05
   contrastive_sample_size: 1024
+  peft_enabled: true
+  lora_r: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  use_dora: true
+  lora_block_scope: "late_and_global"
+  lora_target_modules: ["qkv", "proj"]
+  train_neck: true
+  train_vit_norms: false
+  prior_anchor_weight: 0.1
   aux_classifier: false
   num_classes: 2
 
@@ -42,11 +52,14 @@ loss:
 
 training:
   epochs: 10
-  learning_rate: 0.00002
+  learning_rate: 0.00005
+  neck_lr_multiplier: 0.25
+  lora_lr_multiplier: 1.0
+  lora_weight_decay: 0.01
   weight_decay: 0.0001
   optimizer: "adamw"
   scheduler: "cosine"
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 2
   amp: true
   mixed_precision: "auto"
   precision: "auto"

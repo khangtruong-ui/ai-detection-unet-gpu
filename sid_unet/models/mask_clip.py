@@ -1107,6 +1107,7 @@ class SurgicalLoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / max(r, 1)
         self.use_dora = use_dora
+        self.bypass = False
 
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.lora_A = nn.Parameter(torch.empty(r, self.in_features, device=base_linear.weight.device, dtype=base_linear.weight.dtype))
@@ -1120,16 +1121,53 @@ class SurgicalLoRALinear(nn.Module):
         else:
             self.register_parameter("dora_m", None)
 
+    def compute_merged_weight(self) -> torch.Tensor:
+        """Compute merged [out_features, in_features] weight for zero-overhead inference."""
+        w0 = self.base_linear.weight.detach().float()
+        delta_w = (self.lora_B.detach().float() @ self.lora_A.detach().float()) * float(self.scaling)
+        combined = w0 + delta_w
+        if self.use_dora and self.dora_m is not None:
+            norm = combined.norm(p=2, dim=1, keepdim=True).clamp(min=1e-6)
+            combined = (self.dora_m.detach().float() / norm) * combined
+        return combined.to(dtype=self.base_linear.weight.dtype, device=self.base_linear.weight.device)
+
+    def to_merged_linear(self) -> nn.Linear:
+        """Collapse this LoRA/DoRA adapter into a plain `nn.Linear` module."""
+        has_bias = self.base_linear.bias is not None
+        merged = nn.Linear(
+            self.in_features,
+            self.out_features,
+            bias=has_bias,
+            device=self.base_linear.weight.device,
+            dtype=self.base_linear.weight.dtype,
+        )
+        with torch.no_grad():
+            merged.weight.copy_(self.compute_merged_weight())
+            if has_bias:
+                merged.bias.copy_(self.base_linear.bias.detach())
+        return merged
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "bypass", False):
+            return self.base_linear(x)
+
         if self.use_dora and self.dora_m is not None:
             delta_w = (self.lora_B @ self.lora_A) * self.scaling
             combined_w = self.base_linear.weight + delta_w
             norm = combined_w.norm(p=2, dim=1, keepdim=True).clamp(min=1e-6)
             effective_w = (self.dora_m / norm) * combined_w
-            return F.linear(x, effective_w, self.base_linear.bias)
+            bias = self.base_linear.bias
+            if not torch.is_autocast_enabled() and effective_w.dtype != x.dtype:
+                effective_w = effective_w.to(dtype=x.dtype)
+                if bias is not None and bias.dtype != x.dtype:
+                    bias = bias.to(dtype=x.dtype)
+            return F.linear(x, effective_w, bias)
 
         base_out = self.base_linear(x)
-        lora_out = (self.lora_dropout(x) @ self.lora_A.t() @ self.lora_B.t()) * self.scaling
+        x_drop = self.lora_dropout(x)
+        lora_a = self.lora_A if (torch.is_autocast_enabled() or self.lora_A.dtype == x_drop.dtype) else self.lora_A.to(dtype=x_drop.dtype)
+        lora_b = self.lora_B if (torch.is_autocast_enabled() or self.lora_B.dtype == x_drop.dtype) else self.lora_B.to(dtype=x_drop.dtype)
+        lora_out = (x_drop @ lora_a.t() @ lora_b.t()) * self.scaling
         return base_out + lora_out
 
 

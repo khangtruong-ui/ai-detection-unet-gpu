@@ -1,0 +1,57 @@
+# Configuration: FOCAL with HRNet-W32 Backbone (Strategy B Mode 1B: Prior-Preserving Contrastive Surgery)
+# Paper-Aligned Image-Relative Soft Contrastive Learning (MyInfoNCE) + Prior Anchoring + Unsupervised Clustering Eval
+# Official Pretrained Weights: KhangTruong/FOCAL (FOCAL_HRNet_weights.pth)
+
+project:
+  name: "sid_focal_hrnet_contrastive_peft"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_hrnet_contrastive_peft"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 128
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+
+model:
+  name: "focal"
+  backbone: "hrnet"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "contrastive"
+  use_clustering: true
+  cluster_temperature: 0.1
+  cluster_separability_threshold: 0.02
+  contrastive_sample_size: 1024
+  peft_enabled: true
+  hrnet_trainable_stages: ["stage4"]
+  freeze_backbone_bn: true
+  use_feature_adapter: false
+  prior_anchor_weight: 0.1
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  align_weight: 1.0
+
+training:
+  epochs: 10
+  learning_rate: 0.00005
+  neck_lr_multiplier: 0.25
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_accumulation_steps: 1
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

@@ -321,11 +321,22 @@ def resolve_precision_spec(
     )
 
 
+def _is_peft_wrapped_base_linear(fqn: str) -> bool:
+    """Return True if fqn refers to a frozen `base_linear` inside a LoRA/DoRA wrapper."""
+    if not fqn:
+        return False
+    return fqn == "base_linear" or fqn.endswith(".base_linear") or ".base_linear." in fqn
+
+
 def fp8_linear_module_filter(mod: nn.Module, fqn: str = "") -> bool:
     """
     Match nn.Linear modules whose weight dimensions satisfy CUDA _scaled_mm
-    16-byte alignment constraints (in_features % 16 == 0 and out_features % 16 == 0).
+    16-byte alignment constraints (in_features % 16 == 0 and out_features % 16 == 0),
+    excluding frozen `base_linear` children inside PEFT/DoRA wrappers so
+    `base_linear.weight + delta_w` never mixes Float8Tensor subclasses with float deltas.
     """
+    if _is_peft_wrapped_base_linear(fqn):
+        return False
     return (
         isinstance(mod, nn.Linear)
         and (mod.in_features % 16 == 0)
@@ -476,35 +487,36 @@ def prepare_model_for_fp8_inference(
                 Float8WeightOnlyConfig,
             )
 
-            def _is_standard_unquantized_linear(m: nn.Module) -> bool:
+            def _is_standard_unquantized_linear(m: nn.Module, fqn: str = "") -> bool:
                 return (
                     isinstance(m, nn.Linear)
+                    and not _is_peft_wrapped_base_linear(fqn)
                     and not _has_quantized_or_lowbit_weight(m)
                     and type(m.weight.data).__name__ not in ("Float8Tensor", "Float8TrainingTensor")
                 )
 
             eligible_dyn = [
                 n for n, m in target.named_modules()
-                if _is_standard_unquantized_linear(m) and fp8_linear_module_filter(m, n)
+                if _is_standard_unquantized_linear(m, n) and fp8_linear_module_filter(m, n)
             ]
             if eligible_dyn:
                 quantize_(
                     target,
                     Float8DynamicActivationFloat8WeightConfig(),
-                    filter_fn=lambda m, fqn: _is_standard_unquantized_linear(m) and fp8_linear_module_filter(m, fqn),
+                    filter_fn=lambda m, fqn: _is_standard_unquantized_linear(m, fqn) and fp8_linear_module_filter(m, fqn),
                 )
                 dyn_count = len(eligible_dyn)
 
             if precision_spec.fp8_all_parameters:
                 eligible_wo = [
                     n for n, m in target.named_modules()
-                    if _is_standard_unquantized_linear(m) and not fp8_linear_module_filter(m, n)
+                    if _is_standard_unquantized_linear(m, n) and not fp8_linear_module_filter(m, n)
                 ]
                 if eligible_wo:
                     quantize_(
                         target,
                         Float8WeightOnlyConfig(),
-                        filter_fn=lambda m, fqn: _is_standard_unquantized_linear(m) and not fp8_linear_module_filter(m, fqn),
+                        filter_fn=lambda m, fqn: _is_standard_unquantized_linear(m, fqn) and not fp8_linear_module_filter(m, fqn),
                     )
                     wo_count = len(eligible_wo)
         except Exception as exc:

@@ -18,6 +18,7 @@ from sid_unet.process_manager import (
     STATUS_KILLED,
 )
 from sid_unet.tail import (
+    _StreamLineRenderer,
     cli_main,
     print_initial_lines,
     resolve_tail_target,
@@ -250,3 +251,71 @@ def test_cli_main_invocation(temp_env):
 
     exit_code = cli_main([log_file, "-n", "5", "--quiet"])
     assert exit_code == 0
+
+
+def test_print_initial_lines_collapses_tqdm_carriage_returns(tmp_path, capsys):
+    """Initial log display should collapse TQDM \\r updates instead of splitting into many lines."""
+    log_file = tmp_path / "tqdm_init.log"
+    content = (
+        "Epoch 1 start\n"
+        "\rEpoch 1:  10%|#         | 1/10\rEpoch 1:  50%|#####     | 5/10\rEpoch 1: 100%|##########| 10/10\n"
+        "Epoch 1 done\n"
+    )
+    with open(log_file, "wb") as f:
+        f.write(content.encode("utf-8"))
+
+    print_initial_lines(str(log_file), lines_count=3, start_offset=0)
+    captured = capsys.readouterr()
+    out_lines = captured.out.splitlines()
+    assert out_lines == [
+        "Epoch 1 start",
+        "Epoch 1: 100%|##########| 10/10",
+        "Epoch 1 done",
+    ]
+
+
+def test_tail_log_stream_tqdm_carriage_returns_across_polls(tmp_path, capsys, monkeypatch):
+    """Streaming TQDM \\r updates across polls should not produce stacked intermediate lines."""
+    monkeypatch.delenv("COLAB_RELEASE_TAG", raising=False)
+    log_file = tmp_path / "tqdm_stream.log"
+    with open(log_file, "wb") as f:
+        f.write(b"Init\n\rTrain:  10%|#         | 1/10")
+
+    cmd = (
+        f"{sys.executable} -c \""
+        f"import time; "
+        f"f = open('{log_file}', 'ab'); "
+        f"time.sleep(0.15); "
+        f"f.write(b'\\rTrain:  50%|#####     | 5/10'); f.flush(); "
+        f"time.sleep(0.15); "
+        f"f.write(b'\\rTrain: 100%|##########| 10/10\\nTraining finished completed successfully\\n'); f.flush(); "
+        f"f.close()\""
+    )
+    proc = subprocess.Popen(cmd, shell=True)
+    exit_code = tail_log_stream(
+        log_path=str(log_file),
+        monitored_pid=proc.pid,
+        lines_count=10,
+        poll_interval=0.05,
+        timeout=10.0,
+        quiet=True,
+    )
+    proc.wait()
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.splitlines() == [
+        "Init",
+        "Train: 100%|##########| 10/10",
+        "Training finished completed successfully",
+    ]
+
+
+def test_stream_line_renderer_tty_clears_line():
+    """TTY mode should emit ANSI clear-to-EOL on carriage-return updates."""
+    renderer = _StreamLineRenderer(is_tty=True, allow_live_cr=True)
+    out1 = renderer.feed("\rBar:  10%|#   | [loss=0.1234]")
+    out2 = renderer.feed("\rBar: 100%|####| [loss=0.0100]")
+    out3 = renderer.feed("\nDone\n")
+    assert out1 == "\r\x1b[KBar:  10%|#   | [loss=0.1234]"
+    assert out2 == "\r\x1b[KBar: 100%|####| [loss=0.0100]"
+    assert out3 == "\r\x1b[KBar: 100%|####| [loss=0.0100]\nDone\n"

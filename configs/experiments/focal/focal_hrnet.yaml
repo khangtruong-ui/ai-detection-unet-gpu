@@ -13,7 +13,7 @@ data:
   streaming: false
   normalize: false
   image_size: [512, 512]
-  batch_size: 8
+  batch_size: 32
   num_workers: -1
   pin_memory: true
   train_split: "train"
@@ -46,7 +46,7 @@ training:
   weight_decay: 0.0001
   optimizer: "adamw"
   scheduler: "cosine"
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   amp: true
   mixed_precision: "auto"
   precision: "auto"

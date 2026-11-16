@@ -1,5 +1,5 @@
-# Configuration: FOCAL with HRNet-W32 Backbone (Strategy 1 Mode 1B: Contrastive Finetuning)
-# Paper-Aligned Image-Relative Soft Contrastive Learning (MyInfoNCE) + Unsupervised Clustering Eval
+# Configuration: FOCAL with HRNet-W32 Backbone (Strategy B Mode 1B: Prior-Preserving Contrastive Surgery)
+# Paper-Aligned Image-Relative Soft Contrastive Learning (MyInfoNCE) + Prior Anchoring + Unsupervised Clustering Eval
 # Official Pretrained Weights: KhangTruong/FOCAL (FOCAL_HRNet_weights.pth)
 
 project:
@@ -13,7 +13,7 @@ data:
   streaming: false
   normalize: false
   image_size: [512, 512]
-  batch_size: 32
+  batch_size: 128
   num_workers: -1
   pin_memory: true
   train_split: "train"
@@ -30,6 +30,11 @@ model:
   cluster_temperature: 0.1
   cluster_separability_threshold: 0.02
   contrastive_sample_size: 1024
+  peft_enabled: true
+  hrnet_trainable_stages: ["stage4"]
+  freeze_backbone_bn: true
+  use_feature_adapter: false
+  prior_anchor_weight: 0.1
   aux_classifier: false
   num_classes: 2
 
@@ -42,10 +47,11 @@ loss:
 training:
   epochs: 10
   learning_rate: 0.00005
+  neck_lr_multiplier: 0.25
   weight_decay: 0.0001
   optimizer: "adamw"
   scheduler: "cosine"
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   amp: true
   mixed_precision: "auto"
   precision: "auto"
