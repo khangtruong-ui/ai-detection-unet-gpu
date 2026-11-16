@@ -3,7 +3,7 @@
 **Author**: Antigravity Assistant  
 **Date**: November 16, 2026  
 **Target Repository**: `khangtruong-ui/ai-detection-unet-gpu`  
-**Status**: Proposed Requirements Specification (No Implementation Code)  
+**Status**: Implemented & Verified (PR #26)  
 **Predecessors**:  
 - Strategy 1: [`docs/focal_finetuning_strategy1_requirements.md`](focal_finetuning_strategy1_requirements.md) (PR #24, `73e4a11`)  
 - Strategy B: [`docs/focal_finetuning_strategy_b_requirements.md`](focal_finetuning_strategy_b_requirements.md) (PR #25, `998f3bd`)  
@@ -166,29 +166,30 @@ Support `finetune_mode: "hybrid"` (aliases: `"supervised_contrastive"`, `"1a_plu
 New experiment configs should live alongside Strategy 1 configs in `configs/experiments/focal/` (preserving existing Strategy 1 & Strategy B configs intact):
 
 ### 7.1 `configs/experiments/focal/focal_hrnet_strategy1_plus.yaml` (Hybrid `1A+`)
-- `data`: `image_size: [512, 512]`, `normalize: false`, `batch_size: 16`–`32`
+- `data`: `image_size: [512, 512]`, `normalize: false`, `batch_size: 32` (empirically verified on NVIDIA L4 22.5 GiB: 73.3% peak VRAM, 16.5 GiB, 23.9 img/s; `batch_size: 64` OOMs without activation checkpointing)
 - `model`:
   - `backbone: "hrnet"`, `finetune_mode: "hybrid"`, `head_type: "decoder"`, `use_clustering: false`
   - `hrnet_freeze_stem: true`, `freeze_backbone_bn: true`
-  - `llrd_enabled: true`, `hrnet_stage_lr_multipliers: {stage4: 1.0, transition3: 0.6, stage3: 0.4, transition2: 0.25, stage2: 0.15}`
+  - `llrd_enabled: true`, `hrnet_stage_lr_multipliers: {stage4: 1.0, transition3: 0.6, stage3: 0.4, transition2: 0.25, stage2: 0.15, transition1: 0.10}`
   - `prior_anchor_weight: 0.15`, `prior_anchor_mode: "pristine_only"`, `pristine_anchor_threshold: 0.05`
   - `l2_sp_weight: 0.0005`
 - `loss`: `bce_weight: 0.5`, `dice_weight: 0.5`, `edge_weight: 0.5`, `align_weight: 0.3`
 - `training`: `learning_rate: 0.0002`, `backbone_lr_multiplier: 0.5`, `freeze_backbone_epochs: 1`, `epochs: 10`
 
 ### 7.2 `configs/experiments/focal/focal_vit_strategy1_plus.yaml` (Hybrid `1A+`)
-- `data`: `image_size: [512, 512]`, `normalize: false`, `batch_size: 8`, `gradient_accumulation_steps: 2`
+- `data`: `image_size: [512, 512]`, `normalize: false`, `batch_size: 32`, `gradient_accumulation_steps: 1` (empirically verified on NVIDIA L4 22.5 GiB with `gradient_checkpointing: true`: 80.9% peak VRAM, 18.3 GiB)
 - `model`:
   - `backbone: "vit"`, `finetune_mode: "hybrid"`, `head_type: "decoder"`, `use_clustering: false`, `force_vit_1024: false`
   - `freeze_vit_stem_and_pos: true` (`patch_embed`, `pos_embed`, `rel_pos_h/w` permanently frozen)
   - `llrd_enabled: true`, `llrd_decay: 0.85`, `llrd_min_scale: 0.02`, `neck_lr_multiplier: 0.5`
-  - `prior_anchor_weight: 0.1` (or `0.0` if VRAM-limited, relying on LLRD + L2-SP + `MyInfoNCE`), `prior_anchor_mode: "pristine_only"`
+  - `prior_anchor_weight: 0.1`, `prior_anchor_mode: "pristine_only"`, `anchor_half_precision: true`, `gradient_checkpointing: true`
   - `l2_sp_weight: 0.0005`
 - `loss`: `bce_weight: 0.5`, `dice_weight: 0.5`, `edge_weight: 0.5`, `align_weight: 0.3`
 - `training`: `learning_rate: 0.0001`, `backbone_lr_multiplier: 0.5`, `freeze_backbone_epochs: 1`, `epochs: 10`
 
 ### 7.3 `configs/experiments/focal/focal_vit_contrastive_strategy1_plus.yaml` & `focal_hrnet_contrastive_strategy1_plus.yaml` (Contrastive `1B+`)
-- Same LLRD + Stem/Pos/BN lock + L2-SP + **Pristine-Only** Feature Anchor (`prior_anchor_mode: "pristine_only"`, `prior_anchor_weight: 0.15`), with `finetune_mode: "contrastive"`, `use_clustering: true`, `align_weight: 1.0`, `learning_rate: 0.00005`, `backbone_lr_multiplier: 0.5`.
+- Same LLRD + Stem/Pos/BN lock + L2-SP + **Pristine-Only** Feature Anchor (`prior_anchor_mode: "pristine_only"`, `prior_anchor_weight: 0.15`), with `finetune_mode: "contrastive"`, `use_clustering: true`, `align_weight: 1.0`, `learning_rate: 0.00005`, `backbone_lr_multiplier: 0.5`, `freeze_backbone_epochs: 0`.
+- L4-verified batch sizes: `batch_size: 64` for HRNet Contrastive `1B+` (93.0% peak VRAM, 21.0 GiB) and `batch_size: 32` (`gradient_checkpointing: true`, `gradient_accumulation_steps: 1`) for ViT Contrastive `1B+` (81.1% peak VRAM, 18.3 GiB).
 
 ---
 

@@ -1,0 +1,67 @@
+# Configuration: FOCAL with HRNet-W32 Backbone (Strategy 1+ Mode 1A+: Anchored Full-Rank Hybrid Finetuning)
+# Forensic Contrastive Clustering for Image Forgery Detection and Localization
+# Official Pretrained Weights: KhangTruong/FOCAL (FOCAL_HRNet_weights.pth)
+
+project:
+  name: "sid_focal_hrnet_strategy1_plus"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_hrnet_strategy1_plus"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 32
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "focal"
+  backbone: "hrnet"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "hybrid"
+  head_type: "decoder"
+  use_clustering: false
+  hrnet_freeze_stem: true
+  freeze_backbone_bn: true
+  llrd_enabled: true
+  hrnet_stage_lr_multipliers:
+    stage4: 1.0
+    transition3: 0.6
+    stage3: 0.4
+    transition2: 0.25
+    stage2: 0.15
+    transition1: 0.10
+  prior_anchor_weight: 0.15
+  prior_anchor_mode: "pristine_only"
+  pristine_anchor_threshold: 0.05
+  l2_sp_weight: 0.0005
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  edge_weight: 0.5
+  edge_mask_width: 7
+  align_weight: 0.3
+
+training:
+  epochs: 10
+  learning_rate: 0.0002
+  backbone_lr_multiplier: 0.5
+  freeze_backbone_epochs: 1
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_accumulation_steps: 1
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

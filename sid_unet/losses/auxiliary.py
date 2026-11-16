@@ -71,6 +71,8 @@ class SIDTotalLoss(nn.Module):
         art_loss = None
         prior_anchor_penalty = None
         raw_prior_anchor = None
+        l2_sp_penalty = None
+        raw_l2_sp = None
         multiscale_logits = None
         skip_mask_loss = False
         if isinstance(model_output, (tuple, list)):
@@ -119,6 +121,8 @@ class SIDTotalLoss(nn.Module):
             )
             prior_anchor_penalty = model_output.get("prior_anchor_penalty")
             raw_prior_anchor = model_output.get("prior_anchor_loss")
+            l2_sp_penalty = model_output.get("l2_sp_penalty")
+            raw_l2_sp = model_output.get("l2_sp_loss")
             multiscale_logits = model_output.get("multiscale_logits")
             skip_mask_loss = bool(model_output.get("skip_mask_loss", False)) or (mask_logits is None)
         else:
@@ -126,6 +130,8 @@ class SIDTotalLoss(nn.Module):
             class_logits = None
             prior_anchor_penalty = None
             raw_prior_anchor = None
+            l2_sp_penalty = None
+            raw_l2_sp = None
             skip_mask_loss = mask_logits is None
 
         if skip_mask_loss:
@@ -198,6 +204,23 @@ class SIDTotalLoss(nn.Module):
                 raw_prior_anchor.item() if hasattr(raw_prior_anchor, "item") else raw_prior_anchor
             )
 
+        if l2_sp_penalty is not None:
+            if torch.is_tensor(l2_sp_penalty) and l2_sp_penalty.numel() > 1:
+                l2_sp_penalty = l2_sp_penalty.mean()
+            total_loss = total_loss + l2_sp_penalty
+            if raw_l2_sp is not None:
+                loss_metrics["l2_sp_loss"] = float(
+                    raw_l2_sp.item() if hasattr(raw_l2_sp, "item") else raw_l2_sp
+                )
+            else:
+                loss_metrics["l2_sp_loss"] = float(
+                    l2_sp_penalty.item() if hasattr(l2_sp_penalty, "item") else l2_sp_penalty
+                )
+        elif raw_l2_sp is not None:
+            loss_metrics["l2_sp_loss"] = float(
+                raw_l2_sp.item() if hasattr(raw_l2_sp, "item") else raw_l2_sp
+            )
+
         loss_metrics["total_loss"] = total_loss.item()
         return total_loss, loss_metrics
 
@@ -206,7 +229,13 @@ def build_loss(config: Any) -> SIDTotalLoss:
     """Build total loss module from config dictionary."""
     loss_cfg = config.get("loss", {})
     model_cfg = config.get("model", {})
-    default_art_wt = 1.0 if str(model_cfg.get("finetune_mode", "")).lower().strip() == "contrastive" else 0.2
+    f_mode = str(model_cfg.get("finetune_mode", "")).lower().strip()
+    if f_mode == "contrastive":
+        default_art_wt = 1.0
+    elif f_mode in ("hybrid", "supervised_contrastive", "1a_plus", "strategy1_plus", "mode_1a_plus"):
+        default_art_wt = 0.3
+    else:
+        default_art_wt = 0.2
     return SIDTotalLoss(
         mask_loss_type=loss_cfg.get("mask_loss_type", "combined"),
         bce_weight=float(loss_cfg.get("bce_weight", 0.5)),

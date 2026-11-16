@@ -1200,6 +1200,22 @@ class Trainer:
                         for p in sub.parameters():
                             p.requires_grad_(backbone_trainable)
                         sub.train(backbone_trainable)
+            if not backbone_trainable and not any(p.requires_grad for p in raw_target.parameters()):
+                if hasattr(raw_target, "set_backbone_trainable"):
+                    raw_target.set_backbone_trainable(True)
+                else:
+                    for attr_name in ("net", "backbone", "encoder", "image_encoder"):
+                        sub = getattr(raw_target, attr_name, None)
+                        if isinstance(sub, nn.Module):
+                            for p in sub.parameters():
+                                p.requires_grad_(True)
+                            sub.train(True)
+                backbone_trainable = True
+                if self.is_main_process:
+                    self.logger.warning(
+                        f"⚠️ Backbone Warmup Policy [Epoch {epoch}]: freezing backbone leaves zero trainable "
+                        "parameters (e.g. head-less contrastive mode); keeping backbone trainable."
+                    )
             if self.is_main_process:
                 state_str = "UNFROZEN (joint finetuning)" if backbone_trainable else f"FROZEN (head warmup {epoch}/{self.freeze_backbone_epochs})"
                 self.logger.info(f"🧊 Backbone Warmup Policy [Epoch {epoch}]: backbone is {state_str}.")
@@ -1751,8 +1767,12 @@ class Trainer:
                         else ""
                     )
                     extra_diag = ""
+                    if "align_loss" in train_metrics:
+                        extra_diag += f" - Align: {train_metrics['align_loss']:.4f}"
                     if "prior_anchor_loss" in train_metrics:
                         extra_diag += f" - Anchor Drift: {train_metrics['prior_anchor_loss']:.4f}"
+                    if "l2_sp_loss" in train_metrics:
+                        extra_diag += f" - L2-SP: {train_metrics['l2_sp_loss']:.2e}"
                     if "val_cluster_separability" in val_summary:
                         extra_diag += f" - Cluster Sep: {val_summary['val_cluster_separability']:.4f}"
                     self.logger.info(

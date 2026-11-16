@@ -371,6 +371,9 @@ class UNet(nn.Module):
                             merged["model"]["lora_target_modules"] = sorted(targets)
                 if any(k.startswith(("feature_adapter.", "module.feature_adapter.")) for k in state_dict.keys()):
                     merged["model"]["use_feature_adapter"] = True
+                if any(k.startswith(("decoder.", "module.decoder.")) for k in state_dict.keys()):
+                    if "head_type" not in saved_cfg_dict.get("model", {}):
+                        merged["model"]["head_type"] = "decoder"
 
         if override_config is not None:
             override_dict = override_config.to_dict() if isinstance(override_config, ConfigDict) else override_config
@@ -958,6 +961,8 @@ def build_model(config: Any) -> nn.Module:
             "checkpoint_path",
             model_cfg.get("pretrained_model_name_or_path", None)
         )
+        llrd_enabled_val = bool(model_cfg.get("llrd_enabled", training_cfg.get("llrd_enabled", False)))
+        default_neck_mult = 0.5 if llrd_enabled_val else 0.25
         return FOCAL(
             backbone=focal_backbone,
             pretrained=bool(model_cfg.get("pretrained", True)),
@@ -966,7 +971,7 @@ def build_model(config: Any) -> nn.Module:
             cache_dir=model_cfg.get("cache_dir", None),
             aux_classifier=bool(model_cfg.get("aux_classifier", False)),
             num_classes=int(model_cfg.get("num_classes", 2)),
-            use_clustering=bool(model_cfg.get("use_clustering", True)),
+            use_clustering=model_cfg.get("use_clustering", None),
             cluster_temperature=float(model_cfg.get("cluster_temperature", 0.1)),
             finetune_mode=model_cfg.get("finetune_mode", None),
             head_type=str(model_cfg.get("head_type", "auto")),
@@ -990,9 +995,24 @@ def build_model(config: Any) -> nn.Module:
             use_feature_adapter=bool(model_cfg.get("use_feature_adapter", False)),
             prior_anchor_weight=float(model_cfg.get("prior_anchor_weight", loss_cfg.get("prior_anchor_weight", 0.0))),
             neck_l2_anchor_weight=float(model_cfg.get("neck_l2_anchor_weight", loss_cfg.get("neck_l2_anchor_weight", 0.0))),
-            neck_lr_multiplier=float(model_cfg.get("neck_lr_multiplier", training_cfg.get("neck_lr_multiplier", 0.25))),
+            neck_lr_multiplier=float(model_cfg.get("neck_lr_multiplier", training_cfg.get("neck_lr_multiplier", default_neck_mult))),
             lora_lr_multiplier=float(model_cfg.get("lora_lr_multiplier", training_cfg.get("lora_lr_multiplier", 1.0))),
             lora_weight_decay=float(model_cfg.get("lora_weight_decay", training_cfg.get("lora_weight_decay", 0.01))),
+            prior_anchor_mode=str(model_cfg.get("prior_anchor_mode", loss_cfg.get("prior_anchor_mode", "pristine_only"))),
+            pristine_anchor_threshold=float(model_cfg.get("pristine_anchor_threshold", loss_cfg.get("pristine_anchor_threshold", 0.05))),
+            prior_anchor_when_no_masks=str(model_cfg.get("prior_anchor_when_no_masks", "zero")),
+            anchor_half_precision=bool(model_cfg.get("anchor_half_precision", False)),
+            llrd_enabled=llrd_enabled_val,
+            llrd_decay=float(model_cfg.get("llrd_decay", training_cfg.get("llrd_decay", 0.85))),
+            llrd_min_scale=float(model_cfg.get("llrd_min_scale", training_cfg.get("llrd_min_scale", 0.02))),
+            backbone_lr_multiplier=float(model_cfg.get("backbone_lr_multiplier", training_cfg.get("backbone_lr_multiplier", 0.5))),
+            freeze_vit_stem_and_pos=model_cfg.get("freeze_vit_stem_and_pos", None),
+            freeze_vit_blocks_below=int(model_cfg.get("freeze_vit_blocks_below", 0)),
+            hrnet_freeze_stem=model_cfg.get("hrnet_freeze_stem", None),
+            hrnet_stage_lr_multipliers=model_cfg.get("hrnet_stage_lr_multipliers", None),
+            l2_sp_weight=float(model_cfg.get("l2_sp_weight", loss_cfg.get("l2_sp_weight", 0.0))),
+            eval_clustering_diagnostic=bool(model_cfg.get("eval_clustering_diagnostic", False)),
+            gradient_checkpointing=ckpt_flag,
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(

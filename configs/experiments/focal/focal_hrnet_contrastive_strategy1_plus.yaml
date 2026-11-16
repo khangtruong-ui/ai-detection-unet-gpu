@@ -1,0 +1,67 @@
+# Configuration: FOCAL with HRNet-W32 Backbone (Strategy 1+ Mode 1B+: Anchored Full-Rank Contrastive Finetuning)
+# Paper-Aligned Image-Relative Soft Contrastive Learning (MyInfoNCE) + Pristine-Only Anchor + LLRD + L2-SP
+# Official Pretrained Weights: KhangTruong/FOCAL (FOCAL_HRNet_weights.pth)
+
+project:
+  name: "sid_focal_hrnet_contrastive_strategy1_plus"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_hrnet_contrastive_strategy1_plus"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 64
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+
+model:
+  name: "focal"
+  backbone: "hrnet"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "contrastive"
+  use_clustering: true
+  cluster_temperature: 0.1
+  cluster_separability_threshold: 0.02
+  contrastive_sample_size: 1024
+  hrnet_freeze_stem: true
+  freeze_backbone_bn: true
+  llrd_enabled: true
+  hrnet_stage_lr_multipliers:
+    stage4: 1.0
+    transition3: 0.6
+    stage3: 0.4
+    transition2: 0.25
+    stage2: 0.15
+    transition1: 0.10
+  prior_anchor_weight: 0.15
+  prior_anchor_mode: "pristine_only"
+  pristine_anchor_threshold: 0.05
+  l2_sp_weight: 0.0005
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  align_weight: 1.0
+
+training:
+  epochs: 10
+  learning_rate: 0.00005
+  backbone_lr_multiplier: 0.5
+  freeze_backbone_epochs: 0
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_accumulation_steps: 1
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

@@ -29,6 +29,15 @@ DEFAULT_FOCAL_HF_REPO = "KhangTruong/FOCAL"
 DEFAULT_FOCAL_HRNET_CKPT = "FOCAL_HRNet_weights.pth"
 DEFAULT_FOCAL_VIT_CKPT = "FOCAL_ViT_weights.pth"
 
+DEFAULT_HRNET_STAGE_LR_MULTIPLIERS: Dict[str, float] = {
+    "stage4": 1.0,
+    "transition3": 0.6,
+    "stage3": 0.4,
+    "transition2": 0.25,
+    "stage2": 0.15,
+    "transition1": 0.10,
+}
+
 
 # ------------------------------------------------------------------------------
 # HRNet Backbone for FOCAL
@@ -222,8 +231,9 @@ class HighResolutionModule(nn.Module):
 class HRNet(nn.Module):
     """HRNet-W32 architecture matching FOCAL HRNet backbone."""
 
-    def __init__(self):
+    def __init__(self, gradient_checkpointing: bool = False):
         super().__init__()
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64, momentum=BN_MOMENTUM)
         self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, bias=False)
@@ -341,7 +351,12 @@ class HRNet(nn.Module):
                 x_list.append(self.transition2[i](y_list[-1]))
             else:
                 x_list.append(y_list[i])
-        y_list = self.stage3(x_list)
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and any(
+            p.requires_grad for p in self.stage3.parameters()
+        ):
+            y_list = list(torch.utils.checkpoint.checkpoint(self._forward_stage3, *x_list, use_reentrant=False))
+        else:
+            y_list = self.stage3(x_list)
 
         x_list = []
         for i in range(self.stage4_cfg["NUM_BRANCHES"]):
@@ -349,8 +364,19 @@ class HRNet(nn.Module):
                 x_list.append(self.transition3[i](y_list[-1]))
             else:
                 x_list.append(y_list[i])
-        feats = self.stage4(x_list)[0]  # [B, 32, H // 4, W // 4]
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and any(
+            p.requires_grad for p in self.stage4.parameters()
+        ):
+            feats = torch.utils.checkpoint.checkpoint(self._forward_stage4, *x_list, use_reentrant=False)
+        else:
+            feats = self.stage4(x_list)[0]  # [B, 32, H // 4, W // 4]
         return feats
+
+    def _forward_stage3(self, *x_list: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        return tuple(self.stage3(list(x_list)))
+
+    def _forward_stage4(self, *x_list: torch.Tensor) -> torch.Tensor:
+        return self.stage4(list(x_list))[0]
 
 
 # ------------------------------------------------------------------------------
@@ -556,9 +582,11 @@ class ImageEncoderViT(nn.Module):
         qkv_bias: bool = True,
         window_size: int = 14,
         global_attn_indexes: Tuple[int, ...] = (5, 11, 17, 23),
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.img_size = img_size
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
             stride=(patch_size, patch_size),
@@ -607,7 +635,12 @@ class ImageEncoderViT(nn.Module):
                 x = x + self.pos_embed
 
         for blk in self.blocks:
-            x = blk(x)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and any(
+                p.requires_grad for p in blk.parameters()
+            ):
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
 
         x = self.neck(x.permute(0, 3, 1, 2))  # [B, out_chans, H // 16, W // 16]
         return x
@@ -646,6 +679,7 @@ class FOCALViTNet(nn.Module):
         qkv_bias: bool = True,
         window_size: int = 14,
         global_attn_indexes: Tuple[int, ...] = (5, 11, 17, 23),
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.image_encoder = ImageEncoderViT(
@@ -660,6 +694,7 @@ class FOCALViTNet(nn.Module):
             qkv_bias=qkv_bias,
             window_size=window_size,
             global_attn_indexes=global_attn_indexes,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -779,11 +814,13 @@ class FOCAL(nn.Module):
     - Backbone: "hrnet" (default, lightweight 32-dim features) or "vit" (SAM ViT-L, 256-dim features).
     - Pretrained weights loaded from Hugging Face repository `KhangTruong/FOCAL` with strict verification.
     - Zero fallback to random/dummy weights: missing weights raise an immediate RuntimeError.
-    - Strategy 1 Finetuning Modes:
+    - Strategy 1 / 1+ / B Finetuning Modes:
       - `"supervised"` (Mode 1A): Strict train/eval parity using a lightweight residual upsampling
         decoder (`FOCALSupervisedHead`) or legacy `fc` head (`use_clustering=False`).
       - `"contrastive"` (Mode 1B): Image-relative Soft Contrastive Learning (`MyInfoNCE`) during
         training with on-the-fly clustering (`_cluster_features`) and pristine-safety gating in eval.
+      - `"hybrid"` (Strategy 1+ Mode 1A+): Joint supervised (`FOCALSupervisedHead` with `skip_mask_loss=False`)
+        and per-image `MyInfoNCE` contrastive supervision preserving hypersphere geometry.
 
     Args:
         backbone (str): "hrnet" or "vit" (default: "hrnet").
@@ -793,9 +830,9 @@ class FOCAL(nn.Module):
         cache_dir (Optional[str]): Local cache directory for weights.
         aux_classifier (bool): Whether to enable auxiliary class logits (default: False).
         num_classes (int): Auxiliary class count (default: 2).
-        use_clustering (bool): Enable unsupervised clustering inference (default: True).
+        use_clustering (Optional[bool]): Enable unsupervised clustering inference (default: None -> True in legacy/contrastive, False in supervised/hybrid).
         cluster_temperature (float): Temperature scaling for clustering and MyInfoNCE (default: 0.1).
-        finetune_mode (Optional[str]): Strategy 1 mode: `"supervised"`, `"contrastive"`, or `None` (legacy).
+        finetune_mode (Optional[str]): Mode: `"supervised"`, `"contrastive"`, `"hybrid"`, or `None` (legacy).
         head_type (str): Supervised head variant: `"auto"`, `"decoder"`, or `"legacy"`.
         force_vit_1024 (bool): If True, upsamples ViT inputs to 1024x1024; otherwise uses native size.
         cluster_separability_threshold (float): Pristine-safety threshold on `1 - cos(c0, c1)`.
@@ -812,7 +849,7 @@ class FOCAL(nn.Module):
         cache_dir: Optional[str] = None,
         aux_classifier: bool = False,
         num_classes: int = 2,
-        use_clustering: bool = True,
+        use_clustering: Optional[bool] = None,
         cluster_temperature: float = 0.1,
         finetune_mode: Optional[str] = None,
         head_type: str = "auto",
@@ -840,6 +877,22 @@ class FOCAL(nn.Module):
         neck_lr_multiplier: float = 0.25,
         lora_lr_multiplier: float = 1.0,
         lora_weight_decay: float = 0.01,
+        # Strategy 1+: Anchored Full-Rank Finetuning parameters
+        prior_anchor_mode: str = "pristine_only",
+        pristine_anchor_threshold: float = 0.05,
+        prior_anchor_when_no_masks: str = "zero",
+        anchor_half_precision: bool = False,
+        llrd_enabled: bool = False,
+        llrd_decay: float = 0.85,
+        llrd_min_scale: float = 0.02,
+        backbone_lr_multiplier: float = 0.5,
+        freeze_vit_stem_and_pos: Optional[bool] = None,
+        freeze_vit_blocks_below: int = 0,
+        hrnet_freeze_stem: Optional[bool] = None,
+        hrnet_stage_lr_multipliers: Optional[Dict[str, float]] = None,
+        l2_sp_weight: float = 0.0,
+        eval_clustering_diagnostic: bool = False,
+        gradient_checkpointing: bool = False,
         **kwargs: Any,
     ):
         super().__init__()
@@ -879,26 +932,72 @@ class FOCAL(nn.Module):
         self.lora_weight_decay = max(0.0, float(lora_weight_decay))
         self.freeze_stage4_bn = bool(freeze_stage4_bn)
 
-        # Normalize Strategy 1 finetuning mode
+        # Strategy 1+ configuration
+        raw_anchor_mode = str(prior_anchor_mode).lower().strip()
+        if raw_anchor_mode in ("pristine_only", "pristine", "masked", "asymmetric"):
+            self.prior_anchor_mode = "pristine_only"
+        elif raw_anchor_mode in ("uniform", "all", "legacy"):
+            self.prior_anchor_mode = "uniform"
+        else:
+            raise ValueError(
+                f"Unsupported prior_anchor_mode '{prior_anchor_mode}'. "
+                "Supported: 'pristine_only', 'uniform'."
+            )
+        self.pristine_anchor_threshold = max(0.0, min(1.0, float(pristine_anchor_threshold)))
+        self.prior_anchor_when_no_masks = str(prior_anchor_when_no_masks).lower().strip()
+        if self.prior_anchor_when_no_masks not in ("zero", "uniform"):
+            self.prior_anchor_when_no_masks = "zero"
+        self.anchor_half_precision = bool(anchor_half_precision)
+
+        self.llrd_enabled = bool(llrd_enabled)
+        self.llrd_decay = max(1e-4, min(1.0, float(llrd_decay)))
+        self.llrd_min_scale = max(0.0, min(1.0, float(llrd_min_scale)))
+        self.backbone_lr_multiplier = float(backbone_lr_multiplier)
+        self.freeze_vit_stem_and_pos = (
+            bool(freeze_vit_stem_and_pos)
+            if freeze_vit_stem_and_pos is not None
+            else bool(self.llrd_enabled)
+        )
+        self.freeze_vit_blocks_below = max(0, int(freeze_vit_blocks_below))
+        self.hrnet_freeze_stem = (
+            bool(hrnet_freeze_stem)
+            if hrnet_freeze_stem is not None
+            else bool(self.llrd_enabled)
+        )
+        merged_hrnet_mults = dict(DEFAULT_HRNET_STAGE_LR_MULTIPLIERS)
+        if isinstance(hrnet_stage_lr_multipliers, dict):
+            for k, v in hrnet_stage_lr_multipliers.items():
+                merged_hrnet_mults[str(k).strip().lower()] = float(v)
+        self.hrnet_stage_lr_multipliers: Dict[str, float] = merged_hrnet_mults
+        self.l2_sp_weight = max(0.0, float(l2_sp_weight))
+        self.eval_clustering_diagnostic = bool(eval_clustering_diagnostic)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+
+        # Normalize Strategy 1 / 1+ finetuning mode
         raw_mode = None if finetune_mode is None else str(finetune_mode).lower().strip()
+        if "eval_use_clustering" in kwargs and use_clustering is None:
+            use_clustering = bool(kwargs["eval_use_clustering"])
         if raw_mode in (None, "", "legacy", "default", "none"):
             self.finetune_mode: Optional[str] = None
-            self.use_clustering = bool(use_clustering)
+            self.use_clustering = True if use_clustering is None else bool(use_clustering)
         elif raw_mode in ("supervised", "mode_1a", "1a"):
             self.finetune_mode = "supervised"
             self.use_clustering = False
         elif raw_mode in ("contrastive", "mode_1b", "1b", "scl"):
             self.finetune_mode = "contrastive"
             self.use_clustering = True
+        elif raw_mode in ("hybrid", "supervised_contrastive", "1a_plus", "strategy1_plus", "mode_1a_plus"):
+            self.finetune_mode = "hybrid"
+            self.use_clustering = False if use_clustering is None else bool(use_clustering)
         else:
             raise ValueError(
                 f"Unsupported FOCAL finetune_mode '{finetune_mode}'. "
-                "Supported: 'supervised', 'contrastive', or None."
+                "Supported: 'supervised', 'contrastive', 'hybrid', or None."
             )
 
         raw_head = str(head_type).lower().strip()
         if raw_head in ("auto", ""):
-            self.head_type = "decoder" if self.finetune_mode == "supervised" else "legacy"
+            self.head_type = "decoder" if self.finetune_mode in ("supervised", "hybrid") else "legacy"
         elif raw_head in ("decoder", "upsample", "residual", "residual_upsample"):
             self.head_type = "decoder"
         elif raw_head in ("legacy", "fc", "conv"):
@@ -913,7 +1012,7 @@ class FOCAL(nn.Module):
 
         # Build clean architecture BEFORE loading pretrained weights
         if self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
-            self.net = HRNet()
+            self.net = HRNet(gradient_checkpointing=self.gradient_checkpointing)
             in_dim = 32
             num_upsample_stages = 2
             default_filename = DEFAULT_FOCAL_HRNET_CKPT
@@ -925,6 +1024,7 @@ class FOCAL(nn.Module):
                 depth=24,
                 num_heads=16,
                 out_chans=256,
+                gradient_checkpointing=self.gradient_checkpointing,
             )
             in_dim = 256
             num_upsample_stages = 4
@@ -966,7 +1066,7 @@ class FOCAL(nn.Module):
         else:
             self.class_head = None
 
-        # Strategy B state tracking (populated by _apply_strategy_b_surgery)
+        # Strategy B & Strategy 1+ state tracking (populated by _apply_strategy_b_surgery)
         hrnet_stages_explicit = self.hrnet_trainable_stages is not None
         is_hrnet = self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32")
         self._surgery_active = bool(
@@ -974,6 +1074,12 @@ class FOCAL(nn.Module):
             or (is_hrnet and hrnet_stages_explicit)
             or self.use_feature_adapter
             or (freeze_backbone_bn is True)
+            or self.llrd_enabled
+            or self.freeze_vit_stem_and_pos
+            or (self.freeze_vit_blocks_below > 0)
+            or self.hrnet_freeze_stem
+            or (self.prior_anchor_weight > 0.0)
+            or (self.l2_sp_weight > 0.0)
         )
         if freeze_backbone_bn is None:
             self.freeze_backbone_bn = bool(is_hrnet and self._surgery_active)
@@ -987,7 +1093,13 @@ class FOCAL(nn.Module):
         self._surgery_applied: bool = False
         object.__setattr__(self, "_anchor_neck", None)
         object.__setattr__(self, "_anchor_hrnet_stage4", None)
+        object.__setattr__(self, "_anchor_backbone", None)
         self._neck_init_params: Dict[str, torch.Tensor] = {}
+        self._l2_sp_init_params: Dict[str, torch.Tensor] = {}
+        self._l2_sp_total_numel: int = 0
+        self._checkpoint_path: Optional[str] = checkpoint_path
+        self._default_filename: str = default_filename
+        self._cache_dir: Optional[str] = cache_dir
 
         # Step 2 (strict init order): Load & verify pretrained base weights FIRST
         self._load_pretrained(
@@ -996,7 +1108,7 @@ class FOCAL(nn.Module):
             cache_dir=cache_dir,
         )
 
-        # Step 3 (strict init order): Apply Strategy B surgery AFTER base weights are loaded
+        # Step 3 (strict init order): Apply Strategy B / 1+ surgery AFTER base weights are loaded
         if self._surgery_active and not self._surgery_applied:
             self._apply_strategy_b_surgery()
         elif not self._surgery_active:
@@ -1007,8 +1119,11 @@ class FOCAL(nn.Module):
 
     @property
     def requires_gt_masks(self) -> bool:
-        """True when Mode 1B contrastive training requires ground-truth masks in forward()."""
-        return self.finetune_mode == "contrastive"
+        """True when forward() requires ground-truth masks (Mode 1B, Hybrid, or pristine-only anchor)."""
+        return (
+            self.finetune_mode in ("contrastive", "hybrid")
+            or (self.prior_anchor_weight > 0.0 and self.prior_anchor_mode == "pristine_only")
+        )
 
     def _resolve_vit_block_indices(self) -> List[int]:
         """Resolve which SAMBlock indices receive LoRA/DoRA surgery."""
@@ -1121,7 +1236,7 @@ class FOCAL(nn.Module):
         return block_indices
 
     def _apply_hrnet_surgery(self) -> None:
-        """Apply stage-wise freezing and BatchNorm2d running-stat protection on HRNet."""
+        """Apply stage-wise freezing, stem lock, and BatchNorm2d running-stat protection on HRNet."""
         stages = self._normalize_hrnet_stages()
         stage_modules: Dict[str, List[nn.Module]] = {
             "stem": [self.net.conv1, self.net.bn1, self.net.conv2, self.net.bn2],
@@ -1150,32 +1265,153 @@ class FOCAL(nn.Module):
                     for p in mod.parameters():
                         p.requires_grad_(True)
 
-        # Lock BatchNorm2d running stats & affine params for all frozen stages (and optionally stage4)
+        if self.hrnet_freeze_stem:
+            for mod in stage_modules["stem"] + stage_modules["layer1"]:
+                for p in mod.parameters():
+                    p.requires_grad_(False)
+
+        # Lock BatchNorm2d running stats & affine params for frozen stages (or all BNs in Strategy 1+)
+        lock_all_bn = bool(self.llrd_enabled or self.hrnet_freeze_stem)
         self._frozen_bn_modules = []
         if self.freeze_backbone_bn:
             for mod_name, mod in self.net.named_modules():
                 if isinstance(mod, nn.BatchNorm2d):
                     in_stage4 = mod_name.startswith("stage4")
                     has_trainable_param = any(p.requires_grad for p in mod.parameters())
-                    if (not has_trainable_param) or (in_stage4 and self.freeze_stage4_bn):
+                    if lock_all_bn or (not has_trainable_param) or (in_stage4 and self.freeze_stage4_bn):
                         for p in mod.parameters():
                             p.requires_grad_(False)
                         mod.eval()
                         self._frozen_bn_modules.append(mod)
 
+    def _apply_vit_full_rank_locks(self) -> None:
+        """Apply Strategy 1+ permanent stem/pos/rel_pos locks and optional early-block cutoff on ViT."""
+        encoder = self.net.image_encoder
+        if self.freeze_vit_stem_and_pos:
+            for p in encoder.patch_embed.parameters():
+                p.requires_grad_(False)
+            if encoder.pos_embed is not None:
+                encoder.pos_embed.requires_grad_(False)
+            for blk in encoder.blocks:
+                if getattr(blk.attn, "rel_pos_h", None) is not None:
+                    blk.attn.rel_pos_h.requires_grad_(False)
+                if getattr(blk.attn, "rel_pos_w", None) is not None:
+                    blk.attn.rel_pos_w.requires_grad_(False)
+
+        if self.freeze_vit_blocks_below > 0:
+            cutoff = min(self.freeze_vit_blocks_below, len(encoder.blocks))
+            for idx in range(cutoff):
+                for p in encoder.blocks[idx].parameters():
+                    p.requires_grad_(False)
+
+        if not self.train_neck:
+            for p in encoder.neck.parameters():
+                p.requires_grad_(False)
+
+    def _try_load_upstream_base_backbone_sd(self) -> Optional[Dict[str, torch.Tensor]]:
+        """Attempt to load original upstream `hf_repo` backbone weights for Strategy 1+ anchors on resume."""
+        if not self._checkpoint_path:
+            return None
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_candidates = [self._default_filename]
+            if self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
+                for c in ["checkpoints/checkpoint_best.pt", "checkpoint_best.pt", "FOCAL_HRNet_weights.pth"]:
+                    if c not in hf_candidates:
+                        hf_candidates.append(c)
+            else:
+                for c in ["checkpoints/focal_vit.pt", "focal_vit.pt", "FOCAL_ViT_weights.pth"]:
+                    if c not in hf_candidates:
+                        hf_candidates.append(c)
+
+            resolved = None
+            for local_only in (True, False):
+                for c_fn in hf_candidates:
+                    try:
+                        resolved = hf_hub_download(
+                            repo_id=self.hf_repo,
+                            filename=c_fn,
+                            cache_dir=self._cache_dir,
+                            local_files_only=local_only,
+                        )
+                        if resolved and os.path.isfile(resolved):
+                            break
+                    except Exception:
+                        continue
+                if resolved is not None:
+                    break
+            if resolved is None:
+                return None
+
+            ckpt = torch.load(resolved, map_location="cpu", weights_only=False)
+            raw_sd = (
+                ckpt.get("model_state_dict")
+                or ckpt.get("model")
+                or ckpt.get("state_dict")
+                or ckpt
+            )
+            net_sd: Dict[str, torch.Tensor] = {}
+            expected_net_keys = set(self.net.state_dict().keys())
+            for k, v in raw_sd.items():
+                ck = k[7:] if k.startswith("module.") else k
+                if ck.startswith("net."):
+                    nk = ck[4:]
+                    if nk in expected_net_keys:
+                        net_sd[nk] = v
+                elif ck in expected_net_keys:
+                    net_sd[ck] = v
+            return net_sd if len(net_sd) == len(expected_net_keys) else None
+        except Exception:
+            return None
+
     def _init_prior_anchors(self) -> None:
-        """Snapshot minimal frozen anchor submodules/weights without duplicating the full backbone."""
+        """Snapshot frozen anchor reference modules (`_anchor_backbone`, `_anchor_neck`, `_anchor_hrnet_stage4`) and L2-SP theta^(0)."""
         object.__setattr__(self, "_anchor_neck", None)
         object.__setattr__(self, "_anchor_hrnet_stage4", None)
+        object.__setattr__(self, "_anchor_backbone", None)
         self._neck_init_params = {}
+        self._l2_sp_init_params = {}
+        self._l2_sp_total_numel = 0
+
+        upstream_net_sd: Optional[Dict[str, torch.Tensor]] = None
+        needs_base_ref = (self.prior_anchor_weight > 0.0) or (self.l2_sp_weight > 0.0)
+        if needs_base_ref and self._checkpoint_path is not None:
+            upstream_net_sd = self._try_load_upstream_base_backbone_sd()
+            if upstream_net_sd is None:
+                logger.warning(
+                    "⚠️ [FOCAL Strategy 1+] Could not resolve upstream base checkpoint from '%s' "
+                    "while initializing from custom checkpoint '%s'; falling back to loaded weights for theta^(0).",
+                    self.hf_repo,
+                    self._checkpoint_path,
+                )
+
+        if self.l2_sp_weight > 0.0 and self._surgical_backbone_param_names:
+            for name, p in self.net.named_parameters():
+                if name in self._surgical_backbone_param_names and p.ndim >= 2:
+                    if upstream_net_sd is not None and name in upstream_net_sd:
+                        ref_t = upstream_net_sd[name].detach().clone().to(dtype=p.dtype)
+                    else:
+                        ref_t = p.detach().clone()
+                    self._l2_sp_init_params[name] = ref_t
+            self._l2_sp_total_numel = sum(t.numel() for t in self._l2_sp_init_params.values())
 
         if self.backbone_name in ("vit", "vit-l", "sam_vit"):
-            if self.prior_anchor_weight > 0.0 and self.train_neck:
-                anchor_neck = copy.deepcopy(self.net.image_encoder.neck)
-                anchor_neck.eval()
-                for p in anchor_neck.parameters():
-                    p.requires_grad_(False)
-                object.__setattr__(self, "_anchor_neck", anchor_neck)
+            if self.prior_anchor_weight > 0.0 and self._surgical_backbone_param_names:
+                if self.peft_enabled:
+                    if self.train_neck:
+                        anchor_neck = copy.deepcopy(self.net.image_encoder.neck)
+                        anchor_neck.eval()
+                        for p in anchor_neck.parameters():
+                            p.requires_grad_(False)
+                        object.__setattr__(self, "_anchor_neck", anchor_neck)
+                else:
+                    anchor_bb = copy.deepcopy(self.net)
+                    if upstream_net_sd is not None:
+                        anchor_bb.load_state_dict(upstream_net_sd, strict=False)
+                    anchor_bb.eval()
+                    for p in anchor_bb.parameters():
+                        p.requires_grad_(False)
+                    object.__setattr__(self, "_anchor_backbone", anchor_bb)
             if self.neck_l2_anchor_weight > 0.0 and self.train_neck:
                 self._neck_init_params = {
                     name: p.detach().clone()
@@ -1183,14 +1419,24 @@ class FOCAL(nn.Module):
                 }
         elif self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
             if self.prior_anchor_weight > 0.0 and self._surgical_backbone_param_names:
-                anchor_s4 = copy.deepcopy(self.net.stage4)
-                anchor_s4.eval()
-                for p in anchor_s4.parameters():
-                    p.requires_grad_(False)
-                object.__setattr__(self, "_anchor_hrnet_stage4", anchor_s4)
+                all_in_stage4 = all(n.startswith("stage4.") for n in self._surgical_backbone_param_names)
+                if all_in_stage4 and upstream_net_sd is None:
+                    anchor_s4 = copy.deepcopy(self.net.stage4)
+                    anchor_s4.eval()
+                    for p in anchor_s4.parameters():
+                        p.requires_grad_(False)
+                    object.__setattr__(self, "_anchor_hrnet_stage4", anchor_s4)
+                else:
+                    anchor_bb = copy.deepcopy(self.net)
+                    if upstream_net_sd is not None:
+                        anchor_bb.load_state_dict(upstream_net_sd, strict=False)
+                    anchor_bb.eval()
+                    for p in anchor_bb.parameters():
+                        p.requires_grad_(False)
+                    object.__setattr__(self, "_anchor_backbone", anchor_bb)
 
     def _apply(self, fn: Any) -> "FOCAL":
-        """Ensure non-registered anchor helper modules follow `.to(device)` / `.to(dtype)` calls."""
+        """Ensure non-registered anchor modules and L2-SP snapshots follow `.to(device)` / `.to(dtype)` calls."""
         super()._apply(fn)
         anchor_neck = getattr(self, "_anchor_neck", None)
         if anchor_neck is not None:
@@ -1198,18 +1444,29 @@ class FOCAL(nn.Module):
         anchor_s4 = getattr(self, "_anchor_hrnet_stage4", None)
         if anchor_s4 is not None:
             anchor_s4._apply(fn)
+        anchor_bb = getattr(self, "_anchor_backbone", None)
+        if anchor_bb is not None:
+            anchor_bb._apply(fn)
+            if self.anchor_half_precision:
+                ref_p = next(anchor_bb.parameters(), None)
+                if ref_p is not None and ref_p.is_cuda and ref_p.dtype == torch.float32:
+                    target_half = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                    anchor_bb.to(dtype=target_half)
+        if getattr(self, "_l2_sp_init_params", None):
+            with torch.no_grad():
+                for k, v in list(self._l2_sp_init_params.items()):
+                    self._l2_sp_init_params[k] = fn(v)
         return self
 
     def _apply_strategy_b_surgery(self) -> None:
-        """Apply configured Strategy B model surgery and record authoritative trainable mask."""
+        """Apply configured Strategy B / Strategy 1+ model surgery and record authoritative trainable mask."""
         if self._surgery_applied:
             return
         if self.backbone_name in ("vit", "vit-l", "sam_vit"):
             if self.peft_enabled:
                 self.inject_peft_lora()
-            elif not self.train_neck:
-                for p in self.net.image_encoder.neck.parameters():
-                    p.requires_grad_(False)
+            else:
+                self._apply_vit_full_rank_locks()
         elif self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
             self._apply_hrnet_surgery()
 
@@ -1221,7 +1478,7 @@ class FOCAL(nn.Module):
         self._enforce_frozen_backbone_eval()
 
     def _enforce_frozen_backbone_eval(self) -> None:
-        """Keep permanently frozen BatchNorm2d layers (or fully frozen backbone) in eval mode."""
+        """Keep permanently frozen BatchNorm2d layers (or fully frozen backbone) and anchor refs in eval mode."""
         if self._backbone_temporarily_frozen:
             self.net.eval()
         elif self._surgery_active:
@@ -1234,6 +1491,8 @@ class FOCAL(nn.Module):
             self._anchor_neck.eval()
         if self._anchor_hrnet_stage4 is not None:
             self._anchor_hrnet_stage4.eval()
+        if self._anchor_backbone is not None:
+            self._anchor_backbone.eval()
 
     def train(self, mode: bool = True) -> "FOCAL":
         """Override train() so frozen backbone BatchNorm2d stats never leak during Trainer.train_epoch()."""
@@ -1243,7 +1502,7 @@ class FOCAL(nn.Module):
         return self
 
     def set_backbone_trainable(self, trainable: bool) -> None:
-        """Freeze or unfreeze backbone (`self.net`) respecting Strategy B surgical freeze masks."""
+        """Freeze or unfreeze backbone (`self.net`) respecting Strategy B / Strategy 1+ surgical freeze masks."""
         self._backbone_temporarily_frozen = not bool(trainable)
         if not trainable:
             for p in self.net.parameters():
@@ -1261,6 +1520,23 @@ class FOCAL(nn.Module):
                 p.requires_grad_(True)
             self.net.train(self.training)
 
+    @staticmethod
+    def _extract_vit_block_idx(param_name: str) -> Optional[int]:
+        parts = param_name.split(".")
+        for idx_i, part in enumerate(parts):
+            if part == "blocks" and idx_i + 1 < len(parts) and parts[idx_i + 1].isdigit():
+                return int(parts[idx_i + 1])
+        return None
+
+    @staticmethod
+    def _extract_hrnet_stage_key(param_name: str) -> str:
+        for prefix in ("stage4", "transition3", "stage3", "transition2", "stage2", "transition1", "layer1"):
+            if param_name.startswith(f"{prefix}."):
+                return prefix
+        if param_name.startswith(("conv1.", "bn1.", "conv2.", "bn2.")):
+            return "stem"
+        return "backbone_other"
+
     def get_param_groups(
         self,
         lr: float,
@@ -1269,7 +1545,7 @@ class FOCAL(nn.Module):
     ) -> List[Dict[str, Any]]:
         """
         Build optimizer parameter groups separating head, LoRA/DoRA adapters, and
-        trainable neck / partial HRNet stages without exposing frozen base weights.
+        LLRD / neck / partial HRNet stages without exposing frozen base weights.
         """
         if not self._surgery_active:
             if backbone_lr is None:
@@ -1286,49 +1562,119 @@ class FOCAL(nn.Module):
                 groups.append({"params": backbone_params, "lr": float(backbone_lr), "name": "backbone"})
             return groups
 
-        # Strategy B surgical parameter groups
+        # Surgical parameter groups (Strategy B & Strategy 1+)
         backbone_param_ids = {id(p) for p in self.net.parameters()}
         anchor_param_ids: Set[int] = set()
         if self._anchor_neck is not None:
             anchor_param_ids.update(id(p) for p in self._anchor_neck.parameters())
         if self._anchor_hrnet_stage4 is not None:
             anchor_param_ids.update(id(p) for p in self._anchor_hrnet_stage4.parameters())
+        if self._anchor_backbone is not None:
+            anchor_param_ids.update(id(p) for p in self._anchor_backbone.parameters())
 
         head_params = [
             p for p in self.parameters()
             if id(p) not in backbone_param_ids and id(p) not in anchor_param_ids and p.requires_grad
         ]
 
-        lora_params: List[nn.Parameter] = []
-        neck_params: List[nn.Parameter] = []
-        partial_bb_params: List[nn.Parameter] = []
-
-        for name, p in self.net.named_parameters():
-            if name not in self._surgical_backbone_param_names:
-                continue
-            if name.endswith((".lora_A", ".lora_B", ".dora_m")):
-                lora_params.append(p)
-            elif "image_encoder.neck." in name or name.startswith("neck."):
-                neck_params.append(p)
-            else:
-                partial_bb_params.append(p)
-
         groups = []
         if head_params:
-            groups.append({"params": head_params, "lr": float(lr), "name": "head"})
-        if lora_params:
-            groups.append({
-                "params": lora_params,
-                "lr": float(lr) * self.lora_lr_multiplier,
-                "weight_decay": float(self.lora_weight_decay),
-                "name": "lora",
-            })
-        if neck_params:
-            resolved_neck_lr = float(lr) * self.neck_lr_multiplier
-            groups.append({"params": neck_params, "lr": resolved_neck_lr, "name": "neck"})
-        if partial_bb_params:
+            head_grp: Dict[str, Any] = {"params": head_params, "lr": float(lr), "name": "head"}
+            if weight_decay is not None:
+                head_grp["weight_decay"] = float(weight_decay)
+            groups.append(head_grp)
+
+        # Decouple AdamW decay-toward-zero on pretrained self.net when L2-SP is active
+        bb_wd_override: Optional[float] = 0.0 if self.l2_sp_weight > 0.0 else (
+            float(weight_decay) if weight_decay is not None else None
+        )
+
+        def _append_bb_group(name: str, params_list: List[nn.Parameter], group_lr: float, wd_val: Optional[float] = bb_wd_override) -> None:
+            if not params_list:
+                return
+            grp: Dict[str, Any] = {"params": params_list, "lr": float(group_lr), "name": name}
+            if wd_val is not None:
+                grp["weight_decay"] = float(wd_val)
+            groups.append(grp)
+
+        if self.llrd_enabled:
+            effective_bb_lr = (
+                float(backbone_lr)
+                if backbone_lr is not None
+                else float(lr) * float(self.backbone_lr_multiplier)
+            )
+            lora_params: List[nn.Parameter] = []
+            neck_params: List[nn.Parameter] = []
+
+            if self.backbone_name in ("vit", "vit-l", "sam_vit"):
+                depth = len(self.net.image_encoder.blocks)
+                block_buckets: Dict[int, List[nn.Parameter]] = {}
+                other_bb_params: List[nn.Parameter] = []
+
+                for name, p in self.net.named_parameters():
+                    if name not in self._surgical_backbone_param_names:
+                        continue
+                    if name.endswith((".lora_A", ".lora_B", ".dora_m")):
+                        lora_params.append(p)
+                    elif "image_encoder.neck." in name or name.startswith("neck."):
+                        neck_params.append(p)
+                    else:
+                        b_idx = self._extract_vit_block_idx(name)
+                        if b_idx is not None:
+                            block_buckets.setdefault(b_idx, []).append(p)
+                        else:
+                            other_bb_params.append(p)
+
+                _append_bb_group(
+                    "lora",
+                    lora_params,
+                    float(lr) * self.lora_lr_multiplier,
+                    wd_val=float(self.lora_weight_decay),
+                )
+                _append_bb_group("neck", neck_params, float(lr) * self.neck_lr_multiplier)
+                for b_idx in sorted(block_buckets.keys(), reverse=True):
+                    scale = max(self.llrd_min_scale, self.llrd_decay ** (depth - 1 - b_idx))
+                    _append_bb_group(f"block_{b_idx}", block_buckets[b_idx], effective_bb_lr * scale)
+                _append_bb_group("backbone_other", other_bb_params, effective_bb_lr * self.llrd_min_scale)
+            else:
+                stage_order = ["stage4", "transition3", "stage3", "transition2", "stage2", "transition1", "layer1", "stem", "backbone_other"]
+                stage_buckets: Dict[str, List[nn.Parameter]] = {k: [] for k in stage_order}
+                for name, p in self.net.named_parameters():
+                    if name not in self._surgical_backbone_param_names:
+                        continue
+                    s_key = self._extract_hrnet_stage_key(name)
+                    stage_buckets.setdefault(s_key, []).append(p)
+
+                for s_key in stage_order:
+                    params_list = stage_buckets.get(s_key, [])
+                    if not params_list:
+                        continue
+                    mult = self.hrnet_stage_lr_multipliers.get(s_key, self.llrd_min_scale)
+                    _append_bb_group(s_key, params_list, effective_bb_lr * float(mult))
+        else:
+            lora_params = []
+            neck_params = []
+            partial_bb_params: List[nn.Parameter] = []
+
+            for name, p in self.net.named_parameters():
+                if name not in self._surgical_backbone_param_names:
+                    continue
+                if name.endswith((".lora_A", ".lora_B", ".dora_m")):
+                    lora_params.append(p)
+                elif "image_encoder.neck." in name or name.startswith("neck."):
+                    neck_params.append(p)
+                else:
+                    partial_bb_params.append(p)
+
+            _append_bb_group(
+                "lora",
+                lora_params,
+                float(lr) * self.lora_lr_multiplier,
+                wd_val=float(self.lora_weight_decay),
+            )
+            _append_bb_group("neck", neck_params, float(lr) * self.neck_lr_multiplier)
             resolved_bb_lr = float(backbone_lr) if backbone_lr is not None else float(lr) * self.neck_lr_multiplier
-            groups.append({"params": partial_bb_params, "lr": resolved_bb_lr, "name": "backbone_partial"})
+            _append_bb_group("backbone_partial", partial_bb_params, resolved_bb_lr)
 
         if not groups:
             trainable = [p for p in self.parameters() if p.requires_grad]
@@ -1362,12 +1708,14 @@ class FOCAL(nn.Module):
         return self
 
     def get_surgery_summary(self) -> Dict[str, Any]:
-        """Return parameter footprint and active Strategy B surgery metadata."""
+        """Return parameter footprint and active Strategy B / Strategy 1+ surgery metadata."""
         anchor_ids: Set[int] = set()
         if self._anchor_neck is not None:
             anchor_ids.update(id(p) for p in self._anchor_neck.parameters())
         if self._anchor_hrnet_stage4 is not None:
             anchor_ids.update(id(p) for p in self._anchor_hrnet_stage4.parameters())
+        if self._anchor_backbone is not None:
+            anchor_ids.update(id(p) for p in self._anchor_backbone.parameters())
 
         total_params = sum(p.numel() for p in self.parameters() if id(p) not in anchor_ids)
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad and id(p) not in anchor_ids)
@@ -1375,6 +1723,25 @@ class FOCAL(nn.Module):
         backbone_trainable = sum(
             p.numel() for n, p in self.net.named_parameters() if n in self._surgical_backbone_param_names
         )
+
+        bb_lrs = [
+            float(g["lr"])
+            for g in self.get_param_groups(lr=1.0)
+            if g.get("name") != "head"
+        ]
+        lr_scale_min = min(bb_lrs) if bb_lrs else 1.0
+        lr_scale_max = max(bb_lrs) if bb_lrs else 1.0
+
+        locked_modules: List[str] = []
+        if self.backbone_name in ("vit", "vit-l", "sam_vit") and (self.freeze_vit_stem_and_pos or self.peft_enabled):
+            locked_modules.extend(["patch_embed", "pos_embed", "rel_pos"])
+            if self.freeze_vit_blocks_below > 0:
+                locked_modules.append(f"blocks[0..{self.freeze_vit_blocks_below - 1}]")
+        elif self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32") and self.hrnet_freeze_stem:
+            locked_modules.extend(["conv1..layer1"])
+        if self._frozen_bn_modules:
+            locked_modules.append(f"BatchNorm2d({len(self._frozen_bn_modules)})")
+
         return {
             "backbone": self.backbone_name,
             "finetune_mode": self.finetune_mode,
@@ -1391,6 +1758,19 @@ class FOCAL(nn.Module):
             "frozen_bn_count": len(self._frozen_bn_modules),
             "use_feature_adapter": self.use_feature_adapter,
             "prior_anchor_weight": self.prior_anchor_weight,
+            "prior_anchor_mode": self.prior_anchor_mode,
+            "pristine_anchor_threshold": self.pristine_anchor_threshold,
+            "l2_sp_weight": self.l2_sp_weight,
+            "l2_sp_param_count": len(self._l2_sp_init_params),
+            "l2_sp_total_numel": self._l2_sp_total_numel,
+            "llrd_enabled": self.llrd_enabled,
+            "llrd_decay": self.llrd_decay,
+            "llrd_min_scale": self.llrd_min_scale,
+            "backbone_lr_multiplier": self.backbone_lr_multiplier,
+            "lr_scale_min": lr_scale_min,
+            "lr_scale_max": lr_scale_max,
+            "locked_modules": locked_modules,
+            "has_anchor_backbone": self._anchor_backbone is not None,
             "total_params": total_params,
             "trainable_params": trainable_params,
             "trainable_pct": (100.0 * trainable_params / max(1, total_params)),
@@ -1400,17 +1780,26 @@ class FOCAL(nn.Module):
         }
 
     def log_surgery_summary(self, custom_logger: Optional[logging.Logger] = None) -> None:
-        """Log concise Strategy B startup surgery summary."""
+        """Log concise startup surgery summary for Strategy B or Strategy 1+."""
         lg = custom_logger or logger
         s = self.get_surgery_summary()
-        lg.info(
-            f"🧬 [FOCAL Strategy B Surgery] backbone={s['backbone']} mode={s['finetune_mode']} | "
-            f"trainable={s['trainable_params']:,}/{s['total_params']:,} ({s['trainable_pct']:.2f}%) | "
-            f"backbone_trainable={s['backbone_trainable_params']:,}/{s['backbone_total_params']:,} ({s['backbone_trainable_pct']:.2f}%) | "
-            f"peft={s['peft_enabled']} dora={s['use_dora']} blocks={s['adapted_block_indices']} "
-            f"train_neck={s['train_neck']} frozen_bn={s['frozen_bn_count']} "
-            f"adapter={s['use_feature_adapter']} prior_anchor={s['prior_anchor_weight']}"
-        )
+        if self.llrd_enabled or self.l2_sp_weight > 0.0 or self.finetune_mode == "hybrid":
+            lg.info(
+                f"🧬 [FOCAL Strategy 1+ Anchored Full-Rank] backbone={s['backbone']} mode={s['finetune_mode']} | "
+                f"trainable={s['trainable_params']:,}/{s['total_params']:,} ({s['trainable_pct']:.2f}%) | "
+                f"llrd={s['llrd_enabled']} (decay={s['llrd_decay']}, bb_lr_range=[{s['lr_scale_min']:.4f}x..{s['lr_scale_max']:.4f}x]) | "
+                f"locked={s['locked_modules']} | "
+                f"anchor={s['prior_anchor_mode']}:{s['prior_anchor_weight']} l2_sp={s['l2_sp_weight']}"
+            )
+        else:
+            lg.info(
+                f"🧬 [FOCAL Strategy B Surgery] backbone={s['backbone']} mode={s['finetune_mode']} | "
+                f"trainable={s['trainable_params']:,}/{s['total_params']:,} ({s['trainable_pct']:.2f}%) | "
+                f"backbone_trainable={s['backbone_trainable_params']:,}/{s['backbone_total_params']:,} ({s['backbone_trainable_pct']:.2f}%) | "
+                f"peft={s['peft_enabled']} dora={s['use_dora']} blocks={s['adapted_block_indices']} "
+                f"train_neck={s['train_neck']} frozen_bn={s['frozen_bn_count']} "
+                f"adapter={s['use_feature_adapter']} prior_anchor={s['prior_anchor_weight']}"
+            )
 
     def _load_pretrained(
         self, source: str, default_filename: str, cache_dir: Optional[str] = None
@@ -1573,7 +1962,12 @@ class FOCAL(nn.Module):
 
     @torch.no_grad()
     def _extract_base_features_no_grad(self, x_in: torch.Tensor) -> torch.Tensor:
-        """Compute unmodified pretrained backbone features without duplicating the 307M ViT in VRAM."""
+        """Compute unmodified pretrained backbone features via `_anchor_backbone` or Strategy B bypass."""
+        if self._anchor_backbone is not None:
+            ref_p = next(self._anchor_backbone.parameters(), None)
+            x_ref = x_in.to(dtype=ref_p.dtype) if (ref_p is not None and ref_p.dtype != x_in.dtype) else x_in
+            return self._anchor_backbone(x_ref)
+
         if self.backbone_name in ("vit", "vit-l", "sam_vit"):
             lora_mods = [m for m in self.net.modules() if isinstance(m, SurgicalLoRALinear)]
             for m in lora_mods:
@@ -1623,10 +2017,15 @@ class FOCAL(nn.Module):
         return self.net(x_in)
 
     def _compute_prior_anchor_terms(
-        self, x_in: torch.Tensor, feats: torch.Tensor, feats_backbone: torch.Tensor
+        self,
+        x_in: torch.Tensor,
+        feats: torch.Tensor,
+        feats_backbone: torch.Tensor,
+        gt_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Compute feature-space cosine prior-anchoring loss and optional neck L2 anchor penalty.
+        Compute feature-space cosine prior-anchoring loss (pristine-only or uniform)
+        and optional neck L2 anchor penalty.
         Returns `(raw_cosine_drift, weighted_total_penalty)`.
         """
         raw_cos_loss: Optional[torch.Tensor] = None
@@ -1639,7 +2038,35 @@ class FOCAL(nn.Module):
                 feats_base = self._extract_base_features_no_grad(x_in)
             f_ad = F.normalize(feats.float(), p=2, dim=1)
             f_ba = F.normalize(feats_base.detach().float(), p=2, dim=1)
-            raw_cos_loss = (1.0 - (f_ad * f_ba).sum(dim=1)).mean()
+            cos_dist = 1.0 - (f_ad * f_ba).sum(dim=1)  # [B, H', W']
+
+            if self.prior_anchor_mode == "pristine_only":
+                if gt_masks is None:
+                    if self.prior_anchor_when_no_masks == "uniform":
+                        raw_cos_loss = cos_dist.mean()
+                    else:
+                        logger.debug(
+                            "prior_anchor_mode='pristine_only' received gt_masks=None; returning 0.0 anchor loss."
+                        )
+                        raw_cos_loss = feats.float().sum() * 0.0
+                else:
+                    _, _, h_f, w_f = feats.shape
+                    gt_f = gt_masks.float()
+                    if gt_f.ndim == 3:
+                        gt_f = gt_f.unsqueeze(1)
+                    if gt_f.shape[2] != h_f or gt_f.shape[3] != w_f:
+                        gt_small = F.interpolate(gt_f, size=(h_f, w_f), mode="area")
+                    else:
+                        gt_small = gt_f
+                    m_pristine = (gt_small <= self.pristine_anchor_threshold).squeeze(1).to(dtype=cos_dist.dtype)
+                    denom = m_pristine.sum()
+                    raw_cos_loss = torch.where(
+                        denom > 0,
+                        (m_pristine * cos_dist).sum() / (denom + 1e-6),
+                        feats.float().sum() * 0.0,
+                    )
+            else:
+                raw_cos_loss = cos_dist.mean()
             weighted_penalty = self.prior_anchor_weight * raw_cos_loss
 
         if self.neck_l2_anchor_weight > 0.0 and self._neck_init_params:
@@ -1654,6 +2081,33 @@ class FOCAL(nn.Module):
                 weighted_penalty = weighted_neck if weighted_penalty is None else (weighted_penalty + weighted_neck)
 
         return raw_cos_loss, weighted_penalty
+
+    def _compute_l2_sp_loss(self, ref_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute scale-normalized L2-SP starting-point weight regularization in float32:
+            L_L2-SP = l2_sp_weight * sum(||p_k - theta_k^(0)||_2^2) / sum(numel(p_k))
+        Returns `(raw_l2_sp_deviation, weighted_l2_sp_penalty)`.
+        """
+        zero = ref_tensor.float().sum() * 0.0
+        if self.l2_sp_weight <= 0.0 or not self._l2_sp_init_params:
+            return zero, zero
+
+        sq_sum = torch.zeros((), device=ref_tensor.device, dtype=torch.float32)
+        total_elems = 0
+        for name, p in self.net.named_parameters():
+            if not p.requires_grad or name not in self._l2_sp_init_params:
+                continue
+            init_w = self._l2_sp_init_params[name]
+            if init_w.device != p.device:
+                init_w = init_w.to(device=p.device)
+                self._l2_sp_init_params[name] = init_w
+            sq_sum = sq_sum + (p.float() - init_w.float()).pow(2).sum()
+            total_elems += p.numel()
+
+        if total_elems == 0:
+            return zero, zero
+        raw_l2_sp = sq_sum / float(total_elems)
+        return raw_l2_sp, self.l2_sp_weight * raw_l2_sp
 
     def _apply_pristine_gate(
         self,
@@ -1889,8 +2343,13 @@ class FOCAL(nn.Module):
         prior_anchor_penalty: Optional[torch.Tensor] = None
         if self.training and (self.prior_anchor_weight > 0.0 or self.neck_l2_anchor_weight > 0.0):
             prior_anchor_loss, prior_anchor_penalty = self._compute_prior_anchor_terms(
-                x_in=x_in, feats=feats, feats_backbone=feats_backbone
+                x_in=x_in, feats=feats, feats_backbone=feats_backbone, gt_masks=gt_masks
             )
+
+        l2_sp_loss: Optional[torch.Tensor] = None
+        l2_sp_penalty: Optional[torch.Tensor] = None
+        if self.training and self.l2_sp_weight > 0.0:
+            l2_sp_loss, l2_sp_penalty = self._compute_l2_sp_loss(feats)
 
         class_logits = self.class_head(feats) if self.class_head is not None else None
         aux_pristine_flags = (
@@ -1907,6 +2366,32 @@ class FOCAL(nn.Module):
             # Mode 1A: strict train/eval parity via supervised head
             mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
             pred_mask = torch.sigmoid(mask_logits)
+        elif self.finetune_mode == "hybrid":
+            # Strategy 1+ Mode 1A+: simultaneous supervised decoder + per-image MyInfoNCE contrastive branch
+            if self.training:
+                mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
+                pred_mask = torch.sigmoid(mask_logits)
+                align_loss = self.compute_contrastive_loss(feats, gt_masks)
+                skip_mask_loss = False
+                if self.eval_clustering_diagnostic:
+                    with torch.no_grad():
+                        _, _, separability = self._cluster_features_with_stats(
+                            feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                        )
+            else:
+                if self.use_clustering:
+                    mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                    logits_full = mask_logits
+                else:
+                    mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
+                    pred_mask = torch.sigmoid(mask_logits)
+                    if self.eval_clustering_diagnostic:
+                        with torch.no_grad():
+                            _, _, separability = self._cluster_features_with_stats(
+                                feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                            )
         elif self.finetune_mode == "contrastive":
             # Mode 1B: image-relative contrastive training + clustering eval
             if self.training:
@@ -1950,6 +2435,10 @@ class FOCAL(nn.Module):
                 res["prior_anchor_loss"] = prior_anchor_loss
             if prior_anchor_penalty is not None:
                 res["prior_anchor_penalty"] = prior_anchor_penalty
+            if l2_sp_loss is not None:
+                res["l2_sp_loss"] = l2_sp_loss
+            if l2_sp_penalty is not None:
+                res["l2_sp_penalty"] = l2_sp_penalty
             if separability is not None:
                 res["cluster_separability"] = separability
             return res
