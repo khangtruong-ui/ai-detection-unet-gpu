@@ -277,13 +277,18 @@ class UNet(nn.Module):
                     "inc.", "downs.", "bottleneck.", "stage1.", "linear.", "stage5.",
                     "aggregator.", "prompt_learner.", "cls_aggregator.",
                     "net.", "module.net.", "backbone_swin.", "module.backbone_swin.",
-                    "uperhead.", "module.uperhead.", "fc.", "module.fc."
+                    "uperhead.", "module.uperhead.", "fc.", "module.fc.",
+                    "backbone_net.", "mscc.", "bottleneck_fusion.", "classifer.",
+                    "backbone.trunk.", "neck.module.", "head.decoder_modules.",
                 ))
                 for k in ckpt.keys()
             ) or any("backbone_swin" in k or "image_encoder" in k for k in ckpt.keys())
         ):
             state_dict = ckpt
             saved_cfg = {}
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            state_dict = ckpt["state_dict"]
+            saved_cfg = ckpt.get("config", {})
         else:
             raise ValueError(f"Unrecognized checkpoint format in '{checkpoint_path}'")
 
@@ -322,6 +327,35 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "sam2"
             elif any(k.startswith(("base_model.", "model.vision_encoder", "model.detr_encoder", "model.mask_decoder")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_qlora"
+            elif any(k.startswith(("mscc.", "bottleneck_fusion.", "module.mscc.", "backbone_net.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "msccnet"
+                merged["model"]["pretrained"] = False
+                merged["model"]["backbone_pretrained"] = False
+                merged["model"]["allow_random_init"] = True
+                merged["model"]["aux_classifier"] = any(k.startswith(("classifer.", "module.classifer.")) for k in state_dict.keys())
+                if any("backbone_net.layer3.22." in k for k in state_dict.keys()):
+                    merged["model"].setdefault("backbone_depth", 101)
+                elif any("backbone_net.layer3.5." in k for k in state_dict.keys()):
+                    merged["model"].setdefault("backbone_depth", 50)
+                if "classifer.fc.weight" in state_dict and hasattr(state_dict["classifer.fc.weight"], "shape"):
+                    merged["model"].setdefault("num_classes", int(state_dict["classifer.fc.weight"].shape[0]))
+                if "mscc.fuse.weight" in state_dict and hasattr(state_dict["mscc.fuse.weight"], "shape"):
+                    n_groups = int(state_dict["mscc.fuse.weight"].shape[1])
+                    k_val = int(round(n_groups ** 0.5))
+                    if k_val * k_val == n_groups:
+                        merged["model"].setdefault("spectral_k", k_val)
+            elif any(k.startswith(("backbone.trunk.", "neck.module.", "head.decoder_modules.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "omnifd"
+                merged["model"]["pretrained"] = False
+                merged["model"]["backbone_pretrained"] = False
+                merged["model"]["allow_random_init"] = True
+                if any("backbone.trunk.layers.2.blocks.6." in k for k in state_dict.keys()):
+                    merged["model"].setdefault("variant", "swin-s")
+                else:
+                    merged["model"].setdefault("variant", "swin-t")
+                merged["model"]["has_image_head"] = any("head.decoder_modules.image." in k for k in state_dict.keys())
+                merged["model"]["has_spatial_head"] = any("head.decoder_modules.spatial." in k for k in state_dict.keys())
+                merged["model"]["aux_classifier"] = merged["model"]["has_image_head"]
             elif any(k.startswith("decoder.perp_fusions.") for k in state_dict.keys()):
                 merged["model"]["name"] = "diffusion_diff_v2"
             elif any(k.startswith(("decoder.", "diffuser.")) for k in state_dict.keys()):
@@ -1009,6 +1043,71 @@ def build_model(config: Any) -> nn.Module:
             hf_repo=str(model_cfg.get("hf_repo", "KhangTruong/PIM")),
             cache_dir=model_cfg.get("cache_dir", None),
             num_classes=int(model_cfg.get("num_classes", 2)),
+        )
+
+    if any(k in model_name for k in ["msccnet", "mscc"]) or any(
+        k in backbone for k in ["msccnet", "mscc"]
+    ):
+        from sid_unet.models.msccnet import MSCCNet
+        ckpt_path = model_cfg.get(
+            "checkpoint_path",
+            model_cfg.get("pretrained_model_name_or_path", None),
+        )
+        bb_depth = model_cfg.get("backbone_depth", 50)
+        if isinstance(backbone, str) and "101" in backbone:
+            bb_depth = 101
+        elif isinstance(backbone, str) and "50" in backbone:
+            bb_depth = 50
+        return MSCCNet(
+            backbone_depth=int(bb_depth),
+            backbone_outstride=int(model_cfg.get("backbone_outstride", 8)),
+            use_stem=bool(model_cfg.get("use_stem", True)),
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            backbone_pretrained=model_cfg.get("backbone_pretrained", None),
+            checkpoint_path=str(ckpt_path) if ckpt_path else None,
+            hf_repo=model_cfg.get("hf_repo", None),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
+            num_classes=int(model_cfg.get("num_classes", 2)),
+            feats_channels=int(model_cfg.get("feats_channels", 512)),
+            out_channels=int(model_cfg.get("out_channels", 512)),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+            spectral_height=int(model_cfg.get("spectral_height", 64)),
+            spectral_width=int(model_cfg.get("spectral_width", 64)),
+            spectral_k=int(model_cfg.get("spectral_k", 2)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", True)),
+            align_corners=bool(model_cfg.get("align_corners", False)),
+            use_sync_bn=bool(model_cfg.get("use_sync_bn", False)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+        )
+
+    if any(k in model_name for k in ["omnifd", "omni_fd", "omnivore"]) or any(
+        k in backbone for k in ["omnifd", "omni_fd"]
+    ):
+        from sid_unet.models.omnifd import OmniFD
+        ckpt_path = model_cfg.get(
+            "checkpoint_path",
+            model_cfg.get("pretrained_model_name_or_path", None),
+        )
+        variant = model_cfg.get("variant", model_cfg.get("backbone", "swin-t"))
+        if str(variant).lower() in ("omnifd", "omni_fd", "default"):
+            variant = "swin-t"
+        return OmniFD(
+            variant=str(variant),
+            checkpoint_name=model_cfg.get("checkpoint_name", "omnifd_swin-t_50k_forgerynet"),
+            checkpoint_path=str(ckpt_path) if ckpt_path else None,
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            backbone_pretrained=bool(model_cfg.get("backbone_pretrained", False)),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
+            hf_repo=model_cfg.get("hf_repo", None),
+            cache_dir=model_cfg.get("cache_dir", None),
+            latent_channels=int(model_cfg.get("latent_channels", 512)),
+            num_latents=int(model_cfg.get("num_latents", 64)),
+            spatial_channels=int(model_cfg.get("spatial_channels", 256)),
+            num_classes=int(model_cfg.get("num_classes", 2)),
+            aux_classifier=model_cfg.get("aux_classifier", None),
+            has_image_head=model_cfg.get("has_image_head", None),
+            has_spatial_head=model_cfg.get("has_spatial_head", None),
+            with_cp=bool(ckpt_flag or model_cfg.get("with_cp", False)),
         )
 
     return UNet(

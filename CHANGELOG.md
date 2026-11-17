@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-17
+
+### Added & Updated
+- **MSCCNet Integration (`sid_unet.models.msccnet`, `sid_unet.models.unet`, `configs/experiments/msccnet/*.yaml`)**:
+  - Added pure-PyTorch `MSCCNet` (ACM TOMM 2025, `miaoct/MSCCNet`) featuring dilated ResNet-50/101 (`outstride=8`, `use_stem=True`) backbone, image-level `MSCCClassifier` branch, multi-level feature bottlenecks, and `MSCCModule` (2D `MultiSpectralDCTLayer` with dynamic resolution interpolation, frequency-residual `decoder_map`, `MSCCGCN`, and spectral attention fusion).
+  - Supports ImageNet-pretrained `resnet50_v1c` / `resnet101_v1c` initialization and explicit `checkpoint_path` loading (since official upstream repo does not release task-trained MSCCNet checkpoints).
+- **OmniFD Integration (`sid_unet.models.omnifd`, `sid_unet.models.unet`, `configs/experiments/omnifd/*.yaml`, `pyproject.toml`)**:
+  - Added pure-PyTorch `OmniFD` (arXiv:2512.01128, `haotianll/OmniFD`) featuring `SwinTransformerOmni` (`SwinTransformer3D` for Swin-T / Swin-S / Swin-B), Perceiver-style `InteractionNeck`, `OmniFDImageClsHead`, and `OmniFDSpatialHead` without requiring `mmcv`/`mmengine`/`mmpretrain`.
+  - Auto-downloads official pretrained checkpoints from Google Drive via `gdown` (`omnifd_swin-t_50k_forgerynet`, `omnifd_swin-s_50k_forgerynet`, `omnifd_swin-s_20k_ff_spatial`, `omnifd_swin-s_20k_fmld_spatial`, etc.) and supports local/HF Hub paths.
+- **Detailed 8-Column PDF Inference Reporting (`sid_unet.utils.plotting`, `sid_unet.illustration`, `scripts/infer_msccnet_omnifd_pdf.py`)**:
+  - Implemented `plot_detailed_inference_pdf()` producing a multi-page PDF with an executive summary page (models/weights table, aggregate metrics table, bar chart) followed by 8-column visual & quantitative breakdowns (Input Image, Ground Truth, Prob Heatmap, Binary Pred, Aux/Spectral/Post Map, Overlay, Error Map, Detection Score & Pixel Probability Histogram).
+  - Updated `sid-illu` (`sid_unet.illustration`) to handle `dict` and `tuple` model outputs and emit detailed 8-column PDF reports (`--pdf` enabled by default).
+- **Strict Zero-Random-Init Policy & Hugging Face Domain Evaluation (`sid_unet.models.msccnet`, `sid_unet.models.omnifd`, `sid_unet.models.unet`, `scripts/build_face_domain_dataset.py`, `scripts/infer_msccnet_omnifd_pdf.py`)**:
+  - Enforced `allow_random_init=False` by default on both `MSCCNet` and `OmniFD` so uninitialized heads raise `ValueError`/`RuntimeError` unless explicitly opted in for training (`configs/experiments/msccnet/*.yaml`). Added `hf_repo` checkpoint resolution to `MSCCNet`.
+  - Built and published [KhangTruong/face-forgery-domain-eval](https://huggingface.co/datasets/KhangTruong/face-forgery-domain-eval) (`36` human-face images across `model1_in_domain`, `model2_in_domain`, and `out_of_domain` splits using FaceForensics++ C23, `nielsr/CelebA-faces`, and Celeb-DF-v2).
+  - Updated `plot_detailed_inference_pdf()` in `sid_unet/utils/plotting.py` with a dedicated Page 2 Domain Breakdown table (`Mean IoU`, `Dice/F1`, `Tampered F1`, `Pixel Acc`, `Image Cls ACC`), aligned OmniFD evaluation resolutions (`224x224` / `299x299`), and regenerated `docs/msccnet_omnifd_domain_metrics.json` & `docs/msccnet_omnifd_inference_report.pdf` under strict zero-random-init weights.
+- **Documentation & Tests**:
+  - Added `docs/msccnet_and_omnifd_integration.md`, generated `docs/msccnet_omnifd_domain_metrics.json` and `docs/msccnet_omnifd_inference_report.pdf`, updated `README.md` and `configs/experiments/README.md`, and added `tests/test_msccnet.py` (strict zero-random-init guards), `tests/test_omnifd.py`, and PDF coverage in `tests/test_illustrations.py`.
+
 ## [Unreleased] - 2026-11-16
 
 ### Added & Fixed

@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Use headless backend for server/Docker environments
 import matplotlib
@@ -783,3 +783,405 @@ def plot_cross_eval_heatmaps(
         saved_paths.append(out_file)
 
     return saved_paths
+
+
+def plot_detailed_inference_pdf(
+    samples_data: List[Dict[str, Any]],
+    model_names: List[str],
+    output_path: str,
+    title: str = "Detailed Multi-Column Forensic Inference Report",
+    model_summaries: Optional[List[Dict[str, Any]]] = None,
+    rows_per_page: int = 3,
+    dpi: int = 200,
+) -> str:
+    """
+    Generate a multi-page, 8-column detailed PDF inference report across samples and models.
+
+    Page 1 renders an executive summary (architecture/weights metadata table, aggregate
+    quantitative metrics table, and comparative bar chart). Subsequent pages render an
+    8-column per-(sample, model) visual & quantitative breakdown:
+      1. Input Image
+      2. Ground Truth Mask
+      3. Continuous Probability Heatmap [0, 1]
+      4. Thresholded Binary Prediction Mask
+      5. Auxiliary / Spectral Residual / Post-Processed Map
+      6. Red Mask Overlay on Input Image
+      7. Pixel Error Map (TP=Green, FP=Red, FN=Blue)
+      8. Image-Level Real/Fake Detection & Pixel Probability Distribution
+    """
+    if not samples_data or not model_names:
+        return ""
+
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
+
+    label_names = {0: "Real", 1: "Synthetic", 2: "Tampered"}
+
+    # Build flat list of (sample_dict, model_name) entries
+    entries: List[Tuple[Dict[str, Any], str]] = []
+    for s in samples_data:
+        for m_name in model_names:
+            if m_name in s.get("models", {}):
+                entries.append((s, m_name))
+
+    if not entries:
+        return ""
+
+    # Compute aggregate stats per model
+    agg_rows: List[List[str]] = []
+    agg_chart_data: Dict[str, Dict[str, float]] = {}
+    for m_name in model_names:
+        m_entries = [s["models"][m_name] for s in samples_data if m_name in s.get("models", {})]
+        if not m_entries:
+            continue
+        ious = [float(e.get("iou", 0.0)) for e in m_entries]
+        dices = [float(e.get("dice", 0.0)) for e in m_entries]
+        paccs = [float(e.get("pixel_acc", 0.0)) for e in m_entries]
+        precs = [float(e.get("precision", 0.0)) for e in m_entries]
+        recs = [float(e.get("recall", 0.0)) for e in m_entries]
+        p_fakes = [float(e["cls_probs"][1]) for e in m_entries if e.get("cls_probs") is not None and len(e["cls_probs"]) >= 2]
+        lats = [float(e["inference_ms"]) for e in m_entries if e.get("inference_ms") is not None]
+
+        mean_iou = float(np.mean(ious))
+        mean_dice = float(np.mean(dices))
+        mean_pacc = float(np.mean(paccs))
+        mean_prec = float(np.mean(precs))
+        mean_rec = float(np.mean(recs))
+        mean_pfake = f"{np.mean(p_fakes):.3f}" if p_fakes else "N/A (spatial)"
+        mean_lat = f"{np.mean(lats):.1f} ms" if lats else "—"
+
+        agg_rows.append([
+            m_name,
+            f"{len(m_entries)}",
+            f"{mean_iou:.4f}",
+            f"{mean_dice:.4f}",
+            f"{mean_pacc:.4f}",
+            f"{mean_prec:.4f}",
+            f"{mean_rec:.4f}",
+            mean_pfake,
+            mean_lat,
+        ])
+        agg_chart_data[m_name] = {
+            "Mean IoU": mean_iou,
+            "Dice / F1": mean_dice,
+            "Pixel Acc": mean_pacc,
+            "Precision": mean_prec,
+            "Recall": mean_rec,
+        }
+
+    # Optional per-domain breakdown (when samples include 'domain_split')
+    domain_order: List[str] = []
+    for s in samples_data:
+        ds_sp = s.get("domain_split")
+        if ds_sp and ds_sp not in domain_order:
+            domain_order.append(ds_sp)
+    domain_rows: List[List[str]] = []
+    if domain_order:
+        for dom in domain_order:
+            dom_samples = [s for s in samples_data if s.get("domain_split") == dom]
+            for m_name in model_names:
+                d_entries = [(s, s["models"][m_name]) for s in dom_samples if m_name in s.get("models", {})]
+                if not d_entries:
+                    continue
+                d_ious = [float(e.get("iou", 0.0)) for _, e in d_entries]
+                d_dices = [float(e.get("dice", 0.0)) for _, e in d_entries]
+                d_paccs = [float(e.get("pixel_acc", 0.0)) for _, e in d_entries]
+                fake_dices = [
+                    float(e.get("dice", 0.0))
+                    for s, e in d_entries
+                    if float((_to_mask_2d(s["gt_mask"]) > 0.5).mean()) > 0.0 or int(s.get("label", 0)) > 0
+                ]
+                fake_f1_str = f"{np.mean(fake_dices):.4f}" if fake_dices else "N/A"
+                cls_hits = []
+                for s, e in d_entries:
+                    cp = e.get("cls_probs")
+                    if cp is not None and len(cp) >= 2:
+                        pred_fake = int(float(cp[1]) >= 0.5)
+                        gt_fake = int(float((_to_mask_2d(s["gt_mask"]) > 0.5).mean()) > 0.0 or int(s.get("label", 0)) > 0)
+                        cls_hits.append(float(pred_fake == gt_fake))
+                cls_acc_str = f"{np.mean(cls_hits):.3f}" if cls_hits else "N/A"
+                domain_rows.append([
+                    str(dom),
+                    m_name,
+                    str(len(d_entries)),
+                    f"{np.mean(d_ious):.4f}",
+                    f"{np.mean(d_dices):.4f}",
+                    fake_f1_str,
+                    f"{np.mean(d_paccs):.4f}",
+                    cls_acc_str,
+                ])
+
+    with PdfPages(output_path) as pdf:
+        # ------------------------------------------------------------------
+        # Page 1: Executive Summary, Weights/Architecture & Aggregate Metrics
+        # ------------------------------------------------------------------
+        has_domains = bool(domain_rows)
+        fig_sum = plt.figure(figsize=(18, 11), dpi=dpi)
+        gs = fig_sum.add_gridspec(3, 1, height_ratios=[1.15, 0.95, 1.4], hspace=0.35)
+        fig_sum.suptitle(title, fontsize=15, fontweight="bold", y=0.98)
+
+        # Panel A: Model & Pretrained Weights Metadata Table
+        ax_meta = fig_sum.add_subplot(gs[0])
+        ax_meta.axis("off")
+        ax_meta.set_title("1. Integrated Models, Branches & Pretrained Weights Summary", fontsize=11, fontweight="bold", loc="left", pad=6)
+        if model_summaries:
+            meta_headers = ["Model", "Paper / Repo", "Backbone", "Detection", "Localization", "Weights / Status"]
+            meta_rows = [
+                [
+                    str(ms.get("model", "")),
+                    str(ms.get("paper", "")),
+                    str(ms.get("backbone", "")),
+                    str(ms.get("detection", "")),
+                    str(ms.get("localization", "")),
+                    str(ms.get("weights", "")),
+                ]
+                for ms in model_summaries
+            ]
+        else:
+            meta_headers = ["Model", "Evaluated Samples"]
+            meta_rows = [[m, str(len(samples_data))] for m in model_names]
+        tbl_meta = ax_meta.table(cellText=meta_rows, colLabels=meta_headers, loc="center", cellLoc="left")
+        tbl_meta.auto_set_font_size(False)
+        tbl_meta.set_fontsize(7.5)
+        tbl_meta.auto_set_column_width(col=list(range(len(meta_headers))))
+        tbl_meta.scale(1.0, 1.55)
+        for (r, c), cell in tbl_meta.get_celld().items():
+            if r == 0:
+                cell.set_facecolor("#2c3e50")
+                cell.set_text_props(color="white", fontweight="bold")
+            elif r % 2 == 1:
+                cell.set_facecolor("#f7f9fb")
+
+        # Panel B: Aggregate Quantitative Metrics Table
+        ax_tbl = fig_sum.add_subplot(gs[1])
+        ax_tbl.axis("off")
+        ax_tbl.set_title("2. Aggregate Quantitative Inference Metrics", fontsize=11, fontweight="bold", loc="left", pad=6)
+        agg_headers = ["Model", "N", "Mean IoU", "Dice / F1", "Pixel Acc", "Precision", "Recall", "Mean P(Fake)", "Avg Latency"]
+        tbl_agg = ax_tbl.table(cellText=agg_rows, colLabels=agg_headers, loc="center", cellLoc="center")
+        tbl_agg.auto_set_font_size(False)
+        tbl_agg.set_fontsize(8.0)
+        tbl_agg.auto_set_column_width(col=list(range(len(agg_headers))))
+        tbl_agg.scale(1.0, 1.55)
+        for (r, c), cell in tbl_agg.get_celld().items():
+            if r == 0:
+                cell.set_facecolor("#1f4e78")
+                cell.set_text_props(color="white", fontweight="bold")
+            elif r % 2 == 1:
+                cell.set_facecolor("#f4f7fa")
+
+        # Panel C: Comparative Metric Bar Chart
+        ax_bar = fig_sum.add_subplot(gs[2])
+        met_names = ["Mean IoU", "Dice / F1", "Pixel Acc", "Precision", "Recall"]
+        x_pos = np.arange(len(met_names))
+        n_m = max(1, len(agg_chart_data))
+        bar_w = 0.72 / n_m
+        palette = ["#2b5c8f", "#d95f02", "#1b9e77", "#7570b3", "#e7298a"]
+        for m_i, (m_name, m_vals) in enumerate(agg_chart_data.items()):
+            vals = [m_vals[k] for k in met_names]
+            offset = (m_i - n_m / 2.0 + 0.5) * bar_w
+            bars = ax_bar.bar(x_pos + offset, vals, width=bar_w, label=m_name, color=palette[m_i % len(palette)], alpha=0.9, edgecolor="black", linewidth=0.5)
+            for b_rect, v in zip(bars, vals):
+                ax_bar.annotate(
+                    f"{v:.3f}",
+                    xy=(b_rect.get_x() + b_rect.get_width() / 2.0, b_rect.get_height()),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7.5,
+                    fontweight="semibold",
+                )
+        ax_bar.set_title("3. Per-Model Quantitative Comparison Across Sampled Images", fontsize=11, fontweight="bold", loc="left")
+        ax_bar.set_xticks(x_pos)
+        ax_bar.set_xticklabels(met_names, fontsize=10, fontweight="medium")
+        ax_bar.set_ylim([0.0, 1.15])
+        ax_bar.set_ylabel("Score [0.0 - 1.0]")
+        ax_bar.legend(loc="upper right", fontsize=8.5, frameon=True)
+        ax_bar.grid(True, linestyle="--", alpha=0.45, axis="y")
+
+        fig_sum.text(
+            0.5, 0.01,
+            "Note: Each subsequent page shows an 8-column forensic inspection grid (Input, GT, Prob Heatmap, Binary Pred, Aux/Spectral/Post Map, Overlay, Error Map, Detection & Calibration).",
+            ha="center", fontsize=8.5, style="italic", color="#444444",
+        )
+        pdf.savefig(fig_sum, dpi=dpi, bbox_inches="tight")
+        plt.close(fig_sum)
+
+        # ------------------------------------------------------------------
+        # Optional Page 2: Domain-Aligned Quantitative Breakdown
+        # ------------------------------------------------------------------
+        if has_domains:
+            fig_dom = plt.figure(figsize=(18, max(7.0, 2.2 + len(domain_rows) * 0.42)), dpi=dpi)
+            ax_dom = fig_dom.add_subplot(111)
+            ax_dom.axis("off")
+            ax_dom.set_title(
+                f"{title}\n4. Domain Breakdown (Model 1 In-Domain vs Model 2 In-Domain vs Out-of-Domain Faces)",
+                fontsize=12.5,
+                fontweight="bold",
+                loc="left",
+                pad=14,
+            )
+            dom_headers = ["Domain Split", "Model", "N", "Mean IoU", "Dice / F1", "Tampered F1", "Pixel Acc", "Image Cls ACC"]
+            tbl_dom = ax_dom.table(cellText=domain_rows, colLabels=dom_headers, loc="center", cellLoc="center")
+            tbl_dom.auto_set_font_size(False)
+            tbl_dom.set_fontsize(8.5)
+            tbl_dom.auto_set_column_width(col=list(range(len(dom_headers))))
+            tbl_dom.scale(1.0, 1.55)
+            for (r, c), cell in tbl_dom.get_celld().items():
+                if r == 0:
+                    cell.set_facecolor("#274e13")
+                    cell.set_text_props(color="white", fontweight="bold")
+                elif r % 2 == 1:
+                    cell.set_facecolor("#f3f8f1")
+            pdf.savefig(fig_dom, dpi=dpi, bbox_inches="tight")
+            plt.close(fig_dom)
+
+        # ------------------------------------------------------------------
+        # Subsequent Pages: 8-Column Detailed Visual & Quantitative Rows
+        # ------------------------------------------------------------------
+        col_titles = [
+            "1. Input Image",
+            "2. Ground Truth",
+            "3. Prob Heatmap [0..1]",
+            "4. Binary Pred (≥0.5)",
+            "5. Aux / Spectral / Post",
+            "6. Mask Overlay",
+            "7. Error Map\n(G=TP, R=FP, B=FN)",
+            "8. Detection Score &\nProb Histogram",
+        ]
+        num_cols = len(col_titles)
+
+        for start_idx in range(0, len(entries), rows_per_page):
+            chunk = entries[start_idx : start_idx + rows_per_page]
+            n_rows = len(chunk)
+            fig_w = num_cols * 2.85
+            fig_h = max(4.2, n_rows * 3.15 + 1.0)
+            fig, axes = plt.subplots(n_rows, num_cols, figsize=(fig_w, fig_h), dpi=dpi)
+            if n_rows == 1:
+                axes = np.expand_dims(axes, axis=0)
+
+            page_num = (3 if has_domains else 2) + (start_idx // rows_per_page)
+            fig.suptitle(f"{title} — Detailed Visual Breakdown (Page {page_num})", fontsize=13, fontweight="bold", y=0.995)
+
+            for r_idx, (s, m_name) in enumerate(chunk):
+                m_res = s["models"][m_name]
+                img_rgb = _to_rgb_array(s["image"])
+                gt_m = _to_mask_2d(s["gt_mask"])
+                pred_m = _to_mask_2d(m_res["pred_mask"])
+
+                prob_raw = m_res.get("prob_map")
+                if prob_raw is not None:
+                    prob_m = np.asarray(prob_raw, dtype=np.float32)
+                    if prob_m.ndim == 3:
+                        prob_m = prob_m.squeeze()
+                    prob_m = np.clip(prob_m, 0.0, 1.0)
+                else:
+                    prob_m = pred_m
+
+                aux_raw = m_res.get("aux_map")
+                if aux_raw is not None:
+                    aux_m = np.asarray(aux_raw, dtype=np.float32)
+                    if aux_m.ndim == 3:
+                        aux_m = aux_m.squeeze()
+                    aux_m = np.clip(aux_m, 0.0, 1.0)
+                    aux_cmap = m_res.get("aux_cmap", "viridis")
+                    aux_title = m_res.get("aux_label", "Aux / Spectral Map")
+                else:
+                    aux_m = pred_m
+                    aux_cmap = "gray"
+                    aux_title = "Thresholded Mask"
+
+                overlay = create_mask_overlay(img_rgb, pred_m)
+                error_map = create_error_map(pred_m, gt_m)
+
+                iou = float(m_res.get("iou", 0.0))
+                dice = float(m_res.get("dice", 0.0))
+                pacc = float(m_res.get("pixel_acc", 0.0))
+                prec = float(m_res.get("precision", 0.0))
+                rec = float(m_res.get("recall", 0.0))
+                gt_area = float((gt_m > 0.5).mean())
+                pred_area = float((pred_m > 0.5).mean())
+
+                lbl = s.get("label")
+                lbl_str = label_names.get(int(lbl), str(lbl)) if lbl is not None else ("Tampered" if gt_area > 0 else "Real")
+                ds_tag = s.get("dataset", "")
+                row_tag = f"{s.get('image_id', 'sample')}\n[{m_name}]"
+
+                # Col 0: Input Image
+                ax = axes[r_idx, 0]
+                ax.imshow(img_rgb)
+                ax.set_ylabel(row_tag, fontsize=8, fontweight="bold")
+                ax.set_xlabel(f"{ds_tag} | {img_rgb.shape[1]}x{img_rgb.shape[0]} | GT:{lbl_str}".strip(" |"), fontsize=7.5)
+
+                # Col 1: Ground Truth
+                ax = axes[r_idx, 1]
+                ax.imshow(gt_m, cmap="gray", vmin=0.0, vmax=1.0)
+                ax.set_xlabel(f"GT Tampered: {gt_area:.1%}", fontsize=7.5)
+
+                # Col 2: Prob Heatmap
+                ax = axes[r_idx, 2]
+                ax.imshow(prob_m, cmap="inferno", vmin=0.0, vmax=1.0)
+                ax.set_xlabel(f"min:{prob_m.min():.2f} μ:{prob_m.mean():.2f} max:{prob_m.max():.2f}", fontsize=7.5)
+
+                # Col 3: Binary Pred
+                ax = axes[r_idx, 3]
+                ax.imshow(pred_m, cmap="gray", vmin=0.0, vmax=1.0)
+                ax.set_xlabel(f"IoU:{iou:.3f} | F1:{dice:.3f} | Area:{pred_area:.1%}", fontsize=7.5)
+
+                # Col 4: Aux / Spectral / Post
+                ax = axes[r_idx, 4]
+                ax.imshow(aux_m, cmap=aux_cmap, vmin=0.0, vmax=1.0)
+                aux_extra = m_res.get("aux_metric_str", "")
+                ax.set_xlabel(f"{aux_title}" + (f"\n{aux_extra}" if aux_extra else ""), fontsize=7.5)
+
+                # Col 5: Overlay
+                ax = axes[r_idx, 5]
+                ax.imshow(overlay)
+                lat_ms = m_res.get("inference_ms")
+                ax.set_xlabel(f"Latency: {lat_ms:.1f} ms" if lat_ms is not None else f"{m_name}", fontsize=7.5)
+
+                # Col 6: Error Map
+                ax = axes[r_idx, 6]
+                ax.imshow(error_map)
+                ax.set_xlabel(f"Acc:{pacc:.3f} P:{prec:.2f} R:{rec:.2f}", fontsize=7.5)
+
+                for c_i in range(7):
+                    axes[r_idx, c_i].set_xticks([])
+                    axes[r_idx, c_i].set_yticks([])
+                    if r_idx == 0:
+                        axes[r_idx, c_i].set_title(col_titles[c_i], fontsize=9, fontweight="bold", pad=6)
+
+                # Col 7: Detection Score & Pixel Probability Histogram
+                ax7 = axes[r_idx, 7]
+                if r_idx == 0:
+                    ax7.set_title(col_titles[7], fontsize=9, fontweight="bold", pad=6)
+                cls_probs = m_res.get("cls_probs")
+                if cls_probs is not None and len(cls_probs) >= 2:
+                    p_real = float(cls_probs[0])
+                    p_fake = float(1.0 - p_real) if len(cls_probs) == 2 else float(sum(cls_probs[1:]))
+                    cls_summary = f"Img Cls: P(Real)={p_real:.2f}, P(Fake)={p_fake:.2f}"
+                else:
+                    p_fake = float(np.percentile(prob_m, 99))
+                    p_real = 1.0 - p_fake
+                    cls_summary = f"Spatial p99={p_fake:.2f} (no img head)"
+
+                hist_vals, bin_edges = np.histogram(prob_m.ravel(), bins=20, range=(0.0, 1.0))
+                hist_frac = hist_vals / max(1, hist_vals.sum())
+                centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                ax7.bar(centers, hist_frac, width=0.045, color="#3b75af", alpha=0.85, edgecolor="#1c3b57", linewidth=0.4)
+                ax7.axvline(0.5, color="#d62728", linestyle="--", linewidth=1.1, label="thr=0.5")
+                # Overlay top bar badge for Real vs Fake prob
+                ax7.barh([0.92], [p_real], height=0.08, left=0.0, color="#2ca02c", alpha=0.85, transform=ax7.get_xaxis_transform())
+                ax7.barh([0.92], [p_fake], height=0.08, left=p_real, color="#d62728", alpha=0.85, transform=ax7.get_xaxis_transform())
+                ax7.set_xlim([0.0, 1.0])
+                ax7.set_ylim([0.0, 1.05])
+                ax7.tick_params(axis="both", labelsize=7)
+                ax7.set_xlabel(cls_summary, fontsize=7.2)
+
+            plt.tight_layout(rect=[0, 0.01, 1, 0.97])
+            pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
+            plt.close(fig)
+
+    return output_path

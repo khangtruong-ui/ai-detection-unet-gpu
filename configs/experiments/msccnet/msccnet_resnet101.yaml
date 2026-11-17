@@ -1,0 +1,54 @@
+# Configuration: MSCCNet (ResNet-101 outstride=8 + Multi-Spectral Class Center)
+# Multi-spectral Class Center Network for Face Manipulation Localization (ACM TOMM 2025)
+
+project:
+  name: "sid_msccnet_r101"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/msccnet_r101"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: true
+  image_size: [512, 512]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "msccnet"
+  backbone_depth: 101
+  backbone_outstride: 8
+  use_stem: true
+  pretrained: true
+  backbone_pretrained: true
+  # Training-only: allows initializing task heads when training from ImageNet backbone.
+  allow_random_init: true
+  num_classes: 2
+  feats_channels: 512
+  out_channels: 512
+  dropout: 0.1
+  spectral_height: 64
+  spectral_width: 64
+  spectral_k: 2
+  aux_classifier: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  aux_loss_type: "cross_entropy"
+  aux_weight: 0.2
+
+training:
+  epochs: 20
+  learning_rate: 0.0003
+  weight_decay: 0.0005
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  precision: "auto"

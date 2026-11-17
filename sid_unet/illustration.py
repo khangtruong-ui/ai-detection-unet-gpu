@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import glob
+import inspect
 import logging
 import os
 import random
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -29,7 +31,13 @@ from sid_unet.models.unet import UNet
 from sid_unet.postprocessing import get_postprocessor_from_config
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.logger import setup_logger
-from sid_unet.utils.plotting import create_mask_overlay, create_error_map, _to_rgb_array, _to_mask_2d
+from sid_unet.utils.plotting import (
+    create_mask_overlay,
+    create_error_map,
+    plot_detailed_inference_pdf,
+    _to_rgb_array,
+    _to_mask_2d,
+)
 
 
 def parse_args():
@@ -135,6 +143,19 @@ def parse_args():
         action="store_true",
         default=False,
         help="Enforce strict state_dict key matching when loading model checkpoints (default: False).",
+    )
+    parser.add_argument(
+        "--pdf",
+        dest="save_pdf",
+        action="store_true",
+        default=True,
+        help="Generate detailed 8-column multi-page PDF inference report (default: True).",
+    )
+    parser.add_argument(
+        "--no-pdf",
+        dest="save_pdf",
+        action="store_false",
+        help="Disable detailed PDF inference report generation.",
     )
     return parser.parse_args()
 
@@ -355,6 +376,7 @@ def run_illustration(
     overrides: Optional[List[str]] = None,
     device: Optional[Union[str, torch.device]] = None,
     strict: Optional[bool] = None,
+    save_pdf: bool = True,
 ) -> Dict[str, Any]:
     """Execute multi-model illustration pipeline across dataset configs."""
     os.makedirs(output_dir, exist_ok=True)
@@ -475,16 +497,43 @@ def run_illustration(
                 except Exception:
                     m_dev = target_device
                 m_img_batch = img_batch.to(m_dev)
+                t0 = time.perf_counter()
                 with torch.no_grad():
-                    out = model(m_img_batch)
-                    mask_logits = out[0] if isinstance(out, tuple) else out
+                    try:
+                        sig = inspect.signature(getattr(model, "module", model).forward)
+                        if "return_dict" in sig.parameters:
+                            out = model(m_img_batch, return_dict=True)
+                        else:
+                            out = model(m_img_batch)
+                    except Exception:
+                        out = model(m_img_batch)
+
+                    if isinstance(out, dict):
+                        mask_logits = out.get("mask_logits", out.get("pred_masks", out.get("masks", out.get("logits"))))
+                        class_logits = out.get("class_logits", out.get("pred_logits"))
+                        aux_prob = out.get("fres_map_prob")
+                    elif isinstance(out, (tuple, list)):
+                        mask_logits = out[0]
+                        class_logits = out[1] if len(out) > 1 and torch.is_tensor(out[1]) else None
+                        aux_prob = None
+                    else:
+                        mask_logits, class_logits, aux_prob = out, None, None
+
                     prob_map = torch.sigmoid(mask_logits.float()).squeeze().cpu().numpy()
-                    bin_mask = (prob_map >= threshold).astype(np.float32)
+                    raw_bin_mask = (prob_map >= threshold).astype(np.float32)
+                    bin_mask = raw_bin_mask.copy()
+                infer_ms = (time.perf_counter() - t0) * 1000.0
+
+                cls_probs = None
+                if class_logits is not None:
+                    cls_probs = torch.softmax(class_logits.float(), dim=-1).squeeze(0).cpu().tolist()
 
                 # Post-processing
+                post_mask = None
                 if postprocessor and postprocessor.enabled:
                     proc_res = postprocessor.process_single(bin_mask)
-                    bin_mask = proc_res[0] if isinstance(proc_res, tuple) else proc_res
+                    post_mask = proc_res[0] if isinstance(proc_res, tuple) else proc_res
+                    bin_mask = post_mask
 
                 # SAM Refinement
                 if sam_refiner is not None:
@@ -498,11 +547,32 @@ def run_illustration(
                 iou = sample_metrics.get("iou", 0.0)
                 dice = sample_metrics.get("dice", sample_metrics.get("f1", 0.0))
 
+                if aux_prob is not None:
+                    aux_map_np = aux_prob.float().squeeze().cpu().numpy()
+                    aux_label = "MSCC Spectral Map"
+                    aux_cmap = "viridis"
+                elif post_mask is not None:
+                    aux_map_np = post_mask
+                    aux_label = "Post-Processed Mask"
+                    aux_cmap = "gray"
+                else:
+                    aux_map_np = raw_bin_mask
+                    aux_label = "Raw Binary Mask"
+                    aux_cmap = "gray"
+
                 sample_entry["models"][m_name] = {
                     "pred_mask": bin_mask,
                     "prob_map": prob_map,
+                    "aux_map": aux_map_np,
+                    "aux_label": aux_label,
+                    "aux_cmap": aux_cmap,
+                    "cls_probs": cls_probs,
+                    "inference_ms": infer_ms,
                     "iou": iou,
                     "dice": dice,
+                    "pixel_acc": sample_metrics.get("pixel_acc", 0.0),
+                    "precision": sample_metrics.get("precision", 0.0),
+                    "recall": sample_metrics.get("recall", 0.0),
                 }
 
             samples_with_predictions.append(sample_entry)
@@ -517,6 +587,18 @@ def run_illustration(
             dataset_name=ds_name,
         )
         logger.info(f"Saved visual comparison grid: {fig_path}")
+
+        pdf_path = ""
+        if save_pdf:
+            pdf_name = f"illustration_{cfg_name}_detailed.pdf"
+            pdf_path = os.path.join(output_dir, pdf_name)
+            plot_detailed_inference_pdf(
+                samples_data=samples_with_predictions,
+                model_names=list(models_dict.keys()),
+                output_path=pdf_path,
+                title=f"SID-Illu Detailed 8-Column Forensic Report: {ds_name}",
+            )
+            logger.info(f"Saved detailed 8-column PDF report: {pdf_path}")
 
         # Tabulate sample metrics
         table_rows = []
@@ -553,6 +635,7 @@ def run_illustration(
         all_dataset_results[cfg_name] = {
             "dataset_name": ds_name,
             "figure_path": fig_path,
+            "pdf_path": pdf_path,
             "samples": samples_with_predictions,
         }
 
@@ -635,6 +718,7 @@ def main():
         overrides=args.override,
         device=args.device,
         strict=args.strict if args.strict else None,
+        save_pdf=args.save_pdf,
     )
     return results
 
