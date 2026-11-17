@@ -1,0 +1,71 @@
+# Configuration: FOCAL Dual-Backbone Fusion (Frozen HRNet-W32 Primary + DoRA ViT-Large Secondary)
+# Independent dual-backbone fusion architecture: keeps primary pretrained FOCAL HRNet completely frozen
+# while fusing a second trainable/PEFT SAM ViT-Large backbone via zero-gated residual fusion.
+
+project:
+  name: "sid_focal_hrnet_vit_fusion"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_hrnet_vit_fusion"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "focal"
+  backbone: "hrnet"
+  secondary_backbone: "vit"
+  freeze_primary_backbone: true
+  secondary_trainable: true
+  secondary_peft_enabled: true
+  fusion_mode: "zero_gated"
+  fusion_spatial_align: "primary"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "supervised"
+  use_clustering: false
+  head_type: "decoder"
+  force_vit_1024: false
+  lora_r: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  use_dora: true
+  lora_block_scope: "late_and_global"
+  lora_target_modules: ["qkv", "proj"]
+  train_neck: true
+  train_vit_norms: false
+  prior_anchor_weight: 0.05
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  edge_weight: 0.5
+  edge_mask_width: 7
+
+training:
+  epochs: 10
+  learning_rate: 0.0001
+  neck_lr_multiplier: 0.25
+  secondary_lr_multiplier: 0.25
+  lora_lr_multiplier: 1.0
+  lora_weight_decay: 0.01
+  freeze_backbone_epochs: 1
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_accumulation_steps: 2
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

@@ -1027,6 +1027,28 @@ def build_model(config: Any) -> nn.Module:
             neck_lr_multiplier=float(model_cfg.get("neck_lr_multiplier", training_cfg.get("neck_lr_multiplier", 0.25))),
             lora_lr_multiplier=float(model_cfg.get("lora_lr_multiplier", training_cfg.get("lora_lr_multiplier", 1.0))),
             lora_weight_decay=float(model_cfg.get("lora_weight_decay", training_cfg.get("lora_weight_decay", 0.01))),
+            # Domain-split 4-class / 4-cluster training with 2-class inference
+            domain_split_mode=bool(model_cfg.get("domain_split_mode", False)),
+            domain_loss_weight=float(model_cfg.get("domain_loss_weight", 1.0)),
+            domain_proto_weight=float(model_cfg.get("domain_proto_weight", 0.5)),
+            domain_supcon_weight=float(model_cfg.get("domain_supcon_weight", 0.5)),
+            domain_clustering_mode=str(model_cfg.get("domain_clustering_mode", "prototype")),
+            domain_names=model_cfg.get("domain_names", None),
+            # Dual-backbone fusion (frozen primary + secondary backbone)
+            secondary_backbone=model_cfg.get("secondary_backbone", model_cfg.get("fusion_backbone", None)),
+            secondary_checkpoint_path=model_cfg.get("secondary_checkpoint_path", None),
+            secondary_hf_repo=model_cfg.get("secondary_hf_repo", None),
+            freeze_primary_backbone=model_cfg.get("freeze_primary_backbone", None),
+            secondary_trainable=bool(model_cfg.get("secondary_trainable", True)),
+            secondary_peft_enabled=bool(model_cfg.get("secondary_peft_enabled", False)),
+            secondary_trainable_stages=model_cfg.get("secondary_trainable_stages", None),
+            secondary_out_dim=int(model_cfg.get("secondary_out_dim", 128)),
+            secondary_lr_multiplier=float(
+                model_cfg.get("secondary_lr_multiplier", training_cfg.get("secondary_lr_multiplier", 0.25))
+            ),
+            fusion_mode=str(model_cfg.get("fusion_mode", "concat")),
+            fusion_out_dim=model_cfg.get("fusion_out_dim", None),
+            fusion_spatial_align=str(model_cfg.get("fusion_spatial_align", "primary")),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(

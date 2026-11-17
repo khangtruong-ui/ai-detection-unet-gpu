@@ -1,0 +1,63 @@
+# Configuration: FOCAL with HRNet-W32 Backbone — Domain-Split 4-Cluster Contrastive Finetuning
+# Joint Dataset: KhangTruong/IMD2020-CASIAv2-Joint (uses `dataset_source` column)
+# Training Clusters (4): 0=casia_pristine, 1=casia_tampered, 2=imd_pristine, 3=imd_tampered
+# Inference Classes (2): collapses 4 prototypes {0, 2} -> pristine and {1, 3} -> tampered
+
+project:
+  name: "sid_focal_hrnet_contrastive_domain_split"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_hrnet_contrastive_domain_split"
+
+data:
+  dataset_name: "KhangTruong/IMD2020-CASIAv2-Joint"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 128
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "focal"
+  backbone: "hrnet"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "contrastive"
+  use_clustering: true
+  cluster_temperature: 0.1
+  cluster_separability_threshold: 0.02
+  contrastive_sample_size: 1024
+  domain_split_mode: true
+  domain_proto_weight: 0.5
+  domain_supcon_weight: 0.5
+  domain_clustering_mode: "prototype"
+  domain_names: ["casia", "imd"]
+  peft_enabled: true
+  hrnet_trainable_stages: ["stage4"]
+  freeze_backbone_bn: true
+  use_feature_adapter: false
+  prior_anchor_weight: 0.1
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  align_weight: 1.0
+
+training:
+  epochs: 10
+  learning_rate: 0.00005
+  neck_lr_multiplier: 0.25
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_accumulation_steps: 1
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

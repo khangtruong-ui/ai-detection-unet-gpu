@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,78 @@ logger = logging.getLogger("sid_unet.models.focal")
 DEFAULT_FOCAL_HF_REPO = "KhangTruong/FOCAL"
 DEFAULT_FOCAL_HRNET_CKPT = "FOCAL_HRNet_weights.pth"
 DEFAULT_FOCAL_VIT_CKPT = "FOCAL_ViT_weights.pth"
+
+DOMAIN_SPLIT_LABELS: Tuple[str, ...] = (
+    "casia_pristine",
+    "casia_tampered",
+    "imd_pristine",
+    "imd_tampered",
+)
+
+
+def encode_domain_sources(
+    sources: Union[Sequence[Any], torch.Tensor, str, None],
+    device: Optional[torch.device] = None,
+    domain_names: Optional[Sequence[str]] = None,
+) -> Optional[torch.Tensor]:
+    """
+    Encode dataset source labels (e.g. 'casia', 'imd2020') into integer domain IDs.
+
+    Returns a 1D ``torch.long`` tensor of shape ``[B]`` with:
+      - ``0``: CASIA (e.g. ``casia``, ``casiav2``, ``casia_v2.0``)
+      - ``1``: IMD2020 (e.g. ``imd2020``, ``imd``)
+      - ``-1``: unknown / unmapped source
+    """
+    if sources is None:
+        return None
+    if isinstance(sources, torch.Tensor):
+        out = sources.to(dtype=torch.long)
+        return out.to(device=device) if device is not None else out
+
+    items = [sources] if isinstance(sources, str) else list(sources)
+    canonical = [str(d).lower().strip() for d in domain_names] if domain_names else ["casia", "imd"]
+
+    ids: List[int] = []
+    for item in items:
+        if item is None:
+            ids.append(-1)
+            continue
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            val = int(item)
+            ids.append(val if 0 <= val < len(canonical) else -1)
+            continue
+        s = str(item).lower().strip()
+        if not s:
+            ids.append(-1)
+            continue
+        matched = -1
+        for dom_idx, token in enumerate(canonical):
+            if token in s or (token == "imd2020" and "imd" in s):
+                matched = dom_idx
+                break
+        ids.append(matched)
+    return torch.tensor(ids, dtype=torch.long, device=device)
+
+
+def _collapse_domain_4_to_2_mask_logits(logits_4: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collapse 4 domain-split pixel logits [B, 4, H, W]
+    (0: casia_pristine, 1: casia_tampered, 2: imd_pristine, 3: imd_tampered)
+    into 2-class (pristine vs tampered) binary mask logits [B, 1, H, W] and
+    2-channel [pristine, tampered] logits [B, 2, H, W] via exact log-sum-exp.
+    """
+    pristine_logit = torch.logsumexp(logits_4[:, [0, 2], :, :], dim=1, keepdim=True)
+    tampered_logit = torch.logsumexp(logits_4[:, [1, 3], :, :], dim=1, keepdim=True)
+    mask_logits = tampered_logit - pristine_logit
+    logits_2 = torch.cat([pristine_logit, tampered_logit], dim=1)
+    return mask_logits, logits_2
+
+
+def _collapse_domain_4_to_2_class_logits(logits_4: torch.Tensor) -> torch.Tensor:
+    """Collapse 4-class image logits [B, 4] into 2-class [pristine, tampered] logits [B, 2]."""
+    pristine = torch.logsumexp(logits_4[:, [0, 2]], dim=1, keepdim=True)
+    tampered = torch.logsumexp(logits_4[:, [1, 3]], dim=1, keepdim=True)
+    return torch.cat([pristine, tampered], dim=1)
 
 
 # ------------------------------------------------------------------------------
@@ -703,9 +775,16 @@ class FOCALSupervisedHead(nn.Module):
 
     Refines H/4 (HRNet) or H/16 (ViT) dense forensic features through residual blocks
     and progressive 2x bilinear upsampling stages before projecting to mask logits.
+    Supports ``out_channels=1`` (binary) or ``out_channels=4`` (domain-split 4-class).
     """
 
-    def __init__(self, in_dim: int, num_upsample_stages: int = 2, mid_dim: Optional[int] = None):
+    def __init__(
+        self,
+        in_dim: int,
+        num_upsample_stages: int = 2,
+        mid_dim: Optional[int] = None,
+        out_channels: int = 1,
+    ):
         super().__init__()
         base_dim = mid_dim if mid_dim is not None else (64 if in_dim <= 64 else 128)
         groups_base = _select_num_groups(base_dim)
@@ -730,7 +809,7 @@ class FOCALSupervisedHead(nn.Module):
             )
             cur_dim = next_dim
         self.upsample_stages = nn.ModuleList(stages)
-        self.out_conv = nn.Conv2d(cur_dim, 1, kernel_size=1)
+        self.out_conv = nn.Conv2d(cur_dim, int(out_channels), kernel_size=1)
 
     def forward(self, feats: torch.Tensor, orig_h: int, orig_w: int) -> torch.Tensor:
         x = self.res_block(self.stem(feats))
@@ -765,6 +844,136 @@ class FeatureAdapter(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.proj_out(self.act(self.norm(self.proj_in(x))))
+
+
+class SecondaryTimmBackbone(nn.Module):
+    """
+    Pretrained ``timm`` secondary feature extractor with multi-scale FPN projection.
+
+    Expects raw ``[0, 1]`` RGB tensors and applies ImageNet standardization internally
+    before extracting and fusing the highest-resolution feature stages.
+    """
+
+    def __init__(self, model_name: str, out_dim: int = 128) -> None:
+        super().__init__()
+        clean_name = model_name.split(":", 1)[1] if model_name.startswith("timm:") else model_name
+        try:
+            import timm
+
+            self.encoder = timm.create_model(
+                clean_name,
+                pretrained=True,
+                features_only=True,
+                out_indices=(-2, -1),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load genuine pretrained timm secondary backbone '{clean_name}': {exc}. "
+                "Strict zero-fallback policy: aborting initialization."
+            ) from exc
+
+        in_channels_list = list(self.encoder.feature_info.channels())
+        total_in = sum(in_channels_list)
+        groups = _select_num_groups(out_dim)
+        self.proj = nn.Sequential(
+            nn.Conv2d(total_in, out_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, out_dim),
+            nn.GELU(),
+        )
+        self.out_dim = int(out_dim)
+        self.register_buffer(
+            "_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def forward(self, x_raw: torch.Tensor) -> torch.Tensor:
+        x_norm = (x_raw - self._mean.to(device=x_raw.device, dtype=x_raw.dtype)) / self._std.to(
+            device=x_raw.device, dtype=x_raw.dtype
+        )
+        feats = self.encoder(x_norm)
+        target_hw = feats[0].shape[2:]
+        aligned = [feats[0]]
+        for f in feats[1:]:
+            if f.shape[2:] != target_hw:
+                f = F.interpolate(f, size=target_hw, mode="bilinear", align_corners=False)
+            aligned.append(f)
+        return self.proj(torch.cat(aligned, dim=1))
+
+
+class DualBackboneFusionModule(nn.Module):
+    """
+    Fuses features from a frozen primary FOCAL backbone and a secondary backbone.
+
+    Supported ``fusion_mode`` options:
+      - ``"concat"``: L2-normalized channel concatenation ``[F_norm(f1), F_norm(f2)]`` (FOCAL paper style).
+      - ``"proj_concat"``: L2-normalized concatenation projected via ``1x1 Conv -> GroupNorm -> GELU -> 1x1 Conv``.
+      - ``"zero_gated"``: Zero-initialized residual fusion ``f1 + zero_proj(f2)`` preserving ``f1`` at step 0.
+    """
+
+    def __init__(
+        self,
+        primary_dim: int,
+        secondary_dim: int,
+        fusion_mode: str = "concat",
+        out_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.fusion_mode = str(fusion_mode).lower().strip()
+        self.primary_dim = int(primary_dim)
+        self.secondary_dim = int(secondary_dim)
+
+        if self.fusion_mode == "concat":
+            self.out_dim = self.primary_dim + self.secondary_dim
+            self.proj = None
+        elif self.fusion_mode == "proj_concat":
+            resolved_out = int(out_dim) if out_dim is not None else self.primary_dim
+            mid = max(32, resolved_out)
+            groups = _select_num_groups(mid)
+            self.proj = nn.Sequential(
+                nn.Conv2d(self.primary_dim + self.secondary_dim, mid, kernel_size=1, bias=False),
+                nn.GroupNorm(groups, mid),
+                nn.GELU(),
+                nn.Conv2d(mid, resolved_out, kernel_size=1, bias=True),
+            )
+            self.out_dim = resolved_out
+        elif self.fusion_mode == "zero_gated":
+            self.out_dim = self.primary_dim
+            mid = max(32, min(self.primary_dim, self.secondary_dim))
+            groups = _select_num_groups(mid)
+            self.proj_in = nn.Sequential(
+                nn.Conv2d(self.secondary_dim, mid, kernel_size=1, bias=False),
+                nn.GroupNorm(groups, mid),
+                nn.GELU(),
+            )
+            self.proj_out = nn.Conv2d(mid, self.primary_dim, kernel_size=1, bias=True)
+            nn.init.zeros_(self.proj_out.weight)
+            if self.proj_out.bias is not None:
+                nn.init.zeros_(self.proj_out.bias)
+            self.proj = None
+        else:
+            raise ValueError(
+                f"Unsupported FOCAL fusion_mode '{fusion_mode}'. "
+                "Supported: 'concat', 'proj_concat', 'zero_gated'."
+            )
+
+    def forward(self, f_primary: torch.Tensor, f_secondary: torch.Tensor) -> torch.Tensor:
+        if self.fusion_mode == "concat":
+            p_norm = F.normalize(f_primary.float(), p=2, dim=1).to(dtype=f_primary.dtype)
+            s_norm = F.normalize(f_secondary.float(), p=2, dim=1).to(dtype=f_secondary.dtype)
+            return torch.cat([p_norm, s_norm], dim=1)
+        if self.fusion_mode == "proj_concat":
+            p_norm = F.normalize(f_primary.float(), p=2, dim=1).to(dtype=f_primary.dtype)
+            s_norm = F.normalize(f_secondary.float(), p=2, dim=1).to(dtype=f_secondary.dtype)
+            return self.proj(torch.cat([p_norm, s_norm], dim=1))
+        # zero_gated: preserves f_primary identically at initialization step 0
+        s_norm = F.normalize(f_secondary.float(), p=2, dim=1).to(dtype=f_secondary.dtype)
+        return f_primary + self.proj_out(self.proj_in(s_norm))
 
 
 # ------------------------------------------------------------------------------
@@ -840,6 +1049,26 @@ class FOCAL(nn.Module):
         neck_lr_multiplier: float = 0.25,
         lora_lr_multiplier: float = 1.0,
         lora_weight_decay: float = 0.01,
+        # Task 1: Domain-split 4-class / 4-cluster training with 2-class inference
+        domain_split_mode: bool = False,
+        domain_loss_weight: float = 1.0,
+        domain_proto_weight: float = 0.5,
+        domain_supcon_weight: float = 0.5,
+        domain_clustering_mode: str = "prototype",
+        domain_names: Optional[Sequence[str]] = None,
+        # Task 2: Dual-backbone fusion (frozen primary + secondary backbone)
+        secondary_backbone: Optional[str] = None,
+        secondary_checkpoint_path: Optional[str] = None,
+        secondary_hf_repo: Optional[str] = None,
+        freeze_primary_backbone: Optional[bool] = None,
+        secondary_trainable: bool = True,
+        secondary_peft_enabled: bool = False,
+        secondary_trainable_stages: Optional[Union[str, List[str], Tuple[str, ...]]] = None,
+        secondary_out_dim: int = 128,
+        secondary_lr_multiplier: float = 0.25,
+        fusion_mode: str = "concat",
+        fusion_out_dim: Optional[int] = None,
+        fusion_spatial_align: str = "primary",
         **kwargs: Any,
     ):
         super().__init__()
@@ -852,6 +1081,51 @@ class FOCAL(nn.Module):
         self.cluster_separability_threshold = max(0.0, float(cluster_separability_threshold))
         self.aux_pristine_gate = bool(aux_pristine_gate)
         self.contrastive_sample_size = max(16, int(contrastive_sample_size))
+
+        # Task 1: Domain-split 4-class / 4-cluster training configuration
+        self.domain_split_mode = bool(domain_split_mode)
+        self.domain_loss_weight = max(0.0, float(domain_loss_weight))
+        self.domain_proto_weight = max(0.0, float(domain_proto_weight))
+        self.domain_supcon_weight = max(0.0, float(domain_supcon_weight))
+        self.domain_clustering_mode = str(domain_clustering_mode).lower().strip()
+        if self.domain_clustering_mode not in ("prototype", "hybrid", "kmeans"):
+            raise ValueError(
+                f"Unsupported domain_clustering_mode '{domain_clustering_mode}'. "
+                "Supported: 'prototype', 'hybrid', 'kmeans'."
+            )
+        self.domain_names: Tuple[str, ...] = (
+            tuple(str(d).lower().strip() for d in domain_names)
+            if domain_names is not None
+            else ("casia", "imd")
+        )
+
+        # Task 2: Dual-backbone fusion configuration
+        if secondary_backbone is None and "fusion_backbone" in kwargs:
+            secondary_backbone = kwargs["fusion_backbone"]
+        self.secondary_backbone_name: Optional[str] = (
+            str(secondary_backbone).lower().strip()
+            if secondary_backbone not in (None, "", "none", "null")
+            else None
+        )
+        self.secondary_checkpoint_path = secondary_checkpoint_path
+        self.secondary_hf_repo = secondary_hf_repo or hf_repo
+        self.freeze_primary_backbone = (
+            bool(freeze_primary_backbone)
+            if freeze_primary_backbone is not None
+            else (self.secondary_backbone_name is not None)
+        )
+        self.secondary_trainable = bool(secondary_trainable)
+        self.secondary_peft_enabled = bool(secondary_peft_enabled)
+        self.secondary_trainable_stages = secondary_trainable_stages
+        self.secondary_out_dim = max(16, int(secondary_out_dim))
+        self.secondary_lr_multiplier = float(secondary_lr_multiplier)
+        self.fusion_mode = str(fusion_mode).lower().strip()
+        self.fusion_out_dim = int(fusion_out_dim) if fusion_out_dim is not None else None
+        self.fusion_spatial_align = str(fusion_spatial_align).lower().strip()
+        if self.fusion_spatial_align not in ("primary", "max"):
+            raise ValueError(
+                f"Unsupported fusion_spatial_align '{fusion_spatial_align}'. Supported: 'primary', 'max'."
+            )
 
         # Strategy B configuration
         if "use_peft" in kwargs and not peft_enabled:
@@ -911,35 +1185,67 @@ class FOCAL(nn.Module):
                 f"FOCAL requires pretrained=True. Fallback to random weights is strictly disabled."
             )
 
-        # Build clean architecture BEFORE loading pretrained weights
-        if self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
-            self.net = HRNet()
-            in_dim = 32
-            num_upsample_stages = 2
-            default_filename = DEFAULT_FOCAL_HRNET_CKPT
-        elif self.backbone_name in ("vit", "vit-l", "sam_vit"):
-            self.net = FOCALViTNet(
-                img_size=1024,
-                patch_size=16,
-                embed_dim=1024,
-                depth=24,
-                num_heads=16,
-                out_chans=256,
+        # Build clean primary architecture BEFORE loading pretrained weights
+        self.net, primary_in_dim, primary_upsample_stages, default_filename = self._build_backbone_net(
+            self.backbone_name
+        )
+        self.primary_in_dim = primary_in_dim
+
+        # Optional secondary backbone & fusion module (Task 2)
+        self.secondary_net: Optional[nn.Module] = None
+        self.secondary_kind: Optional[str] = None  # "hrnet", "vit", or "timm"
+        self.fusion_module: Optional[DualBackboneFusionModule] = None
+        secondary_default_ckpt: Optional[str] = None
+
+        if self.secondary_backbone_name is not None:
+            (
+                self.secondary_net,
+                secondary_in_dim,
+                secondary_upsample_stages,
+                secondary_default_ckpt,
+                self.secondary_kind,
+            ) = self._build_secondary_backbone_net(self.secondary_backbone_name)
+            self.fusion_module = DualBackboneFusionModule(
+                primary_dim=primary_in_dim,
+                secondary_dim=secondary_in_dim,
+                fusion_mode=self.fusion_mode,
+                out_dim=self.fusion_out_dim,
             )
-            in_dim = 256
-            num_upsample_stages = 4
-            default_filename = DEFAULT_FOCAL_VIT_CKPT
+            in_dim = self.fusion_module.out_dim
+            if self.fusion_spatial_align == "max":
+                num_upsample_stages = min(primary_upsample_stages, secondary_upsample_stages)
+            else:
+                num_upsample_stages = primary_upsample_stages
         else:
-            raise ValueError(f"Unsupported FOCAL backbone '{backbone}'. Supported: 'hrnet', 'vit'.")
+            in_dim = primary_in_dim
+            num_upsample_stages = primary_upsample_stages
 
         self.in_dim = in_dim
 
-        # 2-class Convolutional classification head (as stored in genuine checkpoint)
-        self.fc = nn.Conv2d(in_dim, 2, kernel_size=3, padding=1)
+        # 2-class Convolutional classification head (matches upstream checkpoint shape `primary_in_dim -> 2`)
+        self.fc = nn.Conv2d(primary_in_dim, 2, kernel_size=3, padding=1)
+        use_legacy_supervised_conv = (
+            self.head_type == "legacy" and self.finetune_mode != "contrastive"
+        )
+        self.fused_fc: Optional[nn.Conv2d] = (
+            nn.Conv2d(in_dim, 2, kernel_size=3, padding=1)
+            if (self.secondary_net is not None and use_legacy_supervised_conv and in_dim != primary_in_dim)
+            else None
+        )
+        self.domain_fc: Optional[nn.Conv2d] = (
+            nn.Conv2d(in_dim, 4, kernel_size=3, padding=1)
+            if (self.domain_split_mode and use_legacy_supervised_conv)
+            else None
+        )
 
-        # Optional upgraded supervised decoder (Mode 1A)
+        # Optional upgraded supervised decoder (Mode 1A; 4 channels when domain_split_mode=True)
+        decoder_out_channels = 4 if self.domain_split_mode else 1
         self.decoder: Optional[FOCALSupervisedHead] = (
-            FOCALSupervisedHead(in_dim=in_dim, num_upsample_stages=num_upsample_stages)
+            FOCALSupervisedHead(
+                in_dim=in_dim,
+                num_upsample_stages=num_upsample_stages,
+                out_channels=decoder_out_channels,
+            )
             if self.head_type == "decoder"
             else None
         )
@@ -950,23 +1256,38 @@ class FOCAL(nn.Module):
         )
 
         # Freeze unused self.fc so DDP never complains about unused parameters
-        if self.head_type == "decoder" or self.finetune_mode == "contrastive":
+        if (
+            self.head_type == "decoder"
+            or self.finetune_mode == "contrastive"
+            or self.fused_fc is not None
+            or self.domain_fc is not None
+        ):
             for p in self.fc.parameters():
                 p.requires_grad_(False)
 
         # Optional auxiliary classifier
         if self.aux_classifier:
+            eff_aux_classes = 4 if self.domain_split_mode else num_classes
             self.class_head = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Linear(in_dim, 128),
                 nn.GELU(),
-                nn.Linear(128, num_classes),
+                nn.Linear(128, eff_aux_classes),
             )
         else:
             self.class_head = None
 
-        # Strategy B state tracking (populated by _apply_strategy_b_surgery)
+        # Domain-split 4-cluster prototypes (0: casia_p, 1: casia_t, 2: imd_p, 3: imd_t)
+        if self.domain_split_mode and self.finetune_mode == "contrastive":
+            proto_init = F.normalize(torch.randn(4, in_dim), p=2, dim=-1)
+            self.domain_prototypes: Optional[nn.Parameter] = nn.Parameter(proto_init)
+            self.register_buffer("domain_prototypes_initialized", torch.zeros(4, dtype=torch.bool))
+        else:
+            self.domain_prototypes = None
+            self.register_buffer("domain_prototypes_initialized", torch.zeros(0, dtype=torch.bool), persistent=False)
+
+        # Strategy B & Dual-Backbone state tracking
         hrnet_stages_explicit = self.hrnet_trainable_stages is not None
         is_hrnet = self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32")
         self._surgery_active = bool(
@@ -974,15 +1295,23 @@ class FOCAL(nn.Module):
             or (is_hrnet and hrnet_stages_explicit)
             or self.use_feature_adapter
             or (freeze_backbone_bn is True)
+            or self.freeze_primary_backbone
+            or (self.secondary_net is not None)
         )
         if freeze_backbone_bn is None:
-            self.freeze_backbone_bn = bool(is_hrnet and self._surgery_active)
+            self.freeze_backbone_bn = bool(
+                (is_hrnet and self._surgery_active)
+                or self.freeze_primary_backbone
+                or (self.secondary_kind == "hrnet" and self.secondary_trainable_stages is not None)
+            )
         else:
             self.freeze_backbone_bn = bool(freeze_backbone_bn)
 
         self._surgical_backbone_param_names: Set[str] = set()
+        self._surgical_secondary_param_names: Set[str] = set()
         self._frozen_bn_modules: List[nn.Module] = []
         self._adapted_block_indices: List[int] = []
+        self._secondary_adapted_block_indices: List[int] = []
         self._backbone_temporarily_frozen: bool = False
         self._surgery_applied: bool = False
         object.__setattr__(self, "_anchor_neck", None)
@@ -990,13 +1319,24 @@ class FOCAL(nn.Module):
         self._neck_init_params: Dict[str, torch.Tensor] = {}
 
         # Step 2 (strict init order): Load & verify pretrained base weights FIRST
-        self._load_pretrained(
+        secondary_loaded_from_primary_ckpt = self._load_pretrained(
             source=checkpoint_path or default_filename,
             default_filename=default_filename,
             cache_dir=cache_dir,
         )
+        if (
+            self.secondary_net is not None
+            and not secondary_loaded_from_primary_ckpt
+            and self.secondary_kind in ("hrnet", "vit")
+            and secondary_default_ckpt is not None
+        ):
+            self._load_secondary_focal_weights(
+                source=self.secondary_checkpoint_path or secondary_default_ckpt,
+                default_filename=secondary_default_ckpt,
+                cache_dir=cache_dir,
+            )
 
-        # Step 3 (strict init order): Apply Strategy B surgery AFTER base weights are loaded
+        # Step 3 (strict init order): Apply Strategy B / dual-backbone surgery AFTER base weights are loaded
         if self._surgery_active and not self._surgery_applied:
             self._apply_strategy_b_surgery()
         elif not self._surgery_active:
@@ -1005,14 +1345,57 @@ class FOCAL(nn.Module):
         if self._surgery_active:
             self.log_surgery_summary()
 
+    @staticmethod
+    def _canonical_backbone_kind(name: str) -> Optional[str]:
+        norm = str(name).lower().strip()
+        if norm in ("hrnet", "hrnet32", "hrnet-w32"):
+            return "hrnet"
+        if norm in ("vit", "vit-l", "sam_vit"):
+            return "vit"
+        return None
+
+    @classmethod
+    def _build_backbone_net(cls, backbone_name: str) -> Tuple[nn.Module, int, int, str]:
+        kind = cls._canonical_backbone_kind(backbone_name)
+        if kind == "hrnet":
+            return HRNet(), 32, 2, DEFAULT_FOCAL_HRNET_CKPT
+        if kind == "vit":
+            net = FOCALViTNet(
+                img_size=1024,
+                patch_size=16,
+                embed_dim=1024,
+                depth=24,
+                num_heads=16,
+                out_chans=256,
+            )
+            return net, 256, 4, DEFAULT_FOCAL_VIT_CKPT
+        raise ValueError(f"Unsupported FOCAL backbone '{backbone_name}'. Supported: 'hrnet', 'vit'.")
+
+    def _build_secondary_backbone_net(
+        self, backbone_name: str
+    ) -> Tuple[nn.Module, int, int, Optional[str], str]:
+        kind = self._canonical_backbone_kind(backbone_name)
+        if kind is not None:
+            net, dim, upsample, ckpt = self._build_backbone_net(kind)
+            return net, dim, upsample, ckpt, kind
+        # Pretrained timm backbone
+        sec_net = SecondaryTimmBackbone(model_name=backbone_name, out_dim=self.secondary_out_dim)
+        return sec_net, self.secondary_out_dim, 3, None, "timm"
+
     @property
     def requires_gt_masks(self) -> bool:
-        """True when Mode 1B contrastive training requires ground-truth masks in forward()."""
-        return self.finetune_mode == "contrastive"
+        """True when Mode 1B contrastive or domain-split 4-class training needs ground-truth masks."""
+        return self.finetune_mode == "contrastive" or self.domain_split_mode
 
-    def _resolve_vit_block_indices(self) -> List[int]:
+    @property
+    def requires_domain_info(self) -> bool:
+        """True when domain-split training uses dataset source metadata."""
+        return self.domain_split_mode
+
+    def _resolve_vit_block_indices(self, encoder: Optional[ImageEncoderViT] = None) -> List[int]:
         """Resolve which SAMBlock indices receive LoRA/DoRA surgery."""
-        depth = len(self.net.image_encoder.blocks)
+        enc = encoder if encoder is not None else self.net.image_encoder
+        depth = len(enc.blocks)
         global_idxs = {5, 11, 17, 23} & set(range(depth))
         scope = self.lora_block_scope
 
@@ -1041,30 +1424,27 @@ class FOCAL(nn.Module):
             "Supported: 'late_and_global', 'last_k', 'global_only', 'all', 'none', or list of ints."
         )
 
-    def _normalize_hrnet_stages(self) -> List[str]:
+    @staticmethod
+    def _normalize_hrnet_stages_from(raw: Any, default_peft: bool) -> List[str]:
         """Normalize hrnet_trainable_stages config into canonical stage tokens."""
-        raw = self.hrnet_trainable_stages
         if raw is None:
-            return ["stage4"] if self.peft_enabled else ["all"]
+            return ["stage4"] if default_peft else ["all"]
         if isinstance(raw, str):
             tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
         else:
             tokens = [str(t).strip().lower() for t in raw if str(t).strip()]
         return tokens or ["none"]
 
-    def inject_peft_lora(self) -> List[int]:
-        """
-        Apply Strategy B LoRA/DoRA surgery onto `FOCALViTNet` blocks and freeze all
-        unadapted base parameters (`patch_embed`, `pos_embed`, `rel_pos_h/w`, early blocks).
-        """
-        if self.backbone_name not in ("vit", "vit-l", "sam_vit"):
-            raise RuntimeError("inject_peft_lora() is only applicable to FOCAL ViT backbones.")
+    def _normalize_hrnet_stages(self) -> List[str]:
+        return self._normalize_hrnet_stages_from(self.hrnet_trainable_stages, self.peft_enabled)
 
-        # Freeze 100% of self.net first so patch_embed, pos_embed, rel_pos_h/w, and norms stay locked
-        for p in self.net.parameters():
+    def _apply_vit_peft_to_net(self, vit_net: FOCALViTNet) -> List[int]:
+        """Inject LoRA/DoRA adapters onto a `FOCALViTNet` and freeze all unadapted base weights."""
+        for p in vit_net.parameters():
             p.requires_grad_(False)
 
-        block_indices = self._resolve_vit_block_indices()
+        encoder = vit_net.image_encoder
+        block_indices = self._resolve_vit_block_indices(encoder)
         valid_targets = {"qkv", "proj", "lin1", "lin2"}
         for t in self.lora_target_modules:
             if t not in valid_targets:
@@ -1072,7 +1452,6 @@ class FOCAL(nn.Module):
                     f"Unsupported lora_target_modules entry '{t}'. Supported: {sorted(valid_targets)}."
                 )
 
-        encoder = self.net.image_encoder
         for idx in block_indices:
             blk = encoder.blocks[idx]
             if "qkv" in self.lora_target_modules and isinstance(blk.attn.qkv, nn.Linear):
@@ -1117,26 +1496,40 @@ class FOCAL(nn.Module):
             for p in encoder.neck.parameters():
                 p.requires_grad_(True)
 
+        return block_indices
+
+    def inject_peft_lora(self) -> List[int]:
+        """
+        Apply Strategy B LoRA/DoRA surgery onto `FOCALViTNet` blocks and freeze all
+        unadapted base parameters (`patch_embed`, `pos_embed`, `rel_pos_h/w`, early blocks).
+        """
+        if self._canonical_backbone_kind(self.backbone_name) != "vit":
+            raise RuntimeError("inject_peft_lora() is only applicable to FOCAL ViT backbones.")
+        block_indices = self._apply_vit_peft_to_net(self.net)
         self._adapted_block_indices = block_indices
         return block_indices
 
-    def _apply_hrnet_surgery(self) -> None:
-        """Apply stage-wise freezing and BatchNorm2d running-stat protection on HRNet."""
-        stages = self._normalize_hrnet_stages()
+    def _apply_hrnet_stage_surgery(
+        self,
+        hrnet_net: HRNet,
+        stages: List[str],
+        freeze_bn: bool,
+    ) -> List[nn.Module]:
+        """Apply stage-wise freezing and BatchNorm2d running-stat protection on an HRNet module."""
         stage_modules: Dict[str, List[nn.Module]] = {
-            "stem": [self.net.conv1, self.net.bn1, self.net.conv2, self.net.bn2],
-            "layer1": [self.net.layer1],
-            "transition1": [self.net.transition1],
-            "stage2": [self.net.stage2],
-            "transition2": [self.net.transition2],
-            "stage3": [self.net.stage3],
-            "transition3": [self.net.transition3],
-            "stage4": [self.net.stage4],
-            "stage4_last": [self.net.stage4[-1]],
+            "stem": [hrnet_net.conv1, hrnet_net.bn1, hrnet_net.conv2, hrnet_net.bn2],
+            "layer1": [hrnet_net.layer1],
+            "transition1": [hrnet_net.transition1],
+            "stage2": [hrnet_net.stage2],
+            "transition2": [hrnet_net.transition2],
+            "stage3": [hrnet_net.stage3],
+            "transition3": [hrnet_net.transition3],
+            "stage4": [hrnet_net.stage4],
+            "stage4_last": [hrnet_net.stage4[-1]],
         }
 
         if "all" not in stages:
-            for p in self.net.parameters():
+            for p in hrnet_net.parameters():
                 p.requires_grad_(False)
             for s in stages:
                 if s in ("none", "off"):
@@ -1150,10 +1543,9 @@ class FOCAL(nn.Module):
                     for p in mod.parameters():
                         p.requires_grad_(True)
 
-        # Lock BatchNorm2d running stats & affine params for all frozen stages (and optionally stage4)
-        self._frozen_bn_modules = []
-        if self.freeze_backbone_bn:
-            for mod_name, mod in self.net.named_modules():
+        frozen_bns: List[nn.Module] = []
+        if freeze_bn:
+            for mod_name, mod in hrnet_net.named_modules():
                 if isinstance(mod, nn.BatchNorm2d):
                     in_stage4 = mod_name.startswith("stage4")
                     has_trainable_param = any(p.requires_grad for p in mod.parameters())
@@ -1161,7 +1553,15 @@ class FOCAL(nn.Module):
                         for p in mod.parameters():
                             p.requires_grad_(False)
                         mod.eval()
-                        self._frozen_bn_modules.append(mod)
+                        frozen_bns.append(mod)
+        return frozen_bns
+
+    def _apply_hrnet_surgery(self) -> None:
+        """Apply stage-wise freezing and BatchNorm2d running-stat protection on primary HRNet."""
+        stages = self._normalize_hrnet_stages()
+        self._frozen_bn_modules = self._apply_hrnet_stage_surgery(
+            self.net, stages=stages, freeze_bn=self.freeze_backbone_bn
+        )
 
     def _init_prior_anchors(self) -> None:
         """Snapshot minimal frozen anchor submodules/weights without duplicating the full backbone."""
@@ -1169,7 +1569,11 @@ class FOCAL(nn.Module):
         object.__setattr__(self, "_anchor_hrnet_stage4", None)
         self._neck_init_params = {}
 
-        if self.backbone_name in ("vit", "vit-l", "sam_vit"):
+        if self.freeze_primary_backbone:
+            # Primary backbone is already frozen; no anchor copy needed for primary
+            return
+
+        if self._canonical_backbone_kind(self.backbone_name) == "vit":
             if self.prior_anchor_weight > 0.0 and self.train_neck:
                 anchor_neck = copy.deepcopy(self.net.image_encoder.neck)
                 anchor_neck.eval()
@@ -1181,7 +1585,7 @@ class FOCAL(nn.Module):
                     name: p.detach().clone()
                     for name, p in self.net.image_encoder.neck.named_parameters()
                 }
-        elif self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
+        elif self._canonical_backbone_kind(self.backbone_name) == "hrnet":
             if self.prior_anchor_weight > 0.0 and self._surgical_backbone_param_names:
                 anchor_s4 = copy.deepcopy(self.net.stage4)
                 anchor_s4.eval()
@@ -1201,35 +1605,75 @@ class FOCAL(nn.Module):
         return self
 
     def _apply_strategy_b_surgery(self) -> None:
-        """Apply configured Strategy B model surgery and record authoritative trainable mask."""
+        """Apply configured Strategy B and dual-backbone surgery and record trainable masks."""
         if self._surgery_applied:
             return
-        if self.backbone_name in ("vit", "vit-l", "sam_vit"):
+
+        primary_kind = self._canonical_backbone_kind(self.backbone_name)
+        if self.freeze_primary_backbone:
+            for p in self.net.parameters():
+                p.requires_grad_(False)
+            self._frozen_bn_modules = [
+                m for m in self.net.modules() if isinstance(m, nn.BatchNorm2d)
+            ]
+            for bn in self._frozen_bn_modules:
+                bn.eval()
+        elif primary_kind == "vit":
             if self.peft_enabled:
                 self.inject_peft_lora()
             elif not self.train_neck:
                 for p in self.net.image_encoder.neck.parameters():
                     p.requires_grad_(False)
-        elif self.backbone_name in ("hrnet", "hrnet32", "hrnet-w32"):
+        elif primary_kind == "hrnet":
             self._apply_hrnet_surgery()
 
         self._surgical_backbone_param_names = {
             name for name, p in self.net.named_parameters() if p.requires_grad
         }
+
+        # Apply secondary backbone freezing / PEFT surgery if present
+        self._surgical_secondary_param_names = set()
+        if self.secondary_net is not None:
+            if not self.secondary_trainable:
+                for p in self.secondary_net.parameters():
+                    p.requires_grad_(False)
+                for m in self.secondary_net.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
+                        self._frozen_bn_modules.append(m)
+            elif self.secondary_kind == "vit":
+                if self.secondary_peft_enabled or self.peft_enabled:
+                    self._secondary_adapted_block_indices = self._apply_vit_peft_to_net(self.secondary_net)
+                elif not self.train_neck:
+                    for p in self.secondary_net.image_encoder.neck.parameters():
+                        p.requires_grad_(False)
+            elif self.secondary_kind == "hrnet":
+                if self.secondary_trainable_stages is not None or self.freeze_backbone_bn:
+                    sec_stages = self._normalize_hrnet_stages_from(
+                        self.secondary_trainable_stages, default_peft=False
+                    )
+                    sec_bns = self._apply_hrnet_stage_surgery(
+                        self.secondary_net, stages=sec_stages, freeze_bn=self.freeze_backbone_bn
+                    )
+                    self._frozen_bn_modules.extend(sec_bns)
+            self._surgical_secondary_param_names = {
+                name for name, p in self.secondary_net.named_parameters() if p.requires_grad
+            }
+
         self._init_prior_anchors()
         self._surgery_applied = True
         self._enforce_frozen_backbone_eval()
 
     def _enforce_frozen_backbone_eval(self) -> None:
         """Keep permanently frozen BatchNorm2d layers (or fully frozen backbone) in eval mode."""
-        if self._backbone_temporarily_frozen:
+        if self.freeze_primary_backbone or self._backbone_temporarily_frozen or not self._surgical_backbone_param_names:
             self.net.eval()
-        elif self._surgery_active:
-            if not self._surgical_backbone_param_names:
-                self.net.eval()
-            else:
-                for bn in self._frozen_bn_modules:
-                    bn.eval()
+        if self.secondary_net is not None:
+            if self._backbone_temporarily_frozen or not self._surgical_secondary_param_names:
+                self.secondary_net.eval()
+        if self._surgery_active:
+            for bn in self._frozen_bn_modules:
+                bn.eval()
         if self._anchor_neck is not None:
             self._anchor_neck.eval()
         if self._anchor_hrnet_stage4 is not None:
@@ -1243,18 +1687,26 @@ class FOCAL(nn.Module):
         return self
 
     def set_backbone_trainable(self, trainable: bool) -> None:
-        """Freeze or unfreeze backbone (`self.net`) respecting Strategy B surgical freeze masks."""
+        """Freeze or unfreeze backbones respecting Strategy B & frozen-primary surgical masks."""
         self._backbone_temporarily_frozen = not bool(trainable)
         if not trainable:
             for p in self.net.parameters():
                 p.requires_grad_(False)
             self.net.eval()
+            if self.secondary_net is not None:
+                for p in self.secondary_net.parameters():
+                    p.requires_grad_(False)
+                self.secondary_net.eval()
             return
 
         if self._surgery_active:
             for name, p in self.net.named_parameters():
                 p.requires_grad_(name in self._surgical_backbone_param_names)
-            self.net.train(self.training)
+            self.net.train(self.training and not self.freeze_primary_backbone)
+            if self.secondary_net is not None:
+                for name, p in self.secondary_net.named_parameters():
+                    p.requires_grad_(name in self._surgical_secondary_param_names)
+                self.secondary_net.train(self.training)
             self._enforce_frozen_backbone_eval()
         else:
             for p in self.net.parameters():
@@ -1268,8 +1720,8 @@ class FOCAL(nn.Module):
         weight_decay: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Build optimizer parameter groups separating head, LoRA/DoRA adapters, and
-        trainable neck / partial HRNet stages without exposing frozen base weights.
+        Build optimizer parameter groups separating head/fusion, LoRA/DoRA adapters,
+        trainable neck / partial HRNet stages, and optional secondary backbone.
         """
         if not self._surgery_active:
             if backbone_lr is None:
@@ -1286,8 +1738,10 @@ class FOCAL(nn.Module):
                 groups.append({"params": backbone_params, "lr": float(backbone_lr), "name": "backbone"})
             return groups
 
-        # Strategy B surgical parameter groups
         backbone_param_ids = {id(p) for p in self.net.parameters()}
+        secondary_param_ids = (
+            {id(p) for p in self.secondary_net.parameters()} if self.secondary_net is not None else set()
+        )
         anchor_param_ids: Set[int] = set()
         if self._anchor_neck is not None:
             anchor_param_ids.update(id(p) for p in self._anchor_neck.parameters())
@@ -1295,13 +1749,18 @@ class FOCAL(nn.Module):
             anchor_param_ids.update(id(p) for p in self._anchor_hrnet_stage4.parameters())
 
         head_params = [
-            p for p in self.parameters()
-            if id(p) not in backbone_param_ids and id(p) not in anchor_param_ids and p.requires_grad
+            p
+            for p in self.parameters()
+            if id(p) not in backbone_param_ids
+            and id(p) not in secondary_param_ids
+            and id(p) not in anchor_param_ids
+            and p.requires_grad
         ]
 
         lora_params: List[nn.Parameter] = []
         neck_params: List[nn.Parameter] = []
         partial_bb_params: List[nn.Parameter] = []
+        secondary_params: List[nn.Parameter] = []
 
         for name, p in self.net.named_parameters():
             if name not in self._surgical_backbone_param_names:
@@ -1312,6 +1771,17 @@ class FOCAL(nn.Module):
                 neck_params.append(p)
             else:
                 partial_bb_params.append(p)
+
+        if self.secondary_net is not None:
+            for name, p in self.secondary_net.named_parameters():
+                if name not in self._surgical_secondary_param_names:
+                    continue
+                if name.endswith((".lora_A", ".lora_B", ".dora_m")):
+                    lora_params.append(p)
+                elif "image_encoder.neck." in name or name.startswith("neck."):
+                    neck_params.append(p)
+                else:
+                    secondary_params.append(p)
 
         groups = []
         if head_params:
@@ -1329,6 +1799,9 @@ class FOCAL(nn.Module):
         if partial_bb_params:
             resolved_bb_lr = float(backbone_lr) if backbone_lr is not None else float(lr) * self.neck_lr_multiplier
             groups.append({"params": partial_bb_params, "lr": resolved_bb_lr, "name": "backbone_partial"})
+        if secondary_params:
+            resolved_sec_lr = float(lr) * self.secondary_lr_multiplier
+            groups.append({"params": secondary_params, "lr": resolved_sec_lr, "name": "secondary_backbone"})
 
         if not groups:
             trainable = [p for p in self.parameters() if p.requires_grad]
@@ -1353,7 +1826,13 @@ class FOCAL(nn.Module):
                     _replace_recursive(child)
 
         _replace_recursive(self.net)
+        if self.secondary_net is not None:
+            _replace_recursive(self.secondary_net)
+            self._surgical_secondary_param_names = {
+                name for name, p in self.secondary_net.named_parameters() if p.requires_grad
+            }
         self.peft_enabled = False
+        self.secondary_peft_enabled = False
         self._surgical_backbone_param_names = {
             name for name, p in self.net.named_parameters() if p.requires_grad
         }
@@ -1362,7 +1841,7 @@ class FOCAL(nn.Module):
         return self
 
     def get_surgery_summary(self) -> Dict[str, Any]:
-        """Return parameter footprint and active Strategy B surgery metadata."""
+        """Return parameter footprint and active Strategy B / fusion / domain-split metadata."""
         anchor_ids: Set[int] = set()
         if self._anchor_neck is not None:
             anchor_ids.update(id(p) for p in self._anchor_neck.parameters())
@@ -1375,14 +1854,29 @@ class FOCAL(nn.Module):
         backbone_trainable = sum(
             p.numel() for n, p in self.net.named_parameters() if n in self._surgical_backbone_param_names
         )
+        secondary_total = sum(p.numel() for p in self.secondary_net.parameters()) if self.secondary_net is not None else 0
+        secondary_trainable = (
+            sum(
+                p.numel()
+                for n, p in self.secondary_net.named_parameters()
+                if n in self._surgical_secondary_param_names
+            )
+            if self.secondary_net is not None
+            else 0
+        )
         return {
             "backbone": self.backbone_name,
+            "secondary_backbone": self.secondary_backbone_name,
+            "freeze_primary_backbone": self.freeze_primary_backbone,
+            "fusion_mode": self.fusion_mode if self.secondary_net is not None else None,
+            "domain_split_mode": self.domain_split_mode,
             "finetune_mode": self.finetune_mode,
             "peft_enabled": self.peft_enabled,
             "use_dora": self.use_dora,
             "lora_r": self.lora_r,
             "lora_alpha": self.lora_alpha,
             "adapted_block_indices": list(self._adapted_block_indices),
+            "secondary_adapted_block_indices": list(self._secondary_adapted_block_indices),
             "lora_target_modules": list(self.lora_target_modules),
             "train_neck": self.train_neck,
             "train_vit_norms": self.train_vit_norms,
@@ -1397,14 +1891,18 @@ class FOCAL(nn.Module):
             "backbone_total_params": backbone_total,
             "backbone_trainable_params": backbone_trainable,
             "backbone_trainable_pct": (100.0 * backbone_trainable / max(1, backbone_total)),
+            "secondary_total_params": secondary_total,
+            "secondary_trainable_params": secondary_trainable,
         }
 
     def log_surgery_summary(self, custom_logger: Optional[logging.Logger] = None) -> None:
-        """Log concise Strategy B startup surgery summary."""
+        """Log concise Strategy B / dual-backbone startup summary."""
         lg = custom_logger or logger
         s = self.get_surgery_summary()
         lg.info(
-            f"🧬 [FOCAL Strategy B Surgery] backbone={s['backbone']} mode={s['finetune_mode']} | "
+            f"🧬 [FOCAL Surgery] backbone={s['backbone']} secondary={s['secondary_backbone']} "
+            f"freeze_primary={s['freeze_primary_backbone']} fusion={s['fusion_mode']} "
+            f"domain_split={s['domain_split_mode']} mode={s['finetune_mode']} | "
             f"trainable={s['trainable_params']:,}/{s['total_params']:,} ({s['trainable_pct']:.2f}%) | "
             f"backbone_trainable={s['backbone_trainable_params']:,}/{s['backbone_total_params']:,} ({s['backbone_trainable_pct']:.2f}%) | "
             f"peft={s['peft_enabled']} dora={s['use_dora']} blocks={s['adapted_block_indices']} "
@@ -1412,17 +1910,19 @@ class FOCAL(nn.Module):
             f"adapter={s['use_feature_adapter']} prior_anchor={s['prior_anchor_weight']}"
         )
 
-    def _load_pretrained(
-        self, source: str, default_filename: str, cache_dir: Optional[str] = None
-    ) -> None:
-        """Download or resolve genuine pretrained weights and load state_dict strictly."""
+    @staticmethod
+    def _resolve_checkpoint_path(
+        source: str,
+        default_filename: str,
+        backbone_kind: Optional[str],
+        hf_repo: str,
+        cache_dir: Optional[str] = None,
+    ) -> str:
+        """Resolve local or Hugging Face checkpoint path under strict zero-fallback policy."""
         resolved_path = None
-
-        # 1. Direct local file
         if os.path.isfile(source):
             resolved_path = os.path.abspath(source)
 
-        # 2. Local candidate directories
         if resolved_path is None:
             filename = os.path.basename(source) if source.endswith((".pth", ".pt")) else default_filename
             candidates = [
@@ -1437,32 +1937,41 @@ class FOCAL(nn.Module):
                     resolved_path = os.path.abspath(cand)
                     break
 
-        # 3. Download from Hugging Face Hub
         if resolved_path is None:
-            repo_id = self.hf_repo
             filename = os.path.basename(source) if source.endswith((".pth", ".pt")) else default_filename
-            # Priority candidates on Hugging Face Hub (handles both legacy and reformatted SID-UNet layouts)
             hf_candidates = [filename]
-            if self.backbone_name == "hrnet":
-                for c in ["checkpoints/checkpoint_best.pt", "checkpoint_best.pt", "FOCAL_HRNet_weights.pth", "checkpoints/FOCAL_HRNet_weights.pth"]:
+            if backbone_kind == "hrnet":
+                for c in [
+                    "checkpoints/checkpoint_best.pt",
+                    "checkpoint_best.pt",
+                    "FOCAL_HRNet_weights.pth",
+                    "checkpoints/FOCAL_HRNet_weights.pth",
+                ]:
                     if c not in hf_candidates:
                         hf_candidates.append(c)
             else:
-                for c in ["checkpoints/focal_vit.pt", "focal_vit.pt", "checkpoints/checkpoint_best.pt", "FOCAL_ViT_weights.pth", "checkpoints/FOCAL_ViT_weights.pth"]:
+                for c in [
+                    "checkpoints/focal_vit.pt",
+                    "focal_vit.pt",
+                    "checkpoints/checkpoint_best.pt",
+                    "FOCAL_ViT_weights.pth",
+                    "checkpoints/FOCAL_ViT_weights.pth",
+                ]:
                     if c not in hf_candidates:
                         hf_candidates.append(c)
 
             from huggingface_hub import hf_hub_download
+
             last_err = None
             for c_fn in hf_candidates:
                 try:
                     resolved_path = hf_hub_download(
-                        repo_id=repo_id,
+                        repo_id=hf_repo,
                         filename=c_fn,
                         cache_dir=cache_dir,
                     )
                     if resolved_path and os.path.isfile(resolved_path):
-                        logger.info(f"Downloaded FOCAL pretrained weights from HF '{repo_id}/{c_fn}': {resolved_path}")
+                        logger.info(f"Downloaded FOCAL pretrained weights from HF '{hf_repo}/{c_fn}': {resolved_path}")
                         break
                 except Exception as hf_err:
                     last_err = hf_err
@@ -1470,7 +1979,7 @@ class FOCAL(nn.Module):
 
             if resolved_path is None and last_err is not None:
                 raise RuntimeError(
-                    f"Failed to download/load FOCAL weights from Hugging Face repo '{repo_id}' (tried {hf_candidates}): {last_err}. "
+                    f"Failed to download/load FOCAL weights from Hugging Face repo '{hf_repo}' (tried {hf_candidates}): {last_err}. "
                     f"Strict zero-fallback policy: aborting initialization."
                 ) from last_err
 
@@ -1479,13 +1988,15 @@ class FOCAL(nn.Module):
                 f"Failed to resolve FOCAL weights at '{source}'. "
                 f"Strict zero-fallback policy: local initialization is strictly disabled."
             )
+        return resolved_path
 
+    @staticmethod
+    def _extract_clean_state_dict(resolved_path: str) -> Dict[str, Any]:
+        """Load checkpoint dict and strip DataParallel ``module.`` prefixes."""
         try:
             ckpt = torch.load(resolved_path, map_location="cpu", weights_only=False)
         except Exception as load_err:
-            raise RuntimeError(
-                f"Corrupt or unreadable checkpoint at '{resolved_path}': {load_err}"
-            ) from load_err
+            raise RuntimeError(f"Corrupt or unreadable checkpoint at '{resolved_path}': {load_err}") from load_err
 
         if not isinstance(ckpt, dict):
             raise ValueError(f"Invalid FOCAL checkpoint payload from '{resolved_path}': expected state_dict dict.")
@@ -1499,11 +2010,23 @@ class FOCAL(nn.Module):
         else:
             raw_sd = ckpt
 
-        # Strip module. prefix (e.g. from DataParallel save)
-        clean_sd: Dict[str, Any] = {}
-        for k, v in raw_sd.items():
-            clean_k = k[7:] if k.startswith("module.") else k
-            clean_sd[clean_k] = v
+        return {(k[7:] if k.startswith("module.") else k): v for k, v in raw_sd.items()}
+
+    def _load_pretrained(
+        self, source: str, default_filename: str, cache_dir: Optional[str] = None
+    ) -> bool:
+        """
+        Download or resolve genuine pretrained weights and load state_dict strictly.
+        Returns True if the checkpoint already supplied ``secondary_net.*`` weights.
+        """
+        resolved_path = self._resolve_checkpoint_path(
+            source=source,
+            default_filename=default_filename,
+            backbone_kind=self._canonical_backbone_kind(self.backbone_name),
+            hf_repo=self.hf_repo,
+            cache_dir=cache_dir,
+        )
+        clean_sd = self._extract_clean_state_dict(resolved_path)
 
         is_peft_ckpt = any(
             ".lora_A" in k or ".lora_B" in k or ".dora_m" in k or ".base_linear." in k
@@ -1513,16 +2036,26 @@ class FOCAL(nn.Module):
             # Strategy B checkpoint reload: apply matching PEFT surgery before loading state_dict
             self._apply_strategy_b_surgery()
 
-        expected_keys = set(self.state_dict().keys())
+        has_secondary_weights = self.secondary_net is not None and any(
+            k.startswith("secondary_net.") for k in clean_sd.keys()
+        )
+
+        exempt_prefixes = ["_anchor_neck.", "_anchor_hrnet_stage4."]
         if self.class_head is not None:
-            expected_keys = {k for k in expected_keys if not k.startswith("class_head.")}
+            exempt_prefixes.append("class_head.")
         if self.decoder is not None:
-            expected_keys = {k for k in expected_keys if not k.startswith("decoder.")}
+            exempt_prefixes.append("decoder.")
         if self.feature_adapter is not None:
-            expected_keys = {k for k in expected_keys if not k.startswith("feature_adapter.")}
+            exempt_prefixes.append("feature_adapter.")
+        if self.domain_split_mode:
+            exempt_prefixes.extend(["domain_prototypes", "domain_fc."])
+        if self.secondary_net is not None:
+            if not has_secondary_weights:
+                exempt_prefixes.append("secondary_net.")
+            exempt_prefixes.extend(["fusion_module.", "fused_fc."])
+
         expected_keys = {
-            k for k in expected_keys
-            if not k.startswith(("_anchor_neck.", "_anchor_hrnet_stage4."))
+            k for k in self.state_dict().keys() if not k.startswith(tuple(exempt_prefixes))
         }
 
         for k in list(clean_sd.keys()):
@@ -1545,6 +2078,42 @@ class FOCAL(nn.Module):
                 f"Failed strict load_state_dict for FOCAL ({self.backbone_name}): {sd_err}. "
                 f"Zero-fallback policy enforced."
             ) from sd_err
+        return has_secondary_weights
+
+    def _load_secondary_focal_weights(
+        self, source: str, default_filename: str, cache_dir: Optional[str] = None
+    ) -> None:
+        """Load genuine pretrained FOCAL weights for a secondary HRNet or ViT backbone."""
+        assert self.secondary_net is not None
+        resolved_path = self._resolve_checkpoint_path(
+            source=source,
+            default_filename=default_filename,
+            backbone_kind=self.secondary_kind,
+            hf_repo=self.secondary_hf_repo,
+            cache_dir=cache_dir,
+        )
+        clean_sd = self._extract_clean_state_dict(resolved_path)
+
+        sec_sd: Dict[str, Any] = {}
+        expected_sec_keys = set(self.secondary_net.state_dict().keys())
+        for k, v in clean_sd.items():
+            if k in expected_sec_keys:
+                sec_sd[k] = v
+            elif k.startswith("net.") and k[4:] in expected_sec_keys:
+                sec_sd[k[4:]] = v
+            elif k.startswith("secondary_net.") and k[len("secondary_net."):] in expected_sec_keys:
+                sec_sd[k[len("secondary_net."):]] = v
+
+        missing_keys = [k for k in expected_sec_keys if k not in sec_sd]
+        if missing_keys:
+            raise RuntimeError(
+                f"FOCAL secondary backbone ({self.secondary_backbone_name}) missing pretrained weights: "
+                f"{missing_keys[:10]}. Zero-fallback policy enforced."
+            )
+        self.secondary_net.load_state_dict(sec_sd, strict=True)
+        logger.info(
+            f"✅ Loaded genuine FOCAL secondary '{self.secondary_backbone_name}' weights from: {resolved_path}"
+        )
 
     def _ensure_raw_rgb(self, x: torch.Tensor) -> torch.Tensor:
         """Ensure input tensor is in raw [0, 1] range as expected by FOCAL."""
@@ -1557,24 +2126,73 @@ class FOCAL(nn.Module):
 
     def _prepare_backbone_input(self, x: torch.Tensor) -> torch.Tensor:
         x = self._ensure_raw_rgb(x)
-        if self.backbone_name in ("vit", "vit-l", "sam_vit") and self.force_vit_1024:
+        if self._canonical_backbone_kind(self.backbone_name) == "vit" and self.force_vit_1024:
             orig_h, orig_w = x.shape[2], x.shape[3]
             if orig_h != 1024 or orig_w != 1024:
                 return F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
         return x
 
+    def _extract_secondary_features(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """Extract features from the optional secondary backbone."""
+        assert self.secondary_net is not None
+        x_sec = x_raw
+        if self.secondary_kind == "vit" and self.force_vit_1024:
+            if x_sec.shape[2] != 1024 or x_sec.shape[3] != 1024:
+                x_sec = F.interpolate(x_sec, size=(1024, 1024), mode="bilinear", align_corners=False)
+        if not self.secondary_trainable and not any(p.requires_grad for p in self.secondary_net.parameters()):
+            with torch.no_grad():
+                return self.secondary_net(x_sec)
+        return self.secondary_net(x_sec)
+
+    def _extract_primary_and_fused_features(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run primary (and optional secondary + fusion) backbones and optional FeatureAdapter."""
+        x_raw = self._ensure_raw_rgb(x)
+        x_in = self._prepare_backbone_input(x_raw)
+
+        primary_frozen = self.freeze_primary_backbone and not any(
+            p.requires_grad for p in self.net.parameters()
+        )
+        if primary_frozen:
+            with torch.no_grad():
+                f_primary = self.net(x_in)
+        else:
+            f_primary = self.net(x_in)
+
+        if self.secondary_net is not None and self.fusion_module is not None:
+            f_secondary = self._extract_secondary_features(x_raw)
+            if self.fusion_spatial_align == "max":
+                target_h = max(f_primary.shape[2], f_secondary.shape[2])
+                target_w = max(f_primary.shape[3], f_secondary.shape[3])
+                if f_primary.shape[2] != target_h or f_primary.shape[3] != target_w:
+                    f_primary = F.interpolate(
+                        f_primary, size=(target_h, target_w), mode="bilinear", align_corners=False
+                    )
+                if f_secondary.shape[2] != target_h or f_secondary.shape[3] != target_w:
+                    f_secondary = F.interpolate(
+                        f_secondary, size=(target_h, target_w), mode="bilinear", align_corners=False
+                    )
+            elif f_secondary.shape[2:] != f_primary.shape[2:]:
+                f_secondary = F.interpolate(
+                    f_secondary, size=f_primary.shape[2:], mode="bilinear", align_corners=False
+                )
+            feats_backbone = self.fusion_module(f_primary, f_secondary)
+        else:
+            feats_backbone = f_primary
+
+        feats = self.feature_adapter(feats_backbone) if self.feature_adapter is not None else feats_backbone
+        return x_in, f_primary, feats_backbone, feats
+
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract spatial forensic features from input images (including optional FeatureAdapter)."""
-        x_in = self._prepare_backbone_input(x)
-        feats = self.net(x_in)
-        if self.feature_adapter is not None:
-            feats = self.feature_adapter(feats)
+        """Extract spatial forensic features from input images (including fusion & FeatureAdapter)."""
+        _, _, _, feats = self._extract_primary_and_fused_features(x)
         return feats
 
     @torch.no_grad()
     def _extract_base_features_no_grad(self, x_in: torch.Tensor) -> torch.Tensor:
         """Compute unmodified pretrained backbone features without duplicating the 307M ViT in VRAM."""
-        if self.backbone_name in ("vit", "vit-l", "sam_vit"):
+        if self._canonical_backbone_kind(self.backbone_name) == "vit":
             lora_mods = [m for m in self.net.modules() if isinstance(m, SurgicalLoRALinear)]
             for m in lora_mods:
                 m.bypass = True
@@ -1623,7 +2241,11 @@ class FOCAL(nn.Module):
         return self.net(x_in)
 
     def _compute_prior_anchor_terms(
-        self, x_in: torch.Tensor, feats: torch.Tensor, feats_backbone: torch.Tensor
+        self,
+        x_in: torch.Tensor,
+        feats: torch.Tensor,
+        feats_backbone: torch.Tensor,
+        f_primary: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Compute feature-space cosine prior-anchoring loss and optional neck L2 anchor penalty.
@@ -1633,14 +2255,24 @@ class FOCAL(nn.Module):
         weighted_penalty: Optional[torch.Tensor] = None
 
         if self.prior_anchor_weight > 0.0:
-            if not self._surgical_backbone_param_names and self.feature_adapter is not None:
+            feats_base: Optional[torch.Tensor] = None
+            if self.secondary_net is not None:
+                if self.freeze_primary_backbone and f_primary is not None and f_primary.shape[1] == feats.shape[1]:
+                    feats_base = f_primary.detach()
+            elif not self._surgical_backbone_param_names and self.feature_adapter is not None:
                 feats_base = feats_backbone.detach()
             else:
                 feats_base = self._extract_base_features_no_grad(x_in)
-            f_ad = F.normalize(feats.float(), p=2, dim=1)
-            f_ba = F.normalize(feats_base.detach().float(), p=2, dim=1)
-            raw_cos_loss = (1.0 - (f_ad * f_ba).sum(dim=1)).mean()
-            weighted_penalty = self.prior_anchor_weight * raw_cos_loss
+
+            if feats_base is not None:
+                if feats_base.shape[2:] != feats.shape[2:]:
+                    feats_base = F.interpolate(
+                        feats_base, size=feats.shape[2:], mode="bilinear", align_corners=False
+                    )
+                f_ad = F.normalize(feats.float(), p=2, dim=1)
+                f_ba = F.normalize(feats_base.detach().float(), p=2, dim=1)
+                raw_cos_loss = (1.0 - (f_ad * f_ba).sum(dim=1)).mean()
+                weighted_penalty = self.prior_anchor_weight * raw_cos_loss
 
         if self.neck_l2_anchor_weight > 0.0 and self._neck_init_params:
             l2_terms = []
@@ -1738,6 +2370,63 @@ class FOCAL(nn.Module):
 
         return logit_full, prob_full, separability
 
+    def _cluster_domain_features(
+        self,
+        feats: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+        aux_pristine_flags: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Domain-split 4-cluster inference collapsed strictly into 2 classes (pristine vs tampered).
+
+        Uses the 4 learned domain-split prototypes (casia_pristine, casia_tampered,
+        imd_pristine, imd_tampered) when initialized, collapsing {0, 2} -> pristine
+        and {1, 3} -> tampered via exact log-sum-exp, and returns
+        `(mask_logits [B,1,H,W], pred_mask [B,1,H,W], separability [B], logits_2 [B,2,H,W])`.
+        """
+        kmeans_logit, kmeans_prob, separability = self._cluster_features_with_stats(
+            feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+        )
+        if (
+            self.domain_prototypes is None
+            or self.domain_clustering_mode == "kmeans"
+            or not bool(self.domain_prototypes_initialized.all().item())
+        ):
+            logits_2_fallback = torch.cat([-0.5 * kmeans_logit, 0.5 * kmeans_logit], dim=1)
+            return kmeans_logit, kmeans_prob, separability, logits_2_fallback
+
+        feats_norm = F.normalize(feats.float(), p=2, dim=1)
+        proto_norm = F.normalize(self.domain_prototypes.float(), p=2, dim=-1)  # [4, C]
+        sim_4 = torch.einsum("bchw,kc->bkhw", feats_norm, proto_norm) / self.cluster_temperature
+
+        pristine_grid = torch.logsumexp(sim_4[:, [0, 2], :, :], dim=1, keepdim=True)
+        tampered_grid = torch.logsumexp(sim_4[:, [1, 3], :, :], dim=1, keepdim=True)
+        proto_diff_grid = tampered_grid - pristine_grid
+
+        if aux_pristine_flags is not None and aux_pristine_flags.any():
+            b, _, h_f, w_f = proto_diff_grid.shape
+            gated = self._apply_pristine_gate(
+                proto_diff_grid.view(b, h_f * w_f),
+                aux_pristine_flags.to(device=proto_diff_grid.device, dtype=torch.bool),
+            )
+            proto_diff_grid = gated.view(b, 1, h_f, w_f)
+
+        proto_logit_full = F.interpolate(
+            proto_diff_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False
+        )
+        if self.domain_clustering_mode == "hybrid":
+            final_logit = 0.5 * proto_logit_full + 0.5 * kmeans_logit
+            logits_2 = torch.cat([-0.5 * final_logit, 0.5 * final_logit], dim=1)
+        else:
+            final_logit = proto_logit_full
+            logits_2_grid = torch.cat([pristine_grid, tampered_grid], dim=1)
+            logits_2 = F.interpolate(
+                logits_2_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False
+            )
+
+        return final_logit, torch.sigmoid(final_logit), separability, logits_2
+
     def _cluster_features(
         self, feats: torch.Tensor, orig_h: int, orig_w: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1782,6 +2471,105 @@ class FOCAL(nn.Module):
         idx = torch.cat(selected, dim=0)
         return emb_flat[idx], label_flat[idx]
 
+    @staticmethod
+    def _sample_multiclass_tokens(
+        emb_flat: torch.Tensor,
+        label_flat: torch.Tensor,
+        max_tokens: int,
+        num_classes: int = 4,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stratified-balanced sampling across up to ``num_classes`` domain-split classes."""
+        valid_mask = (label_flat >= 0) & (label_flat < num_classes)
+        emb_valid = emb_flat[valid_mask]
+        lbl_valid = label_flat[valid_mask]
+        n_total = emb_valid.shape[0]
+        if n_total <= max_tokens or n_total == 0:
+            return emb_valid, lbl_valid
+
+        class_indices = [
+            torch.nonzero(lbl_valid == c, as_tuple=False).squeeze(-1)
+            for c in range(num_classes)
+        ]
+        present = [idxs for idxs in class_indices if idxs.numel() > 0]
+        if not present:
+            return emb_valid[:0], lbl_valid[:0]
+
+        per_cls = max(1, max_tokens // len(present))
+        selected = []
+        leftover_pools = []
+        taken = 0
+        for idxs in present:
+            k = min(idxs.numel(), per_cls)
+            perm = torch.randperm(idxs.numel(), device=emb_valid.device)
+            selected.append(idxs[perm[:k]])
+            taken += k
+            if idxs.numel() > k:
+                leftover_pools.append(idxs[perm[k:]])
+
+        if taken < max_tokens and leftover_pools:
+            rem = torch.cat(leftover_pools, dim=0)
+            extra = min(rem.numel(), max_tokens - taken)
+            perm_r = torch.randperm(rem.numel(), device=emb_valid.device)[:extra]
+            selected.append(rem[perm_r])
+
+        idx = torch.cat(selected, dim=0)
+        return emb_valid[idx], lbl_valid[idx]
+
+    @staticmethod
+    def _build_domain_4class_mask_targets(
+        gt_masks: torch.Tensor,
+        domain_ids: Optional[torch.Tensor],
+        target_hw: Tuple[int, int],
+        mode: str = "area",
+    ) -> torch.Tensor:
+        """
+        Build 4-class pixel targets (0: casia_pristine, 1: casia_tampered,
+        2: imd_pristine, 3: imd_tampered) with ``-100`` for unknown domain samples.
+        """
+        b = gt_masks.shape[0]
+        gt_f = gt_masks.float()
+        if gt_f.ndim == 3:
+            gt_f = gt_f.unsqueeze(1)
+        if gt_f.shape[2] != target_hw[0] or gt_f.shape[3] != target_hw[1]:
+            gt_resized = F.interpolate(gt_f, size=target_hw, mode=mode)
+        else:
+            gt_resized = gt_f
+        is_tamp = (gt_resized[:, 0] >= 0.5).long()  # [B, H, W]
+
+        if domain_ids is None:
+            return torch.full_like(is_tamp, -100)
+
+        dom = domain_ids.to(device=gt_masks.device, dtype=torch.long).view(b, 1, 1)
+        valid = (dom >= 0) & (dom <= 1)
+        targets = dom.clamp(min=0, max=1) * 2 + is_tamp
+        return torch.where(valid, targets, torch.full_like(targets, -100))
+
+    @staticmethod
+    def _info_nce_on_tokens(
+        z: torch.Tensor,
+        labels: torch.Tensor,
+        temperature: float,
+    ) -> Optional[torch.Tensor]:
+        """Compute InfoNCE across arbitrary integer labels on normalized tokens `[K, C]`."""
+        k_n = z.shape[0]
+        if k_n < 2:
+            return None
+        logits = torch.matmul(z, z.t()) / temperature
+        self_mask = torch.eye(k_n, dtype=torch.bool, device=z.device)
+        same_label = (labels.unsqueeze(0) == labels.unsqueeze(1)) & (~self_mask)
+        valid_anchors = same_label.any(dim=1)
+        if not valid_anchors.any():
+            return None
+
+        logits_masked = logits.masked_fill(self_mask, float("-inf"))
+        row_max = logits_masked.max(dim=-1, keepdim=True).values.detach()
+        logits_stable = logits_masked - row_max
+        log_denom = torch.logsumexp(logits_stable, dim=-1, keepdim=True)
+        log_prob = logits_stable - log_denom
+        pos_counts = same_label.sum(dim=-1).clamp(min=1).to(log_prob.dtype)
+        loss_per_anchor = -(log_prob.masked_fill(~same_label, 0.0)).sum(dim=-1) / pos_counts
+        return loss_per_anchor[valid_anchors].mean()
+
     def compute_contrastive_loss(
         self, feats: torch.Tensor, gt_masks: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -1817,49 +2605,115 @@ class FOCAL(nn.Module):
                 continue
 
             z_i, y_sub = self._sample_contrastive_tokens(emb_all[i], y_i, self.contrastive_sample_size)
-            k_i = z_i.shape[0]
-            if k_i < 2 or not (y_sub == 1).any() or not (y_sub == 0).any():
+            if z_i.shape[0] < 2 or not (y_sub == 1).any() or not (y_sub == 0).any():
                 continue
 
-            logits = torch.matmul(z_i, z_i.t()) / self.cluster_temperature  # [K, K]
-            self_mask = torch.eye(k_i, dtype=torch.bool, device=z_i.device)
-            same_label = (y_sub.unsqueeze(0) == y_sub.unsqueeze(1)) & (~self_mask)
-            valid_anchors = same_label.any(dim=1)
-            if not valid_anchors.any():
-                continue
-
-            logits_masked = logits.masked_fill(self_mask, float("-inf"))
-            # Numerical stabilization per anchor row
-            row_max = logits_masked.max(dim=-1, keepdim=True).values.detach()
-            logits_stable = logits_masked - row_max
-            log_denom = torch.logsumexp(logits_stable, dim=-1, keepdim=True)
-            log_prob = logits_stable - log_denom
-
-            pos_counts = same_label.sum(dim=-1).clamp(min=1).to(log_prob.dtype)
-            loss_per_anchor = -(log_prob.masked_fill(~same_label, 0.0)).sum(dim=-1) / pos_counts
-            per_image_losses.append(loss_per_anchor[valid_anchors].mean())
+            loss_i = self._info_nce_on_tokens(z_i, y_sub, self.cluster_temperature)
+            if loss_i is not None:
+                per_image_losses.append(loss_i)
 
         if not per_image_losses:
             return zero_anchor
         return torch.stack(per_image_losses).mean()
 
+    def compute_domain_contrastive_loss(
+        self,
+        feats: torch.Tensor,
+        gt_masks: Optional[torch.Tensor],
+        domain_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute 4-cluster domain-split contrastive loss:
+          1. Image-relative ``MyInfoNCE`` (preserving sharp intra-image boundary separation),
+          2. 4-class Prototype InfoNCE against ``domain_prototypes``
+             (0: casia_pristine, 1: casia_tampered, 2: imd_pristine, 3: imd_tampered),
+          3. Cross-image 4-class SupCon keeping CASIA and IMD clusters separate.
+        """
+        l_intra = self.compute_contrastive_loss(feats, gt_masks)
+        proto_zero = (
+            self.domain_prototypes.sum() * 0.0 if self.domain_prototypes is not None else feats.sum() * 0.0
+        )
+        if gt_masks is None or self.domain_prototypes is None or domain_ids is None:
+            return l_intra + proto_zero
+
+        b, c, h_f, w_f = feats.shape
+        targets_4 = self._build_domain_4class_mask_targets(
+            gt_masks, domain_ids, target_hw=(h_f, w_f), mode="area"
+        ).view(-1)
+
+        feats_norm = F.normalize(feats.float(), p=2, dim=1)
+        emb_flat = feats_norm.permute(0, 2, 3, 1).reshape(b * h_f * w_f, c)
+
+        # Initialize unseen domain prototypes directly from actual batch centroids on first sight
+        with torch.no_grad():
+            for k in range(4):
+                if not bool(self.domain_prototypes_initialized[k].item()):
+                    k_mask = targets_4 == k
+                    if k_mask.any():
+                        mean_vec = F.normalize(emb_flat[k_mask].mean(dim=0), p=2, dim=0)
+                        self.domain_prototypes.data[k].copy_(
+                            mean_vec.to(dtype=self.domain_prototypes.dtype, device=self.domain_prototypes.device)
+                        )
+                        self.domain_prototypes_initialized[k] = True
+
+        z_sub, y_sub = self._sample_multiclass_tokens(
+            emb_flat, targets_4, self.contrastive_sample_size, num_classes=4
+        )
+        if z_sub.shape[0] == 0:
+            return l_intra + proto_zero
+
+        total = l_intra
+        if self.domain_proto_weight > 0.0:
+            proto_norm = F.normalize(self.domain_prototypes.float(), p=2, dim=-1)
+            proto_logits = torch.matmul(z_sub, proto_norm.t()) / self.cluster_temperature
+            l_proto = F.cross_entropy(proto_logits, y_sub)
+            total = total + self.domain_proto_weight * l_proto
+        else:
+            total = total + proto_zero
+
+        if self.domain_supcon_weight > 0.0 and torch.unique(y_sub).numel() >= 2:
+            l_supcon = self._info_nce_on_tokens(z_sub, y_sub, self.cluster_temperature)
+            if l_supcon is not None:
+                total = total + self.domain_supcon_weight * l_supcon
+
+        return total
+
     def _run_supervised_head(
         self, feats: torch.Tensor, orig_h: int, orig_w: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Execute active supervised segmentation head (`decoder` or legacy `fc`)."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Execute active supervised segmentation head (`decoder`, `domain_fc`, `fused_fc`, or `fc`).
+        When ``domain_split_mode=True``, returns 2-class collapsed `(mask_logits, logits_2, logits_4)`.
+        """
+        if self.domain_split_mode:
+            if self.decoder is not None:
+                logits_4 = self.decoder(feats, orig_h, orig_w)
+            elif self.domain_fc is not None:
+                logits_small = self.domain_fc(feats)
+                logits_4 = F.interpolate(
+                    logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False
+                )
+            else:
+                raise RuntimeError("domain_split_mode requires 4-channel decoder or domain_fc.")
+            mask_logits, logits_2 = _collapse_domain_4_to_2_mask_logits(logits_4)
+            return mask_logits, logits_2, logits_4
+
         if self.decoder is not None:
             mask_logits = self.decoder(feats, orig_h, orig_w)
-            return mask_logits, mask_logits
-        logits_small = self.fc(feats)
+            return mask_logits, mask_logits, None
+        head_conv = self.fused_fc if self.fused_fc is not None else self.fc
+        logits_small = head_conv(feats)
         logits_full = F.interpolate(logits_small, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
         mask_logits = logits_full[:, 1:2] - logits_full[:, 0:1]
-        return mask_logits, logits_full
+        return mask_logits, logits_full, None
 
     def forward(
         self,
         x: torch.Tensor,
         return_dict: bool = True,
         gt_masks: Optional[torch.Tensor] = None,
+        domain_ids: Optional[torch.Tensor] = None,
+        dataset_sources: Optional[Sequence[Any]] = None,
         *args: Any,
         **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[Any, ...], Dict[str, Any]]:
@@ -1869,30 +2723,47 @@ class FOCAL(nn.Module):
         Args:
             x: Input RGB tensor `[B, 3, H, W]`.
             return_dict: If True, returns dictionary with standard keys.
-            gt_masks: Optional ground-truth binary masks `[B, 1, H, W]` for Mode 1B (`contrastive`).
+            gt_masks: Optional ground-truth binary masks `[B, 1, H, W]` for Mode 1B (`contrastive`)
+                and `domain_split_mode` training.
+            domain_ids: Optional `[B]` tensor of domain indices (`0`: casia, `1`: imd2020) during
+                `domain_split_mode` training (never required at inference).
+            dataset_sources: Optional sequence of dataset source strings (`"casia"`, `"imd2020"`).
 
         Returns:
-            Dictionary with:
+            Dictionary with strictly 2-class (pristine vs tampered) inference outputs:
                 - `mask_logits`: `[B, 1, H, W]`
                 - `pred_mask`: Sigmoid probability `[B, 1, H, W]`
                 - `features`: Dense feature map `[B, C, H', W']`
-                - `class_logits`: `[B, num_classes]` (if aux_classifier)
-                - `align_loss`: Per-image Soft Contrastive Loss (if Mode 1B training)
+                - `class_logits`: `[B, 2]` (or `[B, num_classes]` when not domain-split)
+                - `align_loss`: Contrastive / domain-split training loss
                 - `cluster_separability`: Inter-centroid distance `1 - cos(c0, c1)` (if clustering)
         """
         orig_h, orig_w = x.shape[2], x.shape[3]
-        x_in = self._prepare_backbone_input(x)
-        feats_backbone = self.net(x_in)
-        feats = self.feature_adapter(feats_backbone) if self.feature_adapter is not None else feats_backbone
+        x_in, f_primary, feats_backbone, feats = self._extract_primary_and_fused_features(x)
+
+        resolved_domain_ids = domain_ids
+        if resolved_domain_ids is None and dataset_sources is not None:
+            resolved_domain_ids = encode_domain_sources(
+                dataset_sources, device=x.device, domain_names=self.domain_names
+            )
+        elif resolved_domain_ids is None and "dataset" in kwargs:
+            resolved_domain_ids = encode_domain_sources(
+                kwargs["dataset"], device=x.device, domain_names=self.domain_names
+            )
 
         prior_anchor_loss: Optional[torch.Tensor] = None
         prior_anchor_penalty: Optional[torch.Tensor] = None
         if self.training and (self.prior_anchor_weight > 0.0 or self.neck_l2_anchor_weight > 0.0):
             prior_anchor_loss, prior_anchor_penalty = self._compute_prior_anchor_terms(
-                x_in=x_in, feats=feats, feats_backbone=feats_backbone
+                x_in=x_in, feats=feats, feats_backbone=feats_backbone, f_primary=f_primary
             )
 
-        class_logits = self.class_head(feats) if self.class_head is not None else None
+        class_logits_raw = self.class_head(feats) if self.class_head is not None else None
+        if self.domain_split_mode and class_logits_raw is not None and class_logits_raw.shape[-1] == 4:
+            class_logits = _collapse_domain_4_to_2_class_logits(class_logits_raw)
+        else:
+            class_logits = class_logits_raw
+
         aux_pristine_flags = (
             (class_logits[:, 1] < class_logits[:, 0])
             if (self.aux_pristine_gate and class_logits is not None and class_logits.shape[-1] >= 2)
@@ -1904,33 +2775,77 @@ class FOCAL(nn.Module):
         separability: Optional[torch.Tensor] = None
 
         if self.finetune_mode == "supervised":
-            # Mode 1A: strict train/eval parity via supervised head
-            mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
+            # Mode 1A: strict train/eval parity via supervised head (collapsed 4->2 if domain_split_mode)
+            mask_logits, logits_full, logits_4 = self._run_supervised_head(feats, orig_h, orig_w)
             pred_mask = torch.sigmoid(mask_logits)
+            if self.training and self.domain_split_mode and logits_4 is not None and gt_masks is not None:
+                target_4 = self._build_domain_4class_mask_targets(
+                    gt_masks, resolved_domain_ids, target_hw=(orig_h, orig_w), mode="nearest"
+                )
+                if (target_4 != -100).any():
+                    domain_ce = F.cross_entropy(logits_4.float(), target_4, ignore_index=-100)
+                else:
+                    domain_ce = logits_4.sum() * 0.0
+                if (
+                    class_logits_raw is not None
+                    and class_logits_raw.shape[-1] == 4
+                    and resolved_domain_ids is not None
+                ):
+                    gt_f = gt_masks.float()
+                    if gt_f.ndim == 3:
+                        gt_f = gt_f.unsqueeze(1)
+                    img_tamp = (gt_f.amax(dim=(1, 2, 3)) >= 0.5).long()
+                    dom = resolved_domain_ids.to(device=gt_masks.device, dtype=torch.long)
+                    valid_img = (dom >= 0) & (dom <= 1)
+                    img_y4 = torch.where(valid_img, dom.clamp(0, 1) * 2 + img_tamp, torch.full_like(dom, -100))
+                    if (img_y4 != -100).any():
+                        domain_ce = domain_ce + 0.2 * F.cross_entropy(
+                            class_logits_raw.float(), img_y4, ignore_index=-100
+                        )
+                align_loss = self.domain_loss_weight * domain_ce
+                skip_mask_loss = False
         elif self.finetune_mode == "contrastive":
-            # Mode 1B: image-relative contrastive training + clustering eval
+            # Mode 1B: image-relative (or 4-cluster domain-split) contrastive training + 2-class clustering eval
             if self.training:
-                align_loss = self.compute_contrastive_loss(feats, gt_masks)
+                if self.domain_split_mode:
+                    align_loss = self.compute_domain_contrastive_loss(feats, gt_masks, resolved_domain_ids)
+                else:
+                    align_loss = self.compute_contrastive_loss(feats, gt_masks)
                 skip_mask_loss = True
                 with torch.no_grad():
-                    mask_logits, pred_mask, separability = self._cluster_features_with_stats(
-                        feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
-                    )
-                logits_full = mask_logits
+                    if self.domain_split_mode:
+                        mask_logits, pred_mask, separability, logits_full = self._cluster_domain_features(
+                            feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                        )
+                    else:
+                        mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                            feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                        )
+                        logits_full = mask_logits
             else:
-                mask_logits, pred_mask, separability = self._cluster_features_with_stats(
-                    feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
-                )
-                logits_full = mask_logits
+                if self.domain_split_mode:
+                    mask_logits, pred_mask, separability, logits_full = self._cluster_domain_features(
+                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                else:
+                    mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                    logits_full = mask_logits
         else:
             # Legacy mode: preserves backward compatibility with existing zero-shot / audit tests
             if not self.training and self.use_clustering:
-                mask_logits, pred_mask, separability = self._cluster_features_with_stats(
-                    feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
-                )
-                logits_full = mask_logits
+                if self.domain_split_mode:
+                    mask_logits, pred_mask, separability, logits_full = self._cluster_domain_features(
+                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                else:
+                    mask_logits, pred_mask, separability = self._cluster_features_with_stats(
+                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                    logits_full = mask_logits
             else:
-                mask_logits, logits_full = self._run_supervised_head(feats, orig_h, orig_w)
+                mask_logits, logits_full, _ = self._run_supervised_head(feats, orig_h, orig_w)
                 pred_mask = torch.sigmoid(mask_logits)
 
         if return_dict:

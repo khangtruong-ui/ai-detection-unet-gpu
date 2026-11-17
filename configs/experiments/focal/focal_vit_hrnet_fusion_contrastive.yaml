@@ -1,0 +1,60 @@
+# Configuration: FOCAL Dual-Backbone Fusion (Frozen ViT-Large Primary + Trainable HRNet-W32 Secondary)
+# Independent dual-backbone fusion architecture: keeps primary pretrained FOCAL ViT-Large completely frozen
+# while fusing a second HRNet-W32 (stage4 adaptable) via L2-normalized channel concatenation (FOCAL paper style).
+
+project:
+  name: "sid_focal_vit_hrnet_fusion_contrastive"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_vit_hrnet_fusion_contrastive"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "focal"
+  backbone: "vit"
+  secondary_backbone: "hrnet"
+  freeze_primary_backbone: true
+  secondary_trainable: true
+  secondary_trainable_stages: ["stage4"]
+  freeze_backbone_bn: true
+  fusion_mode: "concat"
+  fusion_spatial_align: "max"
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "contrastive"
+  use_clustering: true
+  force_vit_1024: false
+  cluster_temperature: 0.1
+  cluster_separability_threshold: 0.03
+  contrastive_sample_size: 1024
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  align_weight: 1.0
+
+training:
+  epochs: 10
+  learning_rate: 0.00005
+  secondary_lr_multiplier: 0.5
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  gradient_accumulation_steps: 2
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

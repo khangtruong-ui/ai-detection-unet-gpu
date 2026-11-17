@@ -1110,6 +1110,14 @@ class Trainer:
         raw_target = getattr(self.model, "module", self.model)
         if getattr(raw_target, "memory_enabled", False) or getattr(raw_target, "requires_gt_masks", False):
             model_kwargs["gt_masks"] = masks
+        if getattr(raw_target, "requires_domain_info", False):
+            raw_ds = batch.get("dataset_source", batch.get("dataset"))
+            if raw_ds is not None:
+                if isinstance(raw_ds, torch.Tensor):
+                    model_kwargs["domain_ids"] = raw_ds.to(self.device, non_blocking=True)
+                else:
+                    from sid_unet.models.focal import encode_domain_sources
+                    model_kwargs["domain_ids"] = encode_domain_sources(raw_ds, device=self.device)
         model_kwargs = self._filter_model_kwargs(model_kwargs)
 
         with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
