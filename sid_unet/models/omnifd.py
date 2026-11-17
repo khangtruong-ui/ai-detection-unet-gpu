@@ -842,6 +842,7 @@ class OmniFD(nn.Module):
         checkpoint_path: Optional[str] = None,
         pretrained: bool = True,
         backbone_pretrained: bool = False,
+        allow_random_init: bool = False,
         hf_repo: Optional[str] = None,
         cache_dir: Optional[str] = None,
         latent_channels: int = 512,
@@ -898,6 +899,12 @@ class OmniFD(nn.Module):
             has_image_head=self.has_image_head,
             has_spatial_head=self.has_spatial_head,
         )
+
+        if not pretrained and not allow_random_init:
+            raise ValueError(
+                "OmniFD requires pretrained=True (or explicit allow_random_init=True). "
+                "Random weight initialization is strictly disabled."
+            )
 
         if pretrained:
             self._load_pretrained(

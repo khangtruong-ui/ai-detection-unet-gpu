@@ -1550,7 +1550,7 @@ sid-cross-eval \
 - **Detection & Localization**:
   - **Image-Level Branch (`MSCCClassifier`)**: Global average pooling + linear classifier over ResNet stage-4 features producing `class_logits`.
   - **Multi-Spectral Class Center (`MSCCModule`)**: Applies a 2D DCT filter bank (`MultiSpectralDCTLayer`), predicts frequency-residual group maps (`fres_map_logits`), aggregates class-center embeddings refined via a Graph Convolutional Network (`MSCCGCN`), and fuses spectral attention back into pixel decoder predictions (`mask_logits`).
-- **Pretrained Weights Note**: Official upstream `miaoct/MSCCNet` provides ImageNet-pretrained backbones (`resnet50_v1c` / `resnet101_v1c`) without releasing task-trained MSCCNet checkpoints; pass `model.checkpoint_path` to load a custom MSCCNet checkpoint.
+- **Pretrained Weights & Strict Zero-Random-Init Policy**: `MSCCNet` enforces `allow_random_init=False` by default—since upstream `miaoct/MSCCNet` only releases ImageNet-pretrained backbones (`resnet50_v1c` / `resnet101_v1c`) without task-trained `epoch_best.pth`, inference without `checkpoint_path` or `hf_repo` raises `RuntimeError` instead of falling back to random heads (pass `allow_random_init: true` only when training from an ImageNet backbone).
 - **Configuration Files**: `configs/experiments/msccnet/default.yaml`, `configs/experiments/msccnet/msccnet_resnet101.yaml`.
 
 ---
@@ -1563,9 +1563,9 @@ sid-cross-eval \
   - **Omnivore SwinTransformer3D Backbone (`SwinTransformerOmni`)**: Swin-T / Swin-S / Swin-B 3D trunk operating on `[B, 3, 1, H, W]` image tensors across 4 hierarchical feature stages (`[192, 384, 768, 768]`).
   - **Perceiver Interaction Neck (`InteractionNeck`)**: Projects all 4 stages into `512`-d latent space with learnable stage embeddings and cross-attends `64` forgery latent tokens across 3 interaction layers.
   - **Image & Spatial Heads**: `OmniFDImageClsHead` pools the 64 latents for binary real/fake prediction (`class_logits`), while `OmniFDSpatialHead` fuses resized multi-scale features with projected latent queries (`mask_logits`).
-- **Pretrained Weights (Google Drive)**: Official checkpoints (`omnifd_swin-t_50k_forgerynet.pth`, `omnifd_swin-s_50k_forgerynet.pth`, `omnifd_swin-s_20k_ff_spatial.pth`, `omnifd_swin-s_20k_fmld_spatial.pth`, etc.) are automatically downloaded from the [official Google Drive folder](https://drive.google.com/drive/folders/1Bh8FbF-jiyPtgr7-URNuGAOJhi8kZSEC?usp=sharing) via `gdown` or loaded from `model.checkpoint_path`.
+- **Pretrained Weights (Google Drive & Zero-Random-Init)**: Official checkpoints (`omnifd_swin-t_50k_forgerynet.pth`, `omnifd_swin-s_50k_forgerynet.pth`, `omnifd_swin-s_20k_ff_image.pth`, `omnifd_swin-s_20k_ff_spatial.pth`, `omnifd_swin-s_20k_fmld_spatial.pth`, etc.) are automatically downloaded from the [official Google Drive folder](https://drive.google.com/drive/folders/1Bh8FbF-jiyPtgr7-URNuGAOJhi8kZSEC?usp=sharing) via `gdown` or loaded from `model.checkpoint_path` (enforcing `allow_random_init=False` by default).
 - **Configuration Files**: `configs/experiments/omnifd/default.yaml`, `configs/experiments/omnifd/omnifd_swin_s_forgerynet.yaml`, `configs/experiments/omnifd/omnifd_swin_s_ff_spatial.yaml`, `configs/experiments/omnifd/omnifd_swin_s_fmld_spatial.yaml`.
-- **Detailed PDF Reporting**: See [docs/msccnet_and_omnifd_integration.md](docs/msccnet_and_omnifd_integration.md) and `scripts/infer_msccnet_omnifd_pdf.py` (8-column multi-page PDF inference report at `docs/msccnet_omnifd_inference_report.pdf`).
+- **Domain Evaluation Dataset & Detailed PDF Reporting**: Built and published [KhangTruong/face-forgery-domain-eval](https://huggingface.co/datasets/KhangTruong/face-forgery-domain-eval) (`model1_in_domain`, `model2_in_domain`, `out_of_domain`) via `scripts/build_face_domain_dataset.py`; see [docs/msccnet_and_omnifd_integration.md](docs/msccnet_and_omnifd_integration.md), `scripts/infer_msccnet_omnifd_pdf.py`, `docs/msccnet_omnifd_domain_metrics.json`, and `docs/msccnet_omnifd_inference_report.pdf`.
 
 ---
 

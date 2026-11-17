@@ -13,7 +13,7 @@ class TestOmniFDModel:
 
     @pytest.mark.parametrize("hw", [(224, 224), (256, 256), (299, 299)])
     def test_omnifd_swin_t_forward_resolutions(self, hw):
-        model = OmniFD(variant="swin-t", pretrained=False)
+        model = OmniFD(variant="swin-t", pretrained=False, allow_random_init=True)
         model.eval()
         h, w = hw
         x = torch.randn(1, 3, h, w)
@@ -33,28 +33,46 @@ class TestOmniFDModel:
         x = torch.randn(1, 3, 128, 128)
 
         # Unified (image + spatial)
-        m_both = OmniFD(variant="swin-t", pretrained=False, has_image_head=True, has_spatial_head=True)
+        m_both = OmniFD(
+            variant="swin-t",
+            pretrained=False,
+            allow_random_init=True,
+            has_image_head=True,
+            has_spatial_head=True,
+        )
         with torch.no_grad():
             mask_l, cls_l = m_both(x, return_dict=False)
         assert mask_l.shape == (1, 1, 128, 128)
         assert cls_l.shape == (1, 2)
 
         # Spatial-only
-        m_spatial = OmniFD(variant="swin-t", pretrained=False, has_image_head=False, has_spatial_head=True)
+        m_spatial = OmniFD(
+            variant="swin-t",
+            pretrained=False,
+            allow_random_init=True,
+            has_image_head=False,
+            has_spatial_head=True,
+        )
         with torch.no_grad():
             only_mask = m_spatial(x, return_dict=False)
         assert torch.is_tensor(only_mask)
         assert only_mask.shape == (1, 1, 128, 128)
 
         # Image-only
-        m_img = OmniFD(variant="swin-t", pretrained=False, has_image_head=True, has_spatial_head=False)
+        m_img = OmniFD(
+            variant="swin-t",
+            pretrained=False,
+            allow_random_init=True,
+            has_image_head=True,
+            has_spatial_head=False,
+        )
         with torch.no_grad():
             m_zero, img_cls = m_img(x, return_dict=False)
         assert m_zero.shape == (1, 1, 128, 128)
         assert img_cls.shape == (1, 2)
 
     def test_omnifd_backward_pass(self):
-        model = OmniFD(variant="swin-t", pretrained=False)
+        model = OmniFD(variant="swin-t", pretrained=False, allow_random_init=True)
         model.train()
         x = torch.randn(2, 3, 128, 128, requires_grad=True)
         target_mask = torch.randint(0, 2, (2, 1, 128, 128), dtype=torch.float32)
@@ -76,6 +94,7 @@ class TestOmniFDModel:
                 "name": "omnifd",
                 "variant": "swin-t",
                 "pretrained": False,
+                "allow_random_init": True,
                 "has_image_head": True,
                 "has_spatial_head": True,
             }
@@ -96,7 +115,10 @@ class TestOmniFDModel:
         assert isinstance(loaded_raw, OmniFD)
         assert raw_cfg.model.name == "omnifd"
 
-    def test_omnifd_missing_checkpoint_raises(self):
+    def test_omnifd_strict_zero_random_init_guards(self):
+        with pytest.raises(ValueError, match="allow_random_init=True"):
+            _ = OmniFD(variant="swin-t", pretrained=False)
+
         with pytest.raises(RuntimeError, match="Unable to resolve OmniFD checkpoint"):
             _ = OmniFD(
                 variant="swin-t",
@@ -106,14 +128,31 @@ class TestOmniFDModel:
             )
 
     @pytest.mark.timeout(180)
-    def test_omnifd_load_cached_gdrive_checkpoint_if_present(self):
-        cand = "/tmp/omnifd_weights/omnifd_swin-t_50k_forgerynet.pth"
-        if not os.path.isfile(cand):
-            pytest.skip("Pretrained OmniFD Swin-T checkpoint not cached locally.")
-        model = OmniFD(variant="swin-t", checkpoint_path=cand, pretrained=True)
-        model.eval()
+    def test_omnifd_load_cached_gdrive_checkpoints_if_present(self):
+        cases = [
+            ("/tmp/omnifd_weights/omnifd_swin-t_50k_forgerynet.pth", "swin-t", True, True),
+            ("/tmp/omnifd_weights/omnifd_swin-s_20k_ff_spatial.pth", "swin-s", False, True),
+            ("/tmp/omnifd_weights/omnifd_swin-s_20k_ff_image.pth", "swin-s", True, False),
+        ]
+        found = [c for c in cases if os.path.isfile(c[0])]
+        if not found:
+            pytest.skip("Pretrained OmniFD checkpoints not cached locally.")
         x = torch.randn(1, 3, 224, 224)
-        with torch.no_grad():
-            out = model(x, return_dict=True)
-        assert out["mask_logits"].shape == (1, 1, 224, 224)
-        assert out["class_logits"].shape == (1, 2)
+        for cand, variant, has_img, has_spa in found:
+            model = OmniFD(
+                variant=variant,
+                checkpoint_path=cand,
+                pretrained=True,
+                allow_random_init=False,
+                has_image_head=has_img,
+                has_spatial_head=has_spa,
+            )
+            model.eval()
+            with torch.no_grad():
+                out = model(x, return_dict=True)
+            assert out["mask_logits"].shape == (1, 1, 224, 224)
+            if has_img:
+                assert out["class_logits"].shape == (1, 2)
+                assert out["pred_label_probs"].shape == (1, 2)
+            else:
+                assert "class_logits" not in out

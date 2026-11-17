@@ -58,7 +58,8 @@ Omnivore trunk initializations (used when `pretrained=False, backbone_pretrained
   - Added `plot_detailed_inference_pdf()` in `sid_unet/utils/plotting.py` and wired it into `sid-illu` (`sid_unet/illustration.py`, `--pdf` enabled by default) as well as `scripts/infer_msccnet_omnifd_pdf.py`.
   - Produces a multi-page PDF:
     - **Page 1**: Model & pretrained weights inventory table, aggregate quantitative metrics table, and comparative bar chart.
-    - **Pages 2+**: **8 columns** per sample-model row:
+    - **Page 2 (when domain splits are present)**: Per-domain breakdown across `model1_in_domain`, `model2_in_domain`, and `out_of_domain` (including `Tampered F1` and `Image Cls ACC`).
+    - **Pages 3+**: **8 columns** per sample-model row:
       1. Input Image (with resolution & GT class)
       2. Ground Truth Mask (with tampered %)
       3. Continuous Probability Heatmap `[0, 1]` (`min / mean / max`)
@@ -70,19 +71,60 @@ Omnivore trunk initializations (used when `pretrained=False, backbone_pretrained
 
 ---
 
-## 4. Usage Examples
+## 4. Strict Zero-Random-Init Policy & Domain Evaluation Dataset
+
+### 4.1 Zero-Random-Init Guarantees
+
+- Both `MSCCNet` (`sid_unet/models/msccnet.py`) and `OmniFD` (`sid_unet/models/omnifd.py`) enforce `allow_random_init: bool = False` by default (matching `FOCAL` and `PIM`):
+  - Calling `MSCCNet(pretrained=False)` or `OmniFD(pretrained=False)` without `allow_random_init=True` raises `ValueError`.
+  - Calling `MSCCNet(pretrained=True)` without an explicit `checkpoint_path` or `hf_repo` raises `RuntimeError` explaining that `miaoct/MSCCNet` only published ImageNet ResNet backbones and never released task-trained `epoch_best.pth` weights.
+  - `OmniFD._load_pretrained()` verifies that every non-buffer parameter (only ignoring `relative_position_index`) is loaded from the official Google Drive checkpoint before running inference.
+- Training configs `configs/experiments/msccnet/*.yaml` set `allow_random_init: true` explicitly **only** for training MSCCNet from an ImageNet-pretrained `resnet50_v1c` / `resnet101_v1c` backbone.
+
+### 4.2 Hugging Face Domain Dataset (`KhangTruong/face-forgery-domain-eval`)
+
+Created via `scripts/build_face_domain_dataset.py` and published at <https://huggingface.co/datasets/KhangTruong/face-forgery-domain-eval> (`36` human-face images with binary manipulation masks across `3` balanced splits):
+
+| Split | Samples | Real / Tampered | Source | Domain Alignment |
+|---|---|---|---|---|
+| `model1_in_domain` | 12 | 4 real / 8 fake | FaceForensics++ C23 (`test.json` pairs `0..34`) | **Model 1 (MSCCNet)** In-Domain (+ **OmniFD** FF++ aligned) |
+| `model2_in_domain` | 12 | 4 real / 8 fake | FaceForensics++ C23 (`test.json` pairs `35..69`, disjoint) | **Model 2 (OmniFD** `ff_image` / `ff_spatial`) In-Domain |
+| `out_of_domain` | 12 | 8 real / 4 fake | `nielsr/CelebA-faces` (6) + `Celeb-DF-v2` (6) | **Out-of-Domain** human faces for both models |
+
+*(Upstream note: ForgeryNet `public_test_images.tar` on Google Drive currently hits download quota limits and FMLD SharePoint returns HTTP 404, so `model2_in_domain` uses disjoint FaceForensics++ C23 test pairs matching OmniFD's official `ff_image` and `ff_spatial` checkpoints.)*
+
+### 4.3 Zero-Random-Init Domain Inference Results (36 Human Faces)
+
+Recorded in `docs/msccnet_omnifd_domain_metrics.json` and visualized in `docs/msccnet_omnifd_inference_report.pdf`:
+
+| Model Checkpoint | Input Size | `model1_in_domain` (FF++) | `model2_in_domain` (FF++) | `out_of_domain` (CelebA/Celeb-DF) | Overall (N=36) |
+|---|---|---|---|---|---|
+| **OmniFD (Swin-S FF++-Spatial-20k)** | `299x299` | Tampered IoU **0.945** / F1 **0.971** | Tampered IoU **0.962** / F1 **0.981** | Tampered IoU **0.285** / F1 **0.435** | Tampered IoU **0.820** / F1 **0.868** |
+| **OmniFD (Swin-S FF++-Image-20k)** | `224x224` | Img Cls ACC **1.000** | Img Cls ACC **0.917** | Img Cls ACC **0.833** | Img Cls ACC **0.917** |
+| **OmniFD (Swin-T ForgeryNet-50k)** | `224x224` | Img Cls ACC **0.583** | Img Cls ACC **0.667** | Img Cls ACC **0.833** | Img Cls ACC **0.694** |
+| **OmniFD (Swin-S ForgeryNet-50k)** | `224x224` | Img Cls ACC **0.500** | Img Cls ACC **0.583** | Img Cls ACC **0.833** | Img Cls ACC **0.639** |
+| **OmniFD (Swin-S FMLD-Spatial-20k)** | `299x299` | Pixel Acc **0.809** (cross-domain) | Pixel Acc **0.796** (cross-domain) | Pixel Acc **0.900** (cross-domain) | Pixel Acc **0.835** |
+| **MSCCNet (ResNet-50 / Model 1)** | `512x512` | *Blocked* (`RuntimeError`: zero-random-init; no upstream `epoch_best.pth` released; pass `--msccnet-ckpt` when trained) | — | — | — |
+
+---
+
+## 5. Usage Examples
 
 ```bash
-# Train MSCCNet (ResNet-50)
+# Train MSCCNet (ResNet-50; config sets allow_random_init=true for ImageNet backbone training)
 sid-train --config configs/experiments/msccnet/default.yaml
 
 # Train / Evaluate OmniFD (Swin-T ForgeryNet 50k)
 sid-train --config configs/experiments/omnifd/default.yaml
 
-# Run inference across OmniFD & MSCCNet and produce detailed 8-column PDF
+# Build & publish domain-aligned human-face dataset on Hugging Face Hub
+python scripts/build_face_domain_dataset.py --repo-id KhangTruong/face-forgery-domain-eval
+
+# Run strict zero-random-init inference on Hugging Face domain splits and produce 8-column PDF
 python scripts/infer_msccnet_omnifd_pdf.py \
-    --output-pdf docs/msccnet_omnifd_inference_report.pdf \
-    --num-samples-per-dataset 2
+    --dataset-repo KhangTruong/face-forgery-domain-eval \
+    --local-dataset-dir "" \
+    --output-pdf docs/msccnet_omnifd_inference_report.pdf
 
 # Run qualitative multi-model illustration + 8-column PDF via sid-illu
 sid-illu --model-ckpts path/to/ckpt.pt --dataset-configs configs/cross-eval/casia_v2.0.yaml --pdf

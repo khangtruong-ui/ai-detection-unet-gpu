@@ -15,6 +15,7 @@ class TestMSCCNetModel:
             backbone_depth=50,
             pretrained=False,
             backbone_pretrained=False,
+            allow_random_init=True,
             num_classes=2,
             spectral_k=2,
         )
@@ -36,14 +37,28 @@ class TestMSCCNetModel:
         assert not torch.isnan(out["mask_logits"]).any()
 
     def test_msccnet_tuple_and_mask_only_forward(self):
-        model_aux = MSCCNet(backbone_depth=18, pretrained=False, aux_classifier=True, feats_channels=256, out_channels=256)
+        model_aux = MSCCNet(
+            backbone_depth=18,
+            pretrained=False,
+            allow_random_init=True,
+            aux_classifier=True,
+            feats_channels=256,
+            out_channels=256,
+        )
         x = torch.randn(1, 3, 128, 128)
         with torch.no_grad():
             mask_logits, cls_logits = model_aux(x, return_dict=False)
         assert mask_logits.shape == (1, 1, 128, 128)
         assert cls_logits.shape == (1, 2)
 
-        model_no_aux = MSCCNet(backbone_depth=18, pretrained=False, aux_classifier=False, feats_channels=256, out_channels=256)
+        model_no_aux = MSCCNet(
+            backbone_depth=18,
+            pretrained=False,
+            allow_random_init=True,
+            aux_classifier=False,
+            feats_channels=256,
+            out_channels=256,
+        )
         with torch.no_grad():
             only_mask = model_no_aux(x, return_dict=False)
         assert torch.is_tensor(only_mask)
@@ -54,7 +69,13 @@ class TestMSCCNetModel:
         assert torch.all((bin_mask == 0.0) | (bin_mask == 1.0))
 
     def test_msccnet_backward_pass(self):
-        model = MSCCNet(backbone_depth=18, pretrained=False, feats_channels=256, out_channels=256)
+        model = MSCCNet(
+            backbone_depth=18,
+            pretrained=False,
+            allow_random_init=True,
+            feats_channels=256,
+            out_channels=256,
+        )
         model.train()
         x = torch.randn(2, 3, 128, 128, requires_grad=True)
         target_mask = torch.randint(0, 2, (2, 1, 128, 128), dtype=torch.float32)
@@ -77,6 +98,7 @@ class TestMSCCNetModel:
                 "backbone_depth": 50,
                 "pretrained": False,
                 "backbone_pretrained": False,
+                "allow_random_init": True,
                 "spectral_k": 2,
                 "num_classes": 2,
             }
@@ -97,6 +119,12 @@ class TestMSCCNetModel:
         assert isinstance(loaded_raw, MSCCNet)
         assert raw_cfg.model.name == "msccnet"
 
-    def test_msccnet_missing_checkpoint_raises(self):
+    def test_msccnet_strict_zero_random_init_guards(self):
+        with pytest.raises(ValueError, match="allow_random_init=True"):
+            _ = MSCCNet(backbone_depth=18, pretrained=False)
+
+        with pytest.raises(RuntimeError, match="strict zero-random-init policy"):
+            _ = MSCCNet(backbone_depth=50, pretrained=True)
+
         with pytest.raises(FileNotFoundError):
             _ = MSCCNet(checkpoint_path="/nonexistent/msccnet_best.pth")

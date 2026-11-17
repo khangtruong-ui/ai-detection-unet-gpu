@@ -871,10 +871,53 @@ def plot_detailed_inference_pdf(
             "Recall": mean_rec,
         }
 
+    # Optional per-domain breakdown (when samples include 'domain_split')
+    domain_order: List[str] = []
+    for s in samples_data:
+        ds_sp = s.get("domain_split")
+        if ds_sp and ds_sp not in domain_order:
+            domain_order.append(ds_sp)
+    domain_rows: List[List[str]] = []
+    if domain_order:
+        for dom in domain_order:
+            dom_samples = [s for s in samples_data if s.get("domain_split") == dom]
+            for m_name in model_names:
+                d_entries = [(s, s["models"][m_name]) for s in dom_samples if m_name in s.get("models", {})]
+                if not d_entries:
+                    continue
+                d_ious = [float(e.get("iou", 0.0)) for _, e in d_entries]
+                d_dices = [float(e.get("dice", 0.0)) for _, e in d_entries]
+                d_paccs = [float(e.get("pixel_acc", 0.0)) for _, e in d_entries]
+                fake_dices = [
+                    float(e.get("dice", 0.0))
+                    for s, e in d_entries
+                    if float((_to_mask_2d(s["gt_mask"]) > 0.5).mean()) > 0.0 or int(s.get("label", 0)) > 0
+                ]
+                fake_f1_str = f"{np.mean(fake_dices):.4f}" if fake_dices else "N/A"
+                cls_hits = []
+                for s, e in d_entries:
+                    cp = e.get("cls_probs")
+                    if cp is not None and len(cp) >= 2:
+                        pred_fake = int(float(cp[1]) >= 0.5)
+                        gt_fake = int(float((_to_mask_2d(s["gt_mask"]) > 0.5).mean()) > 0.0 or int(s.get("label", 0)) > 0)
+                        cls_hits.append(float(pred_fake == gt_fake))
+                cls_acc_str = f"{np.mean(cls_hits):.3f}" if cls_hits else "N/A"
+                domain_rows.append([
+                    str(dom),
+                    m_name,
+                    str(len(d_entries)),
+                    f"{np.mean(d_ious):.4f}",
+                    f"{np.mean(d_dices):.4f}",
+                    fake_f1_str,
+                    f"{np.mean(d_paccs):.4f}",
+                    cls_acc_str,
+                ])
+
     with PdfPages(output_path) as pdf:
         # ------------------------------------------------------------------
         # Page 1: Executive Summary, Weights/Architecture & Aggregate Metrics
         # ------------------------------------------------------------------
+        has_domains = bool(domain_rows)
         fig_sum = plt.figure(figsize=(18, 11), dpi=dpi)
         gs = fig_sum.add_gridspec(3, 1, height_ratios=[1.15, 0.95, 1.4], hspace=0.35)
         fig_sum.suptitle(title, fontsize=15, fontweight="bold", y=0.98)
@@ -967,6 +1010,35 @@ def plot_detailed_inference_pdf(
         plt.close(fig_sum)
 
         # ------------------------------------------------------------------
+        # Optional Page 2: Domain-Aligned Quantitative Breakdown
+        # ------------------------------------------------------------------
+        if has_domains:
+            fig_dom = plt.figure(figsize=(18, max(7.0, 2.2 + len(domain_rows) * 0.42)), dpi=dpi)
+            ax_dom = fig_dom.add_subplot(111)
+            ax_dom.axis("off")
+            ax_dom.set_title(
+                f"{title}\n4. Domain Breakdown (Model 1 In-Domain vs Model 2 In-Domain vs Out-of-Domain Faces)",
+                fontsize=12.5,
+                fontweight="bold",
+                loc="left",
+                pad=14,
+            )
+            dom_headers = ["Domain Split", "Model", "N", "Mean IoU", "Dice / F1", "Tampered F1", "Pixel Acc", "Image Cls ACC"]
+            tbl_dom = ax_dom.table(cellText=domain_rows, colLabels=dom_headers, loc="center", cellLoc="center")
+            tbl_dom.auto_set_font_size(False)
+            tbl_dom.set_fontsize(8.5)
+            tbl_dom.auto_set_column_width(col=list(range(len(dom_headers))))
+            tbl_dom.scale(1.0, 1.55)
+            for (r, c), cell in tbl_dom.get_celld().items():
+                if r == 0:
+                    cell.set_facecolor("#274e13")
+                    cell.set_text_props(color="white", fontweight="bold")
+                elif r % 2 == 1:
+                    cell.set_facecolor("#f3f8f1")
+            pdf.savefig(fig_dom, dpi=dpi, bbox_inches="tight")
+            plt.close(fig_dom)
+
+        # ------------------------------------------------------------------
         # Subsequent Pages: 8-Column Detailed Visual & Quantitative Rows
         # ------------------------------------------------------------------
         col_titles = [
@@ -990,7 +1062,7 @@ def plot_detailed_inference_pdf(
             if n_rows == 1:
                 axes = np.expand_dims(axes, axis=0)
 
-            page_num = 2 + (start_idx // rows_per_page)
+            page_num = (3 if has_domains else 2) + (start_idx // rows_per_page)
             fig.suptitle(f"{title} — Detailed Visual Breakdown (Page {page_num})", fontsize=13, fontweight="bold", y=0.995)
 
             for r_idx, (s, m_name) in enumerate(chunk):

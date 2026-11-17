@@ -331,6 +331,7 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "msccnet"
                 merged["model"]["pretrained"] = False
                 merged["model"]["backbone_pretrained"] = False
+                merged["model"]["allow_random_init"] = True
                 merged["model"]["aux_classifier"] = any(k.startswith(("classifer.", "module.classifer.")) for k in state_dict.keys())
                 if any("backbone_net.layer3.22." in k for k in state_dict.keys()):
                     merged["model"].setdefault("backbone_depth", 101)
@@ -347,6 +348,7 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "omnifd"
                 merged["model"]["pretrained"] = False
                 merged["model"]["backbone_pretrained"] = False
+                merged["model"]["allow_random_init"] = True
                 if any("backbone.trunk.layers.2.blocks.6." in k for k in state_dict.keys()):
                     merged["model"].setdefault("variant", "swin-s")
                 else:
@@ -1063,6 +1065,8 @@ def build_model(config: Any) -> nn.Module:
             pretrained=bool(model_cfg.get("pretrained", True)),
             backbone_pretrained=model_cfg.get("backbone_pretrained", None),
             checkpoint_path=str(ckpt_path) if ckpt_path else None,
+            hf_repo=model_cfg.get("hf_repo", None),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
             num_classes=int(model_cfg.get("num_classes", 2)),
             feats_channels=int(model_cfg.get("feats_channels", 512)),
             out_channels=int(model_cfg.get("out_channels", 512)),
@@ -1093,6 +1097,7 @@ def build_model(config: Any) -> nn.Module:
             checkpoint_path=str(ckpt_path) if ckpt_path else None,
             pretrained=bool(model_cfg.get("pretrained", True)),
             backbone_pretrained=bool(model_cfg.get("backbone_pretrained", False)),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
             hf_repo=model_cfg.get("hf_repo", None),
             cache_dir=model_cfg.get("cache_dir", None),
             latent_channels=int(model_cfg.get("latent_channels", 512)),

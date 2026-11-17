@@ -1,0 +1,235 @@
+{
+  "dataset_repo": "KhangTruong/face-forgery-domain-eval",
+  "total_samples": 36,
+  "msccnet_status": "blocked_strict_zero_random_init",
+  "msccnet_blocked_reason": "MSCCNet strict zero-random-init policy: official upstream miaoct/MSCCNet only provides ImageNet ResNet backbones and did not release task-trained MSCCNet weights (epoch_best.pth). Provide a full MSCCNet checkpoint via `checkpoint_path` or `hf_repo`, or pass `allow_random_init=True` explicitly when training from an ImageNet-pretrained backbone.",
+  "splits": {
+    "model1_in_domain": {
+      "n_samples": 12,
+      "models": {
+        "OmniFD (Swin-S FF++-Spatial-20k)": {
+          "mean_iou": 0.6300705592504555,
+          "mean_dice_f1": 0.647586171837098,
+          "mean_pixel_acc": 0.8918113708496094,
+          "tampered_only_iou": 0.9451058388756832,
+          "tampered_only_f1": 0.9713792577556468,
+          "image_cls_acc": null,
+          "mean_p_fake_on_real": null,
+          "mean_p_fake_on_tampered": null,
+          "mean_latency_ms": 109.1383923333827
+        },
+        "OmniFD (Swin-S FF++-Image-20k)": {
+          "mean_iou": 0.3333333333333333,
+          "mean_dice_f1": 0.3333333333333333,
+          "mean_pixel_acc": 0.831139882405599,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 1.0,
+          "mean_p_fake_on_real": 1.591783347976161e-05,
+          "mean_p_fake_on_tampered": 0.9984983056783676,
+          "mean_latency_ms": 51.53013650002928
+        },
+        "OmniFD (Swin-S FMLD-Spatial-20k)": {
+          "mean_iou": 0.25686710216320413,
+          "mean_dice_f1": 0.2626885975760574,
+          "mean_pixel_acc": 0.8094189961751302,
+          "tampered_only_iou": 0.010300653244806168,
+          "tampered_only_f1": 0.019032896364086074,
+          "image_cls_acc": null,
+          "mean_p_fake_on_real": null,
+          "mean_p_fake_on_tampered": null,
+          "mean_latency_ms": 56.7368648333589
+        },
+        "OmniFD (Swin-T ForgeryNet-50k)": {
+          "mean_iou": 0.3333333333333333,
+          "mean_dice_f1": 0.3333333333333333,
+          "mean_pixel_acc": 0.831139882405599,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.5833333333333334,
+          "mean_p_fake_on_real": 0.01525137375574559,
+          "mean_p_fake_on_tampered": 0.3183616489113774,
+          "mean_latency_ms": 33.92406058340688
+        },
+        "OmniFD (Swin-S ForgeryNet-50k)": {
+          "mean_iou": 0.3333333333333333,
+          "mean_dice_f1": 0.3333333333333333,
+          "mean_pixel_acc": 0.831139882405599,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.5,
+          "mean_p_fake_on_real": 0.00540905212983489,
+          "mean_p_fake_on_tampered": 0.2560944337164983,
+          "mean_latency_ms": 55.30038116664097
+        }
+      }
+    },
+    "model2_in_domain": {
+      "n_samples": 12,
+      "models": {
+        "OmniFD (Swin-S FF++-Spatial-20k)": {
+          "mean_iou": 0.6416122494045342,
+          "mean_dice_f1": 0.6538722886667593,
+          "mean_pixel_acc": 0.9106915791829427,
+          "tampered_only_iou": 0.9624183741068013,
+          "tampered_only_f1": 0.980808433000139,
+          "image_cls_acc": null,
+          "mean_p_fake_on_real": null,
+          "mean_p_fake_on_tampered": null,
+          "mean_latency_ms": 46.15758283345409
+        },
+        "OmniFD (Swin-S FF++-Image-20k)": {
+          "mean_iou": 0.3333333333333333,
+          "mean_dice_f1": 0.3333333333333333,
+          "mean_pixel_acc": 0.8245112101236979,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.9166666666666666,
+          "mean_p_fake_on_real": 0.3812933444053215,
+          "mean_p_fake_on_tampered": 0.9998157471418381,
+          "mean_latency_ms": 39.47446783339122
+        },
+        "OmniFD (Swin-S FMLD-Spatial-20k)": {
+          "mean_iou": 0.3379009856124935,
+          "mean_dice_f1": 0.342175109269256,
+          "mean_pixel_acc": 0.7963816324869791,
+          "tampered_only_iou": 0.006851478418740308,
+          "tampered_only_f1": 0.013262663903883844,
+          "image_cls_acc": null,
+          "mean_p_fake_on_real": null,
+          "mean_p_fake_on_tampered": null,
+          "mean_latency_ms": 44.99633183316595
+        },
+        "OmniFD (Swin-T ForgeryNet-50k)": {
+          "mean_iou": 0.3333333333333333,
+          "mean_dice_f1": 0.3333333333333333,
+          "mean_pixel_acc": 0.8245112101236979,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.6666666666666666,
+          "mean_p_fake_on_real": 0.03328895359300077,
+          "mean_p_fake_on_tampered": 0.5077751021599397,
+          "mean_latency_ms": 25.59686883334204
+        },
+        "OmniFD (Swin-S ForgeryNet-50k)": {
+          "mean_iou": 0.3333333333333333,
+          "mean_dice_f1": 0.3333333333333333,
+          "mean_pixel_acc": 0.8245112101236979,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.5833333333333334,
+          "mean_p_fake_on_real": 0.036229698394890875,
+          "mean_p_fake_on_tampered": 0.48591690976172686,
+          "mean_latency_ms": 40.92710383345851
+        }
+      }
+    },
+    "out_of_domain": {
+      "n_samples": 12,
+      "models": {
+        "OmniFD (Swin-S FF++-Spatial-20k)": {
+          "mean_iou": 0.09494145241560083,
+          "mean_dice_f1": 0.14497970505490532,
+          "mean_pixel_acc": 0.765655517578125,
+          "tampered_only_iou": 0.2848243572468025,
+          "tampered_only_f1": 0.43493911516471595,
+          "image_cls_acc": null,
+          "mean_p_fake_on_real": null,
+          "mean_p_fake_on_tampered": null,
+          "mean_latency_ms": 38.907568333267285
+        },
+        "OmniFD (Swin-S FF++-Image-20k)": {
+          "mean_iou": 0.6666666666666666,
+          "mean_dice_f1": 0.6666666666666666,
+          "mean_pixel_acc": 0.915411631266276,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.8333333333333334,
+          "mean_p_fake_on_real": 0.051494035998302934,
+          "mean_p_fake_on_tampered": 0.5303081556667166,
+          "mean_latency_ms": 35.40336141660797
+        },
+        "OmniFD (Swin-S FMLD-Spatial-20k)": {
+          "mean_iou": 0.5896824450538533,
+          "mean_dice_f1": 0.5951325799542063,
+          "mean_pixel_acc": 0.9000027974446615,
+          "tampered_only_iou": 0.019047335161559556,
+          "tampered_only_f1": 0.0353977398626191,
+          "image_cls_acc": null,
+          "mean_p_fake_on_real": null,
+          "mean_p_fake_on_tampered": null,
+          "mean_latency_ms": 39.13687733317298
+        },
+        "OmniFD (Swin-T ForgeryNet-50k)": {
+          "mean_iou": 0.6666666666666666,
+          "mean_dice_f1": 0.6666666666666666,
+          "mean_pixel_acc": 0.915411631266276,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.8333333333333334,
+          "mean_p_fake_on_real": 0.15388242877088487,
+          "mean_p_fake_on_tampered": 0.4995114803314209,
+          "mean_latency_ms": 22.224517499883707
+        },
+        "OmniFD (Swin-S ForgeryNet-50k)": {
+          "mean_iou": 0.6666666666666666,
+          "mean_dice_f1": 0.6666666666666666,
+          "mean_pixel_acc": 0.915411631266276,
+          "tampered_only_iou": 0.0,
+          "tampered_only_f1": 0.0,
+          "image_cls_acc": 0.8333333333333334,
+          "mean_p_fake_on_real": 0.11249980621505529,
+          "mean_p_fake_on_tampered": 0.5813026912510395,
+          "mean_latency_ms": 36.58034725003745
+        }
+      }
+    }
+  },
+  "overall": {
+    "OmniFD (Swin-S FF++-Spatial-20k)": {
+      "mean_iou": 0.4555414203568635,
+      "mean_dice_f1": 0.4821460551862542,
+      "mean_pixel_acc": 0.8560528225368924,
+      "tampered_only_iou": 0.8199745566423543,
+      "tampered_only_f1": 0.8678628993352575,
+      "image_cls_acc": null,
+      "mean_latency_ms": 64.73451450003469
+    },
+    "OmniFD (Swin-S FF++-Image-20k)": {
+      "mean_iou": 0.4444444444444444,
+      "mean_dice_f1": 0.4444444444444444,
+      "mean_pixel_acc": 0.8570209079318576,
+      "tampered_only_iou": 0.0,
+      "tampered_only_f1": 0.0,
+      "image_cls_acc": 0.9166666666666666,
+      "mean_latency_ms": 42.13598858334282
+    },
+    "OmniFD (Swin-S FMLD-Spatial-20k)": {
+      "mean_iou": 0.394816844276517,
+      "mean_dice_f1": 0.39999876226650655,
+      "mean_pixel_acc": 0.8352678087022569,
+      "tampered_only_iou": 0.010670319697730503,
+      "tampered_only_f1": 0.019997772079711786,
+      "image_cls_acc": null,
+      "mean_latency_ms": 46.95669133323261
+    },
+    "OmniFD (Swin-T ForgeryNet-50k)": {
+      "mean_iou": 0.4444444444444444,
+      "mean_dice_f1": 0.4444444444444444,
+      "mean_pixel_acc": 0.8570209079318576,
+      "tampered_only_iou": 0.0,
+      "tampered_only_f1": 0.0,
+      "image_cls_acc": 0.6944444444444444,
+      "mean_latency_ms": 27.248482305544208
+    },
+    "OmniFD (Swin-S ForgeryNet-50k)": {
+      "mean_iou": 0.4444444444444444,
+      "mean_dice_f1": 0.4444444444444444,
+      "mean_pixel_acc": 0.8570209079318576,
+      "tampered_only_iou": 0.0,
+      "tampered_only_f1": 0.0,
+      "image_cls_acc": 0.6388888888888888,
+      "mean_latency_ms": 44.269277416712306
+    }
+  }
+}

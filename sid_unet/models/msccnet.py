@@ -437,6 +437,8 @@ class MSCCNet(nn.Module):
         pretrained: bool = True,
         backbone_pretrained: Optional[bool] = None,
         checkpoint_path: Optional[str] = None,
+        hf_repo: Optional[str] = None,
+        allow_random_init: bool = False,
         num_classes: int = 2,
         feats_channels: int = 512,
         out_channels: int = 512,
@@ -511,12 +513,40 @@ class MSCCNet(nn.Module):
             nn.Conv2d(out_channels, self.num_classes, kernel_size=1, stride=1, padding=0),
         )
 
+        if not pretrained and not allow_random_init:
+            raise ValueError(
+                "MSCCNet requires pretrained=True (or explicit allow_random_init=True for training from scratch). "
+                "Random weight initialization is strictly disabled."
+            )
+
         if checkpoint_path:
             self.load_msccnet_checkpoint(checkpoint_path)
+        elif hf_repo:
+            self._load_hf_checkpoint(hf_repo)
+        elif pretrained and not allow_random_init:
+            raise RuntimeError(
+                "MSCCNet strict zero-random-init policy: official upstream miaoct/MSCCNet only provides "
+                "ImageNet ResNet backbones and did not release task-trained MSCCNet weights (epoch_best.pth). "
+                "Provide a full MSCCNet checkpoint via `checkpoint_path` or `hf_repo`, or pass "
+                "`allow_random_init=True` explicitly when training from an ImageNet-pretrained backbone."
+            )
         else:
             load_bb = pretrained if backbone_pretrained is None else bool(backbone_pretrained)
             if load_bb:
                 self._load_imagenet_backbone()
+
+    def _load_hf_checkpoint(self, hf_repo: str) -> None:
+        from huggingface_hub import hf_hub_download
+        last_err = None
+        for fname in ["checkpoints/checkpoint_best.pt", "checkpoint_best.pt", "epoch_best.pth", "checkpoints/epoch_best.pth"]:
+            try:
+                p = hf_hub_download(repo_id=hf_repo, filename=fname)
+                if p and os.path.isfile(p):
+                    self.load_msccnet_checkpoint(p)
+                    return
+            except Exception as exc:
+                last_err = exc
+        raise RuntimeError(f"Failed to download MSCCNet checkpoint from HF repo '{hf_repo}': {last_err}") from last_err
 
     @property
     def classifier(self) -> MSCCClassifier:
