@@ -85,6 +85,26 @@ from sid_unet.models.pim import (
     PIM,
     DEFAULT_PIM_HF_REPO,
 )
+from sid_unet.models.msccnet import (
+    MSCCNet,
+    MSCCResNet,
+    MSCCModule,
+    MSCCClassifier,
+    MultiSpectralDCTLayer,
+    MSCCGCN,
+    MSCC_BACKBONE_URLS,
+)
+from sid_unet.models.omnifd import (
+    OmniFD,
+    SwinTransformerOmni,
+    InteractionNeck,
+    OmniFDImageClsHead,
+    OmniFDSpatialHead,
+    OMNIFD_GDRIVE_FOLDER_URL,
+    OMNIFD_ANNOTATIONS_GDRIVE_URL,
+    OMNIFD_GDRIVE_CHECKPOINTS,
+    OMNIVORE_TRUNK_URLS,
+)
 
 __all__ = [
     "UNet",
@@ -159,6 +179,22 @@ __all__ = [
     "DEFAULT_FOCAL_HF_REPO",
     "PIM",
     "DEFAULT_PIM_HF_REPO",
+    "MSCCNet",
+    "MSCCResNet",
+    "MSCCModule",
+    "MSCCClassifier",
+    "MultiSpectralDCTLayer",
+    "MSCCGCN",
+    "MSCC_BACKBONE_URLS",
+    "OmniFD",
+    "SwinTransformerOmni",
+    "InteractionNeck",
+    "OmniFDImageClsHead",
+    "OmniFDSpatialHead",
+    "OMNIFD_GDRIVE_FOLDER_URL",
+    "OMNIFD_ANNOTATIONS_GDRIVE_URL",
+    "OMNIFD_GDRIVE_CHECKPOINTS",
+    "OMNIVORE_TRUNK_URLS",
 ]
 
 

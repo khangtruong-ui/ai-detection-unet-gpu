@@ -94,6 +94,16 @@ def extract_key_hyperparameters(config: Optional[Dict[str, Any]]) -> Dict[str, A
     if "efficientnet" in str(model_cfg.get("name", "")).lower() or "efficientnet" in str(model_cfg.get("backbone", "")).lower():
         mode_str = "Sacrifice of Pixel (linear + zoom)" if model_cfg.get("sacrifice_of_pixel", False) else "UNet Multi-Scale Decoder"
         model_repr = f"EfficientNet ({model_cfg.get('backbone', 'efficientnet_b0')}, mode={mode_str})"
+    elif "msccnet" in str(model_cfg.get("name", "")).lower():
+        model_repr = (
+            f"MSCCNet (ResNet-{model_cfg.get('backbone_depth', 50)}, "
+            f"outstride={model_cfg.get('backbone_outstride', 8)}, spectral_k={model_cfg.get('spectral_k', 2)})"
+        )
+    elif "omnifd" in str(model_cfg.get("name", "")).lower():
+        model_repr = (
+            f"OmniFD (variant={model_cfg.get('variant', 'swin-t')}, "
+            f"ckpt={model_cfg.get('checkpoint_name', 'custom')})"
+        )
     else:
         model_repr = f"{model_cfg.get('name', 'unet')} (features={model_cfg.get('features')}, bilinear={model_cfg.get('bilinear', True)})"
 

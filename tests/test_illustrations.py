@@ -159,5 +159,68 @@ def test_sid_illu_pipeline(tmp_path, monkeypatch):
     for cfg_k, d_res in results["dataset_results"].items():
         assert os.path.exists(d_res["figure_path"])
         assert os.path.getsize(d_res["figure_path"]) > 0
+        assert os.path.exists(d_res["pdf_path"])
+        assert os.path.getsize(d_res["pdf_path"]) > 0
         assert len(d_res["samples"]) == 2
+
+
+def test_plot_detailed_inference_pdf(tmp_path):
+    from sid_unet.utils.plotting import plot_detailed_inference_pdf
+
+    samples_data = []
+    for i in range(4):
+        gt = np.zeros((64, 64), dtype=np.float32)
+        gt[16:40, 16:40] = 1.0
+        prob = np.clip(gt * 0.8 + 0.1, 0.0, 1.0)
+        pred = (prob >= 0.5).astype(np.float32)
+        samples_data.append({
+            "image": np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8),
+            "gt_mask": gt,
+            "label": 2,
+            "image_id": f"sample_{i}",
+            "dataset": "MockDataset",
+            "models": {
+                "OmniFD": {
+                    "pred_mask": pred,
+                    "prob_map": prob,
+                    "aux_map": pred,
+                    "aux_label": "Post-Processed Mask",
+                    "aux_cmap": "gray",
+                    "cls_probs": [0.15, 0.85],
+                    "inference_ms": 12.3,
+                    "iou": 0.90,
+                    "dice": 0.95,
+                    "pixel_acc": 0.98,
+                    "precision": 0.94,
+                    "recall": 0.96,
+                },
+                "MSCCNet": {
+                    "pred_mask": pred,
+                    "prob_map": prob,
+                    "aux_map": prob,
+                    "aux_label": "MSCC Spectral Map",
+                    "aux_cmap": "viridis",
+                    "cls_probs": [0.40, 0.60],
+                    "inference_ms": 18.7,
+                    "iou": 0.85,
+                    "dice": 0.92,
+                    "pixel_acc": 0.96,
+                    "precision": 0.91,
+                    "recall": 0.93,
+                },
+            },
+        })
+
+    out_pdf = str(tmp_path / "detailed_8col.pdf")
+    res = plot_detailed_inference_pdf(
+        samples_data=samples_data,
+        model_names=["OmniFD", "MSCCNet"],
+        output_path=out_pdf,
+        rows_per_page=3,
+    )
+    assert os.path.exists(res)
+    assert os.path.getsize(res) > 1000
+    with open(res, "rb") as f:
+        header = f.read(5)
+    assert header == b"%PDF-"
 

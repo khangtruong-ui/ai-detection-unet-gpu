@@ -33,6 +33,8 @@ Supports large-scale streaming and local datasets including standard 2-column im
   - [15. FOCAL: Forensic Contrastive Clustering (HRNet & SAM ViT Backbones)](#15-focal-forensic-contrastive-clustering-hrnet--sam-vit-backbones)
   - [16. PIM: Plug-and-Play Image Inpainting Localization Network](#16-pim-plug-and-play-image-inpainting-localization-network)
   - [17. Noise-RAG: Forensic Vector DB Retrieval & FlashAttention Optimization](#17-noise-rag-forensic-vector-db-retrieval--flashattention-optimization)
+  - [18. MSCCNet: Multi-spectral Class Center Network](#18-msccnet-multi-spectral-class-center-network)
+  - [19. OmniFD: A Unified Model for Versatile Face Forgery Detection](#19-omnifd-a-unified-model-for-versatile-face-forgery-detection)
 - [Mechanisms & Architectural Principles](#mechanisms--architectural-principles)
   - [1. Problem Formulation & Task Definition](#1-problem-formulation--task-definition)
   - [2. Multi-Scale Feature Representation & Skip Connections](#2-multi-scale-feature-representation--skip-connections)
@@ -1538,6 +1540,32 @@ sid-cross-eval \
   - PyTorch `nn.MultiheadAttention` layers configured with `need_weights=False`, eliminating materialized $[2, 8, 4096, 4096]$ attention weight matrices (~9 GB VRAM across blocks) and enabling native PyTorch SDPA FlashAttention.
   - Database retrieval operates under `with torch.no_grad():` with detached query tokens (`q.detach()`).
   - Retrieval chunk size capped at 256, eliminating 4.1 GB single matrix allocations and reducing peak forward+backward memory on 1M-vector DBs from >16 GB (CUDA OOM) to ~3.5 GB.
+
+---
+
+### 18. MSCCNet: Multi-spectral Class Center Network
+
+[MSCCNet](https://github.com/miaoct/MSCCNet) (*"Multi-spectral Class Center Network for Face Manipulation Localization"*, ACM TOMM 2025, [arXiv:2305.10794](https://arxiv.org/abs/2305.10794)) integrates multi-level spatial feature fusion with frequency-domain class-center reasoning for joint image-level manipulation detection and pixel-level localization.
+
+- **Detection & Localization**:
+  - **Image-Level Branch (`MSCCClassifier`)**: Global average pooling + linear classifier over ResNet stage-4 features producing `class_logits`.
+  - **Multi-Spectral Class Center (`MSCCModule`)**: Applies a 2D DCT filter bank (`MultiSpectralDCTLayer`), predicts frequency-residual group maps (`fres_map_logits`), aggregates class-center embeddings refined via a Graph Convolutional Network (`MSCCGCN`), and fuses spectral attention back into pixel decoder predictions (`mask_logits`).
+- **Pretrained Weights Note**: Official upstream `miaoct/MSCCNet` provides ImageNet-pretrained backbones (`resnet50_v1c` / `resnet101_v1c`) without releasing task-trained MSCCNet checkpoints; pass `model.checkpoint_path` to load a custom MSCCNet checkpoint.
+- **Configuration Files**: `configs/experiments/msccnet/default.yaml`, `configs/experiments/msccnet/msccnet_resnet101.yaml`.
+
+---
+
+### 19. OmniFD: A Unified Model for Versatile Face Forgery Detection
+
+[OmniFD](https://github.com/haotianll/OmniFD) (*"OmniFD: A Unified Model for Versatile Face Forgery Detection"*, [arXiv:2512.01128](https://arxiv.org/abs/2512.01128), 2025) unifies image classification, spatial localization, video classification, and temporal localization in a shared transformer-latent architecture.
+
+- **Architecture**:
+  - **Omnivore SwinTransformer3D Backbone (`SwinTransformerOmni`)**: Swin-T / Swin-S / Swin-B 3D trunk operating on `[B, 3, 1, H, W]` image tensors across 4 hierarchical feature stages (`[192, 384, 768, 768]`).
+  - **Perceiver Interaction Neck (`InteractionNeck`)**: Projects all 4 stages into `512`-d latent space with learnable stage embeddings and cross-attends `64` forgery latent tokens across 3 interaction layers.
+  - **Image & Spatial Heads**: `OmniFDImageClsHead` pools the 64 latents for binary real/fake prediction (`class_logits`), while `OmniFDSpatialHead` fuses resized multi-scale features with projected latent queries (`mask_logits`).
+- **Pretrained Weights (Google Drive)**: Official checkpoints (`omnifd_swin-t_50k_forgerynet.pth`, `omnifd_swin-s_50k_forgerynet.pth`, `omnifd_swin-s_20k_ff_spatial.pth`, `omnifd_swin-s_20k_fmld_spatial.pth`, etc.) are automatically downloaded from the [official Google Drive folder](https://drive.google.com/drive/folders/1Bh8FbF-jiyPtgr7-URNuGAOJhi8kZSEC?usp=sharing) via `gdown` or loaded from `model.checkpoint_path`.
+- **Configuration Files**: `configs/experiments/omnifd/default.yaml`, `configs/experiments/omnifd/omnifd_swin_s_forgerynet.yaml`, `configs/experiments/omnifd/omnifd_swin_s_ff_spatial.yaml`, `configs/experiments/omnifd/omnifd_swin_s_fmld_spatial.yaml`.
+- **Detailed PDF Reporting**: See [docs/msccnet_and_omnifd_integration.md](docs/msccnet_and_omnifd_integration.md) and `scripts/infer_msccnet_omnifd_pdf.py` (8-column multi-page PDF inference report at `docs/msccnet_omnifd_inference_report.pdf`).
 
 ---
 

@@ -1,0 +1,47 @@
+# Configuration: OmniFD (Swin-S FaceForensics++ Spatial Localization 20k)
+# Official Pretrained Weights (Google Drive): omnifd_swin-s_20k_ff_spatial.pth
+
+project:
+  name: "sid_omnifd_swin_s_ff_spatial"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/omnifd_swin_s_ff_spatial"
+
+data:
+  dataset_name: "KhangTruong/IMD2020"
+  streaming: false
+  normalize: true
+  image_size: [299, 299]
+  batch_size: 16
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "omnifd"
+  variant: "swin-s"
+  checkpoint_name: "omnifd_swin-s_20k_ff_spatial"
+  pretrained: true
+  num_classes: 2
+  latent_channels: 512
+  num_latents: 64
+  spatial_channels: 256
+  aux_classifier: false
+  has_image_head: false
+  has_spatial_head: true
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  precision: "auto"
