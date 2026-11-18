@@ -1,0 +1,82 @@
+# Configuration: ForensicMoE Prototype v1 (3 Frozen Experts + Tiny Trainable Gate)
+# Experts (strictly frozen in .eval()):
+#   1B. SparseViT (50.3M, ImageNet-standardized RGB)
+#   2.  TruFor Noiseprint++ (68.7M, raw [0, 1] RGB)
+#   3.  TruFor-DiffusionPrint (68.7M, raw [0, 1] RGB)
+# Trainable Gate: 415,725 params (~0.42M, <0.25% of 188.2M ensemble), forensic-signal-only routing
+# Joint Dataset: KhangTruong/IMD2020-CASIAv2-Joint (4,354 casia vs 28,000 imd2020 -> balanced per batch)
+
+project:
+  name: "forensic_moe_v1"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/forensic_moe_v1"
+
+data:
+  dataset_name: "KhangTruong/IMD2020-CASIAv2-Joint"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  use_parquet_loader: true
+  save_to_disk: true
+  max_cached_row_groups: 64
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  balance_domains: true
+  balance_val_domains: true
+  domain_column: "dataset_source"
+  balance_strategy: "oversample"
+  train_samples_per_epoch: 10000
+  val_samples_per_epoch: -1
+  val_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+
+model:
+  name: "forensic_moe"
+  pretrained: true
+  img_size: 512
+  gate_temperature: 1.0
+  spectral_hidden_dims: [96, 192, 256]
+  spectral_embed_dim: 64
+  spatial_hidden_dim: 144
+  spatial_num_blocks: 3
+  balance_loss_weight: 0.05
+  oracle_loss_weight: 0.15
+  oracle_temperature: 0.15
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  align_weight: 1.0
+
+training:
+  epochs: 10
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 2
+  auto_batch_size: true
+  amp: true
+  mixed_precision: "bf16"
+  precision: "bf16"
+  save_best: true
+  save_latest: true
+  early_stopping_patience: 5
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20

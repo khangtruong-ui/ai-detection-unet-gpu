@@ -3,7 +3,7 @@
 **Author**: Antigravity Assistant  
 **Date**: November 18, 2026  
 **Target Repository**: `khangtruong-ui/ai-detection-unet-gpu`  
-**Status**: Proposed Specification & PR Plan (No Implementation Code Yet)  
+**Status**: Prototype v1 Implemented (`SparseViT`, `TruFor`, `ForensicMoE`, Balanced Domain Sampling, Tests & Config)  
 **Target Evaluation Protocol**: [`configs/cross-eval/MVSS-v1-protocol.yaml`](../configs/cross-eval/MVSS-v1-protocol.yaml) (`KhangTruong/Tampered-Images-Combined-Dataset-Fake`, `cross_test`)
 
 ---
@@ -101,8 +101,8 @@ Because all three experts (~187.7M params) remain **strictly frozen** in `.eval(
      $$z_{\text{MoE}}(x, y) = \sum_{k=1}^{3} w_k(x, y) \cdot z'_k(x, y)$$
 
 ### 4.3 Gate Training Objective & Anti-Collapse Recipe
-- **Balanced Domain Sampling:** Equal per-batch sampling across Classical (`CASIAv2` / `TampCOCO` / `IMD2020_RealLife`), Diffusion (`TGIF2` / `OpenSDID`), and Synthetic Inpainting (`KhangTruong/IMD2020`), with JPEG quality and scale augmentations.
-- **Loss:** `0.5 * BCE + 0.5 * Dice` + load-balancing / entropy regularizer to prevent routing collapse + optional soft per-sample oracle supervision toward $\arg\max_k \text{IoU}_k$.
+- **Balanced Domain Sampling:** Equal per-batch sampling across domains via `BalancedDomainSampler` and `extract_domain_labels` in [`sid_unet/dataset/loader.py`](../sid_unet/dataset/loader.py) (`data.balance_domains: true`, `data.domain_column: "dataset_source"`). On `KhangTruong/IMD2020-CASIAv2-Joint` (`train`: `4,354` `casia` vs. `28,000` `imd2020`; `validation`: `769` `casia` vs. `3,500` `imd2020`), `BalancedDomainSampler` prevents pre-truncation bias (since `casia` resides in the first shards) and interleaves balanced batches (`50% casia / 50% imd2020`) while rotating through unseen majority samples across epochs.
+- **Loss:** `0.5 * BCE + 0.5 * Dice` + load-balancing KL regularizer to prevent routing collapse + soft per-sample oracle supervision toward the highest-quality expert (`dice - bce` over calibrated logits).
 
 ---
 
@@ -135,8 +135,9 @@ Because all three experts (~187.7M params) remain **strictly frozen** in `.eval(
 
 ## 6. Verification & Next-Step Checklist (GPU Machine)
 
-- [ ] Implement `SparseViT`, shared `TruFor` (`np_out_channels=1` & `64`), and `ForensicMoE` with unit tests verifying `[0, 1]` vs. ImageNet preprocessing routing and `< 1.5M` trainable parameters.
-- [ ] Run individual zero-shot baselines of Experts 1B, 2, and 3 on [`configs/cross-eval/MVSS-v1-protocol.yaml`](../configs/cross-eval/MVSS-v1-protocol.yaml) using `sid-cross-eval` to measure exact `OpenSDID` transfer before gate training.
-- [ ] Cache frozen expert outputs on a balanced calibration split and train the tiny `ForensicMoE` gate.
-- [ ] Evaluate full `ForensicMoE` per-sub-dataset breakdown and verify zero regression on `CASIA_V1`/`Columbia_Gray`/`TGIF2_flux1dev`.
+- [x] Implement `SparseViT`, shared `TruFor` (`np_out_channels=1` & `64`), and `ForensicMoE` with unit tests (`tests/test_forensic_moe.py`) verifying `[0, 1]` vs. ImageNet preprocessing routing, frozen `.eval()` lock, zero-random-init policy, and `< 1.5M` trainable parameters (`415,725` trainable / `188,193,034` total).
+- [x] Implement domain-balanced sampling (`BalancedDomainSampler` & `extract_domain_labels` in `sid_unet/dataset/loader.py`) with unit tests (`tests/test_balanced_domain_sampling.py`) for imbalanced joint datasets (`KhangTruong/IMD2020-CASIAv2-Joint`).
+- [x] Add [`configs/experiments/moe/forensic_moe_v1.yaml`](../configs/experiments/moe/forensic_moe_v1.yaml) and start `sid-train` gate training on `KhangTruong/IMD2020-CASIAv2-Joint`.
+- [ ] Run individual zero-shot baselines of Experts 1B, 2, and 3 on [`configs/cross-eval/MVSS-v1-protocol.yaml`](../configs/cross-eval/MVSS-v1-protocol.yaml) using `sid-cross-eval` to measure exact `OpenSDID` transfer.
+- [ ] Evaluate trained `ForensicMoE` per-sub-dataset breakdown on `MVSS-v1-protocol.yaml` and verify zero regression on `CASIA_V1`/`Columbia_Gray`/`TGIF2_flux1dev`.
 - [ ] In **v2** (if `IMD2020` / `COCO_Inpaint` / `OpenSDID_SD1.5` remain weak), add a 4th frozen LoRA/SegFormer-B2 specialist trained strictly on `OpenSDID + IMD2020` without touching Experts 1B, 2, or 3.

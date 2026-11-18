@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import itertools
 import io
+import json
+import math
 import os
 import queue
+import random
 import sys
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from PIL import Image, ImageFile
 import torch
-from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
 from datasets import load_dataset as hf_load_dataset
 from datasets import IterableDataset as HFIterableDataset
 
@@ -963,6 +967,7 @@ def generate_mock_raw_sample(
         "mask": mask_arr,
         "label": label,
         "img_id": f"mock_{split}_{idx}",
+        "dataset_source": "casia" if (idx % 5 == 0) else "imd2020",
     }
 
 
@@ -1437,6 +1442,291 @@ class SIDMapDataset(Dataset):
                 data.close()
             except Exception:
                 pass
+
+
+def extract_domain_labels(
+    dataset: Any,
+    domain_column: str = "dataset_source",
+    cache_dir: Optional[str] = None,
+) -> List[str]:
+    """
+    Extract per-sample domain labels (e.g. 'casia', 'imd2020') without decoding image bytes.
+    Supports SIDMockDataset, IndexedParquetDataset (parallel column-only row-group read +
+    disk cache), HuggingFace Datasets, and generic map-style datasets.
+    """
+    total_len = len(dataset)
+    if total_len == 0:
+        return []
+
+    if getattr(dataset, "_is_mock", False):
+        split_name = str(getattr(dataset, "split", "train"))
+        return [
+            str(generate_mock_raw_sample(i, target_image_size=(8, 8), split=split_name).get("dataset_source", "default"))
+            for i in range(total_len)
+        ]
+
+    ds_name = str(getattr(dataset, "dataset_name", "") or "")
+    split_name = str(getattr(dataset, "resolved_split", getattr(dataset, "split", "")) or "")
+    cache_file = None
+    if ds_name and split_name:
+        base_cache = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "sid_unet", "domain_indices")
+        safe_ds = ds_name.replace("/", "__").replace(":", "_")
+        cache_file = os.path.join(base_cache, f"{safe_ds}__{split_name}__{domain_column}__{total_len}.json")
+        if os.path.isfile(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if isinstance(cached, list) and len(cached) == total_len:
+                    return [str(v) for v in cached]
+            except Exception:
+                pass
+
+    raw_data = getattr(dataset, "pdl_dataset", getattr(dataset, "data", dataset))
+    candidate_cols = [domain_column, "dataset_source", "dataset", "sub_dataset"]
+    # Deduplicate preserving order
+    candidate_cols = list(dict.fromkeys(candidate_cols))
+
+    labels: Optional[List[str]] = None
+
+    # 1. IndexedParquetDataset fast column-only parallel read
+    if (
+        raw_data is not None
+        and hasattr(raw_data, "index")
+        and hasattr(raw_data, "reader")
+        and hasattr(raw_data.index, "row_groups")
+    ):
+        avail_cols: List[str] = []
+        if hasattr(raw_data, "column_names") and raw_data.column_names:
+            avail_cols = list(raw_data.column_names)
+        elif hasattr(raw_data, "schema") and hasattr(raw_data.schema, "names"):
+            avail_cols = list(raw_data.schema.names)
+
+        resolved_col = next((c for c in candidate_cols if c in avail_cols), None) if avail_cols else domain_column
+        if resolved_col is not None:
+            rgs = list(raw_data.index.row_groups)
+            if rgs:
+                # Use an isolated read-only ParquetReader (no progressive_saver / disk_cache)
+                # so reading a single metadata column never pollutes the dataset's full-row cache.
+                meta_ds = None
+                meta_reader = raw_data.reader
+                if ds_name and split_name and _HAS_PARQUET_LOADER and pdl is not None:
+                    try:
+                        meta_ds = pdl.load_dataset(
+                            path=ds_name,
+                            split=split_name,
+                            streaming=True,
+                            save_to_disk=False,
+                            background_download=False,
+                            cache_files=False,
+                            columns=[resolved_col],
+                            token=getattr(dataset, "token", None),
+                            cache_dir=getattr(dataset, "cache_dir", None),
+                            max_cached_row_groups=0,
+                        )
+                        meta_reader = meta_ds.reader
+                    except Exception:
+                        meta_ds = None
+
+                def _read_rg(rg: Any) -> Tuple[int, List[str]]:
+                    if meta_ds is None and (
+                        getattr(meta_reader, "progressive_saver", None) is not None
+                        or getattr(meta_reader, "disk_cache", None) is not None
+                    ):
+                        # Bypass progressive_saver/disk_cache when using the dataset's own reader
+                        pf = meta_reader._get_parquet_file(rg.file_url)
+                        tbl = pf.read_row_group(rg.rg_index, columns=[resolved_col])
+                    else:
+                        tbl = meta_reader.read_row_group(
+                            rg.file_url,
+                            rg.rg_index,
+                            columns=[resolved_col],
+                            file_index=rg.file_index,
+                        )
+                    col_vals = [str(v) if v is not None else "default" for v in tbl[resolved_col].to_pylist()]
+                    return int(rg.global_start_row), col_vals
+
+                try:
+                    max_w = min(16, max(1, len(rgs)))
+                    with ThreadPoolExecutor(max_workers=max_w) as ex:
+                        rg_results = list(ex.map(_read_rg, rgs))
+                finally:
+                    if meta_ds is not None and hasattr(meta_ds, "close"):
+                        try:
+                            meta_ds.close()
+                        except Exception:
+                            pass
+                rg_results.sort(key=lambda item: item[0])
+
+                full_vals: List[str] = []
+                for _, vals in rg_results:
+                    full_vals.extend(vals)
+
+                offset = int(getattr(raw_data, "offset", 0) or 0)
+                custom_indices = getattr(raw_data, "indices", None)
+                if custom_indices is not None:
+                    labels = [full_vals[int(idx)] for idx in custom_indices[:total_len]]
+                elif len(full_vals) >= offset + total_len:
+                    labels = full_vals[offset : offset + total_len]
+
+    # 2. HuggingFace Arrow Dataset column read (zero image decoding)
+    if labels is None and raw_data is not None and hasattr(raw_data, "column_names"):
+        avail = list(raw_data.column_names)
+        resolved_col = next((c for c in candidate_cols if c in avail), None)
+        if resolved_col is not None:
+            labels = [str(v) if v is not None else "default" for v in raw_data[resolved_col][:total_len]]
+
+    # 3. Fallback: inspect first item or default
+    if labels is None:
+        if raw_data is not None and total_len > 0:
+            try:
+                sample0 = raw_data[0]
+                if isinstance(sample0, dict):
+                    resolved_col = next((c for c in candidate_cols if c in sample0), None)
+                    if resolved_col is not None:
+                        labels = [
+                            str(raw_data[i].get(resolved_col, "default") or "default")
+                            for i in range(total_len)
+                        ]
+            except Exception:
+                labels = None
+
+    if labels is None:
+        labels = ["default"] * total_len
+
+    if cache_file and len(labels) == total_len:
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(labels, f)
+        except Exception:
+            pass
+
+    return labels
+
+
+class BalancedDomainSampler(Sampler[int]):
+    """
+    Domain-balanced sampler for imbalanced multi-source datasets such as
+    `KhangTruong/IMD2020-CASIAv2-Joint` (`casia` vs `imd2020`).
+
+    Features:
+    - Guarantees equal representation across all detected domains per epoch and
+      within each batch (via round-robin interleaving across independently shuffled
+      per-domain index pools).
+    - Majority domains rotate through unseen slices across epochs (`set_epoch`) so
+      every sample is visited over time even when `num_samples` or `undersample` is used.
+    - Minority domains cycle through freshly shuffled permutations (never duplicating
+      one item disproportionately before covering the whole minority domain).
+    - Supports distributed training (`num_replicas`, `rank`).
+    """
+
+    def __init__(
+        self,
+        domain_labels: Sequence[str],
+        num_samples: Optional[int] = None,
+        strategy: str = "oversample",
+        seed: int = 42,
+        interleave: bool = True,
+        num_replicas: int = 1,
+        rank: int = 0,
+    ) -> None:
+        self.domain_labels = [str(d) if (d is not None and str(d).strip()) else "default" for d in domain_labels]
+        if not self.domain_labels:
+            raise ValueError("BalancedDomainSampler requires a non-empty sequence of domain_labels.")
+
+        self.strategy = str(strategy).lower().strip()
+        if self.strategy not in ("oversample", "undersample"):
+            raise ValueError(f"Unsupported balance strategy '{strategy}'. Use 'oversample' or 'undersample'.")
+
+        self.seed = int(seed)
+        self.interleave = bool(interleave)
+        self.num_replicas = max(1, int(num_replicas))
+        self.rank = int(rank)
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(f"rank ({self.rank}) must be in [0, {self.num_replicas - 1}]")
+        self.epoch = 0
+
+        domain_to_indices: Dict[str, List[int]] = {}
+        for idx, dom in enumerate(self.domain_labels):
+            domain_to_indices.setdefault(dom, []).append(idx)
+
+        self.domains: List[str] = sorted(domain_to_indices.keys())
+        self.domain_to_indices = domain_to_indices
+        self.domain_counts: Dict[str, int] = {d: len(v) for d, v in domain_to_indices.items()}
+        num_domains = len(self.domains)
+
+        if num_samples is not None and num_samples > 0:
+            self.per_domain_count = max(1, int(num_samples) // num_domains)
+        elif self.strategy == "undersample":
+            self.per_domain_count = min(len(v) for v in domain_to_indices.values())
+        else:
+            self.per_domain_count = max(len(v) for v in domain_to_indices.values())
+
+        self.total_per_domain_padded = (
+            math.ceil(self.per_domain_count / self.num_replicas) * self.num_replicas
+            if self.num_replicas > 1
+            else self.per_domain_count
+        )
+        self.per_domain_per_replica = self.total_per_domain_padded // self.num_replicas
+        self.total_size = self.per_domain_count * num_domains
+        self.num_samples_per_replica = self.per_domain_per_replica * num_domains
+        self.padded_total_size = self.total_per_domain_padded * num_domains
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.num_samples_per_replica
+
+    def _sample_domain_epoch(self, dom: str, rng: random.Random) -> List[int]:
+        pool = list(self.domain_to_indices[dom])
+        n_pool = len(pool)
+        target = self.per_domain_count
+
+        if n_pool >= target:
+            rng_base = random.Random(self.seed)
+            rng_base.shuffle(pool)
+            start = (self.epoch * target) % n_pool
+            if start + target <= n_pool:
+                selected = pool[start : start + target]
+            else:
+                rem = (start + target) - n_pool
+                selected = pool[start:] + pool[:rem]
+            rng.shuffle(selected)
+            return selected
+
+        selected: List[int] = []
+        while len(selected) < target:
+            chunk = list(pool)
+            rng.shuffle(chunk)
+            need = target - len(selected)
+            selected.extend(chunk[:need])
+        return selected
+
+    def __iter__(self) -> Iterator[int]:
+        rng = random.Random(self.seed + self.epoch)
+        per_domain_lists = [self._sample_domain_epoch(d, rng) for d in self.domains]
+
+        if self.num_replicas > 1:
+            sharded_lists: List[List[int]] = []
+            for d_list in per_domain_lists:
+                if len(d_list) < self.total_per_domain_padded:
+                    d_list = d_list + d_list[: self.total_per_domain_padded - len(d_list)]
+                sharded_lists.append(d_list[self.rank : self.total_per_domain_padded : self.num_replicas])
+            per_domain_lists = sharded_lists
+
+        if self.interleave:
+            ordered: List[int] = []
+            for pos in range(self.per_domain_per_replica):
+                for d_list in per_domain_lists:
+                    ordered.append(d_list[pos])
+        else:
+            ordered = []
+            for d_list in per_domain_lists:
+                ordered.extend(d_list)
+            rng.shuffle(ordered)
+
+        return iter(ordered)
 
 
 def resolve_num_workers(
@@ -2298,6 +2588,16 @@ def create_dataloaders(
     default_cached_rgs = max(8, min(16, num_workers)) if num_workers > 0 else 2
     max_cached_row_groups = int(config.data.get("max_cached_row_groups", default_cached_rgs))
 
+    balance_domains = bool(
+        config.data.get("balance_domains", config.data.get("domain_balanced_sampling", False))
+    )
+    balance_val_domains = bool(config.data.get("balance_val_domains", False))
+    domain_column = str(config.data.get("domain_column", "dataset_source"))
+    balance_strategy = str(config.data.get("balance_strategy", "oversample"))
+
+    effective_train_max = None if balance_domains else train_max_samples
+    effective_val_max = None if (balance_val_domains or (balance_domains and val_max_samples is not None)) else val_max_samples
+
     if use_parquet_loader and _HAS_PARQUET_LOADER and PDLDataLoader is not None:
         logger.info(
             "⚡ Using parquet-dataset-loader DataLoader for high-throughput batching, "
@@ -2307,7 +2607,7 @@ def create_dataloaders(
             dataset_name=dataset_name,
             split=train_split,
             transform=train_transform,
-            max_samples=train_max_samples,
+            max_samples=effective_train_max,
             target_image_size=image_size,
             use_parquet_loader=True,
             save_to_disk=save_to_disk,
@@ -2321,7 +2621,7 @@ def create_dataloaders(
             dataset_name=dataset_name,
             split=val_split,
             transform=val_transform,
-            max_samples=val_max_samples,
+            max_samples=effective_val_max,
             target_image_size=image_size,
             use_parquet_loader=True,
             save_to_disk=save_to_disk,
@@ -2340,15 +2640,61 @@ def create_dataloaders(
         prefetch_factor = max(2, int(config.data.get("prefetch_factor", 4)))
         worker_type = str(config.data.get("worker_type", "thread"))
 
+        train_sampler: Optional[Sampler[int]] = None
+        train_shuffle = True
+        pdl_train_ws = world_size
+        pdl_train_rank = rank
+        if balance_domains:
+            train_domain_labels = extract_domain_labels(train_dataset, domain_column=domain_column)
+            train_sampler = BalancedDomainSampler(
+                domain_labels=train_domain_labels,
+                num_samples=train_max_samples,
+                strategy=balance_strategy,
+                seed=seed,
+                interleave=True,
+                num_replicas=world_size or 1,
+                rank=rank or 0,
+            )
+            train_shuffle = False
+            pdl_train_ws = None
+            pdl_train_rank = None
+            logger.info(
+                f"⚖️ Balanced Domain Sampling enabled for train ({domain_column}): "
+                f"raw={train_sampler.domain_counts} -> {train_sampler.per_domain_count}/domain/epoch "
+                f"(total={len(train_sampler) * (world_size or 1)}, strategy={balance_strategy})."
+            )
+
+        val_sampler: Optional[Sampler[int]] = None
+        pdl_val_ws = world_size
+        pdl_val_rank = rank
+        if balance_val_domains or (balance_domains and val_max_samples is not None and len(val_dataset) > val_max_samples):
+            val_domain_labels = extract_domain_labels(val_dataset, domain_column=domain_column)
+            val_sampler = BalancedDomainSampler(
+                domain_labels=val_domain_labels,
+                num_samples=val_max_samples,
+                strategy="undersample" if val_max_samples is None else balance_strategy,
+                seed=seed,
+                interleave=True,
+                num_replicas=world_size or 1,
+                rank=rank or 0,
+            )
+            pdl_val_ws = None
+            pdl_val_rank = None
+            logger.info(
+                f"⚖️ Balanced Domain Sampling enabled for validation ({domain_column}): "
+                f"raw={val_sampler.domain_counts} -> {val_sampler.per_domain_count}/domain/epoch."
+            )
+
         train_loader = PDLDataLoader(
             dataset=train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            sampler=train_sampler,
+            shuffle=train_shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
             seed=seed,
-            world_size=world_size,
-            rank=rank,
+            world_size=pdl_train_ws,
+            rank=pdl_train_rank,
             worker_type=worker_type,
             prefetch_factor=prefetch_factor,
             timeout=dataloader_timeout,
@@ -2356,12 +2702,13 @@ def create_dataloaders(
         val_loader = PDLDataLoader(
             dataset=val_dataset,
             batch_size=batch_size,
+            sampler=val_sampler,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
             seed=seed,
-            world_size=world_size,
-            rank=rank,
+            world_size=pdl_val_ws,
+            rank=pdl_val_rank,
             worker_type=worker_type,
             prefetch_factor=prefetch_factor,
             timeout=dataloader_timeout,
@@ -2428,7 +2775,7 @@ def create_dataloaders(
             dataset_name=dataset_name,
             split=train_split,
             transform=train_transform,
-            max_samples=train_max_samples,
+            max_samples=effective_train_max,
             target_image_size=image_size,
             use_parquet_loader=use_parquet_loader,
             save_to_disk=save_to_disk,
@@ -2442,7 +2789,7 @@ def create_dataloaders(
             dataset_name=dataset_name,
             split=val_split,
             transform=val_transform,
-            max_samples=val_max_samples,
+            max_samples=effective_val_max,
             target_image_size=image_size,
             use_parquet_loader=use_parquet_loader,
             save_to_disk=save_to_disk,
@@ -2455,9 +2802,26 @@ def create_dataloaders(
 
         train_sampler = None
         val_sampler = None
-        if is_dist_avail_and_initialized():
-            world_size = get_world_size()
-            rank = get_rank()
+        is_dist = is_dist_avail_and_initialized()
+        world_size = get_world_size() if is_dist else 1
+        rank = get_rank() if is_dist else 0
+
+        if balance_domains:
+            train_domain_labels = extract_domain_labels(train_dataset, domain_column=domain_column)
+            train_sampler = BalancedDomainSampler(
+                domain_labels=train_domain_labels,
+                num_samples=train_max_samples,
+                strategy=balance_strategy,
+                seed=seed,
+                interleave=True,
+                num_replicas=world_size,
+                rank=rank,
+            )
+            logger.info(
+                f"⚖️ Balanced Domain Sampling enabled for train ({domain_column}): "
+                f"raw={train_sampler.domain_counts} -> {train_sampler.per_domain_count}/domain/epoch."
+            )
+        elif is_dist:
             train_sampler = torch.utils.data.distributed.DistributedSampler(
                 train_dataset,
                 num_replicas=world_size,
@@ -2465,6 +2829,19 @@ def create_dataloaders(
                 shuffle=True,
                 seed=seed,
             )
+
+        if balance_val_domains or (balance_domains and val_max_samples is not None and len(val_dataset) > val_max_samples):
+            val_domain_labels = extract_domain_labels(val_dataset, domain_column=domain_column)
+            val_sampler = BalancedDomainSampler(
+                domain_labels=val_domain_labels,
+                num_samples=val_max_samples,
+                strategy="undersample" if val_max_samples is None else balance_strategy,
+                seed=seed,
+                interleave=True,
+                num_replicas=world_size,
+                rank=rank,
+            )
+        elif is_dist:
             val_sampler = torch.utils.data.distributed.DistributedSampler(
                 val_dataset,
                 num_replicas=world_size,
