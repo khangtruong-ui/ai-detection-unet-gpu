@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-11-17
 
 ### Added & Updated
+- **FOCAL Domain-Split (4-Class / 4-Cluster) & Dual-Backbone Fusion (`sid_unet.models.focal`, `sid_unet.dataset.loader`, `sid_unet.training.trainer`, `sid_unet.models.unet`, `configs/experiments/focal/*.yaml`)**:
+  - **Domain-Split 4-Class / 4-Cluster Finetuning (`domain_split_mode=True`)**:
+    - Added `dataset_source` column support in `process_raw_sample()` (`sid_unet/dataset/loader.py`) and tensorized `domain_ids` forwarding in `Trainer._step_batch_train()` for `KhangTruong/IMD2020-CASIAv2-Joint` (`"casia"` and `"imd2020"`).
+    - Splits training targets/clusters into 4 domain-specific classes (`0: casia_pristine`, `1: casia_tampered`, `2: imd_pristine`, `3: imd_tampered`) across both Mode 1A Supervised (`FOCALSupervisedHead` 4-channel + 4-class CE + collapsed binary loss) and Mode 1B Contrastive (`domain_prototypes` 4-cluster InfoNCE + 4-class SupCon + intra-image `MyInfoNCE`), while collapsing strictly to 2 classes (`pristine` vs `tampered`) at inference via exact log-sum-exp without requiring `dataset_source`.
+    - Added 4 domain-split YAML configs (2 per existing backbone): `focal_hrnet_domain_split.yaml`, `focal_hrnet_contrastive_domain_split.yaml`, `focal_vit_domain_split.yaml`, and `focal_vit_contrastive_domain_split.yaml`.
+  - **Independent Dual-Backbone Fusion (`secondary_backbone`, `freeze_primary_backbone=True`)**:
+    - Added support for pairing a frozen primary FOCAL backbone (`hrnet` or `vit`) with an independent secondary backbone (`vit`, `hrnet`, or `timm:*` via `SecondaryTimmBackbone`) using `DualBackboneFusionModule` (`"concat"`, `"proj_concat"`, `"zero_gated"`) and configurable spatial alignment (`"primary"` or `"max"`).
+    - Preserves frozen primary weights and `BatchNorm2d` running statistics across `train(True)` and `set_backbone_trainable()`, and provides `focal_hrnet_vit_fusion.yaml` and `focal_vit_hrnet_fusion_contrastive.yaml`.
+  - **Documentation & Tests**:
+    - Added `docs/focal_domain_split_and_dual_backbone.md`, updated `configs/experiments/README.md`, and added `tests/test_focal_domain_split_and_fusion.py`.
 - **MSCCNet Integration (`sid_unet.models.msccnet`, `sid_unet.models.unet`, `configs/experiments/msccnet/*.yaml`)**:
   - Added pure-PyTorch `MSCCNet` (ACM TOMM 2025, `miaoct/MSCCNet`) featuring dilated ResNet-50/101 (`outstride=8`, `use_stem=True`) backbone, image-level `MSCCClassifier` branch, multi-level feature bottlenecks, and `MSCCModule` (2D `MultiSpectralDCTLayer` with dynamic resolution interpolation, frequency-residual `decoder_map`, `MSCCGCN`, and spectral attention fusion).
   - Supports ImageNet-pretrained `resnet50_v1c` / `resnet101_v1c` initialization and explicit `checkpoint_path` loading (since official upstream repo does not release task-trained MSCCNet checkpoints).

@@ -657,7 +657,10 @@ def process_raw_sample(
         default_tf = get_transforms(image_size=target_image_size, is_train=False)
         img_tensor, mask_tensor = default_tf(pil_image, mask_arr)
 
-    raw_dataset = sample.get("dataset", sample.get("sub_dataset", None))
+    raw_dataset = sample.get(
+        "dataset_source",
+        sample.get("dataset", sample.get("sub_dataset", None)),
+    )
     raw_method = sample.get("method", None)
 
     return {
