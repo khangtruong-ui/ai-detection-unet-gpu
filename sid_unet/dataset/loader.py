@@ -1539,7 +1539,8 @@ def create_eval_dataloader(
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", False))
     batch_size = int(config.data.get("batch_size", 16))
-    max_eval_workers = int(config.data.get("max_eval_workers", config.data.get("max_workers", 4)))
+    max_eval_workers_cfg = config.data.get("max_eval_workers", config.data.get("max_workers", None))
+    max_eval_workers = int(max_eval_workers_cfg) if max_eval_workers_cfg is not None else None
     num_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_eval_workers)
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
@@ -1905,9 +1906,14 @@ def create_cached_dataloaders(
                     f"Train samples = {len(train_dataset)}, Val samples = {len(val_dataset)}"
                 )
 
-            raw_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=4)
-            max_cached_workers = int(config.data.get("max_cached_workers", 4))
-            num_workers = min(max(0, raw_workers), max_cached_workers)
+            max_cached_workers_cfg = config.data.get("max_cached_workers", config.data.get("max_workers", None))
+            max_cached_workers = int(max_cached_workers_cfg) if max_cached_workers_cfg is not None else None
+            raw_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_cached_workers)
+            num_workers = (
+                min(max(0, raw_workers), max_cached_workers)
+                if max_cached_workers is not None
+                else max(0, raw_workers)
+            )
             mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
             # Zero-thrashing sampler preserving row-group cache locality
@@ -2104,9 +2110,14 @@ def create_cached_dataloaders(
         return train_loader, val_loader
 
     # Map-style (non-streaming) loader with memory-bounded LRU cache and safe worker count
-    raw_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=4)
-    max_cached_workers = int(config.data.get("max_cached_workers", 4))
-    num_workers = min(max(0, raw_workers), max_cached_workers)
+    max_cached_workers_cfg = config.data.get("max_cached_workers", config.data.get("max_workers", None))
+    max_cached_workers = int(max_cached_workers_cfg) if max_cached_workers_cfg is not None else None
+    raw_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_cached_workers)
+    num_workers = (
+        min(max(0, raw_workers), max_cached_workers)
+        if max_cached_workers is not None
+        else max(0, raw_workers)
+    )
     mp_context = torch.multiprocessing.get_context("spawn") if (num_workers > 0 and os.name != "nt") else None
 
     train_dataset = CachedTensorDataset(
@@ -2235,7 +2246,8 @@ def create_dataloaders(
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", True))
     batch_size = resolve_batch_size(config)
-    max_data_workers = int(config.data.get("max_workers", 4))
+    max_data_workers_cfg = config.data.get("max_workers", None)
+    max_data_workers = int(max_data_workers_cfg) if max_data_workers_cfg is not None else None
     num_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_data_workers)
     pin_memory = bool(config.data.get("pin_memory", True)) and torch.cuda.is_available()
     image_size = tuple(config.data.get("image_size", [256, 256]))
@@ -2283,7 +2295,8 @@ def create_dataloaders(
     columns = config.data.get("columns", None)
     token = config.data.get("token", None)
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
-    max_cached_row_groups = int(config.data.get("max_cached_row_groups", 2))
+    default_cached_rgs = max(8, min(16, num_workers)) if num_workers > 0 else 2
+    max_cached_row_groups = int(config.data.get("max_cached_row_groups", default_cached_rgs))
 
     if use_parquet_loader and _HAS_PARQUET_LOADER and PDLDataLoader is not None:
         logger.info(
@@ -2324,6 +2337,8 @@ def create_dataloaders(
         rank = get_rank() if is_dist else None
         timeout_cfg = config.data.get("timeout", config.data.get("dataloader_timeout", 300.0))
         dataloader_timeout = float(timeout_cfg) if timeout_cfg is not None else 300.0
+        prefetch_factor = max(2, int(config.data.get("prefetch_factor", 4)))
+        worker_type = str(config.data.get("worker_type", "thread"))
 
         train_loader = PDLDataLoader(
             dataset=train_dataset,
@@ -2334,7 +2349,8 @@ def create_dataloaders(
             seed=seed,
             world_size=world_size,
             rank=rank,
-            worker_type="thread",
+            worker_type=worker_type,
+            prefetch_factor=prefetch_factor,
             timeout=dataloader_timeout,
         )
         val_loader = PDLDataLoader(
@@ -2346,7 +2362,8 @@ def create_dataloaders(
             seed=seed,
             world_size=world_size,
             rank=rank,
-            worker_type="thread",
+            worker_type=worker_type,
+            prefetch_factor=prefetch_factor,
             timeout=dataloader_timeout,
         )
     elif streaming:

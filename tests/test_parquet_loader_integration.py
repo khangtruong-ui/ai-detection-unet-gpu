@@ -490,5 +490,57 @@ def test_sid_map_dataset_hf_iterable_fallback_handling(monkeypatch):
     assert "mask" in sample
 
 
+def test_create_dataloaders_num_workers_minus_one_not_capped_and_prefetch_defaults(temp_parquet_dataset):
+    """
+    Verify that data.num_workers=-1 resolves to all available CPU cores (not silently capped to 4),
+    explicit data.max_workers is respected, and PDLDataLoader receives prefetch_factor & row-group cache sizing.
+    """
+    from sid_unet.dataset.loader import resolve_num_workers
+    from parquet_dataset_loader import DataLoader as PDLDataLoader
+
+    expected_auto_workers = resolve_num_workers(-1)
+
+    cfg = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=false",
+        "data.batch_size=4",
+        "training.data_parallel=false",
+        "data.train_samples_per_epoch=8",
+        "data.val_samples_per_epoch=4",
+        "data.image_size=[64, 64]",
+        "data.num_workers=-1",
+        "data.use_parquet_loader=true",
+    ])
+    train_l, val_l = create_dataloaders(cfg, include_test=False)
+    assert isinstance(train_l, PDLDataLoader)
+    assert train_l.num_workers == expected_auto_workers
+    assert val_l.num_workers == expected_auto_workers
+    assert train_l.prefetch_factor == 4
+    if expected_auto_workers > 0:
+        assert train_l.dataset.max_cached_row_groups >= 8
+
+    # Explicit data.max_workers should still cap num_workers=-1
+    cfg_capped = load_config(overrides=[
+        f"data.dataset_name={temp_parquet_dataset}",
+        "data.train_split=train",
+        "data.val_split=train",
+        "data.streaming=false",
+        "data.batch_size=4",
+        "training.data_parallel=false",
+        "data.train_samples_per_epoch=8",
+        "data.val_samples_per_epoch=4",
+        "data.image_size=[64, 64]",
+        "data.num_workers=-1",
+        "data.max_workers=3",
+        "data.prefetch_factor=6",
+        "data.use_parquet_loader=true",
+    ])
+    train_capped, _ = create_dataloaders(cfg_capped, include_test=False)
+    assert train_capped.num_workers == min(expected_auto_workers, 3)
+    assert train_capped.prefetch_factor == 6
+
+
 
 

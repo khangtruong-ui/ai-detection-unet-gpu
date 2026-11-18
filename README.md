@@ -2130,10 +2130,11 @@ The configuration file is divided into modular top-level sections:
 | `columns` | `list[str]` / `null` | `null` | Column projection list (e.g. `["image", "mask"]`). Only these columns are transferred over the network, dramatically saving bandwidth and memory. |
 | `token` | `str` / `bool` / `null` | `null` | Hugging Face authentication token, or `true` to use stored credentials for private/gated datasets. |
 | `cache_dir` | `str` / `null` | `null` | Local directory for caching metadata indices and row groups (defaults to `~/.cache/parquet_dataset_loader`). |
-| `max_cached_row_groups` | `int` | `2` | Number of decoded row groups kept in the thread-safe LRU memory cache (keeps RAM strictly bounded at ~100–200 MB). |
+| `max_cached_row_groups` | `int` | `8` (`2` if `num_workers=0`) | Number of decoded row groups kept in the thread-safe LRU memory cache (scales up to `min(16, max(8, num_workers))` when `num_workers > 0` to prevent cache thrashing). |
 | `image_size` | `[H, W]` | `[256, 256]` | Target input image resolution `[height, width]` passed to model. |
 | `batch_size` | `int` | `16` | Micro-batch size per forward/backward pass. |
-| `num_workers` | `int` | `2` | DataLoader worker processes for multi-process sample prefetching (`-1` for all CPU cores). |
+| `num_workers` | `int` | `-1` | DataLoader worker count (`-1` uses all available CPU cores unless `max_workers` is explicitly set). |
+| `prefetch_factor` | `int` | `4` | Number of batches prefetched per worker in `PDLDataLoader`. |
 | `pin_memory` | `bool` | `true` | Pins CPU memory pages to accelerate host-to-GPU data transfers. |
 | `shuffle_buffer_size` | `int` | `1000` | Sample buffer size for pseudo-random shuffling when `streaming: true`. |
 | `train_split` | `str` | `"train"` | Dataset split name for training. |
