@@ -11,6 +11,8 @@ import sys
 from typing import Any, Dict, Optional, Tuple, Union
 import torch
 
+from sid_unet.utils.precision import is_bf16_supported
+
 logger = logging.getLogger("sid_unet.utils.compatibility")
 
 
@@ -104,7 +106,7 @@ def check_8bit_compatibility(
     fp8_native_supported = cuda_available and fp8_hardware_supported and fp8_torch_supported
 
     # Determine fallback target mode (explicitly GPU 16-bit mode when on CUDA)
-    bf16_ok = cuda_available and torch.cuda.is_bf16_supported()
+    bf16_ok = cuda_available and is_bf16_supported()
     fallback_precision = "BF16" if bf16_ok else "FP16"
     fallback_target = f"GPU 16-Bit Mode (AMP {fallback_precision} + AdamW)" if cuda_available else "CPU 32-Bit Mode"
     overall_compatible = optimizer_8bit_supported

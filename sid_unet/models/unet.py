@@ -280,6 +280,8 @@ class UNet(nn.Module):
                     "uperhead.", "module.uperhead.", "fc.", "module.fc.",
                     "backbone_net.", "mscc.", "bottleneck_fusion.", "classifer.",
                     "backbone.trunk.", "neck.module.", "head.decoder_modules.",
+                    "expert_sparsevit.", "expert_trufor.", "expert_diffusionprint.", "gate.logit_gamma",
+                    "encoder_net.", "lmu.", "dncnn.", "decode_head.",
                 ))
                 for k in ckpt.keys()
             ) or any("backbone_swin" in k or "image_encoder" in k for k in ckpt.keys())
@@ -358,6 +360,22 @@ class UNet(nn.Module):
                 merged["model"]["aux_classifier"] = merged["model"]["has_image_head"]
             elif any(k.startswith("decoder.perp_fusions.") for k in state_dict.keys()):
                 merged["model"]["name"] = "diffusion_diff_v2"
+            elif any(k.startswith(("expert_sparsevit.", "expert_trufor.", "expert_diffusionprint.", "gate.logit_gamma")) for k in state_dict.keys()):
+                merged["model"]["name"] = "forensic_moe"
+                merged["model"]["pretrained"] = False
+                merged["model"]["allow_random_init"] = True
+            elif any(k.startswith(("encoder_net.", "lmu.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "sparsevit"
+                merged["model"]["pretrained"] = False
+                merged["model"]["allow_random_init"] = True
+            elif any(k.startswith(("dncnn.", "decode_head.", "decode_head_conf.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "trufor"
+                merged["model"]["pretrained"] = False
+                merged["model"]["allow_random_init"] = True
+                if "np_adapter.weight" in state_dict and hasattr(state_dict["np_adapter.weight"], "shape"):
+                    merged["model"]["np_out_channels"] = int(state_dict["np_adapter.weight"].shape[1])
+                elif "dncnn.47.weight" in state_dict and hasattr(state_dict["dncnn.47.weight"], "shape"):
+                    merged["model"]["np_out_channels"] = int(state_dict["dncnn.47.weight"].shape[0])
             elif any(k.startswith(("decoder.", "diffuser.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "diffusion_diff"
             elif any(k.startswith("vae.") for k in state_dict.keys()):
@@ -1130,6 +1148,80 @@ def build_model(config: Any) -> nn.Module:
             has_image_head=model_cfg.get("has_image_head", None),
             has_spatial_head=model_cfg.get("has_spatial_head", None),
             with_cp=bool(ckpt_flag or model_cfg.get("with_cp", False)),
+        )
+
+    if any(k in model_name for k in ["forensic_moe", "forensic-moe", "moe"]) or any(
+        k in backbone for k in ["forensic_moe", "forensic-moe"]
+    ):
+        from sid_unet.models.forensic_moe import ForensicMoE
+        img_sz = model_cfg.get("img_size", None)
+        if img_sz is None and hasattr(config, "data"):
+            ds_sz = config.data.get("image_size", [512, 512])
+            img_sz = ds_sz[0] if isinstance(ds_sz, (list, tuple)) else ds_sz
+        return ForensicMoE(
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
+            sparsevit_checkpoint_path=model_cfg.get("sparsevit_checkpoint_path", None),
+            sparsevit_hf_repo=model_cfg.get("sparsevit_hf_repo", None),
+            trufor_checkpoint_path=model_cfg.get("trufor_checkpoint_path", None),
+            trufor_hf_repo=model_cfg.get("trufor_hf_repo", None),
+            diffusionprint_checkpoint_path=model_cfg.get("diffusionprint_checkpoint_path", None),
+            diffusionprint_hf_repo=model_cfg.get("diffusionprint_hf_repo", None),
+            cache_dir=model_cfg.get("cache_dir", None),
+            img_size=int(img_sz or 512),
+            gate_temperature=float(model_cfg.get("gate_temperature", 1.0)),
+            spectral_hidden_dims=tuple(model_cfg.get("spectral_hidden_dims", [96, 192, 256])),
+            spectral_embed_dim=int(model_cfg.get("spectral_embed_dim", 64)),
+            spatial_hidden_dim=int(model_cfg.get("spatial_hidden_dim", 144)),
+            spatial_num_blocks=int(model_cfg.get("spatial_num_blocks", 3)),
+            balance_loss_weight=float(model_cfg.get("balance_loss_weight", loss_cfg.get("balance_loss_weight", 0.05))),
+            oracle_loss_weight=float(model_cfg.get("oracle_loss_weight", loss_cfg.get("oracle_loss_weight", 0.15))),
+            oracle_temperature=float(model_cfg.get("oracle_temperature", 0.15)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            num_classes=int(model_cfg.get("num_classes", 2)),
+        )
+
+    if any(k in model_name for k in ["sparsevit", "sparse_vit"]) or any(
+        k in backbone for k in ["sparsevit", "sparse_vit"]
+    ):
+        from sid_unet.models.sparsevit import SparseViT
+        ckpt_path = model_cfg.get(
+            "checkpoint_path",
+            model_cfg.get("pretrained_model_name_or_path", None),
+        )
+        img_sz = model_cfg.get("img_size", None)
+        if img_sz is None and hasattr(config, "data"):
+            ds_sz = config.data.get("image_size", [512, 512])
+            img_sz = ds_sz[0] if isinstance(ds_sz, (list, tuple)) else ds_sz
+        return SparseViT(
+            img_size=int(img_sz or 512),
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
+            checkpoint_path=str(ckpt_path) if ckpt_path else None,
+            hf_repo=model_cfg.get("hf_repo", None),
+            cache_dir=model_cfg.get("cache_dir", None),
+            freeze=bool(model_cfg.get("freeze", False)),
+            auto_normalize=bool(model_cfg.get("auto_normalize", True)),
+        )
+
+    if any(k in model_name for k in ["trufor", "diffusionprint"]) or any(
+        k in backbone for k in ["trufor", "diffusionprint"]
+    ):
+        from sid_unet.models.trufor import TruFor
+        ckpt_path = model_cfg.get(
+            "checkpoint_path",
+            model_cfg.get("pretrained_model_name_or_path", None),
+        )
+        default_np_ch = 64 if "diffusionprint" in model_name or "diffusionprint" in backbone else 1
+        return TruFor(
+            np_out_channels=int(model_cfg.get("np_out_channels", default_np_ch)),
+            pretrained=bool(model_cfg.get("pretrained", True)),
+            allow_random_init=bool(model_cfg.get("allow_random_init", False)),
+            checkpoint_path=str(ckpt_path) if ckpt_path else None,
+            hf_repo=model_cfg.get("hf_repo", None),
+            hf_filename=model_cfg.get("hf_filename", None),
+            cache_dir=model_cfg.get("cache_dir", None),
+            freeze=bool(model_cfg.get("freeze", False)),
         )
 
     return UNet(

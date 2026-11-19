@@ -12,6 +12,7 @@ from sid_unet.models.noise_rag import ForensicVectorDBRetrieval
 from sid_unet.utils.config import DEFAULT_CONFIG, load_config
 from sid_unet.utils.precision import (
     check_fp8_compatibility,
+    is_bf16_supported,
     is_fp8_supported,
     normalize_precision_mode,
     prepare_model_for_fp8_inference,
@@ -270,4 +271,32 @@ def test_trainer_fp8_default_training_and_checkpoint_roundtrip(tmp_path):
     assert os.path.exists(ckpt_best)
     reload_net = _MiniFP8Net().to("cuda")
     trainer.ckpt_manager.load_checkpoint(ckpt_best, reload_net)
+
+
+def test_emulated_only_bf16_falls_back_to_fp16():
+    """
+    Pre-Ampere GPUs (e.g. Tesla T4 SM 7.5) return True for torch.cuda.is_bf16_supported()
+    when including_emulation=True, but False when including_emulation=False.
+    is_bf16_supported() and resolve_precision_spec() must reject emulated-only BF16
+    and select native FP16.
+    """
+    def _fake_is_bf16(including_emulation: bool = True) -> bool:
+        return bool(including_emulation)
+
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.get_device_name", return_value="Tesla T4"), \
+         patch("torch.cuda.get_device_capability", return_value=(7, 5)), \
+         patch("torch.cuda.is_bf16_supported", side_effect=_fake_is_bf16):
+        assert is_bf16_supported(device=torch.device("cuda:0")) is False
+
+        spec_auto = resolve_precision_spec(mode="auto", device=torch.device("cuda:0"))
+        assert spec_auto.mode == "fp16"
+        assert spec_auto.amp_dtype == torch.float16
+        assert spec_auto.use_grad_scaler is True
+
+        spec_bf16 = resolve_precision_spec(mode="bf16", device=torch.device("cuda:0"))
+        assert spec_bf16.mode == "fp16"
+        assert spec_bf16.amp_dtype == torch.float16
+        assert spec_bf16.use_grad_scaler is True
+        assert spec_bf16.fallback_reason is not None
 

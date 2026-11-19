@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-19
+
+### Fixed
+- **SparseViT / ForensicMoE cuDNN `bfloat16` Depthwise Conv2d Engine Failure & Native BF16 Detection (`sid_unet.models.sparsevit`, `sid_unet.utils.precision`, `sid_unet.utils.compatibility`, `sid_unet.utils.memory`, `sid_unet.training.trainer`, `sid_unet.models.noise_rag`, `sid_unet.models.sam2`, `sid_unet.models.sam3_qlora`)**:
+  - Added `.contiguous()` in `SparseViT` `_DWConv.forward()` and `SABlock.forward()` (`sid_unet/models/sparsevit.py`) so token-to-spatial reshapes emit contiguous NCHW tensors rather than transposed NHWC views, fixing `RuntimeError: GET was unable to find an engine to execute this computation` in cuDNN depthwise `Conv2d` under `bfloat16` autocast.
+  - Added `is_bf16_supported()` in `sid_unet/utils/precision.py` using `torch.cuda.is_bf16_supported(including_emulation=False)` (with SM >= 8.0 fallback) and routed precision resolution, compatibility checks, auto-batch probing, Trainer, Noise-RAG, SAM2, and SAM3 QLoRA through it so pre-Ampere GPUs (e.g. Tesla T4 SM 7.5) cleanly select native `fp16` instead of emulated `bf16`.
+  - Added regression tests in `tests/test_forensic_moe.py` and `tests/test_fp8_precision.py`, and updated `docs/fp8_and_ci_metrics.md`.
+
 ## [Unreleased] - 2026-11-17
 
 ### Added & Updated

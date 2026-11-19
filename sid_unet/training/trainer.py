@@ -50,7 +50,7 @@ from sid_unet.utils.plotting import plot_training_curves, save_history_data
 from sid_unet.utils.report import format_metrics_table, generate_evaluation_report
 from sid_unet.utils.network import NetworkSpeedMonitor, BottleneckDetector
 from sid_unet.utils.compatibility import check_8bit_compatibility
-from sid_unet.utils.precision import resolve_precision_spec, prepare_model_for_fp8_training
+from sid_unet.utils.precision import is_bf16_supported, resolve_precision_spec, prepare_model_for_fp8_training
 from sid_unet.utils.config import save_config
 
 def parse_checkpoint_period(training_cfg: Any) -> float:
@@ -714,7 +714,7 @@ class Trainer:
 
     def _ensure_gpu_16bit_dtype(self) -> None:
         if self.device.type == "cuda" and self.amp_dtype == torch.float32:
-            if torch.cuda.is_bf16_supported():
+            if is_bf16_supported(device=self.device):
                 self.amp_dtype = torch.bfloat16
                 self.amp_dtype_str = "bfloat16"
             else:

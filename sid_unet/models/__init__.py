@@ -105,6 +105,25 @@ from sid_unet.models.omnifd import (
     OMNIFD_GDRIVE_CHECKPOINTS,
     OMNIVORE_TRUNK_URLS,
 )
+from sid_unet.models.sparsevit import (
+    SparseViT,
+    SparseViTEncoder,
+    MultipleLFFHead,
+    SPARSEVIT_GDRIVE_FILE_ID,
+    SPARSEVIT_GDRIVE_URL,
+)
+from sid_unet.models.trufor import (
+    TruFor,
+    DualSegformerMiTB2,
+    MLPDecoderHead,
+    TRUFOR_WEIGHTS_ZIP_URL,
+    DIFFUSIONPRINT_DEFAULT_HF_REPO,
+    DIFFUSIONPRINT_DEFAULT_FILENAME,
+)
+from sid_unet.models.forensic_moe import (
+    ForensicMoE,
+    ForensicMoEGate,
+)
 
 __all__ = [
     "UNet",
@@ -195,6 +214,19 @@ __all__ = [
     "OMNIFD_ANNOTATIONS_GDRIVE_URL",
     "OMNIFD_GDRIVE_CHECKPOINTS",
     "OMNIVORE_TRUNK_URLS",
+    "SparseViT",
+    "SparseViTEncoder",
+    "MultipleLFFHead",
+    "SPARSEVIT_GDRIVE_FILE_ID",
+    "SPARSEVIT_GDRIVE_URL",
+    "TruFor",
+    "DualSegformerMiTB2",
+    "MLPDecoderHead",
+    "TRUFOR_WEIGHTS_ZIP_URL",
+    "DIFFUSIONPRINT_DEFAULT_HF_REPO",
+    "DIFFUSIONPRINT_DEFAULT_FILENAME",
+    "ForensicMoE",
+    "ForensicMoEGate",
 ]
 
 

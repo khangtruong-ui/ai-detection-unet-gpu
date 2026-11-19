@@ -16,6 +16,7 @@ Directory Layout:
 - **`focal/`**: FOCAL (HRNet-W32 & SAM ViT-Large) Strategy 1 & Strategy B (Prior-Preserving PEFT Surgery) finetuning configs at `512x512` with `data.normalize: false`, `precision: "auto"`, and L4-tuned batch sizes (`focal_vit.yaml`, `focal_vit_peft.yaml`, `focal_vit_contrastive.yaml`, `focal_vit_contrastive_peft.yaml`, `focal_hrnet.yaml`, `focal_hrnet_peft.yaml`, `focal_hrnet_contrastive.yaml`, `focal_hrnet_contrastive_peft.yaml`), plus **Domain-Split 4-Class/4-Cluster** joint CASIA+IMD2020 configs (`focal_hrnet_domain_split.yaml`, `focal_hrnet_contrastive_domain_split.yaml`, `focal_vit_domain_split.yaml`, `focal_vit_contrastive_domain_split.yaml`) and **Dual-Backbone Fusion** configs (`focal_hrnet_vit_fusion.yaml`, `focal_vit_hrnet_fusion_contrastive.yaml`).
 - **`msccnet/`**: MSCCNet (ACM TOMM 2025) dilated ResNet-50/101 (`outstride=8`) with Multi-Spectral Class Center (2D DCT + GCN) localization and image-level classification (`default.yaml`, `msccnet_resnet101.yaml`).
 - **`omnifd/`**: OmniFD (arXiv:2512.01128) unified SwinTransformer3D + Perceiver Interaction neck with image classification and spatial localization heads (`default.yaml`, `omnifd_swin_s_forgerynet.yaml`, `omnifd_swin_s_ff_spatial.yaml`, `omnifd_swin_s_fmld_spatial.yaml`).
+- **`moe/`**: `ForensicMoE` Prototype v1 (`forensic_moe_v1.yaml`) combining 3 strictly frozen open-weight experts (`SparseViT`, `TruFor NP++`, `TruFor-DiffusionPrint`) with a tiny `415,725`-param (`~0.42M`) forensic-signal-only gate and balanced domain sampling (`balance_domains: true`) on `KhangTruong/IMD2020-CASIAv2-Joint`.
 
 
 ---
@@ -180,7 +181,12 @@ sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml
 sid-train --config configs/experiments/mask_clip/default.yaml
 ```
 
-### 11. Multi-Experiment Comparative Suite
+### 11. Training with ForensicMoE Prototype v1 (Balanced Domain Sampling)
+```bash
+sid-train --config configs/experiments/moe/forensic_moe_v1.yaml
+```
+
+### 12. Multi-Experiment Comparative Suite
 ```bash
 sid-train --configs \
   configs/experiments/unet_scratch/unet_wide_b32.yaml \

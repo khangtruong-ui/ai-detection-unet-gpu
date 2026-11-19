@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sid_unet.models.blocks import get_submodule_device_dtype
+from sid_unet.utils.precision import is_bf16_supported
 
 warnings.filterwarnings("ignore", message=".*memory_attention_rope_theta.*")
 
@@ -139,7 +140,7 @@ class SAM3QLoRA(nn.Module):
 
         fallback_to_gpu_16bit = False
         if self.load_in_4bit and is_cuda:
-            compute_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+            compute_dtype = torch.bfloat16 if is_bf16_supported(device=self._target_device) else torch.float16
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -174,7 +175,7 @@ class SAM3QLoRA(nn.Module):
             base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=False)
         else:
             if is_cuda and (fallback_to_gpu_16bit or self.load_in_8bit):
-                compute_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+                compute_dtype = torch.bfloat16 if is_bf16_supported(device=self._target_device) else torch.float16
                 base_model = base_model.to(dtype=compute_dtype, device=self._target_device)
             for p in base_model.parameters():
                 p.requires_grad = False
