@@ -14,7 +14,7 @@ This note documents the native **FP8 (`float8_e4m3fn` / `e4m3`)** execution pipe
   - All CLI tools (`sid-train`, `sid-eval`, `sid-cross-eval`, `sid-predict`) accept `--precision` / `--mixed-precision` (`auto`, `fp8`, `bf8`, `e4m3`, `bf16`, `fp16`, `fp32`).
 - **Automatic Hardware Capability Check (`check_fp8_compatibility` / `is_fp8_supported`)**:
   - **SM >= 8.9 (Ada Lovelace / Hopper / Blackwell)** with PyTorch `float8_e4m3fn`, `torch._scaled_mm`, and `torchao`: `"auto"` resolves to `mode="fp8"`, `fp8_dtype=torch.float8_e4m3fn`, `amp_dtype=torch.bfloat16`, `use_grad_scaler=False`.
-  - **Pre-Ada CUDA GPUs (e.g., T4 SM 7.5, V100 SM 7.0, Ampere SM 8.0/8.6)** or unsupported environments: cleanly falls back to `"bf16"` (if supported) or `"fp16"` (`GradScaler` enabled only when `amp_dtype == torch.float16`).
+  - **Pre-Ada CUDA GPUs (e.g., T4 SM 7.5, V100 SM 7.0, Ampere SM 8.0/8.6)** or unsupported environments: cleanly falls back to `"bf16"` when native hardware BF16 is supported (`is_bf16_supported()` checking `torch.cuda.is_bf16_supported(including_emulation=False)`, i.e., SM >= 8.0) or `"fp16"` on pre-Ampere GPUs such as T4/V100 (`GradScaler` enabled only when `amp_dtype == torch.float16`).
   - **CPU**: resolves to `fp32`.
 
 ### Training (`prepare_model_for_fp8_training`)

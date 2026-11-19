@@ -52,7 +52,8 @@ class _DWConv(nn.Module):
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         b, _, c = x.shape
-        x = x.transpose(1, 2).view(b, c, H, W)
+        # Ensure contiguous NCHW layout; transposed NHWC views fail cuDNN depthwise Conv2d engines under BF16 on SM 7.5.
+        x = x.transpose(1, 2).reshape(b, c, H, W).contiguous()
         x = self.dwconv(x)
         return x.flatten(2).transpose(1, 2)
 
@@ -281,7 +282,7 @@ class SABlock(nn.Module):
             x_tok = x_befor + self.drop_path(x_sp)
             x_tok = x_tok + self.drop_path(self.mlp(self.norm2(x_tok), h, w))
 
-        return x_tok.transpose(1, 2).reshape(b, c_dim, h, w)
+        return x_tok.transpose(1, 2).reshape(b, c_dim, h, w).contiguous()
 
 
 class _PatchEmbed(nn.Module):

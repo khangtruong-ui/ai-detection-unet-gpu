@@ -200,3 +200,44 @@ def test_build_model_and_checkpoint_roundtrip_and_yaml_config():
             y1 = model.eval()(x, return_dict=False)
             y2 = reloaded.eval()(x, return_dict=False)
         assert torch.allclose(y1, y2, atol=1e-5)
+
+
+def test_sparsevit_dwconv_and_sablock_contiguous_nchw_and_amp_dtypes():
+    """
+    Regression test: SparseViT _DWConv and SABlock must produce contiguous NCHW tensors
+    so cuDNN depthwise Conv2d never fails with 'GET was unable to find an engine'
+    under bfloat16/float16 autocast on Turing (SM 7.5) or newer GPUs.
+    """
+    from sid_unet.models.sparsevit import SABlock, _DWConv
+
+    dw = _DWConv(dim=1280)
+    captured_input_contiguous: list[bool] = []
+    orig_dwconv = dw.dwconv
+
+    class _SpyConv(torch.nn.Module):
+        def forward(self, inp: torch.Tensor) -> torch.Tensor:
+            captured_input_contiguous.append(inp.is_contiguous())
+            return orig_dwconv(inp)
+
+    dw.dwconv = _SpyConv()  # type: ignore[assignment]
+    x_seq = torch.randn(2, 32 * 32, 1280)
+    out_seq = dw(x_seq, 32, 32)
+    assert out_seq.shape == (2, 1024, 1280)
+    assert captured_input_contiguous == [True]
+
+    sa = SABlock(dim=320, num_heads=5, sparse_size=8)
+    out_sa = sa(torch.randn(2, 320, 32, 32))
+    assert out_sa.is_contiguous()
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        dw_cuda = _DWConv(dim=1280).to(device).eval()
+        sv_cuda = SparseViT(img_size=512, pretrained=False, allow_random_init=True, freeze=True).to(device).eval()
+        x_cuda_seq = torch.randn(2, 32 * 32, 1280, device=device)
+        x_cuda_img = torch.rand(2, 3, 512, 512, device=device)
+        for dtype in (torch.bfloat16, torch.float16):
+            with torch.inference_mode(), torch.amp.autocast(device_type="cuda", dtype=dtype):
+                y_dw = dw_cuda(x_cuda_seq, 32, 32)
+                y_sv = sv_cuda(x_cuda_img, return_dict=False)
+            assert torch.isfinite(y_dw).all()
+            assert torch.isfinite(y_sv).all()

@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from sid_unet.utils.precision import is_bf16_supported
+
 
 def is_oom_error(exc: BaseException) -> bool:
     """
@@ -269,7 +271,7 @@ def find_optimal_batch_size(
 
     amp_dtype = (
         torch.bfloat16
-        if (device.type == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+        if (device.type == "cuda" and torch.cuda.is_available() and is_bf16_supported(device=device))
         else torch.float16
     )
     use_scaler = bool(use_amp and device.type == "cuda" and amp_dtype == torch.float16)

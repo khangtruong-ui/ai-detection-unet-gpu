@@ -172,6 +172,30 @@ def is_fp8_supported(device: Optional[torch.device] = None) -> bool:
     return supported
 
 
+def is_bf16_supported(device: Optional[torch.device] = None) -> bool:
+    """
+    Return True when CUDA natively supports bfloat16 (hardware SM >= 8.0, non-emulated).
+
+    PyTorch 2.4+ defaults `torch.cuda.is_bf16_supported(including_emulation=True)`, which
+    returns True on Turing/Volta GPUs (e.g. Tesla T4 SM 7.5) that emulate BF16 and lack
+    native BF16 Tensor Cores and certain cuDNN BF16 kernels.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if isinstance(device, torch.device) and device.type != "cuda":
+        return False
+    try:
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except TypeError:
+        try:
+            idx = device.index if (isinstance(device, torch.device) and device.index is not None) else 0
+            if torch.cuda.get_device_capability(idx) < (8, 0):
+                return False
+        except Exception:
+            pass
+        return bool(torch.cuda.is_bf16_supported())
+
+
 def _get_nested(cfg: Any, section: str, key: str, default: Any = None) -> Any:
     if cfg is None:
         return default
@@ -241,7 +265,7 @@ def resolve_precision_spec(
             fallback_reason=fallback_reason,
         )
 
-    bf16_ok = torch.cuda.is_bf16_supported()
+    bf16_ok = is_bf16_supported(device=device)
     fp8_ok, fp8_info = check_fp8_compatibility(device=device)
 
     if requested == "fp32":

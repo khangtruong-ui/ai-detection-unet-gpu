@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sid_unet.models.forensic_memory import stop_gradient_query_replacement
+from sid_unet.utils.precision import is_bf16_supported
 
 logger = logging.getLogger("sid_unet.models.noise_rag")
 
@@ -409,7 +410,7 @@ class ForensicVectorDBRetrieval(nn.Module):
         self.memory_dtype_str = str(memory_dtype).lower().strip()
         if any(tok in self.memory_dtype_str for tok in ("bf16", "bfloat16")):
             self.storage_dtype = torch.bfloat16
-        elif self.memory_dtype_str == "auto" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        elif self.memory_dtype_str == "auto" and is_bf16_supported():
             self.storage_dtype = torch.bfloat16
         else:
             self.storage_dtype = torch.float16

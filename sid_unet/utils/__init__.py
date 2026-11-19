@@ -38,6 +38,7 @@ from sid_unet.utils.compatibility import (
 from sid_unet.utils.precision import (
     PrecisionSpec,
     check_fp8_compatibility,
+    is_bf16_supported,
     is_fp8_supported,
     normalize_precision_mode,
     resolve_precision_spec,
@@ -101,6 +102,7 @@ __all__ = [
     "cli_check_8bit",
     "PrecisionSpec",
     "check_fp8_compatibility",
+    "is_bf16_supported",
     "is_fp8_supported",
     "normalize_precision_mode",
     "resolve_precision_spec",
