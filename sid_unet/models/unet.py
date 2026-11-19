@@ -360,6 +360,10 @@ class UNet(nn.Module):
                 merged["model"]["aux_classifier"] = merged["model"]["has_image_head"]
             elif any(k.startswith("decoder.perp_fusions.") for k in state_dict.keys()):
                 merged["model"]["name"] = "diffusion_diff_v2"
+            elif any(k.startswith(("gate.fpn_out.", "gate.fpn_proj_32.", "gate.unc_gate.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "forensic_moe_v2"
+                merged["model"]["pretrained"] = False
+                merged["model"]["allow_random_init"] = True
             elif any(k.startswith(("expert_sparsevit.", "expert_trufor.", "expert_diffusionprint.", "gate.logit_gamma")) for k in state_dict.keys()):
                 merged["model"]["name"] = "forensic_moe"
                 merged["model"]["pretrained"] = False
@@ -1153,12 +1157,18 @@ def build_model(config: Any) -> nn.Module:
     if any(k in model_name for k in ["forensic_moe", "forensic-moe", "moe"]) or any(
         k in backbone for k in ["forensic_moe", "forensic-moe"]
     ):
-        from sid_unet.models.forensic_moe import ForensicMoE
+        from sid_unet.models.forensic_moe import ForensicMoE, ForensicMoEv2
         img_sz = model_cfg.get("img_size", None)
         if img_sz is None and hasattr(config, "data"):
             ds_sz = config.data.get("image_size", [512, 512])
             img_sz = ds_sz[0] if isinstance(ds_sz, (list, tuple)) else ds_sz
-        return ForensicMoE(
+        is_v2 = (
+            ("v2" in model_name)
+            or ("v2" in backbone)
+            or (str(model_cfg.get("version", "")).lower() == "v2")
+            or (str(model_cfg.get("gate_version", "")).lower() == "v2")
+        )
+        common_kwargs = dict(
             pretrained=bool(model_cfg.get("pretrained", True)),
             allow_random_init=bool(model_cfg.get("allow_random_init", False)),
             sparsevit_checkpoint_path=model_cfg.get("sparsevit_checkpoint_path", None),
@@ -1170,15 +1180,29 @@ def build_model(config: Any) -> nn.Module:
             cache_dir=model_cfg.get("cache_dir", None),
             img_size=int(img_sz or 512),
             gate_temperature=float(model_cfg.get("gate_temperature", 1.0)),
+            balance_loss_weight=float(model_cfg.get("balance_loss_weight", loss_cfg.get("balance_loss_weight", 0.05))),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            num_classes=int(model_cfg.get("num_classes", 2)),
+        )
+        if is_v2:
+            return ForensicMoEv2(
+                **common_kwargs,
+                router_proj_dim=int(model_cfg.get("router_proj_dim", 96)),
+                router_hidden_dim=int(model_cfg.get("router_hidden_dim", 192)),
+                unc_hidden_dim=int(model_cfg.get("unc_hidden_dim", 16)),
+                unc_bias_init=float(model_cfg.get("unc_bias_init", -1.5)),
+                oracle_loss_weight=float(model_cfg.get("oracle_loss_weight", loss_cfg.get("oracle_loss_weight", 0.02))),
+                oracle_temperature=float(model_cfg.get("oracle_temperature", 0.5)),
+                residual_l2_weight=float(model_cfg.get("residual_l2_weight", loss_cfg.get("residual_l2_weight", 1e-4))),
+            )
+        return ForensicMoE(
+            **common_kwargs,
             spectral_hidden_dims=tuple(model_cfg.get("spectral_hidden_dims", [96, 192, 256])),
             spectral_embed_dim=int(model_cfg.get("spectral_embed_dim", 64)),
             spatial_hidden_dim=int(model_cfg.get("spatial_hidden_dim", 144)),
             spatial_num_blocks=int(model_cfg.get("spatial_num_blocks", 3)),
-            balance_loss_weight=float(model_cfg.get("balance_loss_weight", loss_cfg.get("balance_loss_weight", 0.05))),
             oracle_loss_weight=float(model_cfg.get("oracle_loss_weight", loss_cfg.get("oracle_loss_weight", 0.15))),
             oracle_temperature=float(model_cfg.get("oracle_temperature", 0.15)),
-            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
-            num_classes=int(model_cfg.get("num_classes", 2)),
         )
 
     if any(k in model_name for k in ["sparsevit", "sparse_vit"]) or any(

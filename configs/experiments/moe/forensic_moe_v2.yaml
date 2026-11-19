@@ -1,0 +1,89 @@
+# Configuration: ForensicMoE v2 (3 Frozen Experts + Multi-Scale FPN + Uncertainty Gate)
+# Experts (strictly frozen in .eval()):
+#   1B. SparseViT (50.3M, ImageNet-standardized RGB, H/8 + LFF H/16 taps)
+#   2.  TruFor Noiseprint++ (68.7M, raw [0, 1] RGB, H/32..H/4 decoder taps)
+#   3.  TruFor-DiffusionPrint (68.7M, raw [0, 1] RGB, H/32..H/4 + 64-ch DnCNN taps)
+# Trainable Gate: ~6.66M params (<3.5% of ~194.4M ensemble), Cross-Expert Attention Router +
+#   Uncertainty-Gated Top-Down Residual FPN Decoder (strictly forensic features, zero raw RGB)
+# Joint Dataset: KhangTruong/IMD2020-CASIAv2-Joint (4,354 casia vs 28,000 imd2020 -> balanced per batch)
+
+project:
+  name: "forensic_moe_v2"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/forensic_moe_v2"
+
+data:
+  dataset_name: "KhangTruong/IMD2020-CASIAv2-Joint"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 32
+  num_workers: -1
+  pin_memory: true
+  use_parquet_loader: true
+  save_to_disk: true
+  max_cached_row_groups: 64
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  balance_domains: true
+  balance_val_domains: true
+  domain_column: "dataset_source"
+  balance_strategy: "oversample"
+  train_samples_per_epoch: 16000
+  val_samples_per_epoch: -1
+  val_samples: -1
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_jpeg: 0.5
+    jpeg_qf_min: 65
+    jpeg_qf_max: 100
+
+model:
+  name: "forensic_moe_v2"
+  pretrained: true
+  img_size: 512
+  gate_temperature: 1.0
+  router_proj_dim: 96
+  router_hidden_dim: 192
+  unc_hidden_dim: 16
+  unc_bias_init: -1.5
+  balance_loss_weight: 0.05
+  oracle_loss_weight: 0.02
+  oracle_temperature: 0.5
+  residual_l2_weight: 0.0001
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.4
+  dice_weight: 0.4
+  focal_weight: 0.2
+  focal_gamma: 2.0
+  align_weight: 1.0
+
+training:
+  epochs: 20
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 1
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
+  gradient_accumulation_steps: 2
+  auto_batch_size: true
+  amp: true
+  mixed_precision: "bf16"
+  precision: "bf16"
+  save_best: true
+  save_latest: true
+  early_stopping_patience: 6
+  early_stopping_metric: "val_iou"
+  early_stopping_mode: "max"
+
+logging:
+  log_interval: 20

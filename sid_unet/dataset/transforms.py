@@ -5,6 +5,7 @@ Ensures joint transformations for segmentation consistency.
 
 from __future__ import annotations
 
+import io
 import random
 from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
@@ -103,6 +104,32 @@ class JointRandomRotate90:
         return image, mask
 
 
+class JointRandomJPEGCompression:
+    """Apply random JPEG recompression at QF in [min_qf, max_qf] without altering mask."""
+
+    def __init__(self, p: float = 0.5, quality_range: Tuple[int, int] = (65, 100)):
+        self.p = float(p)
+        q_min, q_max = int(quality_range[0]), int(quality_range[1])
+        self.quality_range = (max(1, min(q_min, q_max)), min(100, max(q_min, q_max)))
+
+    def __call__(
+        self,
+        image: Image.Image,
+        mask: np.ndarray,
+    ) -> Tuple[Image.Image, np.ndarray]:
+        if random.random() < self.p:
+            qf = random.randint(self.quality_range[0], self.quality_range[1])
+            if qf < 100:
+                rgb_img = image.convert("RGB") if image.mode != "RGB" else image
+                buf = io.BytesIO()
+                rgb_img.save(buf, format="JPEG", quality=qf)
+                buf.seek(0)
+                with Image.open(buf) as decoded:
+                    image = decoded.convert("RGB")
+                buf.close()
+        return image, mask
+
+
 class JointToTensorAndNormalize:
     """Convert PIL image to normalized FloatTensor and mask to (1, H, W) FloatTensor."""
 
@@ -154,6 +181,16 @@ def get_transforms(
         rot90 = augment_config.get("random_rotate90", 0.0)
         if rot90 > 0:
             transforms_list.append(JointRandomRotate90(p=rot90))
+
+        jpeg_p = float(augment_config.get("random_jpeg", augment_config.get("jpeg_compression", 0.0)))
+        if jpeg_p > 0:
+            jpeg_q = augment_config.get("jpeg_quality", None)
+            if isinstance(jpeg_q, (list, tuple)) and len(jpeg_q) >= 2:
+                qf_min, qf_max = int(jpeg_q[0]), int(jpeg_q[1])
+            else:
+                qf_min = int(augment_config.get("jpeg_qf_min", 65))
+                qf_max = int(augment_config.get("jpeg_qf_max", 100))
+            transforms_list.append(JointRandomJPEGCompression(p=jpeg_p, quality_range=(qf_min, qf_max)))
 
     transforms_list.append(JointToTensorAndNormalize(normalize=normalize))
     return JointCompose(transforms_list)

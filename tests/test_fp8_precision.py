@@ -300,3 +300,146 @@ def test_emulated_only_bf16_falls_back_to_fp16():
         assert spec_bf16.use_grad_scaler is True
         assert spec_bf16.fallback_reason is not None
 
+
+@pytest.mark.skipif(not is_fp8_supported(), reason="Requires SM >= 8.9 CUDA GPU with FP8 E4M3 support")
+def test_fp8_128x128_and_in1_linear_shapes_training_and_inference():
+    """
+    Regression test for TorchAO PerTensor vs 128x128 blockwise collision
+    ('AssertionError: input_tensor must be 1x128 scaled') and PerRow WeightOnly
+    failure on in_features == 1 ('RuntimeError: shape [out, 1] is invalid').
+    """
+    device = torch.device("cuda:0")
+    spec = resolve_precision_spec(mode="fp8", device=device)
+
+    class _EdgeShapeBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin_128 = nn.Linear(128, 128)
+            self.lin_wide = nn.Linear(128, 64)
+            self.lin_in1 = nn.Linear(1, 64)
+            self.lin_odd = nn.Linear(64, 3)
+
+        def forward(self, x: torch.Tensor, scalar_x: torch.Tensor) -> torch.Tensor:
+            h = torch.relu(self.lin_128(x))
+            h = self.lin_wide(h) + torch.relu(self.lin_in1(scalar_x))
+            return self.lin_odd(h)
+
+    x = torch.randn(2, 32, 128, device=device)
+    scalar_x = torch.randn(2, 32, 1, device=device)
+
+    # 1. Training
+    train_mod = _EdgeShapeBlock().to(device)
+    train_stats = prepare_model_for_fp8_training(train_mod, spec)
+    assert train_stats["converted_linear_layers"] == 2
+    assert train_stats["skipped_linear_layers"] == 2
+    with torch.amp.autocast("cuda", dtype=spec.amp_dtype, enabled=spec.amp_enabled):
+        out_tr = train_mod(x, scalar_x)
+        loss = out_tr.square().mean()
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in train_mod.parameters())
+
+    # 2. Inference (batch * seq_len = 64 > 1, where PerTensor 128x128 previously crashed)
+    ref_mod = _EdgeShapeBlock().to(device).eval()
+    infer_mod = _EdgeShapeBlock().to(device).eval()
+    infer_mod.load_state_dict(ref_mod.state_dict())
+
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        y_bf16 = ref_mod(x, scalar_x)
+
+    infer_mod, infer_stats = prepare_model_for_fp8_inference(infer_mod, spec)
+    assert infer_stats["dynamic_fp8_layers"] == 2
+    assert infer_stats["weight_only_fp8_layers"] == 2
+
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=spec.amp_dtype, enabled=spec.amp_enabled):
+        y_fp8 = infer_mod(x, scalar_x)
+    assert y_fp8.shape == (2, 32, 3)
+    assert torch.isfinite(y_fp8).all()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        y_bf16.float().flatten(), y_fp8.float().flatten(), dim=0
+    )
+    assert float(cos_sim) > 0.98
+
+
+@pytest.mark.skipif(not is_fp8_supported(), reason="Requires SM >= 8.9 CUDA GPU with FP8 E4M3 support")
+def test_fp8_inference_trufor_and_forensic_moe_v2_cuda():
+    """
+    Verify TruFor (contains 32x 128x128 stage-2 Linear layers) and ForensicMoEv2
+    run cleanly under prepare_model_for_fp8_inference with batch_size=2 (M > 1).
+    """
+    from sid_unet.models.forensic_moe import ForensicMoEv2
+    from sid_unet.models.trufor import TruFor
+
+    device = torch.device("cuda:0")
+    spec = resolve_precision_spec(mode="fp8", device=device)
+    x = torch.rand(2, 3, 64, 64, device=device)
+
+    tf = TruFor(np_out_channels=1, pretrained=False, allow_random_init=True).to(device).eval()
+    tf, tf_stats = prepare_model_for_fp8_inference(tf, spec)
+    assert tf_stats["dynamic_fp8_layers"] > 0
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=spec.amp_dtype, enabled=spec.amp_enabled):
+        out_tf = tf(x, return_dict=True)
+    assert out_tf["mask_logits"].shape == (2, 1, 64, 64)
+    assert torch.isfinite(out_tf["mask_logits"]).all()
+
+    moe = ForensicMoEv2(img_size=64, pretrained=False, allow_random_init=True).to(device).eval()
+    moe, moe_stats = prepare_model_for_fp8_inference(moe, spec)
+    assert moe_stats["dynamic_fp8_layers"] > 0
+    assert moe_stats["weight_only_fp8_layers"] > 0
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=spec.amp_dtype, enabled=spec.amp_enabled):
+        out_moe = moe(x, return_dict=True)
+    assert out_moe["mask_logits"].shape == (2, 1, 64, 64)
+    assert torch.isfinite(out_moe["mask_logits"]).all()
+
+
+def test_fp8_inference_128x128_non_bf16_routes_to_weight_only():
+    """
+    When compute_dtype is float16 (where TorchAO PerRow dynamic FP8 is unsupported),
+    128x128 Linear layers must not receive PerTensor dynamic FP8 and must route to
+    Float8WeightOnlyConfig when fp8_all_parameters=True.
+    """
+    from sid_unet.utils.precision import PrecisionSpec
+
+    pytest.importorskip("torchao.quantization")
+
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l_128 = nn.Linear(128, 128)
+            self.l_64 = nn.Linear(64, 64)
+            self.l_in1 = nn.Linear(1, 32)
+
+    spec_fp16 = PrecisionSpec(
+        mode="fp8",
+        requested_mode="fp8",
+        fp8_enabled=True,
+        fp8_dtype=torch.float8_e4m3fn,
+        amp_enabled=True,
+        amp_dtype=torch.float16,
+        amp_dtype_str="fp8_e4m3fn",
+        use_grad_scaler=True,
+        fp8_all_parameters=True,
+    )
+
+    recorded = []
+
+    def _fake_quantize_(root, config, filter_fn=None, **kwargs):
+        matched = []
+        for n, m in root.named_modules():
+            if filter_fn is None or filter_fn(m, n):
+                matched.append(n)
+                if hasattr(m, "weight") and isinstance(m.weight, nn.Parameter):
+                    m.weight = nn.Parameter(torch.zeros_like(m.weight.data, dtype=torch.int8), requires_grad=False)
+        recorded.append((type(config).__name__, getattr(config, "granularity", None), matched))
+
+    net = _Net()
+    with patch("torchao.quantization.quantize_", side_effect=_fake_quantize_):
+        _, stats = prepare_model_for_fp8_inference(net, spec_fp16)
+
+    assert stats["dynamic_fp8_layers"] == 1  # only l_64
+    assert stats["weight_only_fp8_layers"] == 2  # l_128 + l_in1
+    dyn_entries = [e for e in recorded if e[0] == "Float8DynamicActivationFloat8WeightConfig"]
+    wo_entries = [e for e in recorded if e[0] == "Float8WeightOnlyConfig"]
+    assert len(dyn_entries) == 1
+    assert dyn_entries[0][2] == ["l_64"]
+    assert sorted(n for _, _, names in wo_entries for n in names) == ["l_128", "l_in1"]
+
