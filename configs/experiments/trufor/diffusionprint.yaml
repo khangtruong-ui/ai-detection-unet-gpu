@@ -1,0 +1,41 @@
+# Configuration: TruFor-DiffusionPrint (64-ch MoCo DnCNN + SegFormer MiT-B2, CVPRW 2026, ~68.7M params)
+# Official Pretrained Weights (HF: giakoupg/diffusionprint): automatically resolved by TruFor._resolve_checkpoint_path()
+
+project:
+  name: "trufor_diffusionprint"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/trufor_diffusionprint"
+
+data:
+  dataset_name: "KhangTruong/IMD2020-CASIAv2-Joint"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 16
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+
+model:
+  name: "diffusionprint"
+  np_out_channels: 64
+  pretrained: true
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+
+training:
+  epochs: 10
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  optimizer: "adamw"
+  scheduler: "cosine"
+  amp: true
+  precision: "auto"
