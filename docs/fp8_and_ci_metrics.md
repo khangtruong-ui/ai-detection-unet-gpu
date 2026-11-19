@@ -26,7 +26,7 @@ This note documents the native **FP8 (`float8_e4m3fn` / `e4m3`)** execution pipe
 ### Inference (`prepare_model_for_fp8_inference`)
 - Called across `sid-eval`, `sid-cross-eval`, and `sid-predict`.
 - Aligns only `nn.Linear` and `nn.MultiheadAttention` parameters to `compute_dtype` (`bfloat16`) before TorchAO quantization—leaving `Conv2d` / `BatchNorm` / `NoisePrint++` residual filters untouched in `float32` so accuracy/calibration matches BF16 closely.
-- Applies `Float8DynamicActivationFloat8WeightConfig` to 16-aligned `Linear` layers and, when `fp8_all_parameters=True`, `Float8WeightOnlyConfig` to non-16-aligned `Linear` layers plus FP8 retrieval on `ForensicVectorDBRetrieval`.
+- Applies `Float8DynamicActivationFloat8WeightConfig` to 16-aligned `Linear` layers (`PerRow()` granularity on `128x128` weights under `bfloat16` to avoid TorchAO's `PerTensor` vs `128x128` blockwise `_is_128_128_scaled` collision) and, when `fp8_all_parameters=True`, `Float8WeightOnlyConfig` to remaining `Linear` layers (`PerTensor()` when `in_features == 1`) plus FP8 retrieval on `ForensicVectorDBRetrieval`.
 
 ---
 

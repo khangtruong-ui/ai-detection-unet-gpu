@@ -72,3 +72,27 @@ def test_joint_random_jpeg_compression():
     img_t, mask_t = tf(img, mask)
     assert img_t.shape == (3, 128, 128)
     assert mask_t.shape == (1, 128, 128)
+
+    # p=0.0 and quality_range=(100, 100) must leave pixels completely unchanged
+    img_noop, mask_noop = JointRandomJPEGCompression(p=0.0, quality_range=(65, 85))(img, mask)
+    assert np.array_equal(np.asarray(img_noop), arr)
+    assert np.array_equal(mask_noop, orig_mask)
+
+    img_q100, _ = JointRandomJPEGCompression(p=1.0, quality_range=(100, 100))(img, mask)
+    assert np.array_equal(np.asarray(img_q100), arr)
+
+    # Non-RGB ("L") mode must safely convert to RGB during recompression
+    img_gray = img.convert("L")
+    img_gray_out, _ = JointRandomJPEGCompression(p=1.0, quality_range=(70, 80))(img_gray, mask)
+    assert img_gray_out.mode == "RGB"
+    assert img_gray_out.size == (128, 128)
+
+    # Alias keys jpeg_compression / jpeg_quality list
+    tf_alias = get_transforms(
+        image_size=(128, 128),
+        is_train=True,
+        augment_config={"jpeg_compression": 1.0, "jpeg_quality": [70, 90]},
+        normalize=False,
+    )
+    img_alias_t, _ = tf_alias(img, mask)
+    assert img_alias_t.shape == (3, 128, 128)

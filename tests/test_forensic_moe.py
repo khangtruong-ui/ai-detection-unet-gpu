@@ -25,6 +25,8 @@ def test_zero_random_init_policy():
         TruFor(np_out_channels=64, pretrained=False)
     with pytest.raises(ValueError, match="allow_random_init"):
         ForensicMoE(pretrained=False)
+    with pytest.raises(ValueError, match="allow_random_init"):
+        ForensicMoEv2(pretrained=False)
 
 
 def test_sparsevit_and_trufor_forward_shapes():
@@ -376,3 +378,34 @@ def test_forensic_moe_v2_backward_yaml_and_checkpoint_roundtrip():
             y1 = model.eval()(x, return_dict=False)
             y2 = reloaded.eval()(x, return_dict=False)
         assert torch.allclose(y1, y2, atol=1e-5)
+
+
+def test_forensic_moe_v2_aux_classifier_rectangular_and_cuda_amp():
+    """Verify ForensicMoEv2 aux_classifier, return_dict=False, rectangular inputs, and CUDA AMP."""
+    model = ForensicMoEv2(
+        img_size=64,
+        pretrained=False,
+        allow_random_init=True,
+        aux_classifier=True,
+        num_classes=3,
+    ).eval()
+    x_rect = torch.rand(1, 3, 96, 128)
+    with torch.no_grad():
+        mask_logits, class_logits = model(x_rect, return_dict=False)
+    assert mask_logits.shape == (1, 1, 96, 128)
+    assert class_logits.shape == (1, 3)
+    assert torch.isfinite(mask_logits).all()
+    assert torch.isfinite(class_logits).all()
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        model_cuda = model.to(device)
+        x_cuda = torch.rand(2, 3, 64, 64, device=device)
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype):
+            out = model_cuda(x_cuda, return_dict=True)
+        assert out["mask_logits"].shape == (2, 1, 64, 64)
+        assert out["class_logits"].shape == (2, 3)
+        assert torch.isfinite(out["mask_logits"]).all()
+        assert torch.isfinite(out["class_logits"]).all()
+

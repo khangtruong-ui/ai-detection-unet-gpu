@@ -510,6 +510,11 @@ def prepare_model_for_fp8_inference(
                 Float8DynamicActivationFloat8WeightConfig,
                 Float8WeightOnlyConfig,
             )
+            try:
+                from torchao.quantization import PerRow, PerTensor
+            except ImportError:
+                PerRow = None
+                PerTensor = None
 
             def _is_standard_unquantized_linear(m: nn.Module, fqn: str = "") -> bool:
                 return (
@@ -519,30 +524,47 @@ def prepare_model_for_fp8_inference(
                     and type(m.weight.data).__name__ not in ("Float8Tensor", "Float8TrainingTensor")
                 )
 
-            eligible_dyn = [
-                n for n, m in target.named_modules()
-                if _is_standard_unquantized_linear(m, n) and fp8_linear_module_filter(m, n)
-            ]
-            if eligible_dyn:
-                quantize_(
-                    target,
-                    Float8DynamicActivationFloat8WeightConfig(),
-                    filter_fn=lambda m, fqn: _is_standard_unquantized_linear(m, fqn) and fp8_linear_module_filter(m, fqn),
+            def _is_ambiguous_128x128_linear(m: nn.Module) -> bool:
+                # TorchAO's default PerTensor granularity sets block_size=[128, 128] on
+                # (128, 128) weights, which _is_128_128_scaled() mistakes for blockwise
+                # 128x128 scaling and fails with "input_tensor must be 1x128 scaled".
+                return isinstance(m, nn.Linear) and m.in_features == 128 and m.out_features == 128
+
+            def _apply_quant(cfg: Any, pred: Any) -> int:
+                matched = [n for n, m in target.named_modules() if pred(m, n)]
+                if not matched:
+                    return 0
+                quantize_(target, cfg, filter_fn=lambda m, fqn: pred(m, fqn))
+                return len(matched)
+
+            dyn_count += _apply_quant(
+                Float8DynamicActivationFloat8WeightConfig(),
+                lambda m, fqn: (
+                    _is_standard_unquantized_linear(m, fqn)
+                    and fp8_linear_module_filter(m, fqn)
+                    and not _is_ambiguous_128x128_linear(m)
+                ),
+            )
+            if PerRow is not None and compute_dtype == torch.bfloat16:
+                dyn_count += _apply_quant(
+                    Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()),
+                    lambda m, fqn: (
+                        _is_standard_unquantized_linear(m, fqn)
+                        and fp8_linear_module_filter(m, fqn)
+                        and _is_ambiguous_128x128_linear(m)
+                    ),
                 )
-                dyn_count = len(eligible_dyn)
 
             if precision_spec.fp8_all_parameters:
-                eligible_wo = [
-                    n for n, m in target.named_modules()
-                    if _is_standard_unquantized_linear(m, n) and not fp8_linear_module_filter(m, n)
-                ]
-                if eligible_wo:
-                    quantize_(
-                        target,
-                        Float8WeightOnlyConfig(),
-                        filter_fn=lambda m, fqn: _is_standard_unquantized_linear(m, fqn) and not fp8_linear_module_filter(m, fqn),
+                wo_count += _apply_quant(
+                    Float8WeightOnlyConfig(),
+                    lambda m, fqn: _is_standard_unquantized_linear(m, fqn) and m.in_features > 1,
+                )
+                if PerTensor is not None:
+                    wo_count += _apply_quant(
+                        Float8WeightOnlyConfig(granularity=PerTensor()),
+                        lambda m, fqn: _is_standard_unquantized_linear(m, fqn) and m.in_features == 1,
                     )
-                    wo_count = len(eligible_wo)
         except Exception as exc:
             log.warning(f"TorchAO FP8 inference quantization skipped due to error: {exc}")
 
