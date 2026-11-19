@@ -571,7 +571,11 @@ class MLPDecoderHead(nn.Module):
         )
         self.linear_pred = nn.Conv2d(embed_dim, num_classes, kernel_size=1)
 
-    def forward(self, inputs: Sequence[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: Sequence[torch.Tensor],
+        return_fused: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         c1, c2, c3, c4 = inputs
         n = c4.shape[0]
         target_hw = c1.shape[2:]
@@ -599,7 +603,10 @@ class MLPDecoderHead(nn.Module):
         x = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
         if self.dropout is not None:
             x = self.dropout(x)
-        return self.linear_pred(x)
+        logits = self.linear_pred(x)
+        if return_fused:
+            return logits, x
+        return logits
 
 
 # ------------------------------------------------------------------------------
@@ -848,9 +855,10 @@ class TruFor(nn.Module):
         self,
         rgb: torch.Tensor,
         return_dict: bool = True,
+        return_features: bool = False,
         *args: Any,
         **kwargs: Any,
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Union[torch.Tensor, Dict[str, Any]]:
         orig_h, orig_w = rgb.shape[2], rgb.shape[3]
         pad_h = (32 - orig_h % 32) % 32
         pad_w = (32 - orig_w % 32) % 32
@@ -859,17 +867,24 @@ class TruFor(nn.Module):
         if pad_h > 0 or pad_w > 0:
             rgb_raw = F.pad(rgb_raw, (0, pad_w, 0, pad_h), mode="reflect")
 
-        modal_x = self.dncnn(rgb_raw)
+        dncnn_feat = self.dncnn(rgb_raw)
         if self.np_adapter is not None:
-            modal_x = self.np_adapter(modal_x)
-        elif modal_x.shape[1] == 1:
-            modal_x = modal_x.repeat(1, 3, 1, 1)
+            modal_x = self.np_adapter(dncnn_feat)
+        elif dncnn_feat.shape[1] == 1:
+            modal_x = dncnn_feat.repeat(1, 3, 1, 1)
+        else:
+            modal_x = dncnn_feat
 
         rgb_norm = self._prepro_imagenet(rgb_raw)
         feats = self.backbone(rgb_norm, modal_x)
 
+        if return_features:
+            dec_logits, dec_fused = self.decode_head(feats, return_fused=True)
+        else:
+            dec_logits = self.decode_head(feats)
+
         out = F.interpolate(
-            self.decode_head(feats),
+            dec_logits,
             size=rgb_raw.shape[2:],
             mode="bilinear",
             align_corners=False,
@@ -891,7 +906,7 @@ class TruFor(nn.Module):
         det_logit = self.detection(torch.cat((f1, f2), dim=-1))
 
         if return_dict:
-            return {
+            res: Dict[str, Any] = {
                 "mask_logits": mask_logits,
                 "raw_logits": out,
                 "conf_map": conf,
@@ -900,6 +915,20 @@ class TruFor(nn.Module):
                 "det_score": torch.sigmoid(det_logit),
                 "pred_mask": torch.sigmoid(mask_logits),
             }
+            if return_features:
+                dncnn_out = (
+                    dncnn_feat[:, :, :orig_h, :orig_w].contiguous()
+                    if (pad_h > 0 or pad_w > 0)
+                    else dncnn_feat
+                )
+                res["features"] = {
+                    "h4": dec_fused,
+                    "h8": feats[1],
+                    "h16": feats[2],
+                    "h32": feats[3],
+                    "dncnn": dncnn_out,
+                }
+            return res
         return mask_logits
 
     @torch.no_grad()

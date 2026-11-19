@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-11-19
 
+### Added
+- **ForensicMoE v2 (Multi-Scale Feature-Pyramid MoE & Random JPEG Augmentation) (`sid_unet.models.forensic_moe`, `sid_unet.models.sparsevit`, `sid_unet.models.trufor`, `sid_unet.models.unet`, `sid_unet.dataset.transforms`, `configs/experiments/moe/forensic_moe_v2.yaml`)**:
+  - Exposed `return_features: bool = False` in `SparseViT` (`h8`, `lff` taps) and `TruFor` (`h4`, `h8`, `h16`, `h32`, `dncnn` taps) with zero extra backbone compute and full backward compatibility with `return_dict=True` contracts and existing checkpoints.
+  - Added `ForensicMoEv2` and `ForensicMoEv2Gate` (`6,656,561` trainable params, `3.42%` of the `194.4M` ensemble) combining a Multi-Scale Cross-Expert Attention Router (`H/16 -> H/4`), an Uncertainty/Disagreement Gate $g_{\text{unc}}(x, y)$ (`bias = -1.5`), and a zero-initialized Top-Down Multi-Scale Residual FPN Decoder (`H/32 -> H/16 -> H/8 -> H/4 -> H`) operating strictly on frozen forensic features with mild residual L2 regularization (`1e-4`).
+  - Added `JointRandomJPEGCompression` (`QF 65–100`) to `sid_unet/dataset/transforms.py` and wired `random_jpeg` / `jpeg_qf_min` / `jpeg_qf_max` into `get_transforms()`.
+  - Added `configs/experiments/moe/forensic_moe_v2.yaml` (`epochs=20`, `lr=2e-4`, `weight_decay=0.01`, `batch_size=32`, `grad_accum=2`, `0.4*BCE + 0.4*Dice + 0.2*Focal(gamma=2.0)`, `bf16`), updated `build_model()` / `UNet.from_checkpoint()` auto-detection, and added unit/integration tests in `tests/test_forensic_moe.py` and `tests/test_transforms.py`.
+
 ### Fixed
 - **SparseViT / ForensicMoE cuDNN `bfloat16` Depthwise Conv2d Engine Failure & Native BF16 Detection (`sid_unet.models.sparsevit`, `sid_unet.utils.precision`, `sid_unet.utils.compatibility`, `sid_unet.utils.memory`, `sid_unet.training.trainer`, `sid_unet.models.noise_rag`, `sid_unet.models.sam2`, `sid_unet.models.sam3_qlora`)**:
   - Added `.contiguous()` in `SparseViT` `_DWConv.forward()` and `SABlock.forward()` (`sid_unet/models/sparsevit.py`) so token-to-spatial reshapes emit contiguous NCHW tensors rather than transposed NHWC views, fixing `RuntimeError: GET was unable to find an engine to execute this computation` in cuDNN depthwise `Conv2d` under `bfloat16` autocast.

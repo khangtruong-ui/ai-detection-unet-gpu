@@ -4,7 +4,7 @@
 **Date**: November 19, 2026  
 **Target Repository**: `khangtruong-ui/ai-detection-unet-gpu`  
 **Predecessor**: [`docs/forensic_moe_prototype_v1_requirements.md`](forensic_moe_prototype_v1_requirements.md) (PR #30, `sid_unet/models/forensic_moe.py`)  
-**Status**: Proposed Specification & PR Plan (No Implementation Code Yet)
+**Status**: Implemented (`ForensicMoEv2`, `ForensicMoEv2Gate`, `return_features` taps, `JointRandomJPEGCompression`, Tests & Config) — Pending Training/Cross-Eval Benchmarks
 
 ---
 
@@ -196,6 +196,6 @@ $$z_{\text{MoE-v2}}(x, y) = \underbrace{\sum_{k=1}^{3} w_k(x, y) \cdot z'_k(x, y
 | **`TGIF2_flux1dev`, `OpenSDID_SDXL/Flux.1`** | Limited by image-level scalar routing | **Better spatial selectivity** via `H/16` cross-expert attention + `64-ch` DiffusionPrint tap |
 
 ### Verification Checklist (GPU Target Machine)
-- [ ] Add `return_features: bool = False` to `SparseViT` and `TruFor` without breaking existing `return_dict=True` contracts or checkpoints.
-- [ ] Verify trainable parameter count (`~6.5M–8.5M`), zero frozen-expert parameter updates, and `step-0` equivalence when $\Delta z_{\text{FPN}}$ final conv is zero-initialized.
+- [x] Add `return_features: bool = False` to `SparseViT` and `TruFor` without breaking existing `return_dict=True` contracts or checkpoints.
+- [x] Verify trainable parameter count (`6,656,561` trainable / `194,433,870` total, `3.42%`), zero frozen-expert parameter updates, and `step-0` equivalence when $\Delta z_{\text{FPN}}$ final conv is zero-initialized (`tests/test_forensic_moe.py`).
 - [ ] Compare `forensic_moe_v2` vs `forensic_moe_v1` on both `KhangTruong/IMD2020-CASIAv2-Joint` (`val_iou` curve without early plateau) and `sid-cross-eval` across all 13 in-scope subsets of [`configs/cross-eval/MVSS-v1-protocol.yaml`](../configs/cross-eval/MVSS-v1-protocol.yaml), grouping scores by the color-coded **Green / Blue / Yellow / Orange / Red** intersection modes above.

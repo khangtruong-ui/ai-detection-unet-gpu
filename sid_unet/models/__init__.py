@@ -123,6 +123,8 @@ from sid_unet.models.trufor import (
 from sid_unet.models.forensic_moe import (
     ForensicMoE,
     ForensicMoEGate,
+    ForensicMoEv2,
+    ForensicMoEv2Gate,
 )
 
 __all__ = [
@@ -227,6 +229,8 @@ __all__ = [
     "DIFFUSIONPRINT_DEFAULT_FILENAME",
     "ForensicMoE",
     "ForensicMoEGate",
+    "ForensicMoEv2",
+    "ForensicMoEv2Gate",
 ]
 
 

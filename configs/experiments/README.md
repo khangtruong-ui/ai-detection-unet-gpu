@@ -16,7 +16,7 @@ Directory Layout:
 - **`focal/`**: FOCAL (HRNet-W32 & SAM ViT-Large) Strategy 1 & Strategy B (Prior-Preserving PEFT Surgery) finetuning configs at `512x512` with `data.normalize: false`, `precision: "auto"`, and L4-tuned batch sizes (`focal_vit.yaml`, `focal_vit_peft.yaml`, `focal_vit_contrastive.yaml`, `focal_vit_contrastive_peft.yaml`, `focal_hrnet.yaml`, `focal_hrnet_peft.yaml`, `focal_hrnet_contrastive.yaml`, `focal_hrnet_contrastive_peft.yaml`), plus **Domain-Split 4-Class/4-Cluster** joint CASIA+IMD2020 configs (`focal_hrnet_domain_split.yaml`, `focal_hrnet_contrastive_domain_split.yaml`, `focal_vit_domain_split.yaml`, `focal_vit_contrastive_domain_split.yaml`) and **Dual-Backbone Fusion** configs (`focal_hrnet_vit_fusion.yaml`, `focal_vit_hrnet_fusion_contrastive.yaml`).
 - **`msccnet/`**: MSCCNet (ACM TOMM 2025) dilated ResNet-50/101 (`outstride=8`) with Multi-Spectral Class Center (2D DCT + GCN) localization and image-level classification (`default.yaml`, `msccnet_resnet101.yaml`).
 - **`omnifd/`**: OmniFD (arXiv:2512.01128) unified SwinTransformer3D + Perceiver Interaction neck with image classification and spatial localization heads (`default.yaml`, `omnifd_swin_s_forgerynet.yaml`, `omnifd_swin_s_ff_spatial.yaml`, `omnifd_swin_s_fmld_spatial.yaml`).
-- **`moe/`**: `ForensicMoE` Prototype v1 (`forensic_moe_v1.yaml`) combining 3 strictly frozen open-weight experts (`SparseViT`, `TruFor NP++`, `TruFor-DiffusionPrint`) with a tiny `415,725`-param (`~0.42M`) forensic-signal-only gate and balanced domain sampling (`balance_domains: true`) on `KhangTruong/IMD2020-CASIAv2-Joint`.
+- **`moe/`**: `ForensicMoE` Prototype v1 (`forensic_moe_v1.yaml`, `415,725` trainable params) and **`ForensicMoE v2`** (`forensic_moe_v2.yaml`, `6,656,561` trainable params, `<3.5%` of the `194.4M` ensemble) combining 3 strictly frozen open-weight experts (`SparseViT`, `TruFor NP++`, `TruFor-DiffusionPrint`) with balanced domain sampling (`balance_domains: true`) on `KhangTruong/IMD2020-CASIAv2-Joint`. `v2` upgrades the gate to a Multi-Scale Cross-Expert Attention Router + Uncertainty-Gated Top-Down Residual FPN Decoder with random JPEG compression (`QF 65–100`) and `0.4*BCE + 0.4*Dice + 0.2*Focal`.
 
 
 ---
@@ -181,9 +181,13 @@ sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml
 sid-train --config configs/experiments/mask_clip/default.yaml
 ```
 
-### 11. Training with ForensicMoE Prototype v1 (Balanced Domain Sampling)
+### 11. Training with ForensicMoE (v1 & v2, Balanced Domain Sampling)
 ```bash
+# Prototype v1 (0.42M logit-only gate)
 sid-train --config configs/experiments/moe/forensic_moe_v1.yaml
+
+# ForensicMoE v2 (6.66M Multi-Scale Cross-Expert Router + Uncertainty-Gated Residual FPN)
+sid-train --config configs/experiments/moe/forensic_moe_v2.yaml
 ```
 
 ### 12. Multi-Experiment Comparative Suite

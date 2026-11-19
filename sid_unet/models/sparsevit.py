@@ -411,7 +411,11 @@ class SparseViTEncoder(nn.Module):
         self.norm4 = norm_layer(embed_dim[3])
         self.pre_logits = nn.Identity()
 
-    def forward_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        return_stage2: bool = False,
+    ) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], torch.Tensor]]:
         outputs: Dict[str, torch.Tensor] = {}
         x = self.patch_embed1(x)
         x = self.pos_drop(x)
@@ -420,6 +424,7 @@ class SparseViTEncoder(nn.Module):
         x = self.patch_embed2(x)
         for blk in self.blocks2:
             x = blk(x)
+        stage2_feat = x
         x = self.patch_embed3(x)
         for index, blk in enumerate(self.blocks3):
             x = blk(x)
@@ -435,6 +440,8 @@ class SparseViTEncoder(nn.Module):
                 outputs[f"last{(index + 1) // 4}"] = x
         x_out4 = self.norm4(x.permute(0, 2, 3, 1))
         outputs["last"] = x_out4.permute(0, 3, 1, 2).contiguous()
+        if return_stage2:
+            return outputs, stage2_feat
         return outputs
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -468,7 +475,11 @@ class MultipleLFFHead(nn.Module):
         self.conv_layer4 = nn.Conv2d(stage3_dim, embed_dim, kernel_size=1, stride=1, padding=0)
         self.conv_last = nn.Conv2d(embed_dim, predict_channels, kernel_size=1)
 
-    def forward(self, features: Sequence[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        features: Sequence[torch.Tensor],
+        return_fused: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         c1, c2, c3, c4, c5, c6 = features
         c1 = self.conv_layer1(c1)
         c2 = self.conv_layer2(c2)
@@ -496,7 +507,10 @@ class MultipleLFFHead(nn.Module):
         )
         fused = fused.transpose(1, 2).reshape(b, c, h, w)
         fused = self.norm(fused.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
-        return self.conv_last(fused)
+        logits = self.conv_last(fused)
+        if return_fused:
+            return logits, fused
+        return logits
 
 
 class SparseViT(nn.Module):
@@ -715,20 +729,31 @@ class SparseViT(nn.Module):
         x: torch.Tensor,
         return_dict: bool = True,
         input_is_normalized: Optional[bool] = None,
+        return_features: bool = False,
         *args: Any,
         **kwargs: Any,
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Union[torch.Tensor, Dict[str, Any]]:
         orig_h, orig_w = x.shape[2], x.shape[3]
         x_in = self._prepare_input(x, input_is_normalized=input_is_normalized)
-        feat_dict = self.encoder_net(x_in)
-        logits = self.lmu(list(feat_dict.values()))
+        if return_features:
+            feat_dict, s2_feat = self.encoder_net.forward_features(x_in, return_stage2=True)
+            logits, lff_fused = self.lmu(list(feat_dict.values()), return_fused=True)
+        else:
+            feat_dict = self.encoder_net(x_in)
+            logits = self.lmu(list(feat_dict.values()))
         mask_logits = F.interpolate(logits, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
 
         if return_dict:
-            return {
+            res: Dict[str, Any] = {
                 "mask_logits": mask_logits,
                 "pred_mask": torch.sigmoid(mask_logits),
             }
+            if return_features:
+                res["features"] = {
+                    "h8": s2_feat,
+                    "lff": lff_fused,
+                }
+            return res
         return mask_logits
 
     @torch.no_grad()
