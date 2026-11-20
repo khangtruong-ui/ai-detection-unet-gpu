@@ -129,6 +129,15 @@ Directory Layout:
 
 ---
 
+## 11. DetectiveSAMv2 (`configs/experiments/sam2/`)
+
+| Configuration File | Model & Pretraining | Resolution | Batch Size | Loss & Regularization | Target Use Case & Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| [`detective_sam_v2.yaml`](configs/experiments/sam2/detective_sam_v2.yaml) | `DetectiveSAMv2` (`Gertlek/DetectiveSAMv2`, SAM2.1-Large + Evidence Stream + Cross-Attention Adapters) | $512 \times 512$ | 4 | Combined (`0.2*BCE + 0.8*Dice + 0.5*Focal`) + Multiscale (`0.2`) | Baseline evaluation and fine-tuning template using upstream `Gertlek/DetectiveSAMv2` checkpoint (zero random init for pretrained modules). |
+| [`detective_sam_v2_casia.yaml`](configs/experiments/sam2/detective_sam_v2_casia.yaml) | `DetectiveSAMv2` (`Gertlek/DetectiveSAMv2`) | $512 \times 512$ | 4 (accum 2) | Combined (`0.2*BCE + 0.8*Dice + 0.5*Focal`, $\alpha=0.65$) + Multiscale (`0.2`) + **L2-SP Anchor ($\lambda=0.06$)** | Anti-forgetting CASIA-v2.0 (`KhangTruong/Casia-v2.0-Fake`) adaptation over 4 full epochs (`bf16`, `lr=5e-5` cosine, frozen SAM2 backbone/decoder); pairable with WiSE-FT anchor interpolation. |
+
+---
+
 ## How to Run
 
 ### 1. Training with SAM3 + QLoRA
@@ -212,5 +221,17 @@ sid-train --configs \
   configs/experiments/gap_sam/default.yaml \
   configs/experiments/sam3_distil/default.yaml \
   configs/experiments/mask_clip/default.yaml
+```
+
+### 14. DetectiveSAMv2 Baseline Evaluation & CASIA-v2.0 Anti-Forgetting Adaptation
+```bash
+# Baseline MVSS-v1-protocol cross-evaluation directly from Gertlek/DetectiveSAMv2
+sid-cross-eval \
+  --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
+  --model-configs configs/experiments/sam2/detective_sam_v2.yaml \
+  --samples-per-dataset 150 --precision bf16
+
+# Fine-tune DetectiveSAMv2 on KhangTruong/Casia-v2.0-Fake with L2-SP anchor regularization
+sid-train --config configs/experiments/sam2/detective_sam_v2_casia.yaml --precision bf16
 ```
 

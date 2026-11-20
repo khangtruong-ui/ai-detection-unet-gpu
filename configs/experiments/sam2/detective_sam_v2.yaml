@@ -1,0 +1,81 @@
+# Configuration: DetectiveSAMv2 (Pretrained Evidence-Driven Spatial Cross-Attention)
+# Reference weights: https://huggingface.co/Gertlek/DetectiveSAMv2
+# Uses SAM2.1 Hiera Base+ backbone with 3 perturbation streams
+# (gaussian_blur + jpeg_compression + gaussian_noise), StreamEvidenceBuilder,
+# SpatialCrossAttentionSharedAdapter, and TransformerEvidenceMaskAdapter.
+
+project:
+  name: "sid_detective_sam_v2"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/detective_sam_v2"
+
+data:
+  dataset_name: "KhangTruong/Casia-v2.0-Fake"
+  streaming: true
+  use_parquet_loader: true
+  save_to_disk: true
+  background_download: true
+  columns: ["image", "mask"]
+  image_size: [512, 512]
+  batch_size: 4
+  num_workers: -1
+  pin_memory: true
+  prefetch_batches: 16
+  shuffle_buffer_size: 64
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  train_samples_per_epoch: -1
+  val_samples_per_epoch: -1
+  val_samples: -1
+  test_samples: -1
+  evaluate_on_test: true
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    color_jitter: 0.0
+
+model:
+  name: "detective_sam_v2"
+  pretrained: true
+  pretrained_model_name_or_path: "Gertlek/DetectiveSAMv2"
+  load_pretrained_v2: true
+  prompt_dim: 96
+  dropout_rate: 0.1
+  perturbation_type: "gaussian_blur+jpeg_compression+gaussian_noise"
+  perturbation_intensity: 0.5
+  target_size: [512, 512]
+  freeze_sam2: true
+  freeze_decoder: true
+  trainable_modules: "all"
+  input_normalized: true
+  l2sp_weight: 0.0
+  multiscale_supervision: false
+  aux_classifier: false
+  num_classes: 3
+  in_channels: 3
+  out_channels: 1
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.25
+  dice_weight: 0.5
+  focal_weight: 0.5
+  focal_gamma: 1.0
+  focal_alpha: 0.6
+
+training:
+  epochs: 5
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-4
+  gradient_accumulation_steps: 4
+  mixed_precision: "bf16"
+  grad_clip_norm: 1.0
+  scheduler: "cosine"
+  warmup_epochs: 0
+  min_lr: 1.0e-6
+  save_best: true
+  eval_every: 1

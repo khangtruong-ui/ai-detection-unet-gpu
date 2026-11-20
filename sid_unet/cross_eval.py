@@ -124,6 +124,14 @@ def parse_args(args: Optional[List[str]] = None):
         help="Number of samples to evaluate per configuration (overrides config limits, e.g. --samples 500, -1 for full).",
     )
     parser.add_argument(
+        "--samples-per-dataset",
+        "--samples_per_dataset",
+        type=int,
+        default=None,
+        dest="samples_per_dataset",
+        help="Stratified cap on samples per sub-dataset column (e.g. 150 for >=100 per sub-dataset on MVSS-v1-protocol).",
+    )
+    parser.add_argument(
         "--batch_size",
         "--batch-size",
         type=int,
@@ -387,6 +395,10 @@ PRETRAINED_SELF_RESOLVING_MODELS = {
     "sam2",
     "sam3_distil",
     "gap_sam",
+    "detective_sam_v2",
+    "detective-sam-v2",
+    "detectivesamv2",
+    "detective_samv2",
 }
 
 _GENERIC_PROJECT_NAMES = {
@@ -507,6 +519,11 @@ def infer_checkpoints_from_configs(
 
         if found_local:
             inferred.append(found_local)
+        elif bool(model_cfg.get("pretrained", False)) and (
+            model_name in PRETRAINED_SELF_RESOLVING_MODELS
+            or backbone in PRETRAINED_SELF_RESOLVING_MODELS
+        ) and not (model_cfg.get("checkpoint_path") or training_cfg.get("resume_from") or project_cfg.get("checkpoint_path")):
+            inferred.append(f"{CONFIG_CKPT_PREFIX}{os.path.abspath(cfg_path)}")
         elif explicit_ref:
             ref_str = str(explicit_ref).strip()
             if os.path.isfile(ref_str) or os.path.isdir(ref_str) or is_hf_repo_id(ref_str):
@@ -1663,6 +1680,8 @@ def main(args: Optional[List[str]] = None):
     overrides = list(parsed_args.override or [])
     if getattr(parsed_args, "num_workers", None) is not None:
         overrides.append(f"data.num_workers={parsed_args.num_workers}")
+    if getattr(parsed_args, "samples_per_dataset", None) is not None:
+        overrides.append(f"data.samples_per_dataset={parsed_args.samples_per_dataset}")
 
     # Checkpoint list starts empty when --checkpoint is omitted, then --model-configs inferred checkpoints are appended.
     raw_ckpts = list(parsed_args.checkpoints or [])
