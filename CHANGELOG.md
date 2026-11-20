@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-20
+
+### Added
+- **DetectiveSAMv2 Integration & Anti-Forgetting CASIA-v2.0 Adaptation (`sid_unet.models.detective_sam_v2`, `sid_unet.models.unet`, `sid_unet.models.__init__`, `configs/experiments/sam2/detective_sam_v2*.yaml`, `pyproject.toml`, `tests/test_detective_sam_v2.py`)**:
+  - Integrated `Gertlek/DetectiveSAMv2` (`SAM2.1-Hiera-Large` + `StreamEvidenceBuilder` + `SpatialCrossAttentionSharedAdapter` + `TransformerEvidenceMaskAdapter`) into `build_model()`, `UNet.from_checkpoint()`, and `sid_unet.models`, reproducing upstream demo IoU (`0.8592` / `0.8748` / `0.8448`) and adding `sam2>=1.1.0` to `pyproject.toml`.
+  - Implemented sum-normalized L2-SP starting-point anchor regularization (`compute_l2sp_loss`, `0.5 * sum((p - anchor)^2)`), selective `trainable_modules` gating, and multi-scale supervision hooks (`SIDTotalLoss.prior_anchor_penalty`), plus a WiSE-FT (`alpha=0.5`) adapted checkpoint published to [`KhangTruong/detective-sam-v2-casia`](https://huggingface.co/KhangTruong/detective-sam-v2-casia).
+  - Added `--samples-per-dataset` stratified sub-dataset sampling to `SIDMapDataset`, `create_eval_dataloader()`, and `sid-cross-eval`, plus `PRETRAINED_SELF_RESOLVING_MODELS` registration for `detective_sam_v2` so `sid-cross-eval --model-configs` resolves directly from Hugging Face without local checkpoints.
+  - Added 7 unit/integration tests in `tests/test_detective_sam_v2.py` and documented both configs in `configs/experiments/README.md`.
+
 ## [Unreleased] - 2026-11-19
 
 ### Added

@@ -1310,6 +1310,8 @@ class SIDMapDataset(Dataset):
         token: Optional[Union[bool, str]] = None,
         cache_dir: Optional[str] = None,
         max_cached_row_groups: int = 2,
+        samples_per_dataset: Optional[int] = None,
+        seed: int = 42,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -1317,6 +1319,8 @@ class SIDMapDataset(Dataset):
         self.transform = transform
         self.target_image_size = target_image_size
         self.max_samples = None if (max_samples is not None and max_samples <= 0) else max_samples
+        self.samples_per_dataset = None if (samples_per_dataset is None or samples_per_dataset <= 0) else int(samples_per_dataset)
+        self.seed = int(seed)
         self.use_parquet_loader = use_parquet_loader
         self.save_to_disk = save_to_disk
         self.background_download = background_download
@@ -1355,6 +1359,31 @@ class SIDMapDataset(Dataset):
             ds, resolved = load_hf_dataset_robust(dataset_name, requested_split=split, streaming=False)
             self.resolved_split = resolved
             self.split = resolved
+
+        if self.samples_per_dataset is not None and self.samples_per_dataset > 0:
+            self.data = ds
+            domain_labels = extract_domain_labels(self, domain_column="dataset", cache_dir=cache_dir)
+            by_domain: Dict[str, List[int]] = {}
+            for row_idx, dom in enumerate(domain_labels):
+                by_domain.setdefault(str(dom), []).append(row_idx)
+            rng = random.Random(self.seed)
+            selected_indices: List[int] = []
+            for dom in sorted(by_domain.keys()):
+                pool = by_domain[dom]
+                if len(pool) <= self.samples_per_dataset:
+                    selected_indices.extend(pool)
+                else:
+                    selected_indices.extend(rng.sample(pool, self.samples_per_dataset))
+            # Keep ascending row order to preserve Parquet row-group cache locality
+            selected_indices.sort()
+            logger.info(
+                f"Stratified sub-dataset sampling: selected {len(selected_indices)}/{len(domain_labels)} "
+                f"samples across {len(by_domain)} sub-datasets (up to {self.samples_per_dataset} per sub-dataset)."
+            )
+            if hasattr(ds, "select") and callable(ds.select):
+                ds = ds.select(selected_indices)
+            else:
+                ds = [ds[i] for i in selected_indices]
 
         if self.max_samples is not None and 0 < self.max_samples < len(ds):
             if hasattr(ds, "take") and callable(ds.take):
@@ -1865,6 +1894,8 @@ def create_eval_dataloader(
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
     max_cached_row_groups = max(4, int(config.data.get("max_cached_row_groups", 4)))
     eval_prefetch_factor = max(4, int(config.data.get("prefetch_factor", 4)))
+    samples_per_dataset_cfg = config.data.get("samples_per_dataset", None)
+    samples_per_dataset = int(samples_per_dataset_cfg) if (samples_per_dataset_cfg is not None and int(samples_per_dataset_cfg) > 0) else None
 
     if use_parquet_loader and _HAS_PARQUET_LOADER and PDLDataLoader is not None:
         eval_dataset = SIDMapDataset(
@@ -1880,6 +1911,8 @@ def create_eval_dataloader(
             token=token,
             cache_dir=pdl_cache_dir,
             max_cached_row_groups=max_cached_row_groups,
+            samples_per_dataset=samples_per_dataset,
+            seed=seed,
         )
         is_dist = is_dist_avail_and_initialized()
         world_size = get_world_size() if is_dist else None
@@ -1940,6 +1973,8 @@ def create_eval_dataloader(
             token=token,
             cache_dir=pdl_cache_dir,
             max_cached_row_groups=max_cached_row_groups,
+            samples_per_dataset=samples_per_dataset,
+            seed=seed,
         )
         eval_sampler = None
         if is_dist_avail_and_initialized():

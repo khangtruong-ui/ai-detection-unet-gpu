@@ -10,6 +10,13 @@ from sid_unet.models.detective_sam import (
     MaskAdapter,
     DetectiveSAMLoss,
 )
+from sid_unet.models.detective_sam_v2 import (
+    DetectiveSAMv2,
+    StreamEvidenceBuilder,
+    SpatialCrossAttentionSharedAdapter,
+    TransformerEvidenceMaskAdapter,
+    DEFAULT_DETECTIVE_SAM_V2_REPO,
+)
 from sid_unet.models.iml_maskformer import (
     IMLMaskformer,
     RefactorMaskformer,
@@ -190,6 +197,11 @@ __all__ = [
     "RefactorMaskformerLoss",
     "HungarianMatcher",
     "DetectiveSAM",
+    "DetectiveSAMv2",
+    "StreamEvidenceBuilder",
+    "SpatialCrossAttentionSharedAdapter",
+    "TransformerEvidenceMaskAdapter",
+    "DEFAULT_DETECTIVE_SAM_V2_REPO",
     "ImagePerturbation",
     "FeatureAdapter",
     "MaskAdapter",

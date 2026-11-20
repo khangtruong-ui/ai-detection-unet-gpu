@@ -313,6 +313,8 @@ class UNet(nn.Module):
                 merged["model"]["name"] = saved_model_name
                 if saved_model_name == "efficientnet":
                     merged["model"]["sacrifice_of_pixel"] = any(k.startswith("linear.") for k in state_dict.keys())
+                elif any(k in str(saved_model_name).lower() for k in ("detective_sam_v2", "detective-sam-v2", "detectivesamv2", "detective_samv2")):
+                    merged["model"]["load_pretrained_v2"] = False
             elif any(k.startswith(("aggregator.vit_model.", "prompt_learner.", "cls_aggregator.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "mask_clip"
                 if "num_classes" not in saved_cfg_dict.get("model", {}):
@@ -324,6 +326,9 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "gap_sam"
             elif any(k.startswith(("base_model.backbone.vision_backbone", "peft_model.base_model", "model.backbone.vision_backbone")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sam3_distil"
+            elif any(k.startswith(("evidence_builder.", "adapters.q_proj.", "mask_adapter.mask_evidence_proj.")) for k in state_dict.keys()):
+                merged["model"]["name"] = "detective_sam_v2"
+                merged["model"]["load_pretrained_v2"] = False
             elif any(k.startswith(("feature_adapters.", "mask_adapter.refine_conv", "perturbation.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "detective_sam"
             elif any("vision_encoder.backbone.blocks." in k for k in state_dict.keys()) or any("base_box" in k for k in state_dict.keys()):
@@ -744,6 +749,46 @@ def build_model(config: Any) -> nn.Module:
             target_size=tuple(model_cfg.get("target_size", [384, 384])),
             use_dummy=bool(model_cfg.get("use_dummy", False)),
             device=dev_cfg,
+        )
+
+    if (
+        any(k in model_name for k in ["detective_sam_v2", "detective-sam-v2", "detectivesamv2", "detective_samv2"])
+        or any(k in backbone for k in ["detective_sam_v2", "detective-sam-v2", "detectivesamv2", "detective_samv2"])
+        or (
+            any(k in model_name for k in ["detective_sam", "detective-sam", "detectivesam"])
+            and str(model_cfg.get("version", model_cfg.get("variant", ""))).lower() in ("v2", "2")
+        )
+    ):
+        from sid_unet.models.detective_sam_v2 import DetectiveSAMv2, DEFAULT_DETECTIVE_SAM_V2_REPO, DEFAULT_V2_PERTURBATIONS
+        dev_cfg = config.get("project", {}).get("device", "auto") if hasattr(config, "get") and hasattr(config.get("project", {}), "get") else "auto"
+        return DetectiveSAMv2(
+            pretrained_model_name_or_path=model_cfg.get(
+                "pretrained_model_name_or_path",
+                model_cfg.get("checkpoint_path", DEFAULT_DETECTIVE_SAM_V2_REPO),
+            ),
+            load_pretrained_v2=bool(model_cfg.get("load_pretrained_v2", model_cfg.get("pretrained", True))),
+            sam_config_file=model_cfg.get("sam_config_file", None),
+            sam_checkpoint=model_cfg.get("sam_checkpoint", None),
+            prompt_dim=int(model_cfg.get("prompt_dim", model_cfg.get("layer_width", 96))),
+            dropout_rate=float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.1))),
+            perturbation_type=str(model_cfg.get("perturbation_type", DEFAULT_V2_PERTURBATIONS)),
+            perturbation_intensity=float(model_cfg.get("perturbation_intensity", model_cfg.get("noise_intensity", 0.5))),
+            target_size=tuple(model_cfg.get("target_size", [512, 512])),
+            freeze_sam2=bool(model_cfg.get("freeze_sam2", True)),
+            freeze_decoder=bool(model_cfg.get("freeze_decoder", True)),
+            trainable_modules=str(model_cfg.get("trainable_modules", "all")),
+            input_normalized=bool(model_cfg.get("input_normalized", True)),
+            l2sp_weight=float(model_cfg.get("l2sp_weight", 0.0)),
+            multiscale_supervision=bool(model_cfg.get("multiscale_supervision", False)),
+            aux_classifier=bool(model_cfg.get("aux_classifier", False)),
+            num_classes=int(model_cfg.get("num_classes", 3)),
+            in_channels=int(model_cfg.get("in_channels", 3)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            use_dummy=bool(model_cfg.get("use_dummy", False)),
+            device=dev_cfg,
+            cache_dir=model_cfg.get("cache_dir", None),
+            token=model_cfg.get("token", None),
+            force_download=bool(model_cfg.get("force_download", False)),
         )
 
     if any(k in model_name for k in ["detective_sam", "detective-sam", "detectivesam"]) or any(k in backbone for k in ["detective_sam", "detective-sam", "detectivesam"]):
