@@ -2766,6 +2766,17 @@ sid-cross-eval \
   --cross-configs configs/cross-eval/casia_v2.0.yaml \
   --checkpoints KhangTruong/FOCAL KhangTruong/PIM \
   --no-detach
+
+# Cross-evaluate all 3 frozen experts on MVSS-v1-protocol (--checkpoint omitted -> inferred from --model-configs)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
+  --model-configs configs/experiments/sparsevit configs/experiments/trufor
+
+# Mix an explicit --checkpoint with inferred --model-configs (inferred entries append to the list)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
+  --checkpoint outputs/RUN/forensic_moe_v2/checkpoints/checkpoint_best.pt \
+  --model-configs configs/experiments/sparsevit configs/experiments/trufor
 ```
 
 > [!TIP]

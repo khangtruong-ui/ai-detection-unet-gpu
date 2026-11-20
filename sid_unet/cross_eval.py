@@ -6,6 +6,8 @@ to checkpoint folders, generates visual illustrations (prediction grids & heatma
 
 Usage:
     sid-cross-eval --cross-configs conf1.yaml conf2.yaml --checkpoints ckpt1.pt ckpt2.pt
+    sid-cross-eval --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml --model-configs configs/experiments/sparsevit configs/experiments/trufor
+    sid-cross-eval --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml --checkpoint outputs/RUN/forensic_moe_v2/checkpoints/checkpoint_best.pt --model-configs configs/experiments/sparsevit configs/experiments/trufor
     python -m sid_unet.cross_eval --cross-configs configs/cross-eval/*.yaml --checkpoints "outputs/*/checkpoints/checkpoint_best.pt"
     sid-cross-eval --cross-configs configs/cross-eval/*.yaml --checkpoints ckpt.pt --segment facebook/sam3
 """
@@ -20,7 +22,7 @@ import logging
 import os
 import shutil
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -30,7 +32,7 @@ from sid_unet.losses.auxiliary import build_loss
 from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.sam3_refiner import get_sam_refiner
-from sid_unet.models.unet import UNet
+from sid_unet.models.unet import UNet, build_model
 from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.precision import PrecisionSpec, resolve_precision_spec, prepare_model_for_fp8_inference
@@ -64,10 +66,25 @@ def parse_args(args: Optional[List[str]] = None):
     parser.add_argument(
         "--checkpoints",
         "--checkpoint",
-        nargs="+",
+        nargs="*",
         dest="checkpoints",
-        required=True,
-        help="Path(s) to checkpoint .pt file(s), run directories, or glob pattern(s).",
+        required=False,
+        default=[],
+        help=(
+            "Path(s) to checkpoint .pt file(s), run directories, Hugging Face repo IDs, or glob pattern(s). "
+            "If omitted, starts empty and checkpoints/pretrained models are inferred from --model-configs."
+        ),
+    )
+    parser.add_argument(
+        "--model-configs",
+        "--model_configs",
+        nargs="*",
+        dest="model_configs",
+        default=[],
+        help=(
+            "Optional model YAML config path(s), directories, or glob patterns whose checkpoints or "
+            "upstream pretrained weights are inferred and appended to the checkpoint list."
+        ),
     )
     parser.add_argument(
         "--detach",
@@ -292,11 +309,13 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
     resolved: List[str] = []
     for pat in patterns:
         if any(c in pat for c in ["*", "?", "["]):
-            matches = glob.glob(pat, recursive=True)
+            matches = sorted(glob.glob(pat, recursive=True))
             resolved.extend([m for m in matches if os.path.isfile(m) and m.endswith((".yaml", ".yml"))])
         elif os.path.isdir(pat):
-            matches = glob.glob(os.path.join(pat, "**", "*.yaml"), recursive=True) + \
-                      glob.glob(os.path.join(pat, "**", "*.yml"), recursive=True)
+            matches = sorted(
+                glob.glob(os.path.join(pat, "**", "*.yaml"), recursive=True)
+                + glob.glob(os.path.join(pat, "**", "*.yml"), recursive=True)
+            )
             resolved.extend([m for m in matches if os.path.isfile(m)])
         elif os.path.isfile(pat):
             resolved.append(pat)
@@ -321,8 +340,10 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
                     found = True
                     break
                 elif os.path.isdir(alt):
-                    matches = glob.glob(os.path.join(alt, "**", "*.yaml"), recursive=True) + \
-                              glob.glob(os.path.join(alt, "**", "*.yml"), recursive=True)
+                    matches = sorted(
+                        glob.glob(os.path.join(alt, "**", "*.yaml"), recursive=True)
+                        + glob.glob(os.path.join(alt, "**", "*.yml"), recursive=True)
+                    )
                     if matches:
                         resolved.extend([m for m in matches if os.path.isfile(m)])
                         found = True
@@ -340,27 +361,191 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
     return unique
 
 
+CONFIG_CKPT_PREFIX = "config://"
+
+PRETRAINED_SELF_RESOLVING_MODELS = {
+    "sparsevit",
+    "sparse_vit",
+    "trufor",
+    "diffusionprint",
+    "trufor_diffusionprint",
+    "focal",
+    "focal_hrnet",
+    "focal_vit",
+    "pim",
+    "seg_swin",
+    "segswin",
+    "mask_clip",
+    "mask-clip",
+    "maskclip",
+    "opensdi",
+    "open_sdi",
+    "sideclip",
+    "omnifd",
+    "omni_fd",
+    "omnivore",
+    "sam2",
+    "sam3_distil",
+    "gap_sam",
+}
+
+_GENERIC_PROJECT_NAMES = {
+    "",
+    "default",
+    "unet_training",
+    "unet_experiment",
+    "checkpoint_best",
+    "checkpoint_latest",
+}
+
+
+def is_config_checkpoint(checkpoint_path: str) -> bool:
+    """Return True when checkpoint_path is a config-backed pretrained spec (`config://...`)."""
+    return isinstance(checkpoint_path, str) and checkpoint_path.startswith(CONFIG_CKPT_PREFIX)
+
+
+def parse_config_checkpoint(checkpoint_path: str) -> str:
+    """Parse `config://<yaml_path>` into `yaml_path`."""
+    return checkpoint_path[len(CONFIG_CKPT_PREFIX):]
+
+
+def _normalize_checkpoint_key(checkpoint_path: str) -> str:
+    """Collision-safe unique key for both file paths and `config://...` specifiers."""
+    if is_config_checkpoint(checkpoint_path):
+        cfg_p = parse_config_checkpoint(checkpoint_path)
+        return f"{CONFIG_CKPT_PREFIX}{os.path.abspath(cfg_p)}"
+    return os.path.abspath(checkpoint_path)
+
+
+def _find_run_checkpoint_in_dir(run_dir: Optional[str]) -> Optional[str]:
+    """Locate the highest-priority `.pt` checkpoint inside a training run directory."""
+    if not run_dir or not os.path.isdir(run_dir):
+        return None
+    candidates = [
+        os.path.join(run_dir, "checkpoints", "checkpoint_best.pt"),
+        os.path.join(run_dir, "checkpoints", "checkpoint_latest.pt"),
+        os.path.join(run_dir, "checkpoint_best.pt"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return None
+
+
+def _filter_model_overrides(overrides: Optional[Sequence[str]]) -> List[str]:
+    """Extract only `model.*` and `project.*` overrides when loading a model config spec."""
+    if not overrides:
+        return []
+    return [
+        str(ov)
+        for ov in overrides
+        if str(ov).strip().startswith(("model.", "project."))
+    ]
+
+
+def _resolve_model_config_for_spec(
+    checkpoint_path: str,
+    overrides: Optional[Sequence[str]] = None,
+) -> ConfigDict:
+    """Build a ConfigDict from a `config://<yaml>` checkpoint specifier."""
+    cfg_path = parse_config_checkpoint(checkpoint_path)
+    model_overrides = _filter_model_overrides(overrides)
+    return load_config(cfg_path, overrides=model_overrides)
+
+
+def _merge_checkpoint_lists(explicit_ckpts: Sequence[str], inferred_ckpts: Sequence[str]) -> List[str]:
+    """Append inferred checkpoints to explicit list while preserving order and uniqueness."""
+    merged: List[str] = []
+    seen = set()
+    for p in list(explicit_ckpts) + list(inferred_ckpts):
+        key = _normalize_checkpoint_key(p)
+        if key not in seen:
+            seen.add(key)
+            merged.append(p)
+    return merged
+
+
+def infer_checkpoints_from_configs(
+    config_paths: Sequence[str],
+    overrides: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """
+    Infer checkpoint paths or `config://...` pretrained specs from model YAML configurations
+    without requiring `sid-pull`.
+
+    Resolution priority per config:
+      1. Existing trained checkpoint under `project.output_dir` or `outputs/RUN/<project.name>`
+      2. Explicit `model.checkpoint_path` / `model.pretrained_model_name_or_path` / `training.resume_from`
+      3. Self-resolving pretrained open-weight models (`model.pretrained: true` + supported `model.name`)
+      4. Explicit `project.hub_repo` / `training.hub_repo` (HF fallback)
+    """
+    inferred: List[str] = []
+    model_overrides = _filter_model_overrides(overrides)
+
+    for cfg_path in config_paths:
+        cfg = load_config(cfg_path, overrides=model_overrides)
+        project_cfg = getattr(cfg, "project", {})
+        model_cfg = getattr(cfg, "model", {})
+        training_cfg = getattr(cfg, "training", {})
+
+        model_name = str(model_cfg.get("name", "") or "").strip().lower()
+        backbone = str(model_cfg.get("backbone", "") or "").strip().lower()
+        proj_name = str(project_cfg.get("name", "") or "").strip()
+
+        # 1. Check local run directories derived from config
+        found_local = _find_run_checkpoint_in_dir(project_cfg.get("output_dir"))
+        if not found_local and proj_name and proj_name.lower() not in _GENERIC_PROJECT_NAMES:
+            found_local = _find_run_checkpoint_in_dir(os.path.join("outputs", "RUN", proj_name))
+
+        # 2. Check explicit checkpoint_path / resume_from
+        explicit_ref = (
+            model_cfg.get("checkpoint_path")
+            or model_cfg.get("pretrained_model_name_or_path")
+            or training_cfg.get("resume_from")
+            or project_cfg.get("checkpoint_path")
+        )
+
+        if found_local:
+            inferred.append(found_local)
+        elif explicit_ref:
+            ref_str = str(explicit_ref).strip()
+            if os.path.isfile(ref_str) or os.path.isdir(ref_str) or is_hf_repo_id(ref_str):
+                inferred.extend(expand_checkpoint_patterns([ref_str]))
+            elif bool(model_cfg.get("pretrained", False)) and (
+                model_name in PRETRAINED_SELF_RESOLVING_MODELS or backbone in PRETRAINED_SELF_RESOLVING_MODELS
+            ):
+                inferred.append(f"{CONFIG_CKPT_PREFIX}{os.path.abspath(cfg_path)}")
+            else:
+                raise FileNotFoundError(
+                    f"Inferred checkpoint path '{ref_str}' from config '{cfg_path}' does not exist."
+                )
+        elif bool(model_cfg.get("pretrained", False)) and (
+            model_name in PRETRAINED_SELF_RESOLVING_MODELS
+            or backbone in PRETRAINED_SELF_RESOLVING_MODELS
+            or bool(model_cfg.get("hf_repo"))
+        ):
+            inferred.append(f"{CONFIG_CKPT_PREFIX}{os.path.abspath(cfg_path)}")
+        else:
+            hub_ref = project_cfg.get("hub_repo") or training_cfg.get("hub_repo")
+            if hub_ref and is_hf_repo_id(str(hub_ref)):
+                inferred.extend(expand_checkpoint_patterns([str(hub_ref)]))
+
+    return _merge_checkpoint_lists([], inferred)
+
+
 def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
-    """Expand list of checkpoint file paths, directories, or glob patterns into sorted unique file paths."""
+    """Expand list of checkpoint file paths, directories, or glob patterns into unique paths."""
     resolved: List[str] = []
     for pat in patterns:
         if any(c in pat for c in ["*", "?", "["]):
-            matches = glob.glob(pat, recursive=True)
-            resolved.extend([m for m in matches if os.path.isfile(m) and m.endswith(".pt")])
+            matches = sorted(glob.glob(pat, recursive=True))
+            resolved.extend([m for m in matches if os.path.isfile(m) and m.endswith((".pt", ".pth", ".tar"))])
         elif os.path.isdir(pat):
-            candidates = [
-                os.path.join(pat, "checkpoints", "checkpoint_best.pt"),
-                os.path.join(pat, "checkpoints", "checkpoint_latest.pt"),
-                os.path.join(pat, "checkpoint_best.pt"),
-            ]
-            found = False
-            for c in candidates:
-                if os.path.isfile(c):
-                    resolved.append(c)
-                    found = True
-                    break
-            if not found:
-                resolved.extend(glob.glob(os.path.join(pat, "**", "*.pt"), recursive=True))
+            found = _find_run_checkpoint_in_dir(pat)
+            if found:
+                resolved.append(found)
+            else:
+                resolved.extend(sorted(glob.glob(os.path.join(pat, "**", "*.pt"), recursive=True)))
         elif os.path.isfile(pat):
             resolved.append(pat)
         elif is_hf_repo_id(pat):
@@ -369,14 +554,7 @@ def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
         else:
             raise FileNotFoundError(f"Checkpoint path not found: {pat}")
 
-    seen = set()
-    unique = []
-    for p in resolved:
-        abs_p = os.path.abspath(p)
-        if abs_p not in seen:
-            seen.add(abs_p)
-            unique.append(p)
-    return unique
+    return _merge_checkpoint_lists([], resolved)
 
 
 def resolve_checkpoint_name(checkpoint_path: str, ckpt_config: Optional[Any] = None) -> str:
@@ -384,6 +562,20 @@ def resolve_checkpoint_name(checkpoint_path: str, ckpt_config: Optional[Any] = N
     Resolve a descriptive, collision-resistant checkpoint identifier.
     Falls back to parent directory qualification if stem is generic (e.g. 'checkpoint_best').
     """
+    if is_config_checkpoint(checkpoint_path):
+        cfg_p = parse_config_checkpoint(checkpoint_path)
+        if ckpt_config is None:
+            try:
+                ckpt_config = _resolve_model_config_for_spec(checkpoint_path)
+            except Exception:
+                ckpt_config = None
+        if ckpt_config is not None:
+            raw_name = getattr(ckpt_config, "project", {}).get("name") if hasattr(getattr(ckpt_config, "project", {}), "get") else None
+            if raw_name and str(raw_name).lower() not in _GENERIC_PROJECT_NAMES:
+                return str(raw_name)
+        cfg_stem = os.path.splitext(os.path.basename(cfg_p))[0]
+        return f"{cfg_stem}_pretrained"
+
     ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
     ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
     parent_folder = os.path.basename(os.path.dirname(ckpt_dir)) if os.path.basename(ckpt_dir) == "checkpoints" else os.path.basename(ckpt_dir)
@@ -404,6 +596,17 @@ def resolve_checkpoint_neighbor_dir(checkpoint_path: str) -> str:
     Resolve directory adjacent / neighbor to the checkpoint folder.
     e.g. outputs/RUN/exp_01/checkpoints/checkpoint_best.pt -> outputs/RUN/exp_01/cross_eval_reports
     """
+    if is_config_checkpoint(checkpoint_path):
+        ckpt_name = resolve_checkpoint_name(checkpoint_path)
+        try:
+            cfg = _resolve_model_config_for_spec(checkpoint_path)
+            out_dir = getattr(cfg, "project", {}).get("output_dir")
+            if out_dir:
+                return os.path.join(os.path.abspath(str(out_dir)), "cross_eval_reports")
+        except Exception:
+            pass
+        return os.path.join(os.path.abspath(os.path.join("outputs", "RUN", ckpt_name)), "cross_eval_reports")
+
     ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
     if os.path.basename(ckpt_dir) == "checkpoints":
         run_dir = os.path.dirname(ckpt_dir)
@@ -631,11 +834,15 @@ def evaluate_checkpoint_on_config(
     if dataset_filter is None:
         dataset_filter = eval_config.data.get("dataset_filter", eval_config.data.get("sub_dataset", None))
 
-    # Load model from checkpoint
-    model, ckpt_config = UNet.from_checkpoint(
-        checkpoint_path,
-        return_config=True,
-    )
+    # Load model from checkpoint file or config-inferred pretrained spec (`config://...`)
+    if is_config_checkpoint(checkpoint_path):
+        ckpt_config = _resolve_model_config_for_spec(checkpoint_path, overrides=overrides)
+        model = build_model(ckpt_config)
+    else:
+        model, ckpt_config = UNet.from_checkpoint(
+            checkpoint_path,
+            return_config=True,
+        )
 
     ckpt_run_name = resolve_checkpoint_name(checkpoint_path, ckpt_config)
     cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
@@ -1081,12 +1288,13 @@ def run_cross_evaluation(
         except Exception as e:
             logger.warning(f"Failed to load existing master cross-evaluation report from '{master_json_path}': {e}")
 
-    # Build collision lookup map (keyed by exact absolute paths and unique non-generic (cn, kn) pairs)
+    # Build collision lookup map (keyed by normalized checkpoint/config keys and unique non-generic (cn, kn) pairs)
     existing_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for r in existing_cross_results:
-        cp_abs = os.path.abspath(r.get("checkpoint_path", ""))
-        kp_abs = os.path.abspath(r.get("config_path", ""))
-        cn = r.get("checkpoint_name") or resolve_checkpoint_name(cp_abs)
+        raw_cp = r.get("checkpoint_path", "")
+        cp_abs = _normalize_checkpoint_key(raw_cp) if raw_cp else ""
+        kp_abs = os.path.abspath(r.get("config_path", "")) if r.get("config_path") else ""
+        cn = r.get("checkpoint_name") or (resolve_checkpoint_name(cp_abs) if cp_abs else "")
         kn = r.get("config_name", os.path.splitext(os.path.basename(kp_abs))[0])
         ks = r.get("config_stem", os.path.splitext(os.path.basename(kp_abs))[0])
         if cp_abs and kp_abs:
@@ -1110,7 +1318,7 @@ def run_cross_evaluation(
 
     for ckpt_path in checkpoint_paths:
         checkpoint_to_results[ckpt_path] = []
-        cp_abs = os.path.abspath(ckpt_path)
+        cp_abs = _normalize_checkpoint_key(ckpt_path)
         cn = resolve_checkpoint_name(ckpt_path)
         for cfg_path in config_paths:
             run_idx += 1
@@ -1268,8 +1476,9 @@ def run_cross_evaluation(
     # Merge newly evaluated results with existing master results to ensure continuous accumulation
     evaluated_keys = set()
     for r in all_cross_results:
-        cp_a = os.path.abspath(r.get("checkpoint_path", ""))
-        kp_a = os.path.abspath(r.get("config_path", ""))
+        raw_cp = r.get("checkpoint_path", "")
+        cp_a = _normalize_checkpoint_key(raw_cp) if raw_cp else ""
+        kp_a = os.path.abspath(r.get("config_path", "")) if r.get("config_path") else ""
         cn_k = r.get("checkpoint_name", "")
         kn_k = r.get("config_name", "")
         if cp_a and kp_a:
@@ -1279,8 +1488,9 @@ def run_cross_evaluation(
 
     consolidated_master_results: List[Dict[str, Any]] = list(all_cross_results)
     for prev_r in existing_cross_results:
-        cp_a = os.path.abspath(prev_r.get("checkpoint_path", ""))
-        kp_a = os.path.abspath(prev_r.get("config_path", ""))
+        raw_cp = prev_r.get("checkpoint_path", "")
+        cp_a = _normalize_checkpoint_key(raw_cp) if raw_cp else ""
+        kp_a = os.path.abspath(prev_r.get("config_path", "")) if prev_r.get("config_path") else ""
         cn_k = prev_r.get("checkpoint_name", "")
         kn_k = prev_r.get("config_name", "")
         if (cp_a, kp_a) not in evaluated_keys and (cn_k, kn_k) not in evaluated_keys:
@@ -1447,18 +1657,33 @@ def main(args: Optional[List[str]] = None):
 
     raw_configs = parsed_args.cross_configs if isinstance(parsed_args.cross_configs, list) else [parsed_args.cross_configs]
     config_paths = expand_config_patterns(raw_configs)
-
-    raw_ckpts = parsed_args.checkpoints if isinstance(parsed_args.checkpoints, list) else [parsed_args.checkpoints]
-    checkpoint_paths = expand_checkpoint_patterns(raw_ckpts)
-
     if not config_paths:
         raise FileNotFoundError(f"No valid configuration files found matching: {raw_configs}")
-    if not checkpoint_paths:
-        raise FileNotFoundError(f"No valid checkpoints found matching: {raw_ckpts}")
 
     overrides = list(parsed_args.override or [])
     if getattr(parsed_args, "num_workers", None) is not None:
         overrides.append(f"data.num_workers={parsed_args.num_workers}")
+
+    # Checkpoint list starts empty when --checkpoint is omitted, then --model-configs inferred checkpoints are appended.
+    raw_ckpts = list(parsed_args.checkpoints or [])
+    checkpoint_paths: List[str] = expand_checkpoint_patterns(raw_ckpts) if raw_ckpts else []
+
+    raw_model_configs = list(getattr(parsed_args, "model_configs", None) or [])
+    model_config_paths = expand_config_patterns(raw_model_configs) if raw_model_configs else []
+
+    if model_config_paths:
+        inferred_ckpts = infer_checkpoints_from_configs(
+            model_config_paths,
+            overrides=overrides,
+        )
+        checkpoint_paths = _merge_checkpoint_lists(checkpoint_paths, inferred_ckpts)
+
+    if not checkpoint_paths:
+        raise FileNotFoundError(
+            "No checkpoints provided via --checkpoints / --checkpoint and none could be inferred from "
+            f"--model-configs ({raw_model_configs}). "
+            "Pass --checkpoints <path/repo> and/or --model-configs <experiment_yaml...>."
+        )
 
     results = run_cross_evaluation(
         checkpoint_paths=checkpoint_paths,

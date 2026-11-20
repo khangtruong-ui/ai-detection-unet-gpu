@@ -281,7 +281,8 @@ class UNet(nn.Module):
                     "backbone_net.", "mscc.", "bottleneck_fusion.", "classifer.",
                     "backbone.trunk.", "neck.module.", "head.decoder_modules.",
                     "expert_sparsevit.", "expert_trufor.", "expert_diffusionprint.", "gate.logit_gamma",
-                    "encoder_net.", "lmu.", "dncnn.", "decode_head.",
+                    "encoder_net.", "module.encoder_net.", "lmu.", "module.lmu.",
+                    "dncnn.", "module.dncnn.", "decode_head.", "module.decode_head.",
                 ))
                 for k in ckpt.keys()
             ) or any("backbone_swin" in k or "image_encoder" in k for k in ckpt.keys())
@@ -368,18 +369,26 @@ class UNet(nn.Module):
                 merged["model"]["name"] = "forensic_moe"
                 merged["model"]["pretrained"] = False
                 merged["model"]["allow_random_init"] = True
-            elif any(k.startswith(("encoder_net.", "lmu.")) for k in state_dict.keys()):
+            elif any(k.startswith(("encoder_net.", "module.encoder_net.", "lmu.", "module.lmu.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "sparsevit"
                 merged["model"]["pretrained"] = False
                 merged["model"]["allow_random_init"] = True
-            elif any(k.startswith(("dncnn.", "decode_head.", "decode_head_conf.")) for k in state_dict.keys()):
+            elif any(
+                k.startswith(("dncnn.", "module.dncnn.", "decode_head.", "module.decode_head.", "decode_head_conf.", "module.decode_head_conf."))
+                for k in state_dict.keys()
+            ):
                 merged["model"]["name"] = "trufor"
                 merged["model"]["pretrained"] = False
                 merged["model"]["allow_random_init"] = True
-                if "np_adapter.weight" in state_dict and hasattr(state_dict["np_adapter.weight"], "shape"):
-                    merged["model"]["np_out_channels"] = int(state_dict["np_adapter.weight"].shape[1])
-                elif "dncnn.47.weight" in state_dict and hasattr(state_dict["dncnn.47.weight"], "shape"):
-                    merged["model"]["np_out_channels"] = int(state_dict["dncnn.47.weight"].shape[0])
+                for k_np in ("np_adapter.weight", "module.np_adapter.weight"):
+                    if k_np in state_dict and hasattr(state_dict[k_np], "shape"):
+                        merged["model"]["np_out_channels"] = int(state_dict[k_np].shape[1])
+                        break
+                else:
+                    for k_dn in ("dncnn.47.weight", "module.dncnn.47.weight"):
+                        if k_dn in state_dict and hasattr(state_dict[k_dn], "shape"):
+                            merged["model"]["np_out_channels"] = int(state_dict[k_dn].shape[0])
+                            break
             elif any(k.startswith(("decoder.", "diffuser.")) for k in state_dict.keys()):
                 merged["model"]["name"] = "diffusion_diff"
             elif any(k.startswith("vae.") for k in state_dict.keys()):

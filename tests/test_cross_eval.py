@@ -734,5 +734,219 @@ def test_cross_eval_cross_test_split_resolution_and_loader():
     assert "mask" in batch
 
 
+def test_parse_args_optional_checkpoints_defaults_empty():
+    from sid_unet.cross_eval import parse_args
+
+    parsed = parse_args(["--cross-configs", "configs/cross-eval/MVSS-v1-protocol.yaml"])
+    assert parsed.checkpoints == []
+    assert parsed.model_configs == []
+    assert not hasattr(parsed, "expand_moe_experts")
+
+    # Unsupported extra syntaxes should be rejected by argparse
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--cross-configs", "configs/cross-eval/MVSS-v1-protocol.yaml",
+            "--model-configs", "configs/experiments/moe/forensic_moe_v2.yaml",
+            "--expand-moe-experts",
+        ])
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--cross-configs", "configs/cross-eval/MVSS-v1-protocol.yaml",
+            "--models", "configs/experiments/sparsevit",
+        ])
+
+
+def test_infer_checkpoints_from_configs_and_append(monkeypatch):
+    from sid_unet.cross_eval import (
+        infer_checkpoints_from_configs,
+        is_config_checkpoint,
+        expand_checkpoint_patterns,
+        resolve_checkpoint_name,
+        resolve_checkpoint_neighbor_dir,
+        _merge_checkpoint_lists,
+        main as cross_eval_main,
+    )
+
+    # 1. Pure dataset cross-config with default unet yields no inferred checkpoints
+    none_inferred = infer_checkpoints_from_configs(["configs/cross-eval/MVSS-v1-protocol.yaml"])
+    assert none_inferred == []
+
+    # 2. Standalone configs for the 3 MoE experts infer 3 config:// specs without sid-pull
+    expert_inferred = infer_checkpoints_from_configs([
+        "configs/experiments/sparsevit/default.yaml",
+        "configs/experiments/trufor/default.yaml",
+        "configs/experiments/trufor/diffusionprint.yaml",
+    ])
+    assert len(expert_inferred) == 3
+    assert all(is_config_checkpoint(p) for p in expert_inferred)
+    names = [resolve_checkpoint_name(p) for p in expert_inferred]
+    assert names == ["sparsevit", "trufor_np", "trufor_diffusionprint"]
+    assert all(resolve_checkpoint_neighbor_dir(p).endswith("cross_eval_reports") for p in expert_inferred)
+
+    # 3. Appending inferred checkpoints to explicit list preserves order & deduplicates
+    merged = _merge_checkpoint_lists(["explicit_a.pt"], expert_inferred + [expert_inferred[0]])
+    assert len(merged) == 4
+    assert merged[0] == "explicit_a.pt"
+
+    # 4. Reject config:// passed directly to expand_checkpoint_patterns (--checkpoint syntax)
+    with pytest.raises(FileNotFoundError):
+        expand_checkpoint_patterns([expert_inferred[0]])
+
+    # 5. Interface 1: CLI invocation with --cross-configs + --model-configs directories (no --checkpoint)
+    captured = {}
+
+    def fake_run_cross_eval(**kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return {"cross_results": []}
+
+    monkeypatch.setattr("sid_unet.cross_eval.run_cross_evaluation", fake_run_cross_eval)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sid-cross-eval",
+            "--no-detach",
+            "--cross-configs",
+            "configs/cross-eval/MVSS-v1-protocol.yaml",
+            "--model-configs",
+            "configs/experiments/sparsevit",
+            "configs/experiments/trufor",
+        ],
+    )
+    cross_eval_main()
+    assert len(captured["checkpoint_paths"]) == 3
+    assert all(is_config_checkpoint(p) for p in captured["checkpoint_paths"])
+    assert [resolve_checkpoint_name(p) for p in captured["checkpoint_paths"]] == [
+        "sparsevit",
+        "trufor_np",
+        "trufor_diffusionprint",
+    ]
+    assert len(captured["config_paths"]) == 1
+
+    # 6. Interface 3: Mix explicit --checkpoint with --model-configs (inferred entries append to the list)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        explicit_ckpt = os.path.join(tmpdir, "forensic_moe_v2", "checkpoints", "checkpoint_best.pt")
+        os.makedirs(os.path.dirname(explicit_ckpt), exist_ok=True)
+        with open(explicit_ckpt, "wb") as f:
+            f.write(b"dummy")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "sid-cross-eval",
+                "--no-detach",
+                "--cross-configs",
+                "configs/cross-eval/MVSS-v1-protocol.yaml",
+                "--checkpoint",
+                explicit_ckpt,
+                "--model-configs",
+                "configs/experiments/sparsevit",
+                "configs/experiments/trufor",
+            ],
+        )
+        cross_eval_main()
+        assert len(captured["checkpoint_paths"]) == 4
+        assert captured["checkpoint_paths"][0] == explicit_ckpt
+        assert all(is_config_checkpoint(p) for p in captured["checkpoint_paths"][1:])
+        assert [resolve_checkpoint_name(p) for p in captured["checkpoint_paths"][1:]] == [
+            "sparsevit",
+            "trufor_np",
+            "trufor_diffusionprint",
+        ]
+
+    # 7. Disallowed syntax: --cross-configs + --override without --checkpoint or --model-configs must NOT infer
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sid-cross-eval",
+            "--no-detach",
+            "--cross-configs",
+            "configs/cross-eval/MVSS-v1-protocol.yaml",
+            "--override",
+            "model.name=sparsevit",
+            "model.pretrained=true",
+        ],
+    )
+    with pytest.raises(FileNotFoundError):
+        cross_eval_main()
+
+
+def test_unet_from_checkpoint_module_prefixed_experts(monkeypatch):
+    from sid_unet.models.unet import UNet
+
+    captured_cfgs = []
+
+    class DummyModel(torch.nn.Module):
+        def load_state_dict(self, sd, strict=False):
+            return ([], [])
+
+    def fake_build_model(cfg):
+        captured_cfgs.append(cfg)
+        return DummyModel()
+
+    monkeypatch.setattr("sid_unet.models.unet.build_model", fake_build_model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sv_path = os.path.join(tmpdir, "sparsevit_ddp.pth")
+        torch.save({"module.encoder_net.patch_embed.weight": torch.zeros(1)}, sv_path)
+        _, sv_cfg = UNet.from_checkpoint(sv_path, device="cpu", return_config=True)
+        assert sv_cfg.model.name == "sparsevit"
+        assert sv_cfg.model.pretrained is False
+
+        dp_path = os.path.join(tmpdir, "diffusionprint_ddp.pth")
+        torch.save(
+            {
+                "module.dncnn.0.weight": torch.zeros(1),
+                "module.np_adapter.weight": torch.zeros(1, 64, 1, 1),
+            },
+            dp_path,
+        )
+        _, dp_cfg = UNet.from_checkpoint(dp_path, device="cpu", return_config=True)
+        assert dp_cfg.model.name == "trufor"
+        assert int(dp_cfg.model.np_out_channels) == 64
+        assert len(captured_cfgs) == 2
+
+
+def test_evaluate_checkpoint_on_config_from_config_spec(monkeypatch):
+    from sid_unet.cross_eval import evaluate_checkpoint_on_config
+
+    class DummySegModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(3, 1, kernel_size=1)
+
+        def forward(self, x):
+            return {"mask_logits": self.conv(x)}
+
+    built_configs = []
+
+    def fake_build_model(cfg):
+        built_configs.append(cfg)
+        return DummySegModel()
+
+    monkeypatch.setattr("sid_unet.cross_eval.build_model", fake_build_model)
+    monkeypatch.setattr("sid_unet.dataset.loader.hf_load_dataset", lambda *a, **kw: MockHFDataset(4))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        res = evaluate_checkpoint_on_config(
+            checkpoint_path=f"config://{os.path.abspath('configs/experiments/trufor/diffusionprint.yaml')}",
+            config_path="configs/test_smoke.yaml",
+            split="test",
+            samples=2,
+            batch_size=2,
+            overrides=["data.num_workers=0", "project.device=cpu", "data.image_size=[32,32]"],
+            save_illustrations=False,
+            master_output_dir=tmpdir,
+        )
+    assert len(built_configs) == 1
+    assert built_configs[0].model.name == "diffusionprint"
+    assert res["checkpoint_name"] == "trufor_diffusionprint"
+    assert res["total_evaluated_samples"] == 2
+
+
+
 
 
