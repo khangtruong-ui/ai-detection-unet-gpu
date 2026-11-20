@@ -906,6 +906,74 @@ class SecondaryTimmBackbone(nn.Module):
         return self.proj(torch.cat(aligned, dim=1))
 
 
+class ClusterResidualRefiner(nn.Module):
+    """
+    Zero-initialized residual refinement head for clustering-anchored hybrid adaptation.
+
+    Takes normalized forensic features and unsupervised clustering logits/probabilities,
+    predicts a spatially smooth residual logit correction initialized identically to zero
+    so step-0 predictions match pure unsupervised clustering exactly.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        num_upsample_stages: int = 2,
+        mid_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        mid = max(32, int(mid_dim))
+        groups_mid = _select_num_groups(mid)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_dim + 2, mid, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups_mid, mid),
+            nn.GELU(),
+        )
+        self.res_block = _ResidualConvBlock(mid)
+        stages = []
+        cur_dim = mid
+        for _ in range(max(1, num_upsample_stages)):
+            next_dim = max(32, cur_dim // 2)
+            groups_next = _select_num_groups(next_dim)
+            stages.append(
+                nn.Sequential(
+                    nn.Conv2d(cur_dim, next_dim, kernel_size=3, padding=1, bias=False),
+                    nn.GroupNorm(groups_next, next_dim),
+                    nn.GELU(),
+                )
+            )
+            cur_dim = next_dim
+        self.upsample_stages = nn.ModuleList(stages)
+        self.out_conv = nn.Conv2d(cur_dim, 1, kernel_size=1, bias=True)
+        nn.init.zeros_(self.out_conv.weight)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
+
+    def forward(
+        self,
+        feats: torch.Tensor,
+        cluster_logits: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+    ) -> torch.Tensor:
+        h_f, w_f = feats.shape[2], feats.shape[3]
+        feats_norm = F.normalize(feats.float(), p=2, dim=1).to(dtype=feats.dtype)
+        if cluster_logits.shape[2:] != (h_f, w_f):
+            c_grid = F.interpolate(cluster_logits.float(), size=(h_f, w_f), mode="bilinear", align_corners=False)
+        else:
+            c_grid = cluster_logits.float()
+        c_prob = torch.sigmoid(c_grid).to(dtype=feats.dtype)
+        c_scaled = torch.tanh(c_grid / 5.0).to(dtype=feats.dtype)
+        x = self.res_block(self.stem(torch.cat([feats_norm, c_prob, c_scaled], dim=1)))
+        for stage in self.upsample_stages:
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            x = stage(x)
+        delta = self.out_conv(x)
+        if delta.shape[2] != orig_h or delta.shape[3] != orig_w:
+            delta = F.interpolate(delta, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        return delta
+
+
 class DualBackboneFusionModule(nn.Module):
     """
     Fuses features from a frozen primary FOCAL backbone and a secondary backbone.
@@ -922,11 +990,16 @@ class DualBackboneFusionModule(nn.Module):
         secondary_dim: int,
         fusion_mode: str = "concat",
         out_dim: Optional[int] = None,
+        learnable_fusion_scale: bool = False,
     ) -> None:
         super().__init__()
         self.fusion_mode = str(fusion_mode).lower().strip()
         self.primary_dim = int(primary_dim)
         self.secondary_dim = int(secondary_dim)
+        self.learnable_fusion_scale = bool(learnable_fusion_scale) and self.fusion_mode == "concat"
+        self.fusion_scale_logits: Optional[nn.Parameter] = (
+            nn.Parameter(torch.zeros(2)) if self.learnable_fusion_scale else None
+        )
 
         if self.fusion_mode == "concat":
             self.out_dim = self.primary_dim + self.secondary_dim
@@ -966,6 +1039,10 @@ class DualBackboneFusionModule(nn.Module):
         if self.fusion_mode == "concat":
             p_norm = F.normalize(f_primary.float(), p=2, dim=1).to(dtype=f_primary.dtype)
             s_norm = F.normalize(f_secondary.float(), p=2, dim=1).to(dtype=f_secondary.dtype)
+            if self.fusion_scale_logits is not None:
+                weights = 2.0 * torch.softmax(self.fusion_scale_logits.float(), dim=0)
+                p_norm = p_norm * torch.sqrt(weights[0]).to(dtype=p_norm.dtype)
+                s_norm = s_norm * torch.sqrt(weights[1]).to(dtype=s_norm.dtype)
             return torch.cat([p_norm, s_norm], dim=1)
         if self.fusion_mode == "proj_concat":
             p_norm = F.normalize(f_primary.float(), p=2, dim=1).to(dtype=f_primary.dtype)
@@ -1069,6 +1146,12 @@ class FOCAL(nn.Module):
         fusion_mode: str = "concat",
         fusion_out_dim: Optional[int] = None,
         fusion_spatial_align: str = "primary",
+        learnable_fusion_scale: bool = False,
+        # Clustering-anchored hybrid residual calibration
+        cluster_residual_max_scale: float = 2.5,
+        cluster_refiner_dim: int = 64,
+        cluster_refiner_l2_weight: float = 0.0,
+        detach_refiner_feats: bool = True,
         **kwargs: Any,
     ):
         super().__init__()
@@ -1126,6 +1209,11 @@ class FOCAL(nn.Module):
             raise ValueError(
                 f"Unsupported fusion_spatial_align '{fusion_spatial_align}'. Supported: 'primary', 'max'."
             )
+        self.learnable_fusion_scale = bool(learnable_fusion_scale)
+        self.cluster_residual_max_scale = max(0.0, float(cluster_residual_max_scale))
+        self.cluster_refiner_dim = max(32, int(cluster_refiner_dim))
+        self.cluster_refiner_l2_weight = max(0.0, float(cluster_refiner_l2_weight))
+        self.detach_refiner_feats = bool(detach_refiner_feats)
 
         # Strategy B configuration
         if "use_peft" in kwargs and not peft_enabled:
@@ -1164,10 +1252,13 @@ class FOCAL(nn.Module):
         elif raw_mode in ("contrastive", "mode_1b", "1b", "scl"):
             self.finetune_mode = "contrastive"
             self.use_clustering = True
+        elif raw_mode in ("hybrid", "clustering_hybrid", "cluster_hybrid", "residual_hybrid"):
+            self.finetune_mode = "hybrid"
+            self.use_clustering = True
         else:
             raise ValueError(
                 f"Unsupported FOCAL finetune_mode '{finetune_mode}'. "
-                "Supported: 'supervised', 'contrastive', or None."
+                "Supported: 'supervised', 'contrastive', 'hybrid', or None."
             )
 
         raw_head = str(head_type).lower().strip()
@@ -1210,6 +1301,7 @@ class FOCAL(nn.Module):
                 secondary_dim=secondary_in_dim,
                 fusion_mode=self.fusion_mode,
                 out_dim=self.fusion_out_dim,
+                learnable_fusion_scale=self.learnable_fusion_scale,
             )
             in_dim = self.fusion_module.out_dim
             if self.fusion_spatial_align == "max":
@@ -1255,10 +1347,21 @@ class FOCAL(nn.Module):
             FeatureAdapter(channels=in_dim) if self.use_feature_adapter else None
         )
 
+        # Optional clustering-anchored residual calibration refiner (hybrid mode)
+        self.cluster_refiner: Optional[ClusterResidualRefiner] = (
+            ClusterResidualRefiner(
+                in_dim=in_dim,
+                num_upsample_stages=num_upsample_stages,
+                mid_dim=self.cluster_refiner_dim,
+            )
+            if self.finetune_mode == "hybrid"
+            else None
+        )
+
         # Freeze unused self.fc so DDP never complains about unused parameters
         if (
             self.head_type == "decoder"
-            or self.finetune_mode == "contrastive"
+            or self.finetune_mode in ("contrastive", "hybrid")
             or self.fused_fc is not None
             or self.domain_fc is not None
         ):
@@ -1316,6 +1419,8 @@ class FOCAL(nn.Module):
         self._surgery_applied: bool = False
         object.__setattr__(self, "_anchor_neck", None)
         object.__setattr__(self, "_anchor_hrnet_stage4", None)
+        object.__setattr__(self, "_anchor_secondary_neck", None)
+        object.__setattr__(self, "_anchor_secondary_hrnet_stage4", None)
         self._neck_init_params: Dict[str, torch.Tensor] = {}
 
         # Step 2 (strict init order): Load & verify pretrained base weights FIRST
@@ -1384,8 +1489,8 @@ class FOCAL(nn.Module):
 
     @property
     def requires_gt_masks(self) -> bool:
-        """True when Mode 1B contrastive or domain-split 4-class training needs ground-truth masks."""
-        return self.finetune_mode == "contrastive" or self.domain_split_mode
+        """True when Mode 1B contrastive, hybrid, or domain-split 4-class training needs ground-truth masks."""
+        return self.finetune_mode in ("contrastive", "hybrid") or self.domain_split_mode
 
     @property
     def requires_domain_info(self) -> bool:
@@ -1567,41 +1672,52 @@ class FOCAL(nn.Module):
         """Snapshot minimal frozen anchor submodules/weights without duplicating the full backbone."""
         object.__setattr__(self, "_anchor_neck", None)
         object.__setattr__(self, "_anchor_hrnet_stage4", None)
+        object.__setattr__(self, "_anchor_secondary_neck", None)
+        object.__setattr__(self, "_anchor_secondary_hrnet_stage4", None)
         self._neck_init_params = {}
 
-        if self.freeze_primary_backbone:
-            # Primary backbone is already frozen; no anchor copy needed for primary
-            return
+        if not self.freeze_primary_backbone:
+            if self._canonical_backbone_kind(self.backbone_name) == "vit":
+                if self.prior_anchor_weight > 0.0 and self.train_neck:
+                    anchor_neck = copy.deepcopy(self.net.image_encoder.neck)
+                    anchor_neck.eval()
+                    for p in anchor_neck.parameters():
+                        p.requires_grad_(False)
+                    object.__setattr__(self, "_anchor_neck", anchor_neck)
+                if self.neck_l2_anchor_weight > 0.0 and self.train_neck:
+                    self._neck_init_params = {
+                        name: p.detach().clone()
+                        for name, p in self.net.image_encoder.neck.named_parameters()
+                    }
+            elif self._canonical_backbone_kind(self.backbone_name) == "hrnet":
+                if self.prior_anchor_weight > 0.0 and self._surgical_backbone_param_names:
+                    anchor_s4 = copy.deepcopy(self.net.stage4)
+                    anchor_s4.eval()
+                    for p in anchor_s4.parameters():
+                        p.requires_grad_(False)
+                    object.__setattr__(self, "_anchor_hrnet_stage4", anchor_s4)
 
-        if self._canonical_backbone_kind(self.backbone_name) == "vit":
-            if self.prior_anchor_weight > 0.0 and self.train_neck:
-                anchor_neck = copy.deepcopy(self.net.image_encoder.neck)
-                anchor_neck.eval()
-                for p in anchor_neck.parameters():
+        if self.secondary_net is not None and self.prior_anchor_weight > 0.0 and self._surgical_secondary_param_names:
+            if self.secondary_kind == "vit" and self.train_neck:
+                anchor_sec_neck = copy.deepcopy(self.secondary_net.image_encoder.neck)
+                anchor_sec_neck.eval()
+                for p in anchor_sec_neck.parameters():
                     p.requires_grad_(False)
-                object.__setattr__(self, "_anchor_neck", anchor_neck)
-            if self.neck_l2_anchor_weight > 0.0 and self.train_neck:
-                self._neck_init_params = {
-                    name: p.detach().clone()
-                    for name, p in self.net.image_encoder.neck.named_parameters()
-                }
-        elif self._canonical_backbone_kind(self.backbone_name) == "hrnet":
-            if self.prior_anchor_weight > 0.0 and self._surgical_backbone_param_names:
-                anchor_s4 = copy.deepcopy(self.net.stage4)
-                anchor_s4.eval()
-                for p in anchor_s4.parameters():
+                object.__setattr__(self, "_anchor_secondary_neck", anchor_sec_neck)
+            elif self.secondary_kind == "hrnet":
+                anchor_sec_s4 = copy.deepcopy(self.secondary_net.stage4)
+                anchor_sec_s4.eval()
+                for p in anchor_sec_s4.parameters():
                     p.requires_grad_(False)
-                object.__setattr__(self, "_anchor_hrnet_stage4", anchor_s4)
+                object.__setattr__(self, "_anchor_secondary_hrnet_stage4", anchor_sec_s4)
 
     def _apply(self, fn: Any) -> "FOCAL":
         """Ensure non-registered anchor helper modules follow `.to(device)` / `.to(dtype)` calls."""
         super()._apply(fn)
-        anchor_neck = getattr(self, "_anchor_neck", None)
-        if anchor_neck is not None:
-            anchor_neck._apply(fn)
-        anchor_s4 = getattr(self, "_anchor_hrnet_stage4", None)
-        if anchor_s4 is not None:
-            anchor_s4._apply(fn)
+        for attr in ("_anchor_neck", "_anchor_hrnet_stage4", "_anchor_secondary_neck", "_anchor_secondary_hrnet_stage4"):
+            mod = getattr(self, attr, None)
+            if mod is not None:
+                mod._apply(fn)
         return self
 
     def _apply_strategy_b_surgery(self) -> None:
@@ -1674,10 +1790,10 @@ class FOCAL(nn.Module):
         if self._surgery_active:
             for bn in self._frozen_bn_modules:
                 bn.eval()
-        if self._anchor_neck is not None:
-            self._anchor_neck.eval()
-        if self._anchor_hrnet_stage4 is not None:
-            self._anchor_hrnet_stage4.eval()
+        for attr in ("_anchor_neck", "_anchor_hrnet_stage4", "_anchor_secondary_neck", "_anchor_secondary_hrnet_stage4"):
+            mod = getattr(self, attr, None)
+            if mod is not None:
+                mod.eval()
 
     def train(self, mode: bool = True) -> "FOCAL":
         """Override train() so frozen backbone BatchNorm2d stats never leak during Trainer.train_epoch()."""
@@ -1743,10 +1859,10 @@ class FOCAL(nn.Module):
             {id(p) for p in self.secondary_net.parameters()} if self.secondary_net is not None else set()
         )
         anchor_param_ids: Set[int] = set()
-        if self._anchor_neck is not None:
-            anchor_param_ids.update(id(p) for p in self._anchor_neck.parameters())
-        if self._anchor_hrnet_stage4 is not None:
-            anchor_param_ids.update(id(p) for p in self._anchor_hrnet_stage4.parameters())
+        for attr in ("_anchor_neck", "_anchor_hrnet_stage4", "_anchor_secondary_neck", "_anchor_secondary_hrnet_stage4"):
+            mod = getattr(self, attr, None)
+            if mod is not None:
+                anchor_param_ids.update(id(p) for p in mod.parameters())
 
         head_params = [
             p
@@ -1843,10 +1959,10 @@ class FOCAL(nn.Module):
     def get_surgery_summary(self) -> Dict[str, Any]:
         """Return parameter footprint and active Strategy B / fusion / domain-split metadata."""
         anchor_ids: Set[int] = set()
-        if self._anchor_neck is not None:
-            anchor_ids.update(id(p) for p in self._anchor_neck.parameters())
-        if self._anchor_hrnet_stage4 is not None:
-            anchor_ids.update(id(p) for p in self._anchor_hrnet_stage4.parameters())
+        for attr in ("_anchor_neck", "_anchor_hrnet_stage4", "_anchor_secondary_neck", "_anchor_secondary_hrnet_stage4"):
+            mod = getattr(self, attr, None)
+            if mod is not None:
+                anchor_ids.update(id(p) for p in mod.parameters())
 
         total_params = sum(p.numel() for p in self.parameters() if id(p) not in anchor_ids)
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad and id(p) not in anchor_ids)
@@ -2040,13 +2156,20 @@ class FOCAL(nn.Module):
             k.startswith("secondary_net.") for k in clean_sd.keys()
         )
 
-        exempt_prefixes = ["_anchor_neck.", "_anchor_hrnet_stage4."]
+        exempt_prefixes = [
+            "_anchor_neck.",
+            "_anchor_hrnet_stage4.",
+            "_anchor_secondary_neck.",
+            "_anchor_secondary_hrnet_stage4.",
+        ]
         if self.class_head is not None:
             exempt_prefixes.append("class_head.")
         if self.decoder is not None:
             exempt_prefixes.append("decoder.")
         if self.feature_adapter is not None:
             exempt_prefixes.append("feature_adapter.")
+        if self.cluster_refiner is not None:
+            exempt_prefixes.append("cluster_refiner.")
         if self.domain_split_mode:
             exempt_prefixes.extend(["domain_prototypes", "domain_fc."])
         if self.secondary_net is not None:
@@ -2189,56 +2312,94 @@ class FOCAL(nn.Module):
         _, _, _, feats = self._extract_primary_and_fused_features(x)
         return feats
 
+    @staticmethod
+    @torch.no_grad()
+    def _forward_vit_base_no_grad(
+        vit_net: FOCALViTNet,
+        x_in: torch.Tensor,
+        anchor_neck: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
+        """Run frozen base ViT forward pass with LoRA/DoRA bypassed and optional anchored neck."""
+        lora_mods = [m for m in vit_net.modules() if isinstance(m, SurgicalLoRALinear)]
+        for m in lora_mods:
+            m.bypass = True
+        try:
+            encoder = vit_net.image_encoder
+            feat = encoder.patch_embed(x_in)
+            if encoder.pos_embed is not None:
+                if encoder.pos_embed.shape[1:3] != feat.shape[1:3]:
+                    pe = F.interpolate(
+                        encoder.pos_embed.permute(0, 3, 1, 2),
+                        size=feat.shape[1:3],
+                        mode="bicubic",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
+                    feat = feat + pe
+                else:
+                    feat = feat + encoder.pos_embed
+            for blk in encoder.blocks:
+                feat = blk(feat)
+            neck_mod = anchor_neck if anchor_neck is not None else encoder.neck
+            return neck_mod(feat.permute(0, 3, 1, 2))
+        finally:
+            for m in lora_mods:
+                m.bypass = False
+
+    @staticmethod
+    @torch.no_grad()
+    def _forward_hrnet_with_stage4_no_grad(
+        hrnet_net: HRNet,
+        x_in: torch.Tensor,
+        anchor_stage4: Optional[nn.Module] = None,
+    ) -> torch.Tensor:
+        """Run frozen base HRNet forward pass using optional anchored stage4."""
+        if anchor_stage4 is None:
+            return hrnet_net(x_in)
+        h = hrnet_net.relu(hrnet_net.bn1(hrnet_net.conv1(x_in)))
+        h = hrnet_net.relu(hrnet_net.bn2(hrnet_net.conv2(h)))
+        h = hrnet_net.layer1(h)
+        x_list = [
+            hrnet_net.transition1[i](h) if hrnet_net.transition1[i] is not None else h
+            for i in range(hrnet_net.stage2_cfg["NUM_BRANCHES"])
+        ]
+        y_list = hrnet_net.stage2(x_list)
+        x_list = [
+            hrnet_net.transition2[i](y_list[-1]) if hrnet_net.transition2[i] is not None else y_list[i]
+            for i in range(hrnet_net.stage3_cfg["NUM_BRANCHES"])
+        ]
+        y_list = hrnet_net.stage3(x_list)
+        x_list = [
+            hrnet_net.transition3[i](y_list[-1]) if hrnet_net.transition3[i] is not None else y_list[i]
+            for i in range(hrnet_net.stage4_cfg["NUM_BRANCHES"])
+        ]
+        return anchor_stage4(x_list)[0]
+
     @torch.no_grad()
     def _extract_base_features_no_grad(self, x_in: torch.Tensor) -> torch.Tensor:
-        """Compute unmodified pretrained backbone features without duplicating the 307M ViT in VRAM."""
+        """Compute unmodified pretrained primary backbone features without duplicating the 307M ViT in VRAM."""
         if self._canonical_backbone_kind(self.backbone_name) == "vit":
-            lora_mods = [m for m in self.net.modules() if isinstance(m, SurgicalLoRALinear)]
-            for m in lora_mods:
-                m.bypass = True
-            try:
-                encoder = self.net.image_encoder
-                feat = encoder.patch_embed(x_in)
-                if encoder.pos_embed is not None:
-                    if encoder.pos_embed.shape[1:3] != feat.shape[1:3]:
-                        pe = F.interpolate(
-                            encoder.pos_embed.permute(0, 3, 1, 2),
-                            size=feat.shape[1:3],
-                            mode="bicubic",
-                            align_corners=False,
-                        ).permute(0, 2, 3, 1)
-                        feat = feat + pe
-                    else:
-                        feat = feat + encoder.pos_embed
-                for blk in encoder.blocks:
-                    feat = blk(feat)
-                neck_mod = self._anchor_neck if self._anchor_neck is not None else encoder.neck
-                return neck_mod(feat.permute(0, 3, 1, 2))
-            finally:
-                for m in lora_mods:
-                    m.bypass = False
+            return self._forward_vit_base_no_grad(self.net, x_in, anchor_neck=self._anchor_neck)
+        return self._forward_hrnet_with_stage4_no_grad(
+            self.net, x_in, anchor_stage4=self._anchor_hrnet_stage4
+        )
 
-        # HRNet base features
-        if self._anchor_hrnet_stage4 is not None:
-            h = self.net.relu(self.net.bn1(self.net.conv1(x_in)))
-            h = self.net.relu(self.net.bn2(self.net.conv2(h)))
-            h = self.net.layer1(h)
-            x_list = [
-                self.net.transition1[i](h) if self.net.transition1[i] is not None else h
-                for i in range(self.net.stage2_cfg["NUM_BRANCHES"])
-            ]
-            y_list = self.net.stage2(x_list)
-            x_list = [
-                self.net.transition2[i](y_list[-1]) if self.net.transition2[i] is not None else y_list[i]
-                for i in range(self.net.stage3_cfg["NUM_BRANCHES"])
-            ]
-            y_list = self.net.stage3(x_list)
-            x_list = [
-                self.net.transition3[i](y_list[-1]) if self.net.transition3[i] is not None else y_list[i]
-                for i in range(self.net.stage4_cfg["NUM_BRANCHES"])
-            ]
-            return self._anchor_hrnet_stage4(x_list)[0]
-        return self.net(x_in)
+    @torch.no_grad()
+    def _extract_secondary_base_features_no_grad(self, x_raw: torch.Tensor) -> Optional[torch.Tensor]:
+        """Compute unmodified pretrained secondary backbone features for dual-backbone prior anchoring."""
+        if self.secondary_net is None:
+            return None
+        x_sec = x_raw
+        if self.secondary_kind == "vit":
+            if self.force_vit_1024 and (x_sec.shape[2] != 1024 or x_sec.shape[3] != 1024):
+                x_sec = F.interpolate(x_sec, size=(1024, 1024), mode="bilinear", align_corners=False)
+            return self._forward_vit_base_no_grad(
+                self.secondary_net, x_sec, anchor_neck=self._anchor_secondary_neck
+            )
+        if self.secondary_kind == "hrnet":
+            return self._forward_hrnet_with_stage4_no_grad(
+                self.secondary_net, x_sec, anchor_stage4=self._anchor_secondary_hrnet_stage4
+            )
+        return self.secondary_net(x_sec)
 
     def _compute_prior_anchor_terms(
         self,
@@ -2248,7 +2409,8 @@ class FOCAL(nn.Module):
         f_primary: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Compute feature-space cosine prior-anchoring loss and optional neck L2 anchor penalty.
+        Compute feature-space cosine prior-anchoring loss, optional neck L2 anchor penalty,
+        and optional residual refiner L2 regularization.
         Returns `(raw_cosine_drift, weighted_total_penalty)`.
         """
         raw_cos_loss: Optional[torch.Tensor] = None
@@ -2257,8 +2419,32 @@ class FOCAL(nn.Module):
         if self.prior_anchor_weight > 0.0:
             feats_base: Optional[torch.Tensor] = None
             if self.secondary_net is not None:
-                if self.freeze_primary_backbone and f_primary is not None and f_primary.shape[1] == feats.shape[1]:
+                if (
+                    self.freeze_primary_backbone
+                    and not self._surgical_secondary_param_names
+                    and self.feature_adapter is not None
+                    and feats_backbone.shape[1] == feats.shape[1]
+                ):
+                    feats_base = feats_backbone.detach()
+                elif self.freeze_primary_backbone and f_primary is not None and f_primary.shape[1] == feats.shape[1]:
                     feats_base = f_primary.detach()
+                elif self.fusion_mode == "concat":
+                    x_raw = self._ensure_raw_rgb(x_in)
+                    f_p_base = (
+                        f_primary.detach()
+                        if (self.freeze_primary_backbone and f_primary is not None)
+                        else self._extract_base_features_no_grad(x_in)
+                    )
+                    f_s_base = self._extract_secondary_base_features_no_grad(x_raw)
+                    if f_p_base is not None and f_s_base is not None:
+                        target_hw = feats.shape[2:]
+                        if f_p_base.shape[2:] != target_hw:
+                            f_p_base = F.interpolate(f_p_base, size=target_hw, mode="bilinear", align_corners=False)
+                        if f_s_base.shape[2:] != target_hw:
+                            f_s_base = F.interpolate(f_s_base, size=target_hw, mode="bilinear", align_corners=False)
+                        p_n = F.normalize(f_p_base.float(), p=2, dim=1)
+                        s_n = F.normalize(f_s_base.float(), p=2, dim=1)
+                        feats_base = torch.cat([p_n, s_n], dim=1)
             elif not self._surgical_backbone_param_names and self.feature_adapter is not None:
                 feats_base = feats_backbone.detach()
             else:
@@ -2284,6 +2470,13 @@ class FOCAL(nn.Module):
                 neck_l2 = torch.stack(l2_terms).mean()
                 weighted_neck = self.neck_l2_anchor_weight * neck_l2
                 weighted_penalty = weighted_neck if weighted_penalty is None else (weighted_penalty + weighted_neck)
+
+        if self.cluster_refiner_l2_weight > 0.0 and self.cluster_refiner is not None:
+            ref_l2_terms = [p.float().pow(2).mean() for p in self.cluster_refiner.parameters() if p.requires_grad]
+            if ref_l2_terms:
+                ref_l2 = torch.stack(ref_l2_terms).mean()
+                weighted_ref = self.cluster_refiner_l2_weight * ref_l2
+                weighted_penalty = weighted_ref if weighted_penalty is None else (weighted_penalty + weighted_ref)
 
         return raw_cos_loss, weighted_penalty
 
@@ -2753,7 +2946,11 @@ class FOCAL(nn.Module):
 
         prior_anchor_loss: Optional[torch.Tensor] = None
         prior_anchor_penalty: Optional[torch.Tensor] = None
-        if self.training and (self.prior_anchor_weight > 0.0 or self.neck_l2_anchor_weight > 0.0):
+        if self.training and (
+            self.prior_anchor_weight > 0.0
+            or self.neck_l2_anchor_weight > 0.0
+            or self.cluster_refiner_l2_weight > 0.0
+        ):
             prior_anchor_loss, prior_anchor_penalty = self._compute_prior_anchor_terms(
                 x_in=x_in, feats=feats, feats_backbone=feats_backbone, f_primary=f_primary
             )
@@ -2832,6 +3029,35 @@ class FOCAL(nn.Module):
                         feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
                     logits_full = mask_logits
+        elif self.finetune_mode == "hybrid":
+            # Clustering-anchored hybrid: image-relative contrastive features + bounded zero-init residual refiner
+            if self.training:
+                if self.domain_split_mode:
+                    align_loss = self.compute_domain_contrastive_loss(feats, gt_masks, resolved_domain_ids)
+                else:
+                    align_loss = self.compute_contrastive_loss(feats, gt_masks)
+            with torch.no_grad():
+                if self.domain_split_mode:
+                    cluster_logits, _, separability, _ = self._cluster_domain_features(
+                        feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                else:
+                    cluster_logits, _, separability = self._cluster_features_with_stats(
+                        feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+            if self.cluster_refiner is not None:
+                ref_feats = feats.detach() if self.detach_refiner_feats else feats
+                raw_delta = self.cluster_refiner(ref_feats, cluster_logits.detach(), orig_h, orig_w)
+                if self.cluster_residual_max_scale > 0.0:
+                    delta = self.cluster_residual_max_scale * torch.tanh(raw_delta)
+                else:
+                    delta = raw_delta
+                mask_logits = cluster_logits.to(dtype=delta.dtype) + delta
+            else:
+                mask_logits = cluster_logits
+            logits_full = mask_logits
+            pred_mask = torch.sigmoid(mask_logits)
+            skip_mask_loss = False
         else:
             # Legacy mode: preserves backward compatibility with existing zero-shot / audit tests
             if not self.training and self.use_clustering:

@@ -1,0 +1,84 @@
+# Configuration: FOCAL Dual-Backbone Clustering-Anchored Hybrid Adaptation on CASIA-v2.0
+# Pairs frozen FOCAL ViT-Large primary + frozen FOCAL HRNet-W32 secondary via L2-normalized
+# concatenation (with learnable scale), a prior-anchored zero-initialized FeatureAdapter (MyInfoNCE),
+# and a bounded zero-initialized ClusterResidualRefiner (`cluster_residual_max_scale: 0.35`,
+# calibrated from 0.75 training bound to balance precision with OOD recall preservation)
+# to improve cross-dataset localization without catastrophic forgetting.
+
+project:
+  name: "sid_focal_vit_hrnet_hybrid_casia"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_vit_hrnet_hybrid_casia"
+
+data:
+  dataset_name: "KhangTruong/Casia-v2.0-Fake"
+  streaming: false
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 8
+  num_workers: -1
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  evaluate_on_test: false
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    random_jpeg: 0.3
+    jpeg_quality: [75, 100]
+    color_jitter: 0.0
+
+model:
+  name: "focal"
+  backbone: "vit"
+  secondary_backbone: "hrnet"
+  freeze_primary_backbone: true
+  secondary_trainable: false
+  freeze_backbone_bn: true
+  fusion_mode: "concat"
+  fusion_spatial_align: "max"
+  learnable_fusion_scale: true
+  use_feature_adapter: true
+  prior_anchor_weight: 0.8
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "hybrid"
+  use_clustering: true
+  force_vit_1024: false
+  cluster_temperature: 0.1
+  cluster_separability_threshold: 0.0015
+  contrastive_sample_size: 1024
+  cluster_residual_max_scale: 0.35
+  cluster_refiner_dim: 64
+  cluster_refiner_l2_weight: 0.05
+  detach_refiner_feats: true
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  edge_weight: 0.5
+  edge_mask_width: 7
+  align_weight: 1.0
+
+training:
+  epochs: 3
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  optimizer: "adamw"
+  scheduler: "cosine"
+  min_lr: 0.000001
+  gradient_accumulation_steps: 2
+  val_check_interval: 0.5
+  auto_batch_size: false
+  save_best: true
+  save_latest: true
+  amp: true
+  mixed_precision: "auto"
+  precision: "auto"

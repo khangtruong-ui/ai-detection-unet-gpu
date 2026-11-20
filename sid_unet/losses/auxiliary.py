@@ -206,7 +206,7 @@ def build_loss(config: Any) -> SIDTotalLoss:
     """Build total loss module from config dictionary."""
     loss_cfg = config.get("loss", {})
     model_cfg = config.get("model", {})
-    default_art_wt = 1.0 if str(model_cfg.get("finetune_mode", "")).lower().strip() == "contrastive" else 0.2
+    default_art_wt = 1.0 if str(model_cfg.get("finetune_mode", "")).lower().strip() in ("contrastive", "hybrid") else 0.2
     return SIDTotalLoss(
         mask_loss_type=loss_cfg.get("mask_loss_type", "combined"),
         bce_weight=float(loss_cfg.get("bce_weight", 0.5)),

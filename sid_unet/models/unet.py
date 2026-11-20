@@ -1125,6 +1125,11 @@ def build_model(config: Any) -> nn.Module:
             fusion_mode=str(model_cfg.get("fusion_mode", "concat")),
             fusion_out_dim=model_cfg.get("fusion_out_dim", None),
             fusion_spatial_align=str(model_cfg.get("fusion_spatial_align", "primary")),
+            learnable_fusion_scale=bool(model_cfg.get("learnable_fusion_scale", False)),
+            cluster_residual_max_scale=float(model_cfg.get("cluster_residual_max_scale", 2.5)),
+            cluster_refiner_dim=int(model_cfg.get("cluster_refiner_dim", 64)),
+            cluster_refiner_l2_weight=float(model_cfg.get("cluster_refiner_l2_weight", 0.0)),
+            detach_refiner_feats=bool(model_cfg.get("detach_refiner_feats", True)),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(
