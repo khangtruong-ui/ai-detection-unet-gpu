@@ -192,16 +192,16 @@ sid-train --config configs/experiments/moe/forensic_moe_v2.yaml
 
 ### 12. Direct Cross-Evaluation of the 3 Pretrained Experts (No `sid-pull` / `--checkpoint` Required)
 ```bash
-# Infer pretrained checkpoints directly from the expert configs
+# 1. Cross-evaluate all 3 frozen experts on MVSS-v1-protocol
 sid-cross-eval \
   --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
   --model-configs configs/experiments/sparsevit configs/experiments/trufor
 
-# Or expand all 3 frozen experts directly from a ForensicMoE config
+# 2. Mix an explicit --checkpoint with inferred configs (inferred entries append to the list)
 sid-cross-eval \
   --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
-  --model-configs configs/experiments/moe/forensic_moe_v2.yaml \
-  --expand-moe-experts
+  --checkpoint outputs/RUN/forensic_moe_v2/checkpoints/checkpoint_best.pt \
+  --model-configs configs/experiments/sparsevit configs/experiments/trufor
 ```
 
 ### 13. Multi-Experiment Comparative Suite

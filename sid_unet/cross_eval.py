@@ -7,7 +7,7 @@ to checkpoint folders, generates visual illustrations (prediction grids & heatma
 Usage:
     sid-cross-eval --cross-configs conf1.yaml conf2.yaml --checkpoints ckpt1.pt ckpt2.pt
     sid-cross-eval --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml --model-configs configs/experiments/sparsevit configs/experiments/trufor
-    sid-cross-eval --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml --model-configs configs/experiments/moe/forensic_moe_v2.yaml --expand-moe-experts
+    sid-cross-eval --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml --checkpoint outputs/RUN/forensic_moe_v2/checkpoints/checkpoint_best.pt --model-configs configs/experiments/sparsevit configs/experiments/trufor
     python -m sid_unet.cross_eval --cross-configs configs/cross-eval/*.yaml --checkpoints "outputs/*/checkpoints/checkpoint_best.pt"
     sid-cross-eval --cross-configs configs/cross-eval/*.yaml --checkpoints ckpt.pt --segment facebook/sam3
 """
@@ -72,30 +72,18 @@ def parse_args(args: Optional[List[str]] = None):
         default=[],
         help=(
             "Path(s) to checkpoint .pt file(s), run directories, Hugging Face repo IDs, or glob pattern(s). "
-            "If omitted, starts empty and checkpoints/pretrained models are inferred from --model-configs / --cross-configs."
+            "If omitted, starts empty and checkpoints/pretrained models are inferred from --model-configs."
         ),
     )
     parser.add_argument(
         "--model-configs",
         "--model_configs",
-        "--models",
         nargs="*",
         dest="model_configs",
         default=[],
         help=(
             "Optional model YAML config path(s), directories, or glob patterns whose checkpoints or "
             "upstream pretrained weights are inferred and appended to the checkpoint list."
-        ),
-    )
-    parser.add_argument(
-        "--expand-moe-experts",
-        "--expand_moe_experts",
-        dest="expand_moe_experts",
-        action="store_true",
-        default=False,
-        help=(
-            "When inferring from a ForensicMoE config, also append its constituent frozen experts "
-            "(SparseViT, TruFor NP++, TruFor-DiffusionPrint) to the checkpoint list."
         ),
     )
     parser.add_argument(
@@ -321,11 +309,13 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
     resolved: List[str] = []
     for pat in patterns:
         if any(c in pat for c in ["*", "?", "["]):
-            matches = glob.glob(pat, recursive=True)
+            matches = sorted(glob.glob(pat, recursive=True))
             resolved.extend([m for m in matches if os.path.isfile(m) and m.endswith((".yaml", ".yml"))])
         elif os.path.isdir(pat):
-            matches = glob.glob(os.path.join(pat, "**", "*.yaml"), recursive=True) + \
-                      glob.glob(os.path.join(pat, "**", "*.yml"), recursive=True)
+            matches = sorted(
+                glob.glob(os.path.join(pat, "**", "*.yaml"), recursive=True)
+                + glob.glob(os.path.join(pat, "**", "*.yml"), recursive=True)
+            )
             resolved.extend([m for m in matches if os.path.isfile(m)])
         elif os.path.isfile(pat):
             resolved.append(pat)
@@ -350,8 +340,10 @@ def expand_config_patterns(patterns: List[str]) -> List[str]:
                     found = True
                     break
                 elif os.path.isdir(alt):
-                    matches = glob.glob(os.path.join(alt, "**", "*.yaml"), recursive=True) + \
-                              glob.glob(os.path.join(alt, "**", "*.yml"), recursive=True)
+                    matches = sorted(
+                        glob.glob(os.path.join(alt, "**", "*.yaml"), recursive=True)
+                        + glob.glob(os.path.join(alt, "**", "*.yml"), recursive=True)
+                    )
                     if matches:
                         resolved.extend([m for m in matches if os.path.isfile(m)])
                         found = True
@@ -412,21 +404,16 @@ def is_config_checkpoint(checkpoint_path: str) -> bool:
     return isinstance(checkpoint_path, str) and checkpoint_path.startswith(CONFIG_CKPT_PREFIX)
 
 
-def parse_config_checkpoint(checkpoint_path: str) -> Tuple[str, Optional[str]]:
-    """Parse `config://<yaml_path>[#expert=<name>]` into `(yaml_path, expert_name)`."""
-    raw = checkpoint_path[len(CONFIG_CKPT_PREFIX):]
-    if "#expert=" in raw:
-        path_part, expert_part = raw.split("#expert=", 1)
-        return path_part, expert_part.strip() or None
-    return raw, None
+def parse_config_checkpoint(checkpoint_path: str) -> str:
+    """Parse `config://<yaml_path>` into `yaml_path`."""
+    return checkpoint_path[len(CONFIG_CKPT_PREFIX):]
 
 
 def _normalize_checkpoint_key(checkpoint_path: str) -> str:
     """Collision-safe unique key for both file paths and `config://...` specifiers."""
     if is_config_checkpoint(checkpoint_path):
-        cfg_p, expert_name = parse_config_checkpoint(checkpoint_path)
-        norm_p = f"{CONFIG_CKPT_PREFIX}{os.path.abspath(cfg_p)}"
-        return f"{norm_p}#expert={expert_name}" if expert_name else norm_p
+        cfg_p = parse_config_checkpoint(checkpoint_path)
+        return f"{CONFIG_CKPT_PREFIX}{os.path.abspath(cfg_p)}"
     return os.path.abspath(checkpoint_path)
 
 
@@ -460,71 +447,10 @@ def _resolve_model_config_for_spec(
     checkpoint_path: str,
     overrides: Optional[Sequence[str]] = None,
 ) -> ConfigDict:
-    """Build a ConfigDict from a `config://<yaml>[#expert=<name>]` checkpoint specifier."""
-    cfg_path, expert_name = parse_config_checkpoint(checkpoint_path)
+    """Build a ConfigDict from a `config://<yaml>` checkpoint specifier."""
+    cfg_path = parse_config_checkpoint(checkpoint_path)
     model_overrides = _filter_model_overrides(overrides)
-    cfg = load_config(cfg_path, overrides=model_overrides)
-    if not expert_name:
-        return cfg
-
-    expert_key = expert_name.lower()
-    src_model = cfg.model.to_dict() if hasattr(cfg.model, "to_dict") else dict(cfg.model)
-    base_name = cfg.project.get("name", os.path.splitext(os.path.basename(cfg_path))[0])
-    img_sz = src_model.get("img_size", cfg.data.get("image_size", [512, 512]))
-    if isinstance(img_sz, (list, tuple)):
-        img_sz = img_sz[0]
-
-    expert_specs: Dict[str, Dict[str, Any]] = {
-        "sparsevit": {
-            "project_name": f"{base_name}_expert_sparsevit",
-            "model": {
-                "name": "sparsevit",
-                "pretrained": True,
-                "img_size": int(img_sz or 512),
-                "auto_normalize": True,
-                "checkpoint_path": src_model.get("sparsevit_checkpoint_path"),
-                "hf_repo": src_model.get("sparsevit_hf_repo"),
-                "cache_dir": src_model.get("cache_dir"),
-                "aux_classifier": False,
-                "num_classes": 2,
-            },
-        },
-        "trufor": {
-            "project_name": f"{base_name}_expert_trufor",
-            "model": {
-                "name": "trufor",
-                "np_out_channels": 1,
-                "pretrained": True,
-                "checkpoint_path": src_model.get("trufor_checkpoint_path"),
-                "hf_repo": src_model.get("trufor_hf_repo"),
-                "cache_dir": src_model.get("cache_dir"),
-                "aux_classifier": False,
-                "num_classes": 2,
-            },
-        },
-        "diffusionprint": {
-            "project_name": f"{base_name}_expert_diffusionprint",
-            "model": {
-                "name": "diffusionprint",
-                "np_out_channels": 64,
-                "pretrained": True,
-                "checkpoint_path": src_model.get("diffusionprint_checkpoint_path"),
-                "hf_repo": src_model.get("diffusionprint_hf_repo"),
-                "cache_dir": src_model.get("cache_dir"),
-                "aux_classifier": False,
-                "num_classes": 2,
-            },
-        },
-    }
-    if expert_key not in expert_specs:
-        raise ValueError(f"Unsupported MoE expert expansion key '{expert_name}' in '{checkpoint_path}'.")
-
-    spec = expert_specs[expert_key]
-    cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
-    cfg_dict.setdefault("project", {})["name"] = spec["project_name"]
-    cfg_dict["project"]["output_dir"] = os.path.join("outputs", "RUN", spec["project_name"])
-    cfg_dict["model"] = {k: v for k, v in spec["model"].items() if v is not None}
-    return ConfigDict(cfg_dict)
+    return load_config(cfg_path, overrides=model_overrides)
 
 
 def _merge_checkpoint_lists(explicit_ckpts: Sequence[str], inferred_ckpts: Sequence[str]) -> List[str]:
@@ -542,10 +468,9 @@ def _merge_checkpoint_lists(explicit_ckpts: Sequence[str], inferred_ckpts: Seque
 def infer_checkpoints_from_configs(
     config_paths: Sequence[str],
     overrides: Optional[Sequence[str]] = None,
-    expand_moe_experts: bool = False,
 ) -> List[str]:
     """
-    Infer checkpoint paths or `config://...` pretrained specs from YAML configurations
+    Infer checkpoint paths or `config://...` pretrained specs from model YAML configurations
     without requiring `sid-pull`.
 
     Resolution priority per config:
@@ -553,7 +478,6 @@ def infer_checkpoints_from_configs(
       2. Explicit `model.checkpoint_path` / `model.pretrained_model_name_or_path` / `training.resume_from`
       3. Self-resolving pretrained open-weight models (`model.pretrained: true` + supported `model.name`)
       4. Explicit `project.hub_repo` / `training.hub_repo` (HF fallback)
-      5. When `expand_moe_experts=True` on a `forensic_moe*` config, also appends its 3 constituent experts.
     """
     inferred: List[str] = []
     model_overrides = _filter_model_overrides(overrides)
@@ -567,9 +491,6 @@ def infer_checkpoints_from_configs(
         model_name = str(model_cfg.get("name", "") or "").strip().lower()
         backbone = str(model_cfg.get("backbone", "") or "").strip().lower()
         proj_name = str(project_cfg.get("name", "") or "").strip()
-        is_moe = any(k in model_name for k in ("forensic_moe", "forensic-moe", "moe")) or any(
-            k in backbone for k in ("forensic_moe", "forensic-moe")
-        )
 
         # 1. Check local run directories derived from config
         found_local = _find_run_checkpoint_in_dir(project_cfg.get("output_dir"))
@@ -609,34 +530,24 @@ def infer_checkpoints_from_configs(
             if hub_ref and is_hf_repo_id(str(hub_ref)):
                 inferred.extend(expand_checkpoint_patterns([str(hub_ref)]))
 
-        if is_moe and expand_moe_experts:
-            abs_cfg = os.path.abspath(cfg_path)
-            for exp_name in ("sparsevit", "trufor", "diffusionprint"):
-                inferred.append(f"{CONFIG_CKPT_PREFIX}{abs_cfg}#expert={exp_name}")
-
     return _merge_checkpoint_lists([], inferred)
 
 
 def expand_checkpoint_patterns(patterns: List[str]) -> List[str]:
-    """Expand list of checkpoint file paths, directories, config specs, or glob patterns into unique paths."""
+    """Expand list of checkpoint file paths, directories, or glob patterns into unique paths."""
     resolved: List[str] = []
     for pat in patterns:
-        if is_config_checkpoint(pat):
-            resolved.append(pat)
-        elif any(c in pat for c in ["*", "?", "["]):
-            matches = glob.glob(pat, recursive=True)
+        if any(c in pat for c in ["*", "?", "["]):
+            matches = sorted(glob.glob(pat, recursive=True))
             resolved.extend([m for m in matches if os.path.isfile(m) and m.endswith((".pt", ".pth", ".tar"))])
         elif os.path.isdir(pat):
             found = _find_run_checkpoint_in_dir(pat)
             if found:
                 resolved.append(found)
             else:
-                resolved.extend(glob.glob(os.path.join(pat, "**", "*.pt"), recursive=True))
+                resolved.extend(sorted(glob.glob(os.path.join(pat, "**", "*.pt"), recursive=True)))
         elif os.path.isfile(pat):
-            if pat.endswith((".yaml", ".yml")):
-                resolved.extend(infer_checkpoints_from_configs([pat]))
-            else:
-                resolved.append(pat)
+            resolved.append(pat)
         elif is_hf_repo_id(pat):
             hf_res = download_hf_checkpoint(pat)
             resolved.append(hf_res["checkpoint_path"])
@@ -652,7 +563,7 @@ def resolve_checkpoint_name(checkpoint_path: str, ckpt_config: Optional[Any] = N
     Falls back to parent directory qualification if stem is generic (e.g. 'checkpoint_best').
     """
     if is_config_checkpoint(checkpoint_path):
-        cfg_p, expert_name = parse_config_checkpoint(checkpoint_path)
+        cfg_p = parse_config_checkpoint(checkpoint_path)
         if ckpt_config is None:
             try:
                 ckpt_config = _resolve_model_config_for_spec(checkpoint_path)
@@ -663,7 +574,7 @@ def resolve_checkpoint_name(checkpoint_path: str, ckpt_config: Optional[Any] = N
             if raw_name and str(raw_name).lower() not in _GENERIC_PROJECT_NAMES:
                 return str(raw_name)
         cfg_stem = os.path.splitext(os.path.basename(cfg_p))[0]
-        return f"{cfg_stem}_{expert_name}" if expert_name else f"{cfg_stem}_pretrained"
+        return f"{cfg_stem}_pretrained"
 
     ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
     ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
@@ -1753,34 +1664,25 @@ def main(args: Optional[List[str]] = None):
     if getattr(parsed_args, "num_workers", None) is not None:
         overrides.append(f"data.num_workers={parsed_args.num_workers}")
 
-    # Checkpoint list starts empty when --checkpoint is omitted, then config-inferred checkpoints are appended.
+    # Checkpoint list starts empty when --checkpoint is omitted, then --model-configs inferred checkpoints are appended.
     raw_ckpts = list(parsed_args.checkpoints or [])
     checkpoint_paths: List[str] = expand_checkpoint_patterns(raw_ckpts) if raw_ckpts else []
 
     raw_model_configs = list(getattr(parsed_args, "model_configs", None) or [])
     model_config_paths = expand_config_patterns(raw_model_configs) if raw_model_configs else []
-    expand_moe_experts = bool(getattr(parsed_args, "expand_moe_experts", False))
 
-    inferred_sources = model_config_paths if model_config_paths else []
-    if not inferred_sources:
-        # Infer from --cross-configs when --model-configs is omitted
-        inferred_sources = config_paths
-    else:
-        # Also append any model checkpoints inferable directly from --cross-configs (e.g. mixed list or overrides)
-        inferred_sources = model_config_paths + [p for p in config_paths if p not in model_config_paths]
-
-    inferred_ckpts = infer_checkpoints_from_configs(
-        inferred_sources,
-        overrides=overrides,
-        expand_moe_experts=expand_moe_experts,
-    )
-    checkpoint_paths = _merge_checkpoint_lists(checkpoint_paths, inferred_ckpts)
+    if model_config_paths:
+        inferred_ckpts = infer_checkpoints_from_configs(
+            model_config_paths,
+            overrides=overrides,
+        )
+        checkpoint_paths = _merge_checkpoint_lists(checkpoint_paths, inferred_ckpts)
 
     if not checkpoint_paths:
         raise FileNotFoundError(
-            "No checkpoints provided via --checkpoints and none could be inferred from "
-            f"--model-configs / --cross-configs ({raw_model_configs or raw_configs}). "
-            "Pass --checkpoints <path/repo>, --model-configs <experiment_yaml...>, or set model.pretrained=true with a supported model.name."
+            "No checkpoints provided via --checkpoints / --checkpoint and none could be inferred from "
+            f"--model-configs ({raw_model_configs}). "
+            "Pass --checkpoints <path/repo> and/or --model-configs <experiment_yaml...>."
         )
 
     results = run_cross_evaluation(
