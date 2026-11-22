@@ -26,7 +26,78 @@ Both PR #34 and PR #35 address a central challenge in forensic image manipulatio
 | **PR #34** `focal_vit_hrnet_hybrid_casia` (`scale=0.35`) | `357,669` (`0.11%`) | `0.3980` `[0.3787, 0.4174]` | `0.4584` | `0.7153` | `0.8584` | `0.4674` | `0.5622` | `0.9086` |
 | **PR #35** `focal-v2-image-relative-casia` (`alpha=0.65`) | **`228,246` (`0.07%`)** | **`0.4193`** `[0.3990, 0.4397]` | **`0.4715`** | **`0.7163`** | **`0.8633`** | **`0.4871`** | `0.5595` | **`0.9132`** |
 
-*(Note: When PR #35 re-evaluated `KhangTruong/FOCAL` and PR #34 side-by-side under its paired protocol run, `KhangTruong/FOCAL` scored `0.3503` IoU / `0.8795` Loss and PR #34 scored `0.3984` IoU / `0.5367` Loss — within `0.0001–0.0004` of PR #34's standalone run; see Section 5.3 for both sets of numbers.)*
+*(Note: When PR #35 re-evaluated `KhangTruong/FOCAL` and PR #34 side-by-side under its paired protocol run, `KhangTruong/FOCAL` scored `0.3503` IoU / `0.8795` Loss and PR #34 scored `0.3984` IoU / `0.5367` Loss — within `0.0001–0.0004` of PR #34's standalone run; see Section 5.2 for both sets of numbers.)*
+
+---
+
+## 1.1 What Is New in the Best Approach (FOCAL v2 / PR #35) — Visual Architecture
+
+The best-performing model (**FOCAL v2**, `0.4193` Mean IoU on `MVSS-v1`) is **not** just WiSE-FT alone — it combines **six targeted innovations** on top of PR #34's frozen dual-backbone hybrid paradigm:
+1. **`vit_input_size: 768` + `tta_hflip: true`** (higher-resolution `48×48` ViT tokens + eval horizontal-flip feature averaging).
+2. **`SpatialCrossScaleAdapter`** (replaces 1×1 MLP with `1×1 -> DW 3×3 -> Dilated DW 3×3 (d=2) -> zero-init 1×1`).
+3. **Boundary-Aware `MyInfoNCE`** (`contrastive_boundary_ratio: 0.4`) + **`pos_weight: 1.5`** (focuses 40% of contrastive tokens on tampering edges and counters CASIA's ~90% pristine pixel imbalance).
+4. **`multi_branch_logit_fusion`** (fuses `cluster_logits` from fused, ViT, and HRNet branches via learnable `branch_logit_weights`).
+5. **`ImageRelativeClusterRefiner`** (replaces raw 288-ch CNN with 24 strictly channel-rotation- & domain-invariant descriptors + dilated affine `(scale, bias)` calibration).
+6. **Post-Training WiSE-FT ($\alpha = 0.65$)** (interpolates adapted weights 65% of the way from step-0 clustering identity toward the Epoch-3 solution to recover OOD recall; explained in Section 3.2.E).
+
+### End-to-End FOCAL v2 Pipeline (`focal_vit_hrnet_image_relative_casia`)
+
+```
+Input Image [B, 3, 512, 512] (raw [0, 1], normalize=false)
+  │
+  │  (At Eval: run original + hflip, L2-average features)  ◄── [NEW: tta_hflip=true]
+  │
+  ├──► Bilinear [768×768] ──► Frozen SAM ViT-Large (256-d, 48×48) ◄── [NEW: vit_input_size=768]
+  │                                  │                  │
+  │                                  ▼ (upsample 128×128)└──► Branch 1 k-means ──► c_p, sep_p, area_p
+  │                                  │
+  ├──► Native [512×512]  ──► Frozen HRNet-W32 (32-d, 128×128, 292 BN locked)
+  │                                  │                  │
+  │                                  ▼                  └──► Branch 2 k-means ──► c_s, sep_s, area_s
+  │                                  │
+  ▼                                  ▼
+DualBackboneFusionModule: [√w₀·norm(f_ViT), √w₁·norm(f_HRNet)] ──► 288-ch @ 128×128
+  │
+  ▼
+SpatialCrossScaleAdapter  ◄── [NEW: 1×1 -> DW 3×3 -> Dilated DW 3×3 (d=2) -> zero-init 1×1]
+  │   (Prior-Anchored: λ=0.75 cosine drift vs frozen feats_backbone)
+  │   (Train Align Loss: Boundary-Aware MyInfoNCE, 40% edge tokens) ◄── [NEW: boundary_ratio=0.4]
+  │
+  ├──► Fused k-means (no_grad, feats.detach()) ──► c_fused, sep_f, area_f
+  │
+  ├──► Multi-Branch Base Logits:  ◄── [NEW: multi_branch_logit_fusion=true]
+  │      c_base = c_fused + 0.5·tanh(θ₀)·c_p + 0.5·tanh(θ₁)·c_s
+  │
+  └──► ImageRelativeClusterRefiner  ◄── [NEW: NEVER sees raw 288-ch features]
+         │
+         │  build_descriptors() ──► 24 Rotation/Domain-Invariant Channels @ 128×128:
+         │   • 10 Fused:  p_f, t_f, ent_f, sep_f, area_f, d_mean_z, d_loc{3,9,25}, p_centered
+         │   • 14 Branch: p_p, t_p, p_s, t_s, agree(p_p·p_s), disagree, sep/area_{p,s}, manifold_{p,s}
+         │
+         ▼
+       3×3 Stem -> _DilatedResBlock(d=1, 2, 4) -> 2× Upsample -> zero-init 1×1 ──► (raw_scale, raw_bias)
+         │
+         ▼
+       Affine Logit Calibration + Post-Training WiSE-FT (α = 0.65):  ◄── [NEW: Affine + WiSE-FT]
+         mask_logits = (1 + g·tanh(raw_scale)) · c_base + m·tanh(raw_bias)
+                       └─ Trained: (m=0.40, g=0.20) ──WiSE-FT α=0.65──► Released: (m=0.26, g=0.13)
+```
+
+### Why PR #35 Beats PR #34 (Refiner Design Contrast)
+
+```
+PR #34: ClusterResidualRefiner (Raw-Channel Refiner)
+  [288-ch raw ViT+HRNet features] + [2-ch cluster maps]
+        │
+        ▼  Memorizes CASIA-specific channel coordinates & ~90% authentic prior
+  mask_logits = c_fused + m·tanh(Δ_raw)   ──► High Casia precision, suppresses OOD recall (0.5622)
+
+PR #35: ImageRelativeClusterRefiner (Domain- & Rotation-Invariant Refiner)
+  [24-ch geometry/clustering stats ONLY]  (invariant to orthogonal channel rotations Q ∈ O(C))
+        │
+        ▼  Cannot memorize CASIA texture/channels; calibrates contrast & boundary confidence
+  mask_logits = (1 + g·tanh(s))·c_base + m·tanh(b)  +  WiSE-FT(α=0.65)  ──► +0.0209 MVSS-v1 IoU (0.4193)
+```
 
 ---
 
@@ -117,6 +188,23 @@ In `FOCAL.compute_contrastive_loss()` (`contrastive_boundary_ratio: 0.4`), binar
   $$\text{mask\_logits} = \bigl(1 + g \cdot \tanh(\text{raw\_scale})\bigr)\, c_{\text{base}} + m \cdot \tanh(\text{raw\_bias})$$
   (trained with $m=0.40, g=0.20$; WiSE-FT calibrated at `alpha=0.65` to effective $m=0.26, g=0.13$).
 - **ViT-768 + Eval Flip TTA**: `vit_input_size: 768` runs SAM ViT-Large at $768\times 768$ ($48\times 48$ patches) instead of $512\times 512$ ($32\times 32$) or $1024\times 1024$, preserving high-frequency artifacts within dual T4 VRAM. At evaluation (`not self.training`), `tta_hflip: true` averages L2-normalized features from `x` and `torch.flip(x, [-1])`.
+
+#### E. Post-Training WiSE-FT Calibration ($\alpha = 0.65$)
+**WiSE-FT** (*Weight-Space Ensembling for Fine-Tuning*, Wortsman et al., CVPR 2022) linearly interpolates weights between a zero-shot prior $\theta_0$ and a fine-tuned model $\theta_{\text{ft}}$ without retraining:
+$$\theta_{\text{WiSE}}(\alpha) = (1 - \alpha)\,\theta_0 + \alpha\,\theta_{\text{ft}}, \qquad \alpha \in [0, 1]$$
+
+In **FOCAL v2**, this mechanism is especially clean because both backbones (`SAM ViT-Large`, `HRNet-W32`) remain completely frozen ($\theta_{\text{backbone}} \equiv \theta_0$), while the adapted output layers (`SpatialCrossScaleAdapter.proj_out`, `ImageRelativeClusterRefiner.out_conv`, `branch_logit_weights`, `fusion_scale_logits`) are **zero-initialized at step 0** ($\theta_{\text{head},0} = 0$, pure unsupervised clustering identity). Interpolating at $\alpha = 0.65$ preserves 65% of the Epoch-3 CASIA-adapted refinement while pulling predictions 35% back toward the zero-shot clustering manifold, shrinking effective residual bounds from `(0.40, 0.20)` to **`(0.26, 0.13)`** (`0.65 × 0.40 = 0.26`, `0.65 × 0.20 = 0.13`):
+
+```
+  α = 0.00 (Zero-Shot Identity)                 α = 0.65 (WiSE-FT Released)          α = 1.00 (Epoch 3 Raw)
+  ─────────────────────────────►───────────────────────★──────────────────────◄────────────────────────────
+  Pure k-means clustering prior               MVSS-40 IoU: 0.4303               MVSS-40 IoU: 0.4264
+  • High OOD Recall                           • Recall recovered: 0.5598        • OOD Recall drops: 0.5318
+  • No boundary/logit calibration             • Bounds: (0.26, 0.13)            • Bounds: (0.40, 0.20)
+                                              • Official MVSS-v1: 0.4193 IoU    • Over-fits CASIA background
+```
+
+Across the `MVSS-40` post-training sweep ($\alpha \in \{0.45, 0.65, 0.85, 1.0\}$), `alpha=0.45` scored `0.4276`, **`alpha=0.65` peaked at `0.4303` IoU** (recovering Recall from `0.5318` to `0.5598`), and `alpha=0.85` scored `0.4294`.
 
 ### 3.3 Multi-GPU `DataParallel` & DDP Engineering Fixes (PR #35)
 Scaling 4-epoch training and 1,676-sample cross-evaluation across `2× Tesla T4` GPUs exposed four multi-GPU bugs fixed in PR #35:
