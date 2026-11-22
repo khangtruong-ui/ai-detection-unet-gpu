@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -846,6 +847,45 @@ class FeatureAdapter(nn.Module):
         return x + self.proj_out(self.act(self.norm(self.proj_in(x))))
 
 
+class SpatialCrossScaleAdapter(nn.Module):
+    """
+    Zero-initialized spatial cross-scale forensic feature adapter.
+
+    Uses a bottleneck `1x1` projection followed by depthwise `3x3` (local) and
+    dilated depthwise `3x3` (`dilation=2`, wider context) convolutions with a
+    zero-initialized `1x1` output projection so step-0 features equal `x` identically
+    while allowing high-res HRNet edges and global ViT semantics to interact spatially.
+    """
+
+    def __init__(self, channels: int, mid_channels: Optional[int] = None) -> None:
+        super().__init__()
+        mid = mid_channels if mid_channels is not None else max(32, min(128, channels // 2))
+        groups = _select_num_groups(mid)
+        self.proj_in = nn.Sequential(
+            nn.Conv2d(channels, mid, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, mid),
+            nn.GELU(),
+        )
+        self.dw_local = nn.Sequential(
+            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid, bias=False),
+            nn.GroupNorm(groups, mid),
+            nn.GELU(),
+        )
+        self.dw_dilated = nn.Sequential(
+            nn.Conv2d(mid, mid, kernel_size=3, padding=2, dilation=2, groups=mid, bias=False),
+            nn.GroupNorm(groups, mid),
+            nn.GELU(),
+        )
+        self.proj_out = nn.Conv2d(mid, channels, kernel_size=1, bias=True)
+        nn.init.zeros_(self.proj_out.weight)
+        if self.proj_out.bias is not None:
+            nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.dw_dilated(self.dw_local(self.proj_in(x)))
+        return x + self.proj_out(h)
+
+
 class SecondaryTimmBackbone(nn.Module):
     """
     Pretrained ``timm`` secondary feature extractor with multi-scale FPN projection.
@@ -972,6 +1012,204 @@ class ClusterResidualRefiner(nn.Module):
         if delta.shape[2] != orig_h or delta.shape[3] != orig_w:
             delta = F.interpolate(delta, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
         return delta
+
+
+class _DilatedResBlock(nn.Module):
+    """Dilated residual conv block with GroupNorm and GELU."""
+
+    def __init__(self, channels: int, dilation: int = 1) -> None:
+        super().__init__()
+        groups = _select_num_groups(channels)
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=dilation,
+                dilation=dilation,
+                bias=False,
+            ),
+            nn.GroupNorm(groups, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups, channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.block(x))
+
+
+class ImageRelativeClusterRefiner(nn.Module):
+    """
+    Domain-invariant, rotation-invariant residual refiner for clustering-anchored FOCAL.
+
+    Operates exclusively on image-relative geometric & clustering descriptors (never raw
+    backbone feature channels) so adaptation on a single source domain (e.g. CASIA-v2.0)
+    cannot memorize domain-specific semantic embeddings and cause OOD forgetting.
+    Outputs zero-initialized `(raw_bias, raw_scale)` maps at full image resolution.
+    """
+
+    BASE_DESC_CHANNELS = 10
+    MULTI_BRANCH_DESC_CHANNELS = 24
+
+    def __init__(
+        self,
+        num_upsample_stages: int = 2,
+        mid_dim: int = 48,
+        multi_branch: bool = True,
+    ) -> None:
+        super().__init__()
+        self.multi_branch = bool(multi_branch)
+        in_ch = self.MULTI_BRANCH_DESC_CHANNELS if self.multi_branch else self.BASE_DESC_CHANNELS
+        mid = max(32, int(mid_dim))
+        groups_mid = _select_num_groups(mid)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, mid, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(groups_mid, mid),
+            nn.GELU(),
+        )
+        self.blocks = nn.Sequential(
+            _DilatedResBlock(mid, dilation=1),
+            _DilatedResBlock(mid, dilation=2),
+            _DilatedResBlock(mid, dilation=4),
+        )
+        stages = []
+        cur_dim = mid
+        for _ in range(max(1, num_upsample_stages)):
+            next_dim = max(24, cur_dim // 2)
+            groups_next = _select_num_groups(next_dim)
+            stages.append(
+                nn.Sequential(
+                    nn.Conv2d(cur_dim, next_dim, kernel_size=3, padding=1, bias=False),
+                    nn.GroupNorm(groups_next, next_dim),
+                    nn.GELU(),
+                )
+            )
+            cur_dim = next_dim
+        self.upsample_stages = nn.ModuleList(stages)
+        self.out_conv = nn.Conv2d(cur_dim, 2, kernel_size=1, bias=True)
+        nn.init.zeros_(self.out_conv.weight)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
+
+    @staticmethod
+    def _branch_manifold_stats(feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute rotation-invariant global & multi-scale local cosine discrepancy maps."""
+        f_hat = F.normalize(feats.float(), p=2, dim=1)
+        mean_dir = F.normalize(f_hat.mean(dim=(2, 3), keepdim=True), p=2, dim=1)
+        d_mean = (1.0 - (f_hat * mean_dir).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
+        mu_d = d_mean.mean(dim=(2, 3), keepdim=True)
+        std_d = d_mean.std(dim=(2, 3), keepdim=True, unbiased=False)
+        d_mean_z = torch.tanh((d_mean - mu_d) / (std_d + 1e-5))
+
+        ctx3 = F.normalize(F.avg_pool2d(f_hat, kernel_size=3, stride=1, padding=1), p=2, dim=1)
+        d_loc3 = (1.0 - (f_hat * ctx3).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
+
+        ctx9 = F.normalize(F.avg_pool2d(f_hat, kernel_size=9, stride=1, padding=4), p=2, dim=1)
+        d_loc9 = (1.0 - (f_hat * ctx9).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
+
+        ctx25 = F.normalize(F.avg_pool2d(f_hat, kernel_size=25, stride=1, padding=12), p=2, dim=1)
+        d_loc25 = (1.0 - (f_hat * ctx25).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
+        return d_mean_z, d_loc3, d_loc9, d_loc25
+
+    @classmethod
+    @torch.no_grad()
+    def build_descriptors(
+        cls,
+        feats: torch.Tensor,
+        c_fused_logits: torch.Tensor,
+        sep_fused: torch.Tensor,
+        area_fused: torch.Tensor,
+        primary_branch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        secondary_branch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        multi_branch: bool = True,
+    ) -> torch.Tensor:
+        """Build `[B, 10|24, H_f, W_f]` rotation-invariant image-relative forensic descriptors."""
+        b, _, h_f, w_f = feats.shape
+
+        def _grid(t: torch.Tensor) -> torch.Tensor:
+            t_f = t.float()
+            if t_f.shape[2:] != (h_f, w_f):
+                return F.interpolate(t_f, size=(h_f, w_f), mode="bilinear", align_corners=False)
+            return t_f
+
+        c_f = _grid(c_fused_logits)
+        p_f = torch.sigmoid(c_f)
+        t_f = torch.tanh(c_f / 5.0)
+        p_clamp = p_f.clamp(1e-6, 1.0 - 1e-6)
+        ent_f = -(p_clamp * torch.log(p_clamp) + (1.0 - p_clamp) * torch.log(1.0 - p_clamp)) / math.log(2.0)
+        sep_f_map = sep_fused.float().view(b, 1, 1, 1).expand(-1, -1, h_f, w_f)
+        area_f_map = area_fused.float().view(b, 1, 1, 1).expand(-1, -1, h_f, w_f)
+        d_mean_z_f, d_loc3_f, d_loc9_f, d_loc25_f = cls._branch_manifold_stats(feats)
+
+        desc_list = [
+            p_f,
+            t_f,
+            ent_f,
+            sep_f_map,
+            area_f_map,
+            d_mean_z_f,
+            d_loc3_f,
+            d_loc9_f,
+            d_loc25_f,
+        ]
+        # Include centered probability contrast to make base block exactly 10 channels
+        p_centered = (p_f - p_f.mean(dim=(2, 3), keepdim=True))
+        desc_list.append(p_centered)
+
+        if multi_branch:
+            if primary_branch is not None and secondary_branch is not None:
+                f_p, c_p_full, sep_p, area_p = primary_branch
+                f_s, c_s_full, sep_s, area_s = secondary_branch
+                c_p = _grid(c_p_full)
+                c_s = _grid(c_s_full)
+                p_p = torch.sigmoid(c_p)
+                t_p = torch.tanh(c_p / 5.0)
+                p_s = torch.sigmoid(c_s)
+                t_s = torch.tanh(c_s / 5.0)
+                agree = p_p * p_s
+                disagree = torch.tanh((c_p - c_s) / 5.0)
+                sep_p_map = sep_p.float().view(b, 1, 1, 1).expand(-1, -1, h_f, w_f)
+                sep_s_map = sep_s.float().view(b, 1, 1, 1).expand(-1, -1, h_f, w_f)
+                area_p_map = area_p.float().view(b, 1, 1, 1).expand(-1, -1, h_f, w_f)
+                area_s_map = area_s.float().view(b, 1, 1, 1).expand(-1, -1, h_f, w_f)
+                d_mean_z_p, _, d_loc9_p, _ = cls._branch_manifold_stats(f_p)
+                d_mean_z_s, d_loc3_s, _, _ = cls._branch_manifold_stats(f_s)
+                desc_list.extend(
+                    [
+                        p_p,
+                        t_p,
+                        p_s,
+                        t_s,
+                        agree,
+                        disagree,
+                        sep_p_map,
+                        sep_s_map,
+                        area_p_map,
+                        area_s_map,
+                        d_mean_z_p,
+                        d_mean_z_s,
+                        d_loc9_p,
+                        d_loc3_s,
+                    ]
+                )
+            else:
+                zeros_mb = torch.zeros(b, cls.MULTI_BRANCH_DESC_CHANNELS - cls.BASE_DESC_CHANNELS, h_f, w_f, device=feats.device, dtype=torch.float32)
+                desc_list.append(zeros_mb)
+
+        return torch.cat(desc_list, dim=1).to(dtype=feats.dtype)
+
+    def forward(self, descriptors: torch.Tensor, orig_h: int, orig_w: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.blocks(self.stem(descriptors))
+        for stage in self.upsample_stages:
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            x = stage(x)
+        out = self.out_conv(x)
+        if out.shape[2] != orig_h or out.shape[3] != orig_w:
+            out = F.interpolate(out, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        return out[:, 0:1], out[:, 1:2]
 
 
 class DualBackboneFusionModule(nn.Module):
@@ -1152,6 +1390,15 @@ class FOCAL(nn.Module):
         cluster_refiner_dim: int = 64,
         cluster_refiner_l2_weight: float = 0.0,
         detach_refiner_feats: bool = True,
+        # FOCAL v2 upgrades (domain-invariant image-relative refiner, soft-EM, spatial adapter, ViT res & TTA)
+        clustering_mode: str = "kmeans",
+        vit_input_size: Optional[int] = None,
+        tta_hflip: bool = False,
+        feature_adapter_type: str = "mlp",
+        cluster_refiner_type: str = "legacy",
+        cluster_residual_scale_gain: float = 0.5,
+        multi_branch_logit_fusion: bool = False,
+        contrastive_boundary_ratio: float = 0.0,
         **kwargs: Any,
     ):
         super().__init__()
@@ -1161,9 +1408,21 @@ class FOCAL(nn.Module):
         self.hf_repo = hf_repo
         self.cluster_temperature = max(1e-4, float(cluster_temperature))
         self.force_vit_1024 = bool(force_vit_1024)
+        self.vit_input_size: Optional[int] = (
+            int(vit_input_size)
+            if vit_input_size not in (None, "", "none", "null", 0)
+            else (1024 if self.force_vit_1024 else None)
+        )
+        self.tta_hflip = bool(tta_hflip)
+        self.clustering_mode = str(clustering_mode).lower().strip()
+        if self.clustering_mode not in ("kmeans", "soft_kmeans"):
+            raise ValueError(
+                f"Unsupported clustering_mode '{clustering_mode}'. Supported: 'kmeans', 'soft_kmeans'."
+            )
         self.cluster_separability_threshold = max(0.0, float(cluster_separability_threshold))
         self.aux_pristine_gate = bool(aux_pristine_gate)
         self.contrastive_sample_size = max(16, int(contrastive_sample_size))
+        self.contrastive_boundary_ratio = min(0.95, max(0.0, float(contrastive_boundary_ratio)))
 
         # Task 1: Domain-split 4-class / 4-cluster training configuration
         self.domain_split_mode = bool(domain_split_mode)
@@ -1211,9 +1470,21 @@ class FOCAL(nn.Module):
             )
         self.learnable_fusion_scale = bool(learnable_fusion_scale)
         self.cluster_residual_max_scale = max(0.0, float(cluster_residual_max_scale))
+        self.cluster_residual_scale_gain = max(0.0, float(cluster_residual_scale_gain))
         self.cluster_refiner_dim = max(32, int(cluster_refiner_dim))
         self.cluster_refiner_l2_weight = max(0.0, float(cluster_refiner_l2_weight))
         self.detach_refiner_feats = bool(detach_refiner_feats)
+        self.feature_adapter_type = str(feature_adapter_type).lower().strip()
+        if self.feature_adapter_type not in ("mlp", "spatial"):
+            raise ValueError(
+                f"Unsupported feature_adapter_type '{feature_adapter_type}'. Supported: 'mlp', 'spatial'."
+            )
+        self.cluster_refiner_type = str(cluster_refiner_type).lower().strip()
+        if self.cluster_refiner_type not in ("legacy", "image_relative"):
+            raise ValueError(
+                f"Unsupported cluster_refiner_type '{cluster_refiner_type}'. Supported: 'legacy', 'image_relative'."
+            )
+        self.multi_branch_logit_fusion = bool(multi_branch_logit_fusion)
 
         # Strategy B configuration
         if "use_peft" in kwargs and not peft_enabled:
@@ -1342,23 +1613,39 @@ class FOCAL(nn.Module):
             else None
         )
 
-        # Optional zero-initialized residual forensic adapter (Strategy B)
-        self.feature_adapter: Optional[FeatureAdapter] = (
-            FeatureAdapter(channels=in_dim) if self.use_feature_adapter else None
-        )
+        # Optional zero-initialized residual forensic adapter (Strategy B / SpatialCrossScaleAdapter)
+        if self.use_feature_adapter:
+            if self.feature_adapter_type == "spatial":
+                self.feature_adapter: Optional[nn.Module] = SpatialCrossScaleAdapter(channels=in_dim)
+            else:
+                self.feature_adapter = FeatureAdapter(channels=in_dim)
+        else:
+            self.feature_adapter = None
 
         # Optional clustering-anchored residual calibration refiner (hybrid mode)
-        self.cluster_refiner: Optional[ClusterResidualRefiner] = (
-            ClusterResidualRefiner(
-                in_dim=in_dim,
-                num_upsample_stages=num_upsample_stages,
-                mid_dim=self.cluster_refiner_dim,
-            )
-            if self.finetune_mode == "hybrid"
+        if self.finetune_mode == "hybrid":
+            if self.cluster_refiner_type == "image_relative":
+                self.cluster_refiner: Optional[nn.Module] = ImageRelativeClusterRefiner(
+                    num_upsample_stages=num_upsample_stages,
+                    mid_dim=self.cluster_refiner_dim,
+                    multi_branch=(self.secondary_net is not None),
+                )
+            else:
+                self.cluster_refiner = ClusterResidualRefiner(
+                    in_dim=in_dim,
+                    num_upsample_stages=num_upsample_stages,
+                    mid_dim=self.cluster_refiner_dim,
+                )
+        else:
+            self.cluster_refiner = None
+
+        self.branch_logit_weights: Optional[nn.Parameter] = (
+            nn.Parameter(torch.zeros(2))
+            if (self.finetune_mode == "hybrid" and self.multi_branch_logit_fusion and self.secondary_net is not None)
             else None
         )
 
-        # Freeze unused self.fc so DDP never complains about unused parameters
+        # Freeze unused legacy conv heads so DDP never complains about unused parameters
         if (
             self.head_type == "decoder"
             or self.finetune_mode in ("contrastive", "hybrid")
@@ -1367,6 +1654,13 @@ class FOCAL(nn.Module):
         ):
             for p in self.fc.parameters():
                 p.requires_grad_(False)
+        if self.head_type == "decoder" or self.finetune_mode in ("contrastive", "hybrid"):
+            if self.fused_fc is not None:
+                for p in self.fused_fc.parameters():
+                    p.requires_grad_(False)
+            if self.domain_fc is not None:
+                for p in self.domain_fc.parameters():
+                    p.requires_grad_(False)
 
         # Optional auxiliary classifier
         if self.aux_classifier:
@@ -2170,6 +2464,8 @@ class FOCAL(nn.Module):
             exempt_prefixes.append("feature_adapter.")
         if self.cluster_refiner is not None:
             exempt_prefixes.append("cluster_refiner.")
+        if self.branch_logit_weights is not None:
+            exempt_prefixes.append("branch_logit_weights")
         if self.domain_split_mode:
             exempt_prefixes.extend(["domain_prototypes", "domain_fc."])
         if self.secondary_net is not None:
@@ -2249,27 +2545,37 @@ class FOCAL(nn.Module):
 
     def _prepare_backbone_input(self, x: torch.Tensor) -> torch.Tensor:
         x = self._ensure_raw_rgb(x)
-        if self._canonical_backbone_kind(self.backbone_name) == "vit" and self.force_vit_1024:
+        if self._canonical_backbone_kind(self.backbone_name) == "vit" and self.vit_input_size is not None:
             orig_h, orig_w = x.shape[2], x.shape[3]
-            if orig_h != 1024 or orig_w != 1024:
-                return F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
+            if orig_h != self.vit_input_size or orig_w != self.vit_input_size:
+                return F.interpolate(
+                    x,
+                    size=(self.vit_input_size, self.vit_input_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
         return x
 
     def _extract_secondary_features(self, x_raw: torch.Tensor) -> torch.Tensor:
         """Extract features from the optional secondary backbone."""
         assert self.secondary_net is not None
         x_sec = x_raw
-        if self.secondary_kind == "vit" and self.force_vit_1024:
-            if x_sec.shape[2] != 1024 or x_sec.shape[3] != 1024:
-                x_sec = F.interpolate(x_sec, size=(1024, 1024), mode="bilinear", align_corners=False)
+        if self.secondary_kind == "vit" and self.vit_input_size is not None:
+            if x_sec.shape[2] != self.vit_input_size or x_sec.shape[3] != self.vit_input_size:
+                x_sec = F.interpolate(
+                    x_sec,
+                    size=(self.vit_input_size, self.vit_input_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
         if not self.secondary_trainable and not any(p.requires_grad for p in self.secondary_net.parameters()):
             with torch.no_grad():
                 return self.secondary_net(x_sec)
         return self.secondary_net(x_sec)
 
-    def _extract_primary_and_fused_features(
+    def _extract_all_branch_features_single(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """Run primary (and optional secondary + fusion) backbones and optional FeatureAdapter."""
         x_raw = self._ensure_raw_rgb(x)
         x_in = self._prepare_backbone_input(x_raw)
@@ -2283,6 +2589,7 @@ class FOCAL(nn.Module):
         else:
             f_primary = self.net(x_in)
 
+        f_secondary: Optional[torch.Tensor] = None
         if self.secondary_net is not None and self.fusion_module is not None:
             f_secondary = self._extract_secondary_features(x_raw)
             if self.fusion_spatial_align == "max":
@@ -2305,6 +2612,35 @@ class FOCAL(nn.Module):
             feats_backbone = f_primary
 
         feats = self.feature_adapter(feats_backbone) if self.feature_adapter is not None else feats_backbone
+        return x_in, f_primary, f_secondary, feats_backbone, feats
+
+    def _extract_all_branch_features(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Extract branch and fused features, applying horizontal-flip eval TTA when enabled."""
+        x_in, f_p, f_s, feats_bb, feats = self._extract_all_branch_features_single(x)
+        if not self.training and self.tta_hflip:
+            _, f_p2, f_s2, feats_bb2, feats2 = self._extract_all_branch_features_single(torch.flip(x, dims=[-1]))
+
+            def _avg_l2(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                if a is None or b is None:
+                    return a
+                b_flip = torch.flip(b, dims=[-1])
+                a_n = F.normalize(a.float(), p=2, dim=1)
+                b_n = F.normalize(b_flip.float(), p=2, dim=1)
+                return F.normalize(0.5 * (a_n + b_n), p=2, dim=1).to(dtype=a.dtype)
+
+            f_p = _avg_l2(f_p, f_p2)  # type: ignore[assignment]
+            f_s = _avg_l2(f_s, f_s2)
+            feats_bb = _avg_l2(feats_bb, feats_bb2)  # type: ignore[assignment]
+            feats = _avg_l2(feats, feats2)  # type: ignore[assignment]
+        return x_in, f_p, f_s, feats_bb, feats
+
+    def _extract_primary_and_fused_features(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run primary (and optional secondary + fusion) backbones and optional FeatureAdapter."""
+        x_in, f_primary, _, feats_backbone, feats = self._extract_all_branch_features(x)
         return x_in, f_primary, feats_backbone, feats
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -2340,7 +2676,15 @@ class FOCAL(nn.Module):
             for blk in encoder.blocks:
                 feat = blk(feat)
             neck_mod = anchor_neck if anchor_neck is not None else encoder.neck
-            return neck_mod(feat.permute(0, 3, 1, 2))
+            neck_in = feat.permute(0, 3, 1, 2)
+            if anchor_neck is not None:
+                try:
+                    anchor_dev = next(anchor_neck.parameters()).device
+                    if neck_in.device != anchor_dev:
+                        return anchor_neck(neck_in.to(anchor_dev)).to(neck_in.device)
+                except StopIteration:
+                    pass
+            return neck_mod(neck_in)
         finally:
             for m in lora_mods:
                 m.bypass = False
@@ -2372,6 +2716,13 @@ class FOCAL(nn.Module):
             hrnet_net.transition3[i](y_list[-1]) if hrnet_net.transition3[i] is not None else y_list[i]
             for i in range(hrnet_net.stage4_cfg["NUM_BRANCHES"])
         ]
+        try:
+            anchor_dev = next(anchor_stage4.parameters()).device
+            if x_in.device != anchor_dev:
+                x_list_dev = [t.to(anchor_dev) for t in x_list]
+                return anchor_stage4(x_list_dev)[0].to(x_in.device)
+        except StopIteration:
+            pass
         return anchor_stage4(x_list)[0]
 
     @torch.no_grad()
@@ -2390,8 +2741,8 @@ class FOCAL(nn.Module):
             return None
         x_sec = x_raw
         if self.secondary_kind == "vit":
-            if self.force_vit_1024 and (x_sec.shape[2] != 1024 or x_sec.shape[3] != 1024):
-                x_sec = F.interpolate(x_sec, size=(1024, 1024), mode="bilinear", align_corners=False)
+            if self.vit_input_size is not None and (x_sec.shape[2] != self.vit_input_size or x_sec.shape[3] != self.vit_input_size):
+                x_sec = F.interpolate(x_sec, size=(self.vit_input_size, self.vit_input_size), mode="bilinear", align_corners=False)
             return self._forward_vit_base_no_grad(
                 self.secondary_net, x_sec, anchor_neck=self._anchor_secondary_neck
             )
@@ -2492,63 +2843,90 @@ class FOCAL(nn.Module):
         shifted = diff - (max_pos + 2.0)
         return torch.where(pristine_mask.view(-1, 1), shifted, diff)
 
-    def _cluster_features_with_stats(
+    def _cluster_features_with_full_stats(
         self,
         feats: torch.Tensor,
         orig_h: int,
         orig_w: int,
         aux_pristine_flags: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        On-the-fly unsupervised k-means clustering mask and logit prediction as proposed in FOCAL.
-        Clusters L2-normalized forensic embeddings into tampered and pristine groups per image,
-        and returns `(logit_full, prob_full, cluster_separability)`.
+        On-the-fly unsupervised clustering mask and logit prediction (`"kmeans"` or `"soft_kmeans"`).
+        Returns `(logit_full, prob_full, cluster_separability, minority_ratio)`.
         """
         b, c, h_f, w_f = feats.shape
         n_px = h_f * w_f
         feats_norm = F.normalize(feats.float(), p=2, dim=1)
         f_img = feats_norm.permute(0, 2, 3, 1).reshape(b, n_px, c)
 
-        # Double farthest-point initialization (k-means++ style) across entire batch
-        c1 = f_img[:, 0:1, :]
-        dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
-        idx_max1 = torch.argmax(dists1, dim=-1, keepdim=True)
-        c2 = torch.gather(f_img, dim=1, index=idx_max1.unsqueeze(-1).expand(-1, 1, c))
+        if self.clustering_mode == "soft_kmeans":
+            # Global mean anchor + top-2% farthest-point initialization (immune to corner/outlier pixels)
+            c1 = F.normalize(f_img.mean(dim=1, keepdim=True), p=2, dim=-1)
+            dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
+            k_far = max(1, n_px // 50)
+            far_idx = torch.topk(dists1, k=k_far, dim=-1).indices
+            far_vecs = torch.gather(f_img, dim=1, index=far_idx.unsqueeze(-1).expand(-1, -1, c))
+            c2 = F.normalize(far_vecs.mean(dim=1, keepdim=True), p=2, dim=-1)
+            centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
 
-        dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
-        idx_max2 = torch.argmax(dists2, dim=-1, keepdim=True)
-        c1 = torch.gather(f_img, dim=1, index=idx_max2.unsqueeze(-1).expand(-1, 1, c))
+            for step in range(10):
+                em_temp = 0.15 if step < 5 else 0.08
+                sims = torch.bmm(f_img, centroids.transpose(1, 2))
+                probs = torch.softmax(sims / em_temp, dim=-1)
+                w0 = probs[:, :, 0:1]
+                w1 = probs[:, :, 1:2]
+                mass0 = w0.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                mass1 = w1.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                new_c0 = F.normalize(torch.bmm(w0.transpose(1, 2), f_img) / mass0, p=2, dim=-1)
+                new_c1 = F.normalize(torch.bmm(w1.transpose(1, 2), f_img) / mass1, p=2, dim=-1)
+                centroids = torch.cat([new_c0, new_c1], dim=1)
 
-        centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
+            sims = torch.bmm(f_img, centroids.transpose(1, 2))
+            probs = torch.softmax(sims / 0.08, dim=-1)
+            c0_count = probs[:, :, 0].sum(dim=-1, keepdim=True)
+            c1_count = probs[:, :, 1].sum(dim=-1, keepdim=True)
+        else:
+            # Double farthest-point initialization (k-means++ style) across entire batch
+            c1 = f_img[:, 0:1, :]
+            dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
+            idx_max1 = torch.argmax(dists1, dim=-1, keepdim=True)
+            c2 = torch.gather(f_img, dim=1, index=idx_max1.unsqueeze(-1).expand(-1, 1, c))
 
-        # EM iterations with cosine similarity (vectorized without CPU synchronization)
-        for _ in range(8):
+            dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
+            idx_max2 = torch.argmax(dists2, dim=-1, keepdim=True)
+            c1 = torch.gather(f_img, dim=1, index=idx_max2.unsqueeze(-1).expand(-1, 1, c))
+
+            centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
+
+            # EM iterations with cosine similarity (vectorized without CPU synchronization)
+            for _ in range(8):
+                sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
+                assign = torch.argmax(sims, dim=-1)  # [B, N]
+                w0 = (assign == 0).unsqueeze(-1).to(f_img.dtype)
+                w1 = (assign == 1).unsqueeze(-1).to(f_img.dtype)
+                count0 = w0.sum(dim=1, keepdim=True)
+                count1 = w1.sum(dim=1, keepdim=True)
+                sum0 = torch.bmm(w0.transpose(1, 2), f_img)
+                sum1 = torch.bmm(w1.transpose(1, 2), f_img)
+                new_c0 = torch.where(count0 > 0, sum0 / count0.clamp(min=1.0), centroids[:, 0:1, :])
+                new_c0 = F.normalize(new_c0, p=2, dim=-1)
+                new_c1 = torch.where(count1 > 0, sum1 / count1.clamp(min=1.0), centroids[:, 1:2, :])
+                new_c1 = F.normalize(new_c1, p=2, dim=-1)
+                centroids = torch.cat([new_c0, new_c1], dim=1)
+
             sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
-            assign = torch.argmax(sims, dim=-1)  # [B, N]
-            w0 = (assign == 0).unsqueeze(-1).to(f_img.dtype)
-            w1 = (assign == 1).unsqueeze(-1).to(f_img.dtype)
-            count0 = w0.sum(dim=1, keepdim=True)
-            count1 = w1.sum(dim=1, keepdim=True)
-            sum0 = torch.bmm(w0.transpose(1, 2), f_img)
-            sum1 = torch.bmm(w1.transpose(1, 2), f_img)
-            new_c0 = torch.where(count0 > 0, sum0 / count0.clamp(min=1.0), centroids[:, 0:1, :])
-            new_c0 = F.normalize(new_c0, p=2, dim=-1)
-            new_c1 = torch.where(count1 > 0, sum1 / count1.clamp(min=1.0), centroids[:, 1:2, :])
-            new_c1 = F.normalize(new_c1, p=2, dim=-1)
-            centroids = torch.cat([new_c0, new_c1], dim=1)
+            labels = torch.argmax(sims, dim=-1)  # [B, N]
+            c1_count = labels.sum(dim=-1, keepdim=True).to(f_img.dtype)  # [B, 1]
+            c0_count = float(n_px) - c1_count  # [B, 1]
 
         cos_sim = (centroids[:, 0] * centroids[:, 1]).sum(dim=-1)  # [B]
         separability = (1.0 - cos_sim).clamp(min=0.0)
-
-        sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
-        labels = torch.argmax(sims, dim=-1)  # [B, N]
-        c1_count = labels.sum(dim=-1, keepdim=True)  # [B, 1]
-        c0_count = n_px - c1_count  # [B, 1]
 
         # Tampered regions typically occupy the minority portion of an image.
         cond = (c1_count > c0_count)  # [B, 1]
         sim_tampered = torch.where(cond, sims[:, :, 0], sims[:, :, 1])  # [B, N]
         sim_pristine = torch.where(cond, sims[:, :, 1], sims[:, :, 0])  # [B, N]
+        minority_ratio = (torch.where(cond, c0_count, c1_count).squeeze(-1) / float(max(1, n_px))).clamp(0.0, 1.0)
 
         diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [B, N]
 
@@ -2561,6 +2939,23 @@ class FOCAL(nn.Module):
         logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
         prob_full = torch.sigmoid(logit_full)
 
+        return logit_full, prob_full, separability, minority_ratio
+
+    def _cluster_features_with_stats(
+        self,
+        feats: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+        aux_pristine_flags: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        On-the-fly unsupervised clustering mask and logit prediction as proposed in FOCAL.
+        Clusters L2-normalized forensic embeddings into tampered and pristine groups per image,
+        and returns `(logit_full, prob_full, cluster_separability)`.
+        """
+        logit_full, prob_full, separability, _ = self._cluster_features_with_full_stats(
+            feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+        )
         return logit_full, prob_full, separability
 
     def _cluster_domain_features(
@@ -2784,7 +3179,13 @@ class FOCAL(nn.Module):
             gt_small = F.interpolate(gt_f, size=(h_f, w_f), mode="area")
         else:
             gt_small = gt_f
-        labels_grid = (gt_small >= 0.5).long().view(b, h_f * w_f)
+        mask_bin = (gt_small >= 0.5).float()
+        labels_grid = (mask_bin >= 0.5).long().view(b, h_f * w_f)
+        boundary_grid: Optional[torch.Tensor] = None
+        if self.contrastive_boundary_ratio > 0.0:
+            dilated = F.max_pool2d(mask_bin, kernel_size=3, stride=1, padding=1)
+            eroded = -F.max_pool2d(-mask_bin, kernel_size=3, stride=1, padding=1)
+            boundary_grid = ((dilated - eroded) > 0.5).view(b, h_f * w_f)
 
         feats_norm = F.normalize(feats.float(), p=2, dim=1)
         emb_all = feats_norm.permute(0, 2, 3, 1).reshape(b, h_f * w_f, c)
@@ -2797,7 +3198,19 @@ class FOCAL(nn.Module):
             if not (has_pos and has_neg):
                 continue
 
-            z_i, y_sub = self._sample_contrastive_tokens(emb_all[i], y_i, self.contrastive_sample_size)
+            if boundary_grid is not None and boundary_grid[i].any():
+                b_mask = boundary_grid[i]
+                b_budget = max(2, int(round(self.contrastive_sample_size * self.contrastive_boundary_ratio)))
+                z_b, y_b = self._sample_contrastive_tokens(emb_all[i][b_mask], y_i[b_mask], b_budget)
+                rem_budget = max(0, self.contrastive_sample_size - z_b.shape[0])
+                if rem_budget > 0 and (~b_mask).any():
+                    z_r, y_r = self._sample_contrastive_tokens(emb_all[i][~b_mask], y_i[~b_mask], rem_budget)
+                    z_i = torch.cat([z_b, z_r], dim=0)
+                    y_sub = torch.cat([y_b, y_r], dim=0)
+                else:
+                    z_i, y_sub = z_b, y_b
+            else:
+                z_i, y_sub = self._sample_contrastive_tokens(emb_all[i], y_i, self.contrastive_sample_size)
             if z_i.shape[0] < 2 or not (y_sub == 1).any() or not (y_sub == 0).any():
                 continue
 
@@ -2932,7 +3345,7 @@ class FOCAL(nn.Module):
                 - `cluster_separability`: Inter-centroid distance `1 - cos(c0, c1)` (if clustering)
         """
         orig_h, orig_w = x.shape[2], x.shape[3]
-        x_in, f_primary, feats_backbone, feats = self._extract_primary_and_fused_features(x)
+        x_in, f_primary, f_secondary, feats_backbone, feats = self._extract_all_branch_features(x)
 
         resolved_domain_ids = domain_ids
         if resolved_domain_ids is None and dataset_sources is not None:
@@ -3041,20 +3454,65 @@ class FOCAL(nn.Module):
                     cluster_logits, _, separability, _ = self._cluster_domain_features(
                         feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
+                    area_fused = (cluster_logits > 0).float().mean(dim=(1, 2, 3))
                 else:
-                    cluster_logits, _, separability = self._cluster_features_with_stats(
+                    cluster_logits, _, separability, area_fused = self._cluster_features_with_full_stats(
                         feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
+                primary_branch_stats = None
+                secondary_branch_stats = None
+                if (
+                    self.secondary_net is not None
+                    and f_primary is not None
+                    and f_secondary is not None
+                    and (self.cluster_refiner_type == "image_relative" or self.branch_logit_weights is not None)
+                ):
+                    c_p_full, _, sep_p, area_p = self._cluster_features_with_full_stats(
+                        f_primary.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                    c_s_full, _, sep_s, area_s = self._cluster_features_with_full_stats(
+                        f_secondary.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                    primary_branch_stats = (f_primary.detach(), c_p_full, sep_p, area_p)
+                    secondary_branch_stats = (f_secondary.detach(), c_s_full, sep_s, area_s)
+
+            base_logits = cluster_logits
+            if self.branch_logit_weights is not None and primary_branch_stats is not None and secondary_branch_stats is not None:
+                w_b = 0.5 * torch.tanh(self.branch_logit_weights.float())
+                base_logits = (
+                    cluster_logits.float()
+                    + w_b[0] * primary_branch_stats[1].float()
+                    + w_b[1] * secondary_branch_stats[1].float()
+                )
+
             if self.cluster_refiner is not None:
-                ref_feats = feats.detach() if self.detach_refiner_feats else feats
-                raw_delta = self.cluster_refiner(ref_feats, cluster_logits.detach(), orig_h, orig_w)
-                if self.cluster_residual_max_scale > 0.0:
-                    delta = self.cluster_residual_max_scale * torch.tanh(raw_delta)
+                if isinstance(self.cluster_refiner, ImageRelativeClusterRefiner):
+                    desc = ImageRelativeClusterRefiner.build_descriptors(
+                        feats=feats.detach(),
+                        c_fused_logits=cluster_logits.detach(),
+                        sep_fused=separability.detach(),
+                        area_fused=area_fused.detach(),
+                        primary_branch=primary_branch_stats,
+                        secondary_branch=secondary_branch_stats,
+                        multi_branch=self.cluster_refiner.multi_branch,
+                    )
+                    raw_bias, raw_scale = self.cluster_refiner(desc, orig_h, orig_w)
+                    scale = 1.0 + self.cluster_residual_scale_gain * torch.tanh(raw_scale)
+                    if self.cluster_residual_max_scale > 0.0:
+                        bias = self.cluster_residual_max_scale * torch.tanh(raw_bias)
+                    else:
+                        bias = raw_bias
+                    mask_logits = scale * base_logits.to(dtype=bias.dtype) + bias
                 else:
-                    delta = raw_delta
-                mask_logits = cluster_logits.to(dtype=delta.dtype) + delta
+                    ref_feats = feats.detach() if self.detach_refiner_feats else feats
+                    raw_delta = self.cluster_refiner(ref_feats, cluster_logits.detach(), orig_h, orig_w)
+                    if self.cluster_residual_max_scale > 0.0:
+                        delta = self.cluster_residual_max_scale * torch.tanh(raw_delta)
+                    else:
+                        delta = raw_delta
+                    mask_logits = base_logits.to(dtype=delta.dtype) + delta
             else:
-                mask_logits = cluster_logits
+                mask_logits = base_logits.to(dtype=feats.dtype)
             logits_full = mask_logits
             pred_mask = torch.sigmoid(mask_logits)
             skip_mask_loss = False

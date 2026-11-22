@@ -1,0 +1,95 @@
+# Configuration: FOCAL v2 Domain-Invariant Image-Relative Dual-Backbone Adaptation on CASIA-v2.0
+# Pairs strictly frozen FOCAL ViT-Large (vit_input_size=768) + strictly frozen FOCAL HRNet-W32
+# via L2-normalized concatenation with learnable fusion scaling, a SpatialCrossScaleAdapter
+# (prior_anchor_weight=0.75, boundary-aware MyInfoNCE), and a rotation/domain-invariant
+# ImageRelativeClusterRefiner with multi-branch logit fusion and recall-preserving loss.
+
+project:
+  name: "focal_vit_hrnet_image_relative_casia"
+  seed: 42
+  device: "auto"
+  output_dir: "outputs/RUN/focal_vit_hrnet_image_relative_casia"
+
+data:
+  dataset_name: "KhangTruong/Casia-v2.0-Fake"
+  streaming: false
+  save_to_disk: true
+  normalize: false
+  image_size: [512, 512]
+  batch_size: 4
+  num_workers: 2
+  pin_memory: true
+  train_split: "train"
+  val_split: "validation"
+  test_split: "validation"
+  eval_split: "validation"
+  evaluate_on_test: false
+  augmentations:
+    horizontal_flip: 0.5
+    vertical_flip: 0.2
+    random_rotate90: 0.5
+    random_jpeg: 0.35
+    jpeg_quality: [65, 100]
+    color_jitter: 0.0
+
+model:
+  name: "focal"
+  backbone: "vit"
+  secondary_backbone: "hrnet"
+  freeze_primary_backbone: true
+  secondary_trainable: false
+  freeze_backbone_bn: true
+  fusion_mode: "concat"
+  fusion_spatial_align: "max"
+  learnable_fusion_scale: true
+  use_feature_adapter: true
+  feature_adapter_type: "spatial"
+  prior_anchor_weight: 0.75
+  pretrained: true
+  hf_repo: "KhangTruong/FOCAL"
+  finetune_mode: "hybrid"
+  use_clustering: true
+  clustering_mode: "kmeans"
+  force_vit_1024: false
+  vit_input_size: 768
+  tta_hflip: true
+  cluster_temperature: 0.1
+  cluster_separability_threshold: 0.0015
+  contrastive_sample_size: 1024
+  contrastive_boundary_ratio: 0.4
+  cluster_refiner_type: "image_relative"
+  multi_branch_logit_fusion: true
+  # Trained at (0.40, 0.20), then post-training WiSE-FT calibrated (alpha=0.65 -> 0.26, 0.13) on released checkpoint
+  cluster_residual_max_scale: 0.40
+  cluster_residual_scale_gain: 0.20
+  cluster_refiner_dim: 48
+  cluster_refiner_l2_weight: 0.06
+  detach_refiner_feats: true
+  aux_classifier: false
+  num_classes: 2
+
+loss:
+  mask_loss_type: "combined"
+  bce_weight: 0.5
+  dice_weight: 0.5
+  focal_weight: 0.0
+  pos_weight: 1.5
+  edge_weight: 0.5
+  edge_mask_width: 7
+  align_weight: 1.0
+
+training:
+  epochs: 4
+  learning_rate: 0.00015
+  weight_decay: 0.01
+  optimizer: "adamw"
+  scheduler: "cosine"
+  min_lr: 0.000005
+  gradient_accumulation_steps: 2
+  val_check_interval: null
+  auto_batch_size: false
+  save_best: true
+  save_latest: true
+  amp: true
+  mixed_precision: "fp16"
+  precision: "fp16"

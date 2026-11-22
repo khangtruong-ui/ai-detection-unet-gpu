@@ -1130,6 +1130,14 @@ def build_model(config: Any) -> nn.Module:
             cluster_refiner_dim=int(model_cfg.get("cluster_refiner_dim", 64)),
             cluster_refiner_l2_weight=float(model_cfg.get("cluster_refiner_l2_weight", 0.0)),
             detach_refiner_feats=bool(model_cfg.get("detach_refiner_feats", True)),
+            clustering_mode=str(model_cfg.get("clustering_mode", "kmeans")),
+            vit_input_size=model_cfg.get("vit_input_size", None),
+            tta_hflip=bool(model_cfg.get("tta_hflip", False)),
+            feature_adapter_type=str(model_cfg.get("feature_adapter_type", "mlp")),
+            cluster_refiner_type=str(model_cfg.get("cluster_refiner_type", "legacy")),
+            cluster_residual_scale_gain=float(model_cfg.get("cluster_residual_scale_gain", 0.5)),
+            multi_branch_logit_fusion=bool(model_cfg.get("multi_branch_logit_fusion", False)),
+            contrastive_boundary_ratio=float(model_cfg.get("contrastive_boundary_ratio", 0.0)),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(
