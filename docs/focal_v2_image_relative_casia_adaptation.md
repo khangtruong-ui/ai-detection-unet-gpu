@@ -1,5 +1,7 @@
 # FOCAL v2: Domain-Invariant Image-Relative Dual-Backbone Adaptation on CASIA-v2.0
 
+> **Unified Report**: For a complete comparative explanation of methods, architectural evolution, failure modes, and results across both PR #34 and PR #35, see [`docs/focal_pr34_pr35_methods_failures_results.md`](focal_pr34_pr35_methods_failures_results.md).
+
 - **Hugging Face Weights & Reports**: [`KhangTruong/focal-v2-image-relative-casia`](https://huggingface.co/KhangTruong/focal-v2-image-relative-casia)
 - **Experiment Config**: [`configs/experiments/focal/focal_vit_hrnet_image_relative_casia.yaml`](../configs/experiments/focal/focal_vit_hrnet_image_relative_casia.yaml)
 - **Training Dataset**: `KhangTruong/Casia-v2.0-Fake` (`train`: 4,354, `validation`: 769)

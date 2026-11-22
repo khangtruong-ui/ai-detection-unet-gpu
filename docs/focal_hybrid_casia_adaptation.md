@@ -1,5 +1,7 @@
 # FOCAL Dual-Backbone Clustering-Anchored Hybrid Adaptation on CASIA-v2.0
 
+> **Unified Report**: For a complete comparative explanation of methods, architectural evolution, failure modes, and results across both PR #34 and PR #35, see [`docs/focal_pr34_pr35_methods_failures_results.md`](focal_pr34_pr35_methods_failures_results.md).
+
 ## Objective & Motivation
 
 Adapting [`KhangTruong/FOCAL`](https://huggingface.co/KhangTruong/FOCAL) on `KhangTruong/Casia-v2.0-Fake` to beat its cross-evaluated localization performance under [`configs/cross-eval/MVSS-v1-protocol.yaml`](../configs/cross-eval/MVSS-v1-protocol.yaml) (`KhangTruong/Tampered-Images-Combined-Dataset-Fake`, `cross_test`, `--samples-per-dataset 120`, 1,676 samples across 15 sub-datasets) without suffering catastrophic forgetting on out-of-distribution (OOD) forgery benchmarks (`OpenSDID_*`, `CocoGlide`, `HiFi_IFDL`, `Columbia_Gray`, `Coverage`, `NIST16`, `IMD2020_RealLife`, `SAGI-D`).

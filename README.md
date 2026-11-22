@@ -1460,6 +1460,9 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
   - `configs/experiments/focal/focal_hrnet.yaml` (Strategy 1 Mode 1A Supervised, HRNet-W32, `batch_size: 32`)
   - `configs/experiments/focal/focal_hrnet_peft.yaml` (Strategy B Mode 1A Stage-4 + BN-Locked + FeatureAdapter, HRNet-W32, `batch_size: 32`)
   - `configs/experiments/focal/focal_hrnet_contrastive.yaml` / `focal_hrnet_contrastive_peft.yaml` (Strategy B Mode 1B Stage-4 + BN-Locked + Prior Anchor, HRNet-W32, `batch_size: 128`)
+  - `configs/experiments/focal/focal_vit_hrnet_hybrid_casia.yaml` (PR #34: Clustering-anchored hybrid `ViT + HRNet` adaptation, `0.11%` trainable params, [`KhangTruong/focal-vit-hrnet-hybrid-casia`](https://huggingface.co/KhangTruong/focal-vit-hrnet-hybrid-casia))
+  - `configs/experiments/focal/focal_vit_hrnet_image_relative_casia.yaml` (PR #35: FOCAL v2 domain-/rotation-invariant `ImageRelativeClusterRefiner` + `SpatialCrossScaleAdapter` + `vit_input_size=768` + `tta_hflip`, `0.07%` trainable params, [`KhangTruong/focal-v2-image-relative-casia`](https://huggingface.co/KhangTruong/focal-v2-image-relative-casia))
+- **Adaptation Methods, Failures & Results**: See [docs/focal_pr34_pr35_methods_failures_results.md](docs/focal_pr34_pr35_methods_failures_results.md) (unified report covering PR #34 & PR #35), [docs/focal_hybrid_casia_adaptation.md](docs/focal_hybrid_casia_adaptation.md), and [docs/focal_v2_image_relative_casia_adaptation.md](docs/focal_v2_image_relative_casia_adaptation.md).
 
 #### Checkpoint Synchronization (`sid-pull`)
 ```bash
