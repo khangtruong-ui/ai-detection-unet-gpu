@@ -145,24 +145,15 @@ def reduce_tensor(tensor: torch.Tensor, average: bool = True) -> torch.Tensor:
     return reduced
 
 
-def reduce_dict(metrics: Dict[str, Any], average: bool = True) -> Dict[str, Any]:
+def reduce_dict(metrics: Dict[str, float], average: bool = True) -> Dict[str, float]:
     """
-    Synchronize and reduce a dictionary of numeric scalar metrics across all distributed ranks,
-    preserving non-numeric metadata entries (e.g., bools and strings).
+    Synchronize and reduce a dictionary of float scalar metrics across all distributed ranks.
     """
     if not is_dist_avail_and_initialized() or not metrics:
         return metrics
 
     keys = sorted(metrics.keys())
-    numeric_keys = [
-        k for k in keys
-        if isinstance(metrics[k], (int, float)) and not isinstance(metrics[k], bool)
-    ]
-    out: Dict[str, Any] = {k: metrics[k] for k in keys if k not in numeric_keys}
-    if not numeric_keys:
-        return out
-
-    local_vals = [float(metrics[k]) for k in numeric_keys]
+    local_vals = [float(metrics[k]) for k in keys]
     device = torch.device(f"cuda:{get_local_rank()}" if torch.cuda.is_available() else "cpu")
     t = torch.tensor(local_vals, dtype=torch.float64, device=device)
 
@@ -171,9 +162,7 @@ def reduce_dict(metrics: Dict[str, Any], average: bool = True) -> Dict[str, Any]
         t = t / get_world_size()
 
     out_vals = t.cpu().tolist()
-    for k, v in zip(numeric_keys, out_vals):
-        out[k] = float(v)
-    return out
+    return {k: float(v) for k, v in zip(keys, out_vals)}
 
 
 def broadcast_scalar(val: float, src: int = 0) -> float:

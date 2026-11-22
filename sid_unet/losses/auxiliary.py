@@ -181,8 +181,6 @@ class SIDTotalLoss(nn.Module):
             loss_metrics["align_loss"] = art_val
             loss_metrics["xs_xr_loss"] = art_val
 
-        if raw_prior_anchor is not None and torch.is_tensor(raw_prior_anchor) and raw_prior_anchor.numel() > 1:
-            raw_prior_anchor = raw_prior_anchor.mean()
         if prior_anchor_penalty is not None:
             if torch.is_tensor(prior_anchor_penalty) and prior_anchor_penalty.numel() > 1:
                 prior_anchor_penalty = prior_anchor_penalty.mean()

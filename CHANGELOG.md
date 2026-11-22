@@ -5,22 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-22
-
-### Added
-- **FOCAL v2 Domain-Invariant Image-Relative Dual-Backbone Adaptation (`sid_unet/models/focal.py`, `sid_unet/models/unet.py`, `configs/experiments/focal/focal_vit_hrnet_image_relative_casia.yaml`)**:
-  - Added `SpatialCrossScaleAdapter` (`feature_adapter_type: "spatial"`) with `1x1 -> depthwise 3x3 -> dilated depthwise 3x3 (d=2) -> zero-init 1x1` residual refinement.
-  - Added `ImageRelativeClusterRefiner` (`cluster_refiner_type: "image_relative"`) and `_DilatedResBlock` operating purely on rotation- and domain-invariant clustering/geometric statistics (10 channels single-branch or 24 channels multi-branch) with zero-init `(raw_bias, raw_scale)` output.
-  - Added `vit_input_size` (e.g., `768`), `tta_hflip`, `multi_branch_logit_fusion` (`branch_logit_weights`), `cluster_residual_scale_gain`, `clustering_mode: "soft_kmeans"` (with diagnostic verification), and `contrastive_boundary_ratio` boundary-aware MyInfoNCE sampling.
-  - Added `tests/test_focal_v2_image_relative.py` (6 unit/integration tests covering mathematical channel-rotation invariance, `SpatialCrossScaleAdapter` zero-init identity, multi-branch fusion, `tta_hflip`, and `build_model` config wiring) and `docs/focal_v2_image_relative_casia_adaptation.md`.
-
-### Fixed
-- **Multi-GPU `DataParallel` & DDP Training/Eval Stability**:
-  - Added `_SIDDataParallel(nn.DataParallel)` in `sid_unet/training/trainer.py` to preserve non-tensor scalar/boolean batch metadata (`skip_mask_loss`) during `gather()`.
-  - Reduced vector `raw_prior_anchor` across GPU replicas with `.mean()` in `sid_unet/losses/auxiliary.py` (`SIDTotalLoss`).
-  - Updated `reduce_dict()` in `sid_unet/utils/distributed.py` to skip non-numeric metadata (`filter_zero_positive_mode`, booleans) instead of crashing DDP reduction.
-  - Froze unused `fused_fc` / `domain_fc` heads in `hybrid`/`contrastive` modes and aligned `_anchor_neck` / `_anchor_hrnet_stage4` devices in `sid_unet/models/focal.py` for multi-GPU `DataParallel` and DDP compatibility.
-
 ## [Unreleased] - 2026-11-20
 
 ### Added

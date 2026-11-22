@@ -95,27 +95,6 @@ def parse_checkpoint_period(training_cfg: Any) -> float:
     return 3600.0
 
 
-class _SIDDataParallel(nn.DataParallel):
-    """DataParallel wrapper that preserves non-tensor scalar/bool dict metadata during gather."""
-
-    def gather(self, outputs, output_device):
-        if outputs and isinstance(outputs[0], dict):
-            non_tensor_keys = [
-                k for k, v in outputs[0].items()
-                if not isinstance(v, (torch.Tensor, list, tuple, dict))
-            ]
-            if non_tensor_keys:
-                meta = {k: outputs[0][k] for k in non_tensor_keys}
-                tensor_outputs = [
-                    {k: v for k, v in out.items() if k not in non_tensor_keys}
-                    for out in outputs
-                ]
-                gathered = super().gather(tensor_outputs, output_device)
-                gathered.update(meta)
-                return gathered
-        return super().gather(outputs, output_device)
-
-
 class Trainer:
     """End-to-end training and validation loop manager with OOM safety and gradient accumulation."""
 
@@ -232,7 +211,7 @@ class Trainer:
                         f"(Rank {self.rank}, Local Rank {self.local_rank}, Device {self.device})"
                     )
             elif self.is_data_parallel:
-                self.model = _SIDDataParallel(self.model)
+                self.model = nn.DataParallel(self.model)
                 self.logger.info(
                     f"🚀 Data Parallelism Active: nn.DataParallel enabled across {self.num_gpus} GPUs "
                     f"(Device IDs: {list(range(self.num_gpus))})"
