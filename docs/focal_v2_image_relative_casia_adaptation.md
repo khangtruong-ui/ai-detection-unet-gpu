@@ -116,6 +116,36 @@ After Epoch 3 `checkpoint_best.pt` was selected, WiSE-FT calibration (`alpha=0.6
 | `SAGI-D` | 16 | 0.5551 | **0.6229** | 0.6165 | 0.6991 | 0.8746 | 0.8919 | 0.6831 | 0.8052 | 0.9440 |
 | `TGIF2_flux1dev` | 120 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.4563 | 0.9125 | 0.0000 | 0.0000 | 0.9125 |
 
+### Full Unstratified `MVSS-v1-protocol` Cross-Evaluation (`17,929` Samples)
+
+Published in [`KhangTruong/focal-v2-image-relative-casia` (`master_cross_evaluation_report.md`)](https://huggingface.co/KhangTruong/focal-v2-image-relative-casia/raw/main/cross_evaluation/master_cross_evaluation_report.md):
+
+| Model | Samples | Loss | Mean IoU | IoU 95% CI | Dice / F1 | AUROC | Pixel Acc | Precision | Recall | Specificity |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `KhangTruong/FOCAL` (`sid_focal_hrnet`)* | 17,929 | 1.0407 | 0.2293 | — | 0.2902 | 0.6171 | 0.7758 | 0.2809 | **0.4618** | 0.8233 |
+| PR #34 (`focal-vit-hrnet-hybrid-casia`) | 17,929 | 0.6320 | 0.2639 | `[0.2587, 0.2692]` (`±0.0053`) | 0.3206 | **0.6332** | 0.8274 | 0.3317 | 0.4307 | 0.8835 |
+| **FOCAL v2 (`focal-v2-image-relative-casia`)** | **17,929** | **0.6294** | **0.2755** | `[0.2699, 0.2811]` (`±0.0056`) | **0.3248** | 0.6301 | **0.8333** | **0.3443** | 0.4152 | **0.8910** |
+
+| Sub-Dataset | Samples | PR #34 IoU | **FOCAL v2 IoU** | **FOCAL v2 F1** | **FOCAL v2 AUROC** | **FOCAL v2 Pixel Acc** | **FOCAL v2 Prec** | **FOCAL v2 Rec** | **FOCAL v2 Spec** |
+|---|---|---|---|---|---|---|---|---|---|
+| `CASIA_V1` | 920 | 0.7135 | **0.8234** | 0.8741 | 0.9590 | 0.9798 | 0.8526 | 0.9340 | 0.9840 |
+| `CASIA_V2` | 1,000 | 0.8074 | **0.8942** | 0.9306 | 0.9833 | 0.9887 | 0.9126 | 0.9748 | 0.9918 |
+| `COCO_Inpaint` | 2,000 | **0.0285** | 0.0201 | 0.0347 | 0.4869 | 0.8622 | 0.0375 | 0.0652 | 0.9086 |
+| `CocoGlide` | 507 | **0.4342** | 0.4180 | 0.4976 | 0.7001 | 0.7833 | 0.5773 | 0.5201 | 0.8800 |
+| `Columbia_Gray` | 180 | 0.9516 | **0.9540** | 0.9682 | 0.9783 | 0.9813 | 0.9685 | 0.9685 | 0.9880 |
+| `Coverage` | 100 | 0.5010 | **0.5446** | 0.6243 | 0.8536 | 0.9061 | 0.5698 | 0.7811 | 0.9261 |
+| `HiFi_IFDL` | 2,000 | 0.3219 | **0.3259** | 0.3864 | 0.6605 | 0.6859 | 0.4448 | 0.5288 | 0.7921 |
+| `IMD2020` | 2,000 | 0.0301 | **0.0317** | 0.0524 | 0.5464 | 0.8702 | 0.0377 | 0.2140 | 0.8787 |
+| `IMD2020_RealLife` | 1,000 | 0.4906 | **0.5536** | 0.6417 | 0.9126 | 0.9269 | 0.5842 | 0.8887 | 0.9365 |
+| `NIST16` | 220 | 0.4844 | **0.5065** | 0.5797 | 0.7774 | 0.8697 | 0.5983 | 0.6137 | 0.9411 |
+| `OpenSDID_Flux.1` | 2,000 | **0.2199** | 0.2080 | 0.2802 | 0.6151 | 0.7882 | 0.3191 | 0.3553 | 0.8748 |
+| `OpenSDID_SD1.5` | 2,000 | **0.1281** | 0.1203 | 0.1725 | 0.5533 | 0.7607 | 0.2149 | 0.2350 | 0.8716 |
+| `OpenSDID_SDXL` | 2,000 | **0.1192** | 0.1080 | 0.1607 | 0.5447 | 0.7556 | 0.2164 | 0.2177 | 0.8717 |
+| `SAGI-D` | 16 | **0.6253** | 0.6165 | 0.6991 | 0.8746 | 0.8919 | 0.6831 | 0.8052 | 0.9440 |
+| `TGIF2_flux1dev` | 1,986 | 0.0000 | 0.0000 | 0.0000 | 0.4549 | 0.9097 | 0.0000 | 0.0000 | 0.9097 |
+
+*(\*Note: `KhangTruong/FOCAL`'s historical 17,929-sample report predates the `NIST16` mask-polarity fix; 78.0% of the unstratified 17,929 samples come from the seven ~2,000-image datasets.)*
+
 ---
 
 ## 5. GPU Utilization Audit

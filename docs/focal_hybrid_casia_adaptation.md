@@ -75,6 +75,12 @@ Adapting [`KhangTruong/FOCAL`](https://huggingface.co/KhangTruong/FOCAL) on `Kha
 | `SAGI-D` | 16 | `0.5571` | `0.5663` | **0.6249** | `+0.0678` |
 | `TGIF2_flux1dev` | 120 | `0.0000` | `0.0000` | `0.0000` | `0.0000` |
 
+### Full Unstratified `MVSS-v1-protocol` Cross-Evaluation (`17,929` Samples)
+
+Published in [`KhangTruong/focal-vit-hrnet-hybrid-casia` (`master_cross_evaluation_report.md`)](https://huggingface.co/KhangTruong/focal-vit-hrnet-hybrid-casia/raw/main/cross_evaluation/master_cross_evaluation_report.md):
+- **Overall (`17,929` samples)**: `Loss = 0.6320`, `Mean IoU = 0.2639` `[0.2587, 0.2692] (±0.0053)` (vs. `KhangTruong/FOCAL`: `0.2293`), `Dice/F1 = 0.3206`, `AUROC = 0.6332`, `Pixel Acc = 0.8274`, `Precision = 0.3317`, `Recall = 0.4307`, `Specificity = 0.8835`.
+- **Notable full-scale subsets**: `CASIA_V1` (`920`): `0.7135`, `CASIA_V2` (`1,000`): `0.8074`, `Columbia_Gray` (`180`): `0.9516`, `Coverage` (`100`): `0.5010`, `HiFi_IFDL` (`2,000`): `0.3219`, `IMD2020_RealLife` (`1,000`): `0.4906`, `NIST16` (`220`): `0.4844`, `CocoGlide` (`507`): `0.4342`, `SAGI-D` (`16`): `0.6253`.
+
 ## Usage
 
 ```bash

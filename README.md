@@ -1462,7 +1462,7 @@ Validates query replacement forward/gradient semantics, CPU residency, key/value
   - `configs/experiments/focal/focal_hrnet_contrastive.yaml` / `focal_hrnet_contrastive_peft.yaml` (Strategy B Mode 1B Stage-4 + BN-Locked + Prior Anchor, HRNet-W32, `batch_size: 128`)
   - `configs/experiments/focal/focal_vit_hrnet_hybrid_casia.yaml` (PR #34: Clustering-anchored hybrid `ViT + HRNet` adaptation, `0.11%` trainable params, [`KhangTruong/focal-vit-hrnet-hybrid-casia`](https://huggingface.co/KhangTruong/focal-vit-hrnet-hybrid-casia))
   - `configs/experiments/focal/focal_vit_hrnet_image_relative_casia.yaml` (PR #35: FOCAL v2 domain-/rotation-invariant `ImageRelativeClusterRefiner` + `SpatialCrossScaleAdapter` + `vit_input_size=768` + `tta_hflip`, `0.07%` trainable params, [`KhangTruong/focal-v2-image-relative-casia`](https://huggingface.co/KhangTruong/focal-v2-image-relative-casia))
-- **Best Approach Pipeline (FOCAL v2 / PR #35 — `0.4193` Mean IoU on `MVSS-v1`)**:
+- **Best Approach Pipeline (FOCAL v2 / PR #35 — `0.4193` Mean IoU on 1,676 stratified / `0.2755` on full 17,929 `MVSS-v1`)**:
   ```
   Image [512×512] ─┬─► [768×768] Frozen ViT-L ──► Branch c_p ─┐
      (+ eval hflip)└─► [512×512] Frozen HRNet ──► Branch c_s ─┼─► multi_branch_logit_fusion (c_base)

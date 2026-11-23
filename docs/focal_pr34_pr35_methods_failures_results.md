@@ -289,7 +289,9 @@ PR #35 implemented `clustering_mode: "soft_kmeans"` (global mean initialization 
 
 *(At Epoch 4, Val Recall reached **`0.8662`**. Post-training WiSE-FT `alpha=0.65` on Epoch 3 `checkpoint_best.pt` was promoted to the final released `KhangTruong/focal-v2-image-relative-casia` checkpoint.)*
 
-### 5.2 Official `MVSS-v1-protocol.yaml` Per-Dataset Comparison (1,676 Samples, 15 Sub-Datasets)
+### 5.2 Official `MVSS-v1-protocol.yaml` Comparison
+
+#### 5.2.1 Stratified Protocol (`--samples-per-dataset 120`, 1,676 Samples, 15 Sub-Datasets)
 
 Paired evaluation reported in PR #35 (`--samples-per-dataset 120`, `Coverage`=100, `SAGI-D`=16; note PR #34's standalone per-dataset IoUs are also listed in [`docs/focal_hybrid_casia_adaptation.md`](focal_hybrid_casia_adaptation.md) and agree within `±0.008`):
 
@@ -311,6 +313,45 @@ Paired evaluation reported in PR #35 (`--samples-per-dataset 120`, `Coverage`=10
 | `SAGI-D` | 16 | `0.5551` | **`0.6229`** | `0.6165` | `0.6991` | `0.8746` | `0.8919` | `0.6831` | `0.8052` | `0.9440` |
 | `TGIF2_flux1dev` | 120 | `0.0000` | `0.0000` | `0.0000` | `0.0000` | `0.4563` | `0.9125` | `0.0000` | `0.0000` | `0.9125` |
 | **Overall (1,676)** | **1,676** | `0.3503` | `0.3984` | **`0.4193`** | **`0.4715`** | **`0.7163`** | **`0.8633`** | **`0.4871`** | `0.5595` | **`0.9132`** |
+
+#### 5.2.2 Full Unstratified `MVSS-v1-protocol.yaml` (All `17,929` Samples — Official Hugging Face Reports)
+
+Full-dataset cross-evaluation across all `17,929` images of `KhangTruong/Tampered-Images-Combined-Dataset-Fake` (`cross_test`), published in the official Hugging Face master cross-evaluation reports:
+- [`KhangTruong/FOCAL` Master Report](https://huggingface.co/KhangTruong/FOCAL/raw/main/cross_evaluation/master_cross_evaluation_report.md)
+- [`KhangTruong/focal-vit-hrnet-hybrid-casia` (PR #34) Master Report](https://huggingface.co/KhangTruong/focal-vit-hrnet-hybrid-casia/raw/main/cross_evaluation/master_cross_evaluation_report.md)
+- [`KhangTruong/focal-v2-image-relative-casia` (PR #35) Master Report](https://huggingface.co/KhangTruong/focal-v2-image-relative-casia/raw/main/cross_evaluation/master_cross_evaluation_report.md)
+
+| Model | Samples | Loss | Mean IoU | IoU 95% CI | Dice / F1 | AUROC | Pixel Acc | Precision | Recall | Specificity |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `KhangTruong/FOCAL` (`sid_focal_hrnet`)* | 17,929 | `1.0407` | `0.2293` | — | `0.2902` | `0.6171` | `0.7758` | `0.2809` | **`0.4618`** | `0.8233` |
+| **PR #34** (`focal_vit_hrnet_hybrid_casia`) | 17,929 | `0.6320` | `0.2639` | `[0.2587, 0.2692]` (`±0.0053`) | `0.3206` | **`0.6332`** | `0.8274` | `0.3317` | `0.4307` | `0.8835` |
+| **PR #35** (`focal_vit_hrnet_image_relative_casia`) | 17,929 | **`0.6294`** | **`0.2755`** | `[0.2699, 0.2811]` (`±0.0056`) | **`0.3248`** | `0.6301` | **`0.8333`** | **`0.3443`** | `0.4152` | **`0.8910`** |
+| **Gain vs. `KhangTruong/FOCAL`** | — | **`-0.4113`** | **`+0.0462`** | — | **`+0.0346`** | **`+0.0130`** | **`+0.0575`** | **`+0.0634`** | `-0.0466` | **`+0.0677`** |
+| **Gain vs. PR #34** | — | **`-0.0026`** | **`+0.0116`** | — | **`+0.0042`** | `-0.0031` | **`+0.0059`** | **`+0.0126`** | `-0.0155` | **`+0.0075`** |
+
+| Sub-Dataset | Samples | `KhangTruong/FOCAL` IoU | PR #34 IoU | **PR #35 (FOCAL v2) IoU** | PR #35 F1 | PR #35 AUROC | PR #35 Pixel Acc | PR #35 Prec | PR #35 Rec | PR #35 Spec |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `CASIA_V1` | 920 | `0.6365` | `0.7135` | **`0.8234`** | `0.8741` | `0.9590` | `0.9798` | `0.8526` | `0.9340` | `0.9840` |
+| `CASIA_V2` | 1,000 | `0.7391` | `0.8074` | **`0.8942`** | `0.9306` | `0.9833` | `0.9887` | `0.9126` | `0.9748` | `0.9918` |
+| `COCO_Inpaint` | 2,000 | **`0.0459`** | `0.0285` | `0.0201` | `0.0347` | `0.4869` | `0.8622` | `0.0375` | `0.0652` | `0.9086` |
+| `CocoGlide` | 507 | `0.3778` | **`0.4342`** | `0.4180` | `0.4976` | `0.7001` | `0.7833` | `0.5773` | `0.5201` | `0.8800` |
+| `Columbia_Gray` | 180 | `0.9122` | `0.9516` | **`0.9540`** | `0.9682` | `0.9783` | `0.9813` | `0.9685` | `0.9685` | `0.9880` |
+| `Coverage` | 100 | `0.3435` | `0.5010` | **`0.5446`** | `0.6243` | `0.8536` | `0.9061` | `0.5698` | `0.7811` | `0.9261` |
+| `HiFi_IFDL` | 2,000 | `0.1741` | `0.3219` | **`0.3259`** | `0.3864` | `0.6605` | `0.6859` | `0.4448` | `0.5288` | `0.7921` |
+| `IMD2020` | 2,000 | **`0.0366`** | `0.0301` | `0.0317` | `0.0524` | `0.5464` | `0.8702` | `0.0377` | `0.2140` | `0.8787` |
+| `IMD2020_RealLife` | 1,000 | `0.3906` | `0.4906` | **`0.5536`** | `0.6417` | `0.9126` | `0.9269` | `0.5842` | `0.8887` | `0.9365` |
+| `NIST16` | 220 | `0.1295`* | `0.4844` | **`0.5065`** | `0.5797` | `0.7774` | `0.8697` | `0.5983` | `0.6137` | `0.9411` |
+| `OpenSDID_Flux.1` | 2,000 | **`0.2272`** | `0.2199` | `0.2080` | `0.2802` | `0.6151` | `0.7882` | `0.3191` | `0.3553` | `0.8748` |
+| `OpenSDID_SD1.5` | 2,000 | **`0.1420`** | `0.1281` | `0.1203` | `0.1725` | `0.5533` | `0.7607` | `0.2149` | `0.2350` | `0.8716` |
+| `OpenSDID_SDXL` | 2,000 | **`0.1309`** | `0.1192` | `0.1080` | `0.1607` | `0.5447` | `0.7556` | `0.2164` | `0.2177` | `0.8717` |
+| `SAGI-D` | 16 | `0.5571` | **`0.6253`** | `0.6165` | `0.6991` | `0.8746` | `0.8919` | `0.6831` | `0.8052` | `0.9440` |
+| `TGIF2_flux1dev` | 1,986 | **`0.0030`** | `0.0000` | `0.0000` | `0.0000` | `0.4549` | `0.9097` | `0.0000` | `0.0000` | `0.9097` |
+| **Overall (17,929)** | **17,929** | `0.2293`* | `0.2639` | **`0.2755`** | **`0.3248`** | `0.6301` | **`0.8333`** | **`0.3443`** | `0.4152` | **`0.8910`** |
+
+> **Why `17,929`-sample unweighted IoU (`0.2755`) differs from the `1,676`-sample stratified IoU (`0.4193`)**:
+> 1. **Sample-count skew**: In the unstratified full dataset, seven subsets of ~2,000 images each (`COCO_Inpaint`, `IMD2020`, `OpenSDID_Flux.1`, `OpenSDID_SD1.5`, `OpenSDID_SDXL`, `HiFi_IFDL`, and `TGIF2_flux1dev` [1,986]) account for **`13,986 / 17,929` (`78.0%`)** of all evaluated images, heavily weighting synthetic/diffusion failure regimes (`0.00–0.21` IoU) while high-IoU traditional datasets (`Columbia_Gray` 180, `Coverage` 100, `NIST16` 220, `SAGI-D` 16) have small sample counts.
+> 2. **Full-scale consistency & reversal**: On the full `2,000`-sample `HiFi_IFDL` split, PR #35 (`0.3259`) actually **surpasses** PR #34 (`0.3219`), and widens its margin on `CASIA_V1` (`0.8234` vs `0.7135`), `CASIA_V2` (`0.8942` vs `0.8074`), `IMD2020_RealLife` (`0.5536` vs `0.4906`), `Coverage` (`0.5446` vs `0.5010`), and `NIST16` (`0.5065` vs `0.4844`).
+> 3. **Baseline `NIST16` caveat (`*`)**: `KhangTruong/FOCAL`'s historical `17,929`-sample report ran before the `NIST16` mask-polarity fix (`0.1295` vs. `0.3802` after the fix on the 120-sample paired run; see [`docs/cross_evaluation_focal_pim_mismatch_investigation.md`](cross_evaluation_focal_pim_mismatch_investigation.md)).
 
 ### 5.3 Hardware & GPU Utilization Audit (PR #35)
 Measured on **2× NVIDIA Tesla T4** (`14,912 MiB` VRAM each, SM 7.5 FP16 AMP) with **4 vCPUs** using `nvidia-smi -l 2`:
@@ -338,9 +379,15 @@ Measured on **2× NVIDIA Tesla T4** (`14,912 MiB` VRAM each, SM 7.5 FP16 AMP) wi
 sid-train --config configs/experiments/focal/focal_vit_hrnet_hybrid_casia.yaml
 sid-train --config configs/experiments/focal/focal_vit_hrnet_image_relative_casia.yaml
 
-# Cross-evaluate against MVSS-v1-protocol (1,676 samples) directly from Hugging Face
+# Cross-evaluate against MVSS-v1-protocol (1,676 stratified samples or full 17,929 samples) directly from Hugging Face
 sid-cross-eval \
   --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
   --checkpoints KhangTruong/focal-vit-hrnet-hybrid-casia KhangTruong/focal-v2-image-relative-casia \
   --samples-per-dataset 120 --batch-size 16 --num-workers 4
+
+# Full 17,929-sample cross-evaluation (omit --samples-per-dataset)
+sid-cross-eval \
+  --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
+  --checkpoints KhangTruong/focal-v2-image-relative-casia \
+  --batch-size 16 --num-workers 4
 ```
