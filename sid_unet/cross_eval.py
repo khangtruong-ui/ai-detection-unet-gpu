@@ -739,17 +739,35 @@ def eval_single_batch(
     post_masks = None
     if post_seg_tracker is not None and postprocessor is not None:
         post_masks, _ = postprocessor.process_batch(mask_logits, is_logit=True)
-        post_seg_tracker.update(post_masks, masks, labels, is_logit=False, datasets=datasets)
+        post_seg_tracker.update(
+            post_masks,
+            masks,
+            labels,
+            is_logit=False,
+            datasets=datasets,
+            score_masks=mask_logits,
+            score_is_logit=True,
+        )
 
     # 3. SAM-Refined UNet
     sam_masks = None
+    sam_is_binary = False
     sam_change_metrics = []
     if sam_seg_tracker is not None and refiner is not None:
         try:
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits, is_logit=True)
         except TypeError:
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
-        sam_seg_tracker.update(sam_masks, masks, labels, is_logit=False, datasets=datasets)
+        sam_is_binary = bool(((sam_masks == 0.0) | (sam_masks == 1.0)).all().item())
+        sam_seg_tracker.update(
+            sam_masks,
+            masks,
+            labels,
+            is_logit=False,
+            datasets=datasets,
+            score_masks=mask_logits if sam_is_binary else None,
+            score_is_logit=True if sam_is_binary else None,
+        )
 
     # 4. SAM + Post-Processing
     both_masks = None
@@ -767,7 +785,16 @@ def eval_single_batch(
             base_for_both = mask_logits
             base_is_logit = True
         both_masks, _ = postprocessor.process_batch(base_for_both, is_logit=base_is_logit)
-        both_seg_tracker.update(both_masks, masks, labels, is_logit=False, datasets=datasets)
+        both_use_raw_scores = (sam_masks is None) or sam_is_binary
+        both_seg_tracker.update(
+            both_masks,
+            masks,
+            labels,
+            is_logit=False,
+            datasets=datasets,
+            score_masks=mask_logits if both_use_raw_scores else sam_masks,
+            score_is_logit=True if both_use_raw_scores else False,
+        )
 
     # 5. Classification tracker
     if class_logits is not None and labels is not None:

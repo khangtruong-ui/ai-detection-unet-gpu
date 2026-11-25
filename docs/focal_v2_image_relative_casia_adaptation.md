@@ -38,7 +38,7 @@ PR #34 fed raw 288-channel `[ViT, HRNet]` features directly into `ClusterResidua
    - Enabled via `feature_adapter_type: "spatial"`: bottleneck `1x1 -> depthwise 3x3 -> dilated depthwise 3x3 (dilation=2) -> zero-init 1x1` residual block, plus prior-anchoring regularization (`prior_anchor_weight: 0.75`) and boundary-aware contrastive sampling (`contrastive_boundary_ratio: 0.4`).
 3. **High-Resolution ViT Input & Horizontal-Flip TTA ([`sid_unet/models/focal.py`](../sid_unet/models/focal.py), [`sid_unet/models/unet.py`](../sid_unet/models/unet.py))**:
    - Added `vit_input_size` (`768` vs. default `512` or `1024`) to preserve SAM ViT high-frequency detail with manageable memory on dual T4 GPUs.
-   - Added eval-time `tta_hflip: true` averaging logits across original and horizontally flipped views.
+   - Added eval-time `tta_hflip: true` averaging L2-normalized backbone features across original and horizontally flipped views prior to clustering.
 4. **Multi-GPU `DataParallel` & DDP Stability Fixes**:
    - [`sid_unet/training/trainer.py`](../sid_unet/training/trainer.py): Added `_SIDDataParallel(nn.DataParallel)` preserving non-tensor scalar/boolean batch metadata (`skip_mask_loss`) during `gather()`.
    - [`sid_unet/losses/auxiliary.py`](../sid_unet/losses/auxiliary.py): Reduced replica vectors in `raw_prior_anchor` with `.mean()` before scalar addition in `SIDTotalLoss`.

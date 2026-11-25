@@ -2535,12 +2535,17 @@ class FOCAL(nn.Module):
         )
 
     def _ensure_raw_rgb(self, x: torch.Tensor) -> torch.Tensor:
-        """Ensure input tensor is in raw [0, 1] range as expected by FOCAL."""
+        """Ensure input tensor is in raw [0, 1] range per sample as expected by FOCAL."""
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        if x.ndim >= 4:
+            x_min = x.amin(dim=(1, 2, 3), keepdim=True)
+            x_max = x.amax(dim=(1, 2, 3), keepdim=True)
+            needs_denorm = (x_min < -0.05) | (x_max > 1.05)
+            denorm = torch.clamp(x * std + mean, 0.0, 1.0)
+            return torch.where(needs_denorm, denorm, x)
         if x.min() < -0.05 or x.max() > 1.05:
-            # Shifted / ImageNet standardized (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-            std = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-            return torch.clamp(x * std + mean, 0.0, 1.0)
+            return torch.clamp(x.unsqueeze(0) * std + mean, 0.0, 1.0).squeeze(0)
         return x
 
     def _prepare_backbone_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -2823,7 +2828,27 @@ class FOCAL(nn.Module):
                 weighted_penalty = weighted_neck if weighted_penalty is None else (weighted_penalty + weighted_neck)
 
         if self.cluster_refiner_l2_weight > 0.0 and self.cluster_refiner is not None:
-            ref_l2_terms = [p.float().pow(2).mean() for p in self.cluster_refiner.parameters() if p.requires_grad]
+            norm_weight_ids = {
+                id(m.weight)
+                for m in self.cluster_refiner.modules()
+                if isinstance(
+                    m,
+                    (
+                        nn.GroupNorm,
+                        nn.BatchNorm1d,
+                        nn.BatchNorm2d,
+                        nn.BatchNorm3d,
+                        nn.LayerNorm,
+                        nn.InstanceNorm2d,
+                    ),
+                )
+                and getattr(m, "weight", None) is not None
+            }
+            ref_l2_terms = [
+                (p.float() - 1.0).pow(2).mean() if id(p) in norm_weight_ids else p.float().pow(2).mean()
+                for p in self.cluster_refiner.parameters()
+                if p.requires_grad
+            ]
             if ref_l2_terms:
                 ref_l2 = torch.stack(ref_l2_terms).mean()
                 weighted_ref = self.cluster_refiner_l2_weight * ref_l2
