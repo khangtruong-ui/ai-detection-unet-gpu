@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-25
+
+### Added
+- **FOCAL PR #34 / #35 Cross-Dataset Failure Forensic Report ([`docs/focal_pr34_pr35_cross_dataset_failure_forensic_report.md`](docs/focal_pr34_pr35_cross_dataset_failure_forensic_report.md))**:
+  - Audited pretrained `FOCAL_ViT_weights.pth`, `FOCAL_HRNet_weights.pth`, PR #34 (`focal-vit-hrnet-hybrid-casia`), PR #35 (`focal-v2-image-relative-casia`), and the 36-shard `MVSS-v1-protocol` benchmark (`17,929` samples) via layer-wise split-half CV probing, spectral weight/BatchNorm analysis, causal ablation, and companion [`khangtruong-ui/nn-toolbox#1`](https://github.com/khangtruong-ui/nn-toolbox/pull/1).
+  - Documented the ViT `blocks[23] -> neck[0..3]` OOD bottleneck, HRNet `stage4.2.branches.0.{1,2,3}` subnormal collapse (`5.605e-45`) & 292-BN covariate shift, `ImageRelativeClusterRefiner` rank-1 collapse (`cos=-0.9942`) & negative OOD bias (`-0.205`), `SpatialCrossScaleAdapter` `2.09x` HRNet RMS asymmetry, `CocoGlide`/`HiFi_IFDL` polarity inversion, and `TGIF2_flux1dev` blank PNG masks (`1,986/1,986`).
+- **Regression Tests (`tests/test_focal_forensic_audit_fixes.py`)**:
+  - Added 5 regression tests covering continuous AUROC preservation through post-processing/SAM thresholding, single-class binary AUROC fast-path parity, `GroupNorm` gamma anchoring under `cluster_refiner_l2_weight`, and per-sample batch-independent `_ensure_raw_rgb`.
+
+### Fixed
+- **Continuous AUROC Preservation Under Post-Processing & Single-Class Binary Parity (`sid_unet/metrics/segmentation.py`, `sid_unet/evaluate.py`, `sid_unet/cross_eval.py`)**:
+  - Forwarded continuous `mask_logits` as `score_masks` to `post_seg_tracker`, binary `sam_seg_tracker`, and `both_seg_tracker` so post-processing no longer overwrites threshold-free ROC-AUC with binary balanced accuracy (fixing `-0.1067` / `-0.1130` drops on MVSS-v1), while recording `binary_auroc` alongside continuous `auroc`.
+  - Fixed `compute_binary_metrics_batch` single-class (`n_pos == 0` / `n_neg == 0`) binary AUROC fast-path to match `compute_binary_auroc_batch`.
+- **Normalization Scale Anchor & Per-Sample RGB Normalization (`sid_unet/models/focal.py`, `docs/focal_v2_image_relative_casia_adaptation.md`)**:
+  - Anchored 1D normalization scales (`GroupNorm`/`BatchNorm`/`LayerNorm`) in `cluster_refiner_l2_weight` toward `1.0` (`(p - 1.0)^2`) instead of `0.0`.
+  - Updated `FOCAL._ensure_raw_rgb()` to normalize per-sample rather than across an entire batch, and corrected the `tta_hflip` feature-averaging note in `docs/focal_v2_image_relative_casia_adaptation.md`.
+
 ## [Unreleased] - 2026-11-22
 
 ### Added
