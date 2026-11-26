@@ -2201,7 +2201,7 @@ The configuration file is divided into modular top-level sections:
 | `grad_clip_norm` | `float` | `1.0` | Maximum gradient Euclidean norm threshold to prevent exploding gradients. |
 | `amp` | `bool` | `true` | Automatic Mixed Precision (`torch.cuda.amp`) using FP16/BF16 for 2x speedup. |
 | `gradient_accumulation_steps` | `int` | `1` | Number of forward passes to accumulate gradients over before optimizer step. |
-| `auto_batch_size` | `bool` | `true` | Probes available GPU memory at startup to automatically adjust batch size. |
+| `auto_batch_size` | `bool` | `true` | Probes available GPU memory at startup to automatically adjust batch size. Setting `data.batch_size: -1` (or `--batch-size -1`) automatically infers the largest GPU-saturating batch size for training, evaluation, and cross-evaluation. |
 | `empty_cache_per_epoch` | `bool` | `true` | Flushes `torch.cuda.empty_cache()` at every epoch boundary to prevent memory fragmentation. |
 | **`checkpoint_period`** | `int` / `str` | `3600` | **Time-based periodic checkpointing cadence** (see detailed breakdown below). |
 | **`checkpoint_steps`** | `int` | `null` | **Step-based periodic checkpointing cadence** (saves every $N$ training steps). |
@@ -3151,7 +3151,7 @@ During Distributed Data Parallel (DDP) multi-GPU training:
 - **Persistent Epoch Summaries**: Training epoch bars maintain `leave=True` so that full progress summaries (loss, IoU, network throughput, and learning rate) remain visible across epochs in terminal output and log files.
 - **Real-Time Stream Flushing**: `sys.stdout.flush()` is dispatched on metric updates and log events, while `SafeStreamHandler.emit` and `sys.stdout.reconfigure(line_buffering=True)` prevent block-buffering delays when executing under background processes (`nohup ... > .logs.txt 2>&1 &`).
 - **Distributed Length Synchronization**: In distributed validation loops, batch counts are synchronized across ranks via `sync_scalar_min` to ensure identical loop boundaries.
-- **Instant Memory Probing (`auto_batch_size`)**: Auto batch sizing probes candidate batch sizes in descending order without costly `deepcopy(state_dict)` calls. BatchNorm running statistics are preserved in-place, forward signatures are dynamically inspected to pass auxiliary embeddings (`f_r`) only to models expecting them (e.g. `GAP-SAM`), and candidates that exceed VRAM trigger immediate clean recovery and scale down batch sizes automatically.
+- **Instant Memory Probing (`auto_batch_size` & `batch_size: -1`)**: When `batch_size: -1` is set in training, evaluation (`sid-eval`), or cross-evaluation (`sid-cross-eval`), `infer_optimal_batch_size` performs exponential doubling + bounded binary search on dummy tensors to saturate GPU memory safely (75% VRAM target for training with optimizer/prefetch reserves; 78% VRAM target for inference, plus host-RAM concurrency guardrails). For fixed positive batch sizes, `auto_batch_size` probes descending candidates without costly `deepcopy(state_dict)` calls, preserves BatchNorm running statistics in-place, and scales down with gradient accumulation if needed.
 - **Dataset Streaming Notifications**: Informative progress logs (`⏳ Loading initial batches...`, `🚀 First batch loaded successfully...`) provide immediate status visibility during remote Parquet streaming before the first training batch is processed.
 
 ---

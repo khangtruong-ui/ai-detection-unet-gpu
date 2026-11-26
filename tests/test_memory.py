@@ -21,6 +21,9 @@ from sid_unet.utils.memory import (
     find_optimal_batch_size,
     format_memory_summary,
     get_memory_summary,
+    infer_optimal_batch_size,
+    is_auto_batch_size,
+    is_auto_batch_size_config,
     is_oom_error,
     split_batch,
 )
@@ -337,5 +340,134 @@ def test_find_optimal_batch_size_accelerator_recovery():
         force_probe=True,
     )
     assert safe_bs <= 4
+
+
+def test_is_auto_batch_size_helpers():
+    assert is_auto_batch_size(-1) is True
+    assert is_auto_batch_size("-1") is True
+    assert is_auto_batch_size("auto") is True
+    assert is_auto_batch_size("AUTO") is True
+    assert is_auto_batch_size(16) is False
+    assert is_auto_batch_size(0) is False
+    assert is_auto_batch_size(None) is False
+    assert is_auto_batch_size(False) is False
+
+    cfg_data_auto = load_config(overrides=["data.batch_size=-1"])
+    assert is_auto_batch_size_config(cfg_data_auto) is True
+
+    cfg_train_auto = load_config(overrides=["training.batch_size=-1"])
+    assert is_auto_batch_size_config(cfg_train_auto) is True
+
+    cfg_pos = load_config(overrides=["data.batch_size=8"])
+    assert is_auto_batch_size_config(cfg_pos) is False
+
+
+def test_infer_optimal_batch_size_train_and_eval_modes():
+    class ThresholdOOMModel(nn.Module):
+        def __init__(self, max_bs: int):
+            super().__init__()
+            self.max_bs = max_bs
+            self.conv = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+            self.bn = nn.BatchNorm2d(4)
+            self.out = nn.Conv2d(4, 1, kernel_size=1)
+
+        def forward(self, x):
+            if x.size(0) > self.max_bs:
+                raise RuntimeError("CUDA out of memory. Tried to allocate 1.0 GiB")
+            return self.out(torch.relu(self.bn(self.conv(x))))
+
+    # Eval mode: finds exact/near boundary via exponential doubling + binary search, preserves eval mode & no grads
+    eval_model = ThresholdOOMModel(max_bs=13)
+    eval_model.eval()
+    orig_rm = eval_model.bn.running_mean.clone()
+    inferred_eval = infer_optimal_batch_size(
+        model=eval_model,
+        sample_shape=(3, 32, 32),
+        device=torch.device("cpu"),
+        mode="eval",
+        max_batch_size=64,
+        min_batch_size=1,
+        force_probe=True,
+    )
+    assert 12 <= inferred_eval <= 13
+    assert eval_model.training is False
+    assert torch.equal(eval_model.bn.running_mean, orig_rm)
+    assert all(p.grad is None for p in eval_model.parameters())
+
+    # Train mode: finds boundary and restores BN running stats and train mode
+    train_model = ThresholdOOMModel(max_bs=10)
+    train_model.train()
+    orig_rm_train = train_model.bn.running_mean.clone()
+    inferred_train = infer_optimal_batch_size(
+        model=train_model,
+        sample_shape=(3, 32, 32),
+        device=torch.device("cpu"),
+        mode="train",
+        max_batch_size=64,
+        min_batch_size=1,
+        force_probe=True,
+    )
+    assert inferred_train == 10
+    assert train_model.training is True
+    assert torch.allclose(train_model.bn.running_mean, orig_rm_train)
+
+
+def test_infer_optimal_batch_size_cuda_differentiates_models():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for GPU saturation test")
+
+    dev = torch.device("cuda:0")
+    small_model = UNet(features=[8, 16], dropout=0.0, aux_classifier=False).to(dev)
+    large_model = UNet(features=[64, 128, 256, 512], dropout=0.0, aux_classifier=False).to(dev)
+
+    bs_small = infer_optimal_batch_size(
+        model=small_model,
+        sample_shape=(3, 128, 128),
+        device=dev,
+        mode="eval",
+        max_batch_size=64,
+    )
+    bs_large = infer_optimal_batch_size(
+        model=large_model,
+        sample_shape=(3, 256, 256),
+        device=dev,
+        mode="eval",
+        max_batch_size=64,
+    )
+    assert bs_small >= bs_large >= 1
+    assert torch.cuda.max_memory_allocated(dev) >= 0
+
+
+def test_trainer_auto_infer_batch_size_minus_one():
+    from sid_unet.dataset.loader import resolve_batch_size
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config(overrides=[
+            f"project.output_dir={tmpdir}",
+            "project.device=cpu",
+            "training.epochs=1",
+            "data.batch_size=-1",
+            "data.cpu_fallback_batch_size=4",
+            "model.features=[16, 32]",
+            "data.image_size=[64, 64]",
+            "logging.log_interval=1",
+            "training.amp=false",
+        ])
+
+        # resolve_batch_size must preserve _auto_infer_batch_size flag without clobbering -1
+        placeholder_bs = resolve_batch_size(cfg)
+        assert placeholder_bs >= 1
+        assert is_auto_batch_size_config(cfg) is True
+
+        train_ds = DummyDataset(size=8, img_size=(64, 64))
+        val_ds = DummyDataset(size=4, img_size=(64, 64))
+        train_loader = DataLoader(train_ds, batch_size=placeholder_bs)
+        val_loader = DataLoader(val_ds, batch_size=placeholder_bs)
+
+        trainer = Trainer(config=cfg, train_loader=train_loader, val_loader=val_loader)
+        results = trainer.train()
+        assert cfg.data.batch_size == 4
+        assert trainer.train_loader.batch_size == 4
+        assert results["history"][0]["epoch"] == 1
 
 

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-26
+
+### Added
+- **Automatic GPU-Saturating Batch Size Inference (`batch_size: -1`) (`sid_unet/utils/memory.py`, `sid_unet/dataset/loader.py`, `sid_unet/train.py`, `sid_unet/training/trainer.py`, `sid_unet/evaluate.py`, `sid_unet/cross_eval.py`, `configs/cross-eval/MVSS-v1-protocol.yaml`, `docs/auto_batch_size_inference.md`)**:
+  - Added `is_auto_batch_size()`, `is_auto_batch_size_config()`, and `infer_optimal_batch_size()` using exponential doubling + bounded binary search to saturate GPU VRAM safely (`75%` train / `78%` eval target, including `CUDAPrefetcher` and optimizer state reserves) plus host-RAM concurrency guardrails (`_get_available_host_ram_bytes()`).
+  - Added `SIDMapDataset.close()`, explicit dataset/prefetcher teardown between checkpoints in `evaluate.py` / `cross_eval.py`, and PyArrow + Linux `malloc_trim(0)` cleanup in `clear_memory_cache()`.
+  - Preserved `-1` intent through `resolve_batch_size()` via `_auto_infer_batch_size` and wired automatic batch size inference into `Trainer`, `evaluate_single_checkpoint`, and per-model `evaluate_checkpoint_on_config` in `sid-cross-eval`.
+  - Updated `configs/cross-eval/MVSS-v1-protocol.yaml` to `batch_size: -1` and re-evaluated `KhangTruong/FOCAL` (`batch_size=36`, IoU `0.2333`, F1 `0.2944`, AUROC `0.7230`) and `KhangTruong/PIM` (`batch_size=9`, IoU `0.1675`, F1 `0.2019`, AUROC `0.7176`) across all 17,929 `MVSS-v1` samples, pushing updated reports to both HF Hub repositories.
+- **Tests (`tests/test_memory.py`, `tests/test_cross_eval.py`, `tests/test_checkpoint_sync.py`, `tests/test_config.py`)**:
+  - Added unit and integration tests covering `batch_size: -1` detection, train/eval exponential+binary probing, CUDA model differentiation, `Trainer` / `sid-eval` / `sid-cross-eval` `-1` resolution, and verifying `sid-pull` never creates `outputs/RUN/default`.
+
+### Fixed
+- **Eliminated Stray `outputs/RUN/default` Checkpoints on `sid-pull` (`sid_unet/checkpoint_sync.py`)**:
+  - Removed the legacy copy block in `pull_checkpoint()` that duplicated every pulled `.pt` checkpoint into `outputs/RUN/default/checkpoints/`.
+  - Added `_resolve_repo_output_dir()` to resolve target directories from local experiment configs, remote `config.yaml` `project.output_dir`, or `outputs/RUN/<repo_name>` instead of `outputs/RUN/default`.
+
 ## [Unreleased] - 2026-11-25
 
 ### Added

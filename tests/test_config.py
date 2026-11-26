@@ -86,7 +86,7 @@ def test_all_experiment_configs_validity():
             "KhangTruong/DEAL300K-30K",
         ]
         assert cfg.data.streaming in [True, False]
-        assert cfg.data.batch_size in [1, 2, 4, 8, 16, 32, 64, 128]
+        assert cfg.data.batch_size in [-1, 1, 2, 4, 8, 16, 32, 64, 128]
         # Ensure sample budgets are -1 for running all dataset
         assert cfg.data.train_samples_per_epoch == -1
         assert cfg.data.val_samples == -1

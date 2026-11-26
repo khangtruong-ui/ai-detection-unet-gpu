@@ -345,3 +345,57 @@ def test_push_checkpoint_includes_cross_eval(monkeypatch):
         assert "README.md" in op_paths
 
 
+@patch("sid_unet.checkpoint_sync.hf_hub_download")
+@patch("sid_unet.checkpoint_sync.HfApi")
+def test_pull_checkpoint_does_not_create_outputs_run_default(mock_api_cls, mock_download, monkeypatch):
+    mock_api = MagicMock()
+    mock_api_cls.return_value = mock_api
+    mock_api.list_repo_files.return_value = [
+        "checkpoints/checkpoint_best.pt",
+        "checkpoints/checkpoint_latest.pt",
+        "config.yaml",
+    ]
+
+    with tempfile.TemporaryDirectory() as workdir, tempfile.TemporaryDirectory() as cache_dir:
+        monkeypatch.chdir(workdir)
+        dummy_pt = os.path.join(cache_dir, "ckpt.pt")
+        torch.save({"epoch": 1}, dummy_pt)
+        dummy_cfg = os.path.join(cache_dir, "config.yaml")
+        with open(dummy_cfg, "w", encoding="utf-8") as f:
+            f.write("project:\n  name: sid_focal_hrnet\n  output_dir: outputs/RUN/focal_hrnet\n")
+
+        def _fake_dl(repo_id, filename, **kwargs):
+            return dummy_cfg if filename.endswith(".yaml") else dummy_pt
+
+        mock_download.side_effect = _fake_dl
+
+        # 1. Pull with remote config.yaml specifying outputs/RUN/focal_hrnet -> must NOT create outputs/RUN/default
+        res_focal = pull_checkpoint(name="KhangTruong/FOCAL")
+        assert res_focal["target_dir"] == os.path.abspath("outputs/RUN/focal_hrnet")
+        assert os.path.exists(os.path.join(workdir, "outputs", "RUN", "focal_hrnet", "checkpoints", "checkpoint_best.pt"))
+        assert not os.path.exists(os.path.join(workdir, "outputs", "RUN", "default"))
+
+        # 2. Pull with unknown repo and no config.yaml -> falls back to outputs/RUN/custom_repo, NEVER outputs/RUN/default
+        mock_api.list_repo_files.return_value = ["checkpoints/checkpoint_best.pt"]
+        res_custom = pull_checkpoint(name="KhangTruong/Custom-Repo")
+        assert res_custom["target_dir"] == os.path.abspath("outputs/RUN/custom_repo")
+        assert not os.path.exists(os.path.join(workdir, "outputs", "RUN", "default"))
+
+
+def test_find_local_checkpoint_artifacts_uses_repo_id(monkeypatch):
+    with tempfile.TemporaryDirectory() as workdir:
+        monkeypatch.chdir(workdir)
+        focal_ckpt_dir = os.path.join(workdir, "outputs", "RUN", "focal_hrnet", "checkpoints")
+        os.makedirs(focal_ckpt_dir, exist_ok=True)
+        torch.save({"epoch": 2, "best_score": 0.9}, os.path.join(focal_ckpt_dir, "checkpoint_best.pt"))
+
+        cfg_dir = os.path.join(workdir, "configs", "experiments", "focal")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "focal_hrnet.yaml"), "w", encoding="utf-8") as f:
+            f.write("project:\n  output_dir: outputs/RUN/focal_hrnet\n")
+
+        artifacts = find_local_checkpoint_artifacts(repo_id="KhangTruong/FOCAL")
+        assert artifacts["base_dir"] == os.path.abspath("outputs/RUN/focal_hrnet")
+        assert "checkpoint_best.pt" in artifacts["checkpoints"]
+
+

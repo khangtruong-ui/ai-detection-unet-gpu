@@ -947,6 +947,75 @@ def test_evaluate_checkpoint_on_config_from_config_spec(monkeypatch):
     assert res["total_evaluated_samples"] == 2
 
 
+def test_cross_eval_and_eval_auto_batch_size_minus_one(monkeypatch):
+    from sid_unet.cross_eval import evaluate_checkpoint_on_config
+    from sid_unet.evaluate import evaluate_single_checkpoint
+    from sid_unet.models.unet import UNet
+
+    inferred_calls = []
+
+    def fake_infer(**kwargs):
+        inferred_calls.append((kwargs["mode"], kwargs["max_batch_size"], kwargs["sample_shape"]))
+        return 3
+
+    monkeypatch.setattr("sid_unet.cross_eval.infer_optimal_batch_size", fake_infer)
+    monkeypatch.setattr("sid_unet.evaluate.infer_optimal_batch_size", fake_infer)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = UNet(features=[8, 16], dropout=0.0, aux_classifier=False)
+        ckpt_path = os.path.join(tmpdir, "checkpoint_best.pt")
+        torch.save({
+            "epoch": 1,
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "project": {"name": "tiny_unet", "device": "cpu"},
+                "model": {"name": "unet", "features": [8, 16], "dropout": 0.0, "aux_classifier": False},
+                "data": {"dataset_name": "mock", "image_size": [32, 32], "batch_size": 4},
+            },
+        }, ckpt_path)
+
+        res_ce = evaluate_checkpoint_on_config(
+            checkpoint_path=ckpt_path,
+            config_path="configs/cross-eval/MVSS-v1-protocol.yaml",
+            split="cross_test",
+            samples=4,
+            batch_size=-1,
+            overrides=["data.dataset_name=mock", "data.num_workers=0", "project.device=cpu", "data.image_size=[32,32]"],
+            save_illustrations=False,
+            master_output_dir=tmpdir,
+        )
+        assert res_ce["overall_metrics"]["batch_size"] == 3
+        assert res_ce["overall_metrics"]["auto_batch_size_inferred"] is True
+        assert res_ce["eval_config"]["data"]["batch_size"] == 3
+
+        res_ev = evaluate_single_checkpoint(
+            checkpoint_path=ckpt_path,
+            split="test",
+            samples=4,
+            batch_size=-1,
+            overrides=["data.dataset_name=mock", "data.num_workers=0", "project.device=cpu", "data.image_size=[32,32]"],
+            output_dir=os.path.join(tmpdir, "eval_out"),
+            save_illustrations=False,
+            skip_collision=False,
+        )
+        assert res_ev["overall_metrics"]["batch_size"] == 3
+        assert res_ev["overall_metrics"]["auto_batch_size_inferred"] is True
+
+    assert len(inferred_calls) == 2
+    assert all(mode == "eval" and max_bs == 4 for mode, max_bs, _ in inferred_calls)
+
+
+def test_sid_map_dataset_close_forwards_to_underlying_data():
+    from unittest.mock import MagicMock
+    from sid_unet.dataset.loader import SIDMapDataset
+
+    ds = SIDMapDataset.__new__(SIDMapDataset)
+    inner = MagicMock()
+    ds.data = inner
+    ds.close()
+    inner.close.assert_called_once()
+
+
 
 
 

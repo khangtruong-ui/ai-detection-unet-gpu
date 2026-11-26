@@ -27,6 +27,7 @@ from datasets import load_dataset as hf_load_dataset
 from datasets import IterableDataset as HFIterableDataset
 
 from sid_unet.utils.distributed import is_dist_avail_and_initialized, get_rank, get_world_size
+from sid_unet.utils.memory import is_auto_batch_size, _get_available_host_ram_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -1395,6 +1396,14 @@ class SIDMapDataset(Dataset):
 
         self.data = ds
 
+    def close(self) -> None:
+        """Close underlying parquet/streaming dataset handles and release cached row groups."""
+        if getattr(self, "data", None) is not None and hasattr(self.data, "close"):
+            try:
+                self.data.close()
+            except Exception:
+                pass
+
     def __len__(self) -> int:
         if getattr(self, "_is_mock", False):
             return self._mock_len
@@ -1794,7 +1803,14 @@ def resolve_batch_size(config: Any) -> int:
     if not hasattr(config, "data"):
         return 16
 
-    base_bs = int(config.data.get("base_batch_size", config.data.get("batch_size", 16)))
+    raw_bs = config.data.get("base_batch_size", config.data.get("batch_size", 16))
+    training_bs = config.training.get("batch_size", None) if hasattr(config, "training") and hasattr(config.training, "get") else None
+    if is_auto_batch_size(raw_bs) or is_auto_batch_size(training_bs) or bool(config.data.get("_auto_infer_batch_size", False)):
+        config.data._auto_infer_batch_size = True
+        placeholder_bs = 4 if torch.cuda.is_available() else int(config.data.get("cpu_fallback_batch_size", 16))
+        return max(1, placeholder_bs)
+
+    base_bs = int(raw_bs)
     if base_bs < 1:
         base_bs = 1
     config.data.base_batch_size = base_bs
@@ -1857,7 +1873,16 @@ def create_eval_dataloader(
     if is_mock_dataset(dataset_name) or bool(config.data.get("mock", False)):
         dataset_name = "mock"
     streaming = bool(config.data.get("streaming", False))
-    batch_size = int(config.data.get("batch_size", 16))
+    raw_batch_size = config.data.get("batch_size", 16)
+    if is_auto_batch_size(raw_batch_size) or int(raw_batch_size) < 1:
+        fallback_bs = int(config.data.get("cpu_fallback_batch_size", 16))
+        logger.warning(
+            f"create_eval_dataloader received unresolved batch_size={raw_batch_size}; "
+            f"falling back to batch_size={fallback_bs}."
+        )
+        batch_size = max(1, fallback_bs)
+    else:
+        batch_size = int(raw_batch_size)
     max_eval_workers_cfg = config.data.get("max_eval_workers", config.data.get("max_workers", None))
     max_eval_workers = int(max_eval_workers_cfg) if max_eval_workers_cfg is not None else None
     num_workers = resolve_num_workers(config.data.get("num_workers", -1), max_workers=max_eval_workers)
@@ -1892,8 +1917,23 @@ def create_eval_dataloader(
     columns = config.data.get("columns", None)
     token = config.data.get("token", None)
     pdl_cache_dir = config.data.get("cache_dir", config.data.get("pdl_cache_dir", None))
-    max_cached_row_groups = max(4, int(config.data.get("max_cached_row_groups", 4)))
-    eval_prefetch_factor = max(4, int(config.data.get("prefetch_factor", 4)))
+    max_cached_row_groups = max(1, int(config.data.get("max_cached_row_groups", 2)))
+    avail_ram = _get_available_host_ram_bytes()
+    eval_prefetch_factor = max(2, int(config.data.get("prefetch_factor", 4)))
+    if config.data.get("prefetch_factor", None) is None and (
+        batch_size >= 16 or (avail_ram is not None and avail_ram < int(24 * (1024 ** 3)))
+    ):
+        eval_prefetch_factor = 2
+    # Guard host RAM when combining batch_size + many worker threads
+    if num_workers > 2 and avail_ram is not None and avail_ram > 0:
+        est_batch_bytes = max(1, batch_size * (3 * image_size[0] * image_size[1] + image_size[0] * image_size[1]) * 4 * 2)
+        usable_ram = max(int(avail_ram * 0.25), avail_ram - int(3.5 * (1024 ** 3)))
+        max_queued_batches = max(4, int((usable_ram * 0.30) // est_batch_bytes))
+        if num_workers * eval_prefetch_factor > max_queued_batches:
+            eval_prefetch_factor = 2
+            num_workers = max(2, min(num_workers, max_queued_batches // eval_prefetch_factor))
+        if avail_ram < int(24 * (1024 ** 3)):
+            num_workers = min(num_workers, 4)
     samples_per_dataset_cfg = config.data.get("samples_per_dataset", None)
     samples_per_dataset = int(samples_per_dataset_cfg) if (samples_per_dataset_cfg is not None and int(samples_per_dataset_cfg) > 0) else None
 

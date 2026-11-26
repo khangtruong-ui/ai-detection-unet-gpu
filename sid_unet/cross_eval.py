@@ -38,7 +38,14 @@ from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.precision import PrecisionSpec, resolve_precision_spec, prepare_model_for_fp8_inference
 from sid_unet.utils.logger import setup_logger
 from sid_unet.utils.distributed import is_kaggle_environment
-from sid_unet.utils.memory import clear_memory_cache, is_oom_error, split_batch, format_memory_summary
+from sid_unet.utils.memory import (
+    clear_memory_cache,
+    is_oom_error,
+    split_batch,
+    format_memory_summary,
+    infer_optimal_batch_size,
+    is_auto_batch_size_config,
+)
 from sid_unet.utils.plotting import plot_eval_sample_predictions, plot_cross_eval_heatmaps
 from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.report import (
@@ -136,7 +143,7 @@ def parse_args(args: Optional[List[str]] = None):
         "--batch-size",
         type=int,
         default=None,
-        help="Batch size for evaluation (overrides config data.batch_size).",
+        help="Batch size for evaluation (overrides config data.batch_size; use -1 for automatic GPU-saturating inference).",
     )
     parser.add_argument(
         "--num_workers",
@@ -962,6 +969,41 @@ def evaluate_checkpoint_on_config(
 
     loss_fn = build_loss(eval_config).to(device)
 
+    auto_bs_inferred = False
+    if is_auto_batch_size_config(eval_config):
+        img_size = tuple(eval_config.data.get("image_size", [256, 256]))
+        raw_m = getattr(model, "module", model)
+        in_ch = int(getattr(raw_m, "in_channels", ckpt_config.model.get("in_channels", 3)))
+        max_auto_bs = int(eval_config.data.get("max_auto_batch_size", 256))
+        if samples is not None and int(samples) > 0:
+            max_auto_bs = min(max_auto_bs, max(1, int(samples)))
+        inferred_bs = infer_optimal_batch_size(
+            model=model,
+            loss_fn=loss_fn,
+            sample_shape=(in_ch, int(img_size[0]), int(img_size[1])),
+            mask_shape=(int(img_size[0]), int(img_size[1])),
+            device=device,
+            mode="eval",
+            min_batch_size=1,
+            max_batch_size=max_auto_bs,
+            use_amp=precision_spec.amp_enabled,
+            amp_dtype=precision_spec.amp_dtype,
+            aux_classifier=bool(getattr(raw_m, "aux_classifier", False)),
+            num_classes=int(ckpt_config.model.get("num_classes", 3)),
+            cpu_fallback_batch_size=int(eval_config.data.get("cpu_fallback_batch_size", 16)),
+            logger=eval_logger,
+            refiner=refiner,
+        )
+        eval_config.data.batch_size = inferred_bs
+        eval_config.data.base_batch_size = inferred_bs
+        eval_config.data._batch_size_scaled = True
+        eval_config.data._auto_infer_batch_size = False
+        auto_bs_inferred = True
+        eval_logger.info(
+            f"⚡ Auto Batch Size Inference [{ckpt_run_name} x {cfg_proj_name}]: "
+            f"Resolved batch_size={inferred_bs}."
+        )
+
     eval_loader = create_eval_dataloader(eval_config, split=split, max_samples=samples)
     resolved_split = getattr(eval_loader.dataset, "resolved_split", split or eval_config.data.get("eval_split", "test"))
     dataset_name = eval_config.data.get("dataset_name", "KhangTruong/IMD2020")
@@ -1076,9 +1118,31 @@ def evaluate_checkpoint_on_config(
                     raise exc
             finally:
                 del batch
-                if (batch_idx + 1) % 50 == 0:
+                if (batch_idx + 1) % 20 == 0:
                     clear_memory_cache(device)
 
+    try:
+        prefetcher.close()
+    except Exception:
+        pass
+    try:
+        if hasattr(eval_loader, "close"):
+            eval_loader.close()
+    except Exception:
+        pass
+    try:
+        ds = getattr(eval_loader, "dataset", None)
+        if ds is not None:
+            if hasattr(ds, "close"):
+                ds.close()
+            if getattr(ds, "data", None) is not None and hasattr(ds.data, "close"):
+                ds.data.close()
+    except Exception:
+        pass
+    try:
+        del eval_loader, prefetcher
+    except Exception:
+        pass
     clear_memory_cache(device)
 
     # Compute metrics across variants
@@ -1143,6 +1207,8 @@ def evaluate_checkpoint_on_config(
         "precision_mode": precision_spec.mode,
         "amp_dtype": precision_spec.amp_dtype_str,
         "fp8_enabled": precision_spec.fp8_enabled,
+        "batch_size": int(eval_config.data.get("batch_size", 16)),
+        "auto_batch_size_inferred": auto_bs_inferred,
         "eval_total_loss": total_loss_sum / max(1, total_samples),
         **chosen_seg,
         **cls_metrics,
@@ -1246,7 +1312,7 @@ def evaluate_checkpoint_on_config(
     }
 
     try:
-        del model
+        del model, loss_fn
     except Exception:
         pass
     clear_memory_cache(device)
