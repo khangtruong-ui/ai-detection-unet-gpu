@@ -71,3 +71,25 @@ Cross-evaluation was executed via `sid-cross-eval` on `configs/cross-eval/MVSS-v
 - Across the entire 2-model run (`n = 851` `nvidia-smi` samples at 2s intervals), overall GPU utilization averaged **78.5%** (median **100%**, p95 **100%**), with `batch_size=-1` cleanly differentiating lightweight `FOCAL` (`batch_size=36`) from memory-heavy `PIM` (`batch_size=9`) without OOM.
 - Closing `SIDMapDataset` / `IndexedParquetDataset` between checkpoints and releasing unused PyArrow + glibc malloc arenas in `clear_memory_cache()` kept host RAM stable at ~5.5–6.2 GiB used (~9.3–10 GiB available, 0 B swap) on a 15 GiB RAM container.
 - Updated cross-evaluation artifacts and master reports were pushed back to [`KhangTruong/FOCAL`](https://huggingface.co/KhangTruong/FOCAL) and [`KhangTruong/PIM`](https://huggingface.co/KhangTruong/PIM).
+
+---
+
+## 4. GPU Utilization Optimization (`FOCAL` Pipeline Bottleneck Elimination)
+
+### Root-Cause Analysis (`47.7%` vs `88.0%`)
+Per-stage profiling of `sid-cross-eval` (`512x512`, BF16, RTX 3060 Ti) revealed why `sid_focal_hrnet` (`batch_size=36`) averaged `47.7%` GPU utilization while `sid_pim_swin` (`batch_size=9`) averaged `88.0%`:
+1. **Synchronous CPU OpenCV post-processing (`219.5 ms/batch`, `37.2%` of batch time on `FOCAL`)**: `MaskPostProcessor.process_batch()` converted `probs` to per-sample `float32` CPU slices, ran repeated `float32 <-> uint8` conversions inside `remove_small_components()`, `fill_mask_holes()`, and `apply_morphology()`, and blocked the main GPU thread until all CPU workers finished.
+2. **Duplicate Continuous AUROC Sorting (`53.3 ms/batch`, `9.1%` on `FOCAL`)**: `post_seg_tracker.update(..., score_masks=mask_logits)` re-sorted `36 x 262,144` pixels via `compute_binary_auroc_batch()` immediately after `raw_seg_tracker.update()` had computed the exact same threshold-free per-sample ROC-AUC values.
+3. **Remote HF Parquet DataLoader Stalls (`~15%` + cold start)**: Streaming/cached Parquet shard boundaries and JPEG/PNG decodes under `num_workers=4, prefetch_factor=2` (bound by the 15 GiB host-RAM guardrail) stall fast forward passes between shards.
+
+### Implemented Optimizations
+- **Single-Transfer Pure-`uint8` Morphology (`sid_unet/postprocessing.py`)**: Extracted `_to_binary_u8`, `_remove_small_components_u8`, `_fill_mask_holes_u8`, and `_apply_morphology_u8` operating end-to-end on `uint8 {0, 1}` arrays with an empty-mask fast path; `MaskPostProcessor.process_batch()` now thresholds on the tensor's native device and performs a single contiguous `uint8` D2H/H2D transfer.
+- **Overlapped Asynchronous Post-Processing Pipeline (`AsyncPostProcessPipeline`)**: Runs a bounded background queue (`max_queue_size=4`) on CPU that overlaps `MaskPostProcessor.process_batch_binary_np()`, `post_seg_tracker.update()`, and visual illustration collection (`collect_samples`) concurrently with GPU forward passes in `sid_unet/cross_eval.py` and `sid_unet/evaluate.py` (when running on CUDA without SAM3 refinement), with clean thread flushing and exception propagation via `finish()`.
+- **Continuous AUROC Reuse (`precomputed_auroc` in `sid_unet/metrics/segmentation.py`)**: Added `precomputed_auroc` to `compute_binary_metrics_batch()` and `SegmentationMetricTracker.update()`, returning `batch_metrics["auroc"]` from `update()` and forwarding `raw_auroc` (and `sam_auroc`) across downstream `post_seg_tracker`, `sam_seg_tracker`, and `both_seg_tracker` without re-sorting pixels.
+
+### Measured RTX 3060 Ti Benchmark Comparison (`FOCAL HRNet`, `512x512`, BF16, `bs=36`)
+| Benchmark | Baseline (Sync + Duplicate AUROC) | Optimized (`AsyncPostProcessPipeline` + `precomputed_auroc`) | Improvement |
+|---|---:|---:|---:|
+| **Steady-state batch compute (`bs=36`, 10 batches)** | `584.0 ms/batch` | **`410.6 ms/batch`** | **`1.42x` speedup (`-29.7%` latency)** |
+| **Live HF 2,000-sample `MVSS-v1-protocol` (58 batches incl. startup)** | — | **`45.65 s` total (`51.3%` active GPU-Util mean / `48%` p50)** | Active GPU-Util reflects remaining HF remote Parquet HTTP/decode I/O wait |
+| **Container Host RAM Tunability Check** | `num_workers=4, prefetch=2` | Tested `6 / 3`: `45.84 s`, `45.5%` active util, `6.00 GiB` min avail RAM | Retained `4 / 2` bound for better runtime + ~3 GiB higher RAM headroom |

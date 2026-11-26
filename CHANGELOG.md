@@ -13,8 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `SIDMapDataset.close()`, explicit dataset/prefetcher teardown between checkpoints in `evaluate.py` / `cross_eval.py`, and PyArrow + Linux `malloc_trim(0)` cleanup in `clear_memory_cache()`.
   - Preserved `-1` intent through `resolve_batch_size()` via `_auto_infer_batch_size` and wired automatic batch size inference into `Trainer`, `evaluate_single_checkpoint`, and per-model `evaluate_checkpoint_on_config` in `sid-cross-eval`.
   - Updated `configs/cross-eval/MVSS-v1-protocol.yaml` to `batch_size: -1` and re-evaluated `KhangTruong/FOCAL` (`batch_size=36`, IoU `0.2333`, F1 `0.2944`, AUROC `0.7230`) and `KhangTruong/PIM` (`batch_size=9`, IoU `0.1675`, F1 `0.2019`, AUROC `0.7176`) across all 17,929 `MVSS-v1` samples, pushing updated reports to both HF Hub repositories.
-- **Tests (`tests/test_memory.py`, `tests/test_cross_eval.py`, `tests/test_checkpoint_sync.py`, `tests/test_config.py`)**:
-  - Added unit and integration tests covering `batch_size: -1` detection, train/eval exponential+binary probing, CUDA model differentiation, `Trainer` / `sid-eval` / `sid-cross-eval` `-1` resolution, and verifying `sid-pull` never creates `outputs/RUN/default`.
+- **Tests (`tests/test_memory.py`, `tests/test_cross_eval.py`, `tests/test_checkpoint_sync.py`, `tests/test_config.py`, `tests/test_postprocessing.py`, `tests/test_metrics.py`)**:
+  - Added unit and integration tests covering `batch_size: -1` detection, train/eval exponential+binary probing, CUDA model differentiation, `Trainer` / `sid-eval` / `sid-cross-eval` `-1` resolution, `sid-pull` directory resolution, `process_batch_binary_np` parity, `precomputed_auroc` deduplication, and `AsyncPostProcessPipeline` sync parity / error propagation.
+- **GPU Utilization & Post-Processing Pipeline Optimization (`sid_unet/postprocessing.py`, `sid_unet/metrics/segmentation.py`, `sid_unet/evaluate.py`, `sid_unet/cross_eval.py`, `docs/auto_batch_size_inference.md`)**:
+  - Vectorized `MaskPostProcessor` with native-device thresholding, single contiguous `uint8` D2H/H2D transfers, pure-`uint8` morphological helpers (`_remove_small_components_u8`, `_fill_mask_holes_u8`, `_apply_morphology_u8`), and an empty-mask fast path.
+  - Added `AsyncPostProcessPipeline` to overlap CPU morphological post-processing, tracker updates, and sample collection concurrently with GPU forward passes in `sid-eval` and `sid-cross-eval` (reducing `FOCAL HRNet` `bs=36` steady-state batch latency by `29.7%` from `584.0 ms` to `410.6 ms` on RTX 3060 Ti).
+  - Added `precomputed_auroc` support to `compute_binary_metrics_batch()` and `SegmentationMetricTracker.update()` and reused `raw_auroc` / `sam_auroc` across downstream evaluation trackers to eliminate redundant threshold-free ROC-AUC pixel sorts.
 
 ### Fixed
 - **Eliminated Stray `outputs/RUN/default` Checkpoints on `sid-pull` (`sid_unet/checkpoint_sync.py`)**:

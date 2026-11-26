@@ -1016,6 +1016,79 @@ def test_sid_map_dataset_close_forwards_to_underlying_data():
     inner.close.assert_called_once()
 
 
+def test_eval_single_batch_async_post_pipeline_matches_sync():
+    import numpy as np
+    from sid_unet.cross_eval import eval_single_batch as ce_eval_batch
+    from sid_unet.evaluate import eval_single_batch as ev_eval_batch
+    from sid_unet.losses.auxiliary import build_loss
+    from sid_unet.metrics.classification import ClassificationMetricTracker
+    from sid_unet.metrics.segmentation import SegmentationMetricTracker
+    from sid_unet.models.unet import UNet
+    from sid_unet.postprocessing import AsyncPostProcessPipeline, MaskPostProcessor
+
+    torch.manual_seed(7)
+    model = UNet(features=[8, 16], dropout=0.0, aux_classifier=False).eval()
+    loss_fn = build_loss({"loss": {"type": "bce_dice"}})
+    postproc = MaskPostProcessor(enabled=True, min_area=8, fill_holes=True, morphology="open_close", morph_kernel_size=3)
+
+    batches = [
+        {
+            "image": torch.randn(3, 3, 32, 32),
+            "mask": torch.randint(0, 2, (3, 1, 32, 32)).float(),
+            "label": torch.tensor([0, 2, 1]),
+            "dataset": ["D1", "D2", "D1"],
+            "img_id": ["a", "b", "c"],
+        },
+        {
+            "image": torch.randn(2, 3, 32, 32),
+            "mask": torch.randint(0, 2, (2, 1, 32, 32)).float(),
+            "label": torch.tensor([2, 0]),
+            "dataset": ["D2", "D1"],
+            "img_id": ["d", "e"],
+        },
+    ]
+
+    for fn in (ce_eval_batch, ev_eval_batch):
+        sync_raw = SegmentationMetricTracker(threshold=0.5)
+        sync_post = SegmentationMetricTracker(threshold=0.5)
+        sync_cls = ClassificationMetricTracker(num_classes=3)
+        sync_collect = []
+
+        async_raw = SegmentationMetricTracker(threshold=0.5)
+        async_post = SegmentationMetricTracker(threshold=0.5)
+        async_cls = ClassificationMetricTracker(num_classes=3)
+        async_collect = []
+
+        with torch.inference_mode():
+            for b in batches:
+                fn(
+                    b, model, loss_fn, torch.device("cpu"),
+                    sync_raw, sync_cls, threshold=0.5,
+                    post_seg_tracker=sync_post, postprocessor=postproc,
+                    collect_samples=sync_collect, max_collect=4,
+                )
+
+            with AsyncPostProcessPipeline(postproc, async_post, collect_samples=async_collect, max_collect=4) as pipe:
+                for b in batches:
+                    fn(
+                        b, model, loss_fn, torch.device("cpu"),
+                        async_raw, async_cls, threshold=0.5,
+                        post_seg_tracker=async_post, postprocessor=postproc,
+                        collect_samples=async_collect, max_collect=4,
+                        async_post_pipeline=pipe,
+                    )
+
+        sync_m, _ = sync_post.compute()
+        async_m, _ = async_post.compute()
+        for key in ("iou", "dice", "f1", "auroc", "binary_auroc", "pixel_acc"):
+            assert async_m[key] == pytest.approx(sync_m[key], abs=1e-6)
+        assert async_post.compute_per_dataset().keys() == sync_post.compute_per_dataset().keys()
+        assert len(async_collect) == len(sync_collect) == 4
+        assert [s["img_id"] for s in async_collect] == [s["img_id"] for s in sync_collect]
+        for s_item, a_item in zip(sync_collect, async_collect):
+            np.testing.assert_array_equal(a_item["post_mask"], s_item["post_mask"])
+
+
 
 
 

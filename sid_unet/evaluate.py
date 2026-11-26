@@ -39,7 +39,7 @@ from sid_unet.metrics.classification import ClassificationMetricTracker
 from sid_unet.metrics.segmentation import SegmentationMetricTracker
 from sid_unet.models.sam3_refiner import get_sam_refiner
 from sid_unet.models.unet import UNet
-from sid_unet.postprocessing import MaskPostProcessor, get_postprocessor_from_config
+from sid_unet.postprocessing import MaskPostProcessor, AsyncPostProcessPipeline, get_postprocessor_from_config
 from sid_unet.utils.checkpoint import is_hf_repo_id, download_hf_checkpoint
 from sid_unet.utils.config import load_config, apply_overrides, ConfigDict
 from sid_unet.utils.precision import PrecisionSpec, resolve_precision_spec, prepare_model_for_fp8_inference
@@ -264,6 +264,7 @@ def eval_single_batch(
     collect_samples: Optional[List[Dict[str, Any]]] = None,
     max_collect: int = 8,
     precision_spec: Optional[PrecisionSpec] = None,
+    async_post_pipeline: Optional[AsyncPostProcessPipeline] = None,
 ) -> Tuple[float, int, List[Dict[str, Any]]]:
     """
     Execute forward evaluation for a single batch across all active pipeline stages:
@@ -315,11 +316,24 @@ def eval_single_batch(
 
     # 1. Update Raw UNet baseline tracker
     datasets = batch.get("dataset")
-    raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True, datasets=datasets)
+    raw_auroc = raw_seg_tracker.update(mask_logits, masks, labels, is_logit=True, datasets=datasets)
 
-    # 2. Update Post-Processing tracker if enabled
+    # 2. Update Post-Processing tracker if enabled (overlapped asynchronously on CPU when active)
     post_masks = None
-    if post_seg_tracker is not None and postprocessor is not None:
+    handled_collect_async = False
+    if async_post_pipeline is not None and post_seg_tracker is not None and postprocessor is not None:
+        async_post_pipeline.submit(
+            mask_logits=mask_logits,
+            masks=masks,
+            labels=labels,
+            datasets=datasets,
+            raw_auroc=raw_auroc,
+            is_logit=True,
+            images=images,
+            img_ids=batch.get("img_id"),
+        )
+        handled_collect_async = True
+    elif post_seg_tracker is not None and postprocessor is not None:
         post_masks, _ = postprocessor.process_batch(mask_logits, is_logit=True)
         post_seg_tracker.update(
             post_masks,
@@ -327,13 +341,13 @@ def eval_single_batch(
             labels,
             is_logit=False,
             datasets=datasets,
-            score_masks=mask_logits,
-            score_is_logit=True,
+            precomputed_auroc=raw_auroc,
         )
 
     # 3. Update SAM Refinement tracker if enabled
     sam_masks = None
     sam_is_binary = False
+    sam_auroc = None
     sam_change_metrics = []
     if sam_seg_tracker is not None and refiner is not None:
         try:
@@ -341,14 +355,13 @@ def eval_single_batch(
         except TypeError:
             sam_masks, sam_change_metrics = refiner.refine_batch(images, mask_logits)
         sam_is_binary = bool(((sam_masks == 0.0) | (sam_masks == 1.0)).all().item())
-        sam_seg_tracker.update(
+        sam_auroc = sam_seg_tracker.update(
             sam_masks,
             masks,
             labels,
             is_logit=False,
             datasets=datasets,
-            score_masks=mask_logits if sam_is_binary else None,
-            score_is_logit=True if sam_is_binary else None,
+            precomputed_auroc=raw_auroc if sam_is_binary else None,
         )
 
     # 4. Update combined SAM + Post-Processing tracker if both enabled
@@ -368,14 +381,16 @@ def eval_single_batch(
             base_is_logit = True
         both_masks, _ = postprocessor.process_batch(base_for_both, is_logit=base_is_logit)
         both_use_raw_scores = (sam_masks is None) or sam_is_binary
+        both_precomputed = raw_auroc if both_use_raw_scores else sam_auroc
         both_seg_tracker.update(
             both_masks,
             masks,
             labels,
             is_logit=False,
             datasets=datasets,
-            score_masks=mask_logits if both_use_raw_scores else sam_masks,
-            score_is_logit=True if both_use_raw_scores else False,
+            score_masks=(None if both_precomputed is not None else sam_masks),
+            score_is_logit=(None if both_precomputed is not None else False),
+            precomputed_auroc=both_precomputed,
         )
 
     # 5. Classification metrics
@@ -383,7 +398,7 @@ def eval_single_batch(
         cls_tracker.update(class_logits, labels)
 
     # 6. Sample collection for visual illustrations
-    if collect_samples is not None and len(collect_samples) < max_collect:
+    if (not handled_collect_async) and collect_samples is not None and len(collect_samples) < max_collect:
         raw_probs = torch.sigmoid(mask_logits.float())
         for i in range(b_size):
             if len(collect_samples) >= max_collect:
@@ -686,91 +701,115 @@ def evaluate_single_checkpoint(
     eval_total = safe_dataloader_len(eval_loader)
     prefetcher = CUDAPrefetcher(eval_loader, device=device)
     pbar = tqdm(prefetcher, desc=f"Evaluating [{run_name}] ({resolved_split})", total=eval_total, leave=True, file=sys.stdout, dynamic_ncols=True)
-    with torch.inference_mode():
-        for batch in pbar:
-            b_sz = len(batch["image"])
-            try:
-                loss_contrib, count, change_met = eval_single_batch(
-                    batch,
-                    model,
-                    loss_fn,
-                    device,
-                    raw_seg_tracker,
-                    cls_tracker,
-                    threshold=threshold,
-                    post_seg_tracker=post_seg_tracker,
-                    sam_seg_tracker=sam_seg_tracker,
-                    both_seg_tracker=both_seg_tracker,
-                    postprocessor=postprocessor,
-                    refiner=refiner,
-                    collect_samples=collected_samples,
-                    max_collect=max_illustrations,
-                    precision_spec=precision_spec,
-                )
-                total_loss_sum += loss_contrib
-                total_samples += count
-                if change_met:
-                    all_change_metrics.extend(change_met)
-            except Exception as exc:
-                if is_oom_error(exc):
-                    logger.warning(
-                        f"⚠️ OOM on evaluation batch size {b_sz}! Clearing cache and recovering with sub-batching..."
+    async_post_pipeline = (
+        AsyncPostProcessPipeline(
+            postprocessor=postprocessor,
+            post_seg_tracker=post_seg_tracker,
+            collect_samples=collected_samples,
+            max_collect=max_illustrations,
+        )
+        if (post_seg_tracker is not None and postprocessor is not None and refiner is None and device.type == "cuda")
+        else None
+    )
+
+    try:
+        with torch.inference_mode():
+            for batch in pbar:
+                b_sz = len(batch["image"])
+                try:
+                    loss_contrib, count, change_met = eval_single_batch(
+                        batch,
+                        model,
+                        loss_fn,
+                        device,
+                        raw_seg_tracker,
+                        cls_tracker,
+                        threshold=threshold,
+                        post_seg_tracker=post_seg_tracker,
+                        sam_seg_tracker=sam_seg_tracker,
+                        both_seg_tracker=both_seg_tracker,
+                        postprocessor=postprocessor,
+                        refiner=refiner,
+                        collect_samples=collected_samples,
+                        max_collect=max_illustrations,
+                        precision_spec=precision_spec,
+                        async_post_pipeline=async_post_pipeline,
                     )
-                    clear_memory_cache(device)
-                    sub_batches = split_batch(batch, micro_batch_size=max(1, b_sz // 2))
-                    for sub_b in sub_batches:
-                        try:
-                            loss_contrib, count, change_met = eval_single_batch(
-                                sub_b,
-                                model,
-                                loss_fn,
-                                device,
-                                raw_seg_tracker,
-                                cls_tracker,
-                                threshold=threshold,
-                                post_seg_tracker=post_seg_tracker,
-                                sam_seg_tracker=sam_seg_tracker,
-                                both_seg_tracker=both_seg_tracker,
-                                postprocessor=postprocessor,
-                                refiner=refiner,
-                                collect_samples=collected_samples,
-                                max_collect=max_illustrations,
-                                precision_spec=precision_spec,
-                            )
-                            total_loss_sum += loss_contrib
-                            total_samples += count
-                            if change_met:
-                                all_change_metrics.extend(change_met)
-                        except Exception as sub_exc:
-                            if is_oom_error(sub_exc):
-                                clear_memory_cache(device)
-                                nano_batches = split_batch(sub_b, micro_batch_size=1)
-                                for nano_b in nano_batches:
-                                    loss_contrib, count, change_met = eval_single_batch(
-                                        nano_b,
-                                        model,
-                                        loss_fn,
-                                        device,
-                                        raw_seg_tracker,
-                                        cls_tracker,
-                                        threshold=threshold,
-                                        post_seg_tracker=post_seg_tracker,
-                                        sam_seg_tracker=sam_seg_tracker,
-                                        both_seg_tracker=both_seg_tracker,
-                                        postprocessor=postprocessor,
-                                        refiner=refiner,
-                                        collect_samples=collected_samples,
-                                        max_collect=max_illustrations,
-                                        precision_spec=precision_spec,
-                                    )
-                                    total_loss_sum += loss_contrib
-                                    total_samples += count
-                                    if change_met:
-                                        all_change_metrics.extend(change_met)
-                            else:
-                                raise sub_exc
-                else:
-                    raise exc
+                    total_loss_sum += loss_contrib
+                    total_samples += count
+                    if change_met:
+                        all_change_metrics.extend(change_met)
+                except Exception as exc:
+                    if is_oom_error(exc):
+                        logger.warning(
+                            f"⚠️ OOM on evaluation batch size {b_sz}! Clearing cache and recovering with sub-batching..."
+                        )
+                        clear_memory_cache(device)
+                        sub_batches = split_batch(batch, micro_batch_size=max(1, b_sz // 2))
+                        for sub_b in sub_batches:
+                            try:
+                                loss_contrib, count, change_met = eval_single_batch(
+                                    sub_b,
+                                    model,
+                                    loss_fn,
+                                    device,
+                                    raw_seg_tracker,
+                                    cls_tracker,
+                                    threshold=threshold,
+                                    post_seg_tracker=post_seg_tracker,
+                                    sam_seg_tracker=sam_seg_tracker,
+                                    both_seg_tracker=both_seg_tracker,
+                                    postprocessor=postprocessor,
+                                    refiner=refiner,
+                                    collect_samples=collected_samples,
+                                    max_collect=max_illustrations,
+                                    precision_spec=precision_spec,
+                                    async_post_pipeline=async_post_pipeline,
+                                )
+                                total_loss_sum += loss_contrib
+                                total_samples += count
+                                if change_met:
+                                    all_change_metrics.extend(change_met)
+                            except Exception as sub_exc:
+                                if is_oom_error(sub_exc):
+                                    clear_memory_cache(device)
+                                    nano_batches = split_batch(sub_b, micro_batch_size=1)
+                                    for nano_b in nano_batches:
+                                        loss_contrib, count, change_met = eval_single_batch(
+                                            nano_b,
+                                            model,
+                                            loss_fn,
+                                            device,
+                                            raw_seg_tracker,
+                                            cls_tracker,
+                                            threshold=threshold,
+                                            post_seg_tracker=post_seg_tracker,
+                                            sam_seg_tracker=sam_seg_tracker,
+                                            both_seg_tracker=both_seg_tracker,
+                                            postprocessor=postprocessor,
+                                            refiner=refiner,
+                                            collect_samples=collected_samples,
+                                            max_collect=max_illustrations,
+                                            precision_spec=precision_spec,
+                                            async_post_pipeline=async_post_pipeline,
+                                        )
+                                        total_loss_sum += loss_contrib
+                                        total_samples += count
+                                        if change_met:
+                                            all_change_metrics.extend(change_met)
+                                else:
+                                    raise sub_exc
+                    else:
+                        raise exc
+        if async_post_pipeline is not None:
+            async_post_pipeline.finish()
+    except Exception:
+        if async_post_pipeline is not None:
+            try:
+                async_post_pipeline.finish()
+            except Exception:
+                pass
+        raise
 
     try:
         prefetcher.close()
