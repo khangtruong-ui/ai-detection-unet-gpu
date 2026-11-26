@@ -43,6 +43,9 @@ from sid_unet.utils.memory import (
     find_optimal_batch_size,
     format_memory_summary,
     get_memory_summary,
+    infer_optimal_batch_size,
+    is_auto_batch_size,
+    is_auto_batch_size_config,
     is_oom_error,
     split_batch,
 )
@@ -363,6 +366,8 @@ class Trainer:
         self.grad_clip = float(config.training.get("grad_clip_norm", 1.0))
         self.gradient_accumulation_steps = max(1, int(config.training.get("gradient_accumulation_steps", 1)))
         self.auto_batch_size = bool(config.training.get("auto_batch_size", True))
+        self.auto_infer_batch_size = is_auto_batch_size_config(config)
+        self._batch_size_checked = False
         self.empty_cache_per_epoch = bool(config.training.get("empty_cache_per_epoch", True))
         self.log_memory = bool(config.logging.get("log_memory", True))
 
@@ -995,8 +1000,11 @@ class Trainer:
             return None
 
     def _check_and_auto_scale_batch_size(self) -> None:
-        """Probe GPU memory and scale down batch size / increase gradient accumulation steps if memory is tight."""
-        if not self.auto_batch_size or self.train_loader is None or self.device.type != "cuda":
+        """Probe GPU memory to either infer GPU-saturating batch size (-1) or scale down oversized batch sizes."""
+        self._batch_size_checked = True
+        if self.train_loader is None:
+            return
+        if not self.auto_infer_batch_size and (not self.auto_batch_size or self.device.type != "cuda"):
             return
 
         current_bs = int(self.config.data.get("batch_size", 16))
@@ -1017,7 +1025,103 @@ class Trainer:
             in_ch = int(getattr(self.raw_model, "in_channels", self.config.model.get("in_channels", 3)))
             sample_shape = (in_ch, img_size[0], img_size[1])
 
+        def _reload_loaders(new_bs: int) -> None:
+            eval_test = bool(self.config.data.get("evaluate_on_test", False))
+            ds = getattr(self.train_loader, "dataset", None)
+            ds_name = str(self.config.data.get("dataset_name", "")).lower()
+            is_sid_ds = ds is not None and type(ds).__name__.startswith(("SID", "Cached", "IndexedParquet"))
+            if ds is not None and not is_sid_ds and ds_name != "mock":
+                val_ds = getattr(self.val_loader, "dataset", None) if self.val_loader is not None else None
+                test_ds = getattr(self.test_loader, "dataset", None) if self.test_loader is not None else None
+                self.train_loader = DataLoader(ds, batch_size=new_bs, shuffle=True)
+                if val_ds is not None:
+                    self.val_loader = DataLoader(val_ds, batch_size=new_bs, shuffle=False)
+                if test_ds is not None:
+                    self.test_loader = DataLoader(test_ds, batch_size=new_bs, shuffle=False)
+                self.logger.info(f"⚡ Custom DataLoaders rebuilt with batch_size={new_bs}.")
+                sys.stdout.flush()
+                return
+
+            try:
+                del self.train_loader
+                if eval_test and hasattr(self, "test_loader"):
+                    del self.test_loader
+                del self.val_loader
+            except Exception:
+                pass
+            gc.collect()
+
+            from sid_unet.dataset.loader import create_dataloaders
+            loaders = create_dataloaders(self.config, include_test=eval_test)
+            if eval_test:
+                self.train_loader, self.val_loader, self.test_loader = loaders
+            else:
+                self.train_loader, self.val_loader = loaders
+            self.logger.info(f"⚡ DataLoaders reloaded successfully with batch size {new_bs}.")
+            sys.stdout.flush()
+
         try:
+            if self.auto_infer_batch_size:
+                max_auto_bs = int(self.config.data.get("max_auto_batch_size", self.config.training.get("max_auto_batch_size", 256)))
+                cpu_fallback = int(self.config.data.get("cpu_fallback_batch_size", 16))
+                probe_model = self.model if isinstance(self.model, nn.DataParallel) else self.raw_model
+                if self.device.type != "cuda":
+                    inferred_bs = max(1, min(cpu_fallback, max_auto_bs))
+                elif self.is_distributed:
+                    if self.is_main_process:
+                        inferred_bs = infer_optimal_batch_size(
+                            model=self.raw_model,
+                            loss_fn=self.loss_fn,
+                            sample_shape=sample_shape,
+                            device=self.device,
+                            mode="train",
+                            min_batch_size=1,
+                            max_batch_size=max_auto_bs,
+                            use_amp=self.use_amp,
+                            amp_dtype=self.amp_dtype,
+                            aux_classifier=getattr(self.raw_model, "aux_classifier", False),
+                            num_classes=int(self.config.model.get("num_classes", 3)),
+                            mask_shape=img_size,
+                            cpu_fallback_batch_size=cpu_fallback,
+                            logger=self.logger,
+                            optimizer=self.optimizer,
+                        )
+                    else:
+                        inferred_bs = 1
+                    inferred_bs = max(1, int(broadcast_scalar(float(inferred_bs), src=0)))
+                else:
+                    inferred_bs = infer_optimal_batch_size(
+                        model=probe_model,
+                        loss_fn=self.loss_fn,
+                        sample_shape=sample_shape,
+                        device=self.device,
+                        mode="train",
+                        min_batch_size=1,
+                        max_batch_size=max_auto_bs,
+                        use_amp=self.use_amp,
+                        amp_dtype=self.amp_dtype,
+                        aux_classifier=getattr(self.raw_model, "aux_classifier", False),
+                        num_classes=int(self.config.model.get("num_classes", 3)),
+                        mask_shape=img_size,
+                        cpu_fallback_batch_size=cpu_fallback,
+                        logger=self.logger,
+                        optimizer=self.optimizer,
+                    )
+
+                self.config.data.batch_size = inferred_bs
+                self.config.data.base_batch_size = inferred_bs
+                self.config.data._batch_size_scaled = True
+                self.config.data._auto_infer_batch_size = False
+                if hasattr(self.config, "training") and is_auto_batch_size(self.config.training.get("batch_size", None)):
+                    self.config.training.batch_size = inferred_bs
+
+                loader_bs = getattr(self.train_loader, "batch_size", None)
+                if loader_bs != inferred_bs:
+                    _reload_loaders(inferred_bs)
+                self.logger.info(f"⚡ Auto Batch Size Inference (batch_size=-1): Resolved training batch_size={inferred_bs}.")
+                sys.stdout.flush()
+                return
+
             if self.is_distributed:
                 if self.is_main_process:
                     safe_bs = find_optimal_batch_size(
@@ -1069,24 +1173,7 @@ class Trainer:
                 self.config.training.gradient_accumulation_steps = adjusted_grad_accum
                 self.gradient_accumulation_steps = adjusted_grad_accum
 
-                eval_test = bool(self.config.data.get("evaluate_on_test", False))
-                try:
-                    del self.train_loader
-                    if eval_test and hasattr(self, "test_loader"):
-                        del self.test_loader
-                    del self.val_loader
-                except Exception:
-                    pass
-                gc.collect()
-
-                from sid_unet.dataset.loader import create_dataloaders
-                loaders = create_dataloaders(self.config, include_test=eval_test)
-                if eval_test:
-                    self.train_loader, self.val_loader, self.test_loader = loaders
-                else:
-                    self.train_loader, self.val_loader = loaders
-                self.logger.info(f"⚡ DataLoaders reloaded successfully with scaled batch size {adjusted_bs}.")
-                sys.stdout.flush()
+                _reload_loaders(adjusted_bs)
             else:
                 self.logger.info(f"✅ Configured batch size {current_bs} verified safe for device memory.")
                 sys.stdout.flush()
@@ -1663,6 +1750,10 @@ class Trainer:
         if self.device.type == "cuda":
             self.logger.info(f"Initial GPU memory: {format_memory_summary(self.device)}")
 
+        # Auto-infer GPU-saturating batch size early if batch_size=-1
+        if self.auto_infer_batch_size and not self._batch_size_checked:
+            self._check_and_auto_scale_batch_size()
+
         # Bootstrapping v1.0 Kickstarting Phase
         if getattr(self, "bootstrap_cfg", {}).get("enabled", False) or getattr(self, "bootstrap_cfg", {}).get("run_bootstrap", False):
             from sid_unet.training.bootstrapping import run_bootstrapping_phase
@@ -1684,7 +1775,8 @@ class Trainer:
             self._run_debug_diagnostics()
 
         # Auto-tune batch size if enabled and on GPU
-        self._check_and_auto_scale_batch_size()
+        if not self._batch_size_checked:
+            self._check_and_auto_scale_batch_size()
 
         history = [h for h in self.history if int(h.get("epoch", 0)) < self.start_epoch]
         best_val_score = self.ckpt_manager.best_score

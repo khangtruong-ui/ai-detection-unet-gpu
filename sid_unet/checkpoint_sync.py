@@ -239,10 +239,81 @@ def resolve_repo_and_version(
     return resolved_repo, resolved_version
 
 
+def _extract_output_dir_from_yaml(yaml_path: str) -> Optional[str]:
+    """Read project.output_dir from a YAML file if present and non-generic."""
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        if not isinstance(raw_cfg, dict):
+            return None
+        out = raw_cfg.get("project", {}).get("output_dir")
+        if out:
+            norm = os.path.normpath(str(out)).replace("\\", "/")
+            if norm not in (".", "outputs", "outputs/RUN/default"):
+                return os.path.abspath(str(out))
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_repo_output_dir(
+    repo_id: str,
+    remote_files: Optional[List[str]] = None,
+    prefix: str = "",
+    token: Optional[str] = None,
+) -> str:
+    """Resolve the canonical local output directory for a Hugging Face repository.
+
+    Priority:
+      1. Matching local config under configs/experiments/<clean_name>/
+      2. Remote config.yaml project.output_dir (if remote_files provided)
+      3. Deterministic repo-named directory outputs/RUN/<clean_name> (never outputs/RUN/default)
+    """
+    short_name = repo_id.split("/")[-1].lower()
+    clean_name = short_name.replace("-", "_")
+
+    candidates = [
+        f"configs/experiments/{clean_name}/default.yaml",
+        f"configs/experiments/{clean_name}/{clean_name}.yaml",
+        f"configs/experiments/{clean_name}/{clean_name}_hrnet.yaml",
+    ]
+    exp_dir = os.path.join("configs", "experiments", clean_name)
+    if os.path.isdir(exp_dir):
+        for extra_cfg in sorted(glob.glob(os.path.join(exp_dir, "*.yaml"))):
+            if extra_cfg not in candidates:
+                candidates.append(extra_cfg)
+
+    for matching_config in candidates:
+        if os.path.isfile(matching_config):
+            resolved = _extract_output_dir_from_yaml(matching_config)
+            if resolved:
+                return resolved
+
+    if remote_files and _HF_AVAILABLE:
+        for cfg_cand in [
+            f"{prefix}config.yaml",
+            "config.yaml",
+            f"{prefix}checkpoints/config.yaml",
+            "checkpoints/config.yaml",
+            "checkpoints/checkpoint_best_config.yaml",
+        ]:
+            if cfg_cand in remote_files:
+                try:
+                    cfg_local = hf_hub_download(repo_id=repo_id, filename=cfg_cand, token=token)
+                    resolved = _extract_output_dir_from_yaml(cfg_local)
+                    if resolved:
+                        return resolved
+                except Exception:
+                    pass
+
+    return os.path.abspath(os.path.join("outputs", "RUN", clean_name))
+
+
 def find_local_checkpoint_artifacts(
     source_dir: Optional[str] = None,
     config_path: Optional[str] = None,
     checkpoint_name: Optional[str] = None,
+    repo_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Discover local checkpoint files, configs, and reports to synchronize."""
     target_dir = None
@@ -257,6 +328,11 @@ def find_local_checkpoint_artifacts(
                 target_dir = os.path.abspath(out)
         except Exception:
             pass
+
+    if not target_dir and repo_id:
+        repo_dir = _resolve_repo_output_dir(repo_id)
+        if os.path.isdir(repo_dir):
+            target_dir = repo_dir
 
     # Search common directories if not found
     if not target_dir:
@@ -536,6 +612,7 @@ def push_checkpoint(
         source_dir=source_dir,
         config_path=config_path,
         checkpoint_name=checkpoint_name,
+        repo_id=repo_id,
     )
 
     # Inspect checkpoint metadata
@@ -598,6 +675,9 @@ def push_checkpoint(
             main_cfg_path = fpath
         if set_latest:
             operations.append(CommitOperationAdd(path_in_repo=f"checkpoints/{fname}", path_or_fileobj=fpath))
+
+    if main_cfg_path is None:
+        main_cfg_path = artifacts["configs"].get("config.yaml")
 
     if main_cfg_path and set_latest:
         operations.append(CommitOperationAdd(path_in_repo="config.yaml", path_or_fileobj=main_cfg_path))
@@ -754,7 +834,11 @@ def pull_checkpoint(
             print(f"  - {f}")
         return {"repo_id": repo_id, "versions": available_versions, "files": pt_files}
 
-    # 3. Determine target local directory
+    # 3. Determine version prefix & target local directory
+    prefix = ""
+    if version and version.lower() not in ("latest", "default"):
+        prefix = f"versions/{version}/"
+
     target_dir = None
     if output_dir:
         target_dir = os.path.abspath(output_dir)
@@ -769,37 +853,17 @@ def pull_checkpoint(
             pass
 
     if not target_dir:
-        # Check standard destinations
-        short_name = repo_id.split("/")[-1].lower()
-        clean_name = short_name.replace("-", "_")
-        candidates = [
-            f"configs/experiments/{clean_name}/default.yaml",
-            f"configs/experiments/{clean_name}/{clean_name}.yaml",
-            f"configs/experiments/{clean_name}/{clean_name}_hrnet.yaml",
-        ]
-        for matching_config in candidates:
-            if os.path.isfile(matching_config):
-                try:
-                    with open(matching_config, "r", encoding="utf-8") as f:
-                        raw_cfg = yaml.safe_load(f) or {}
-                    out = raw_cfg.get("project", {}).get("output_dir")
-                    if out:
-                        target_dir = os.path.abspath(out)
-                        break
-                except Exception:
-                    pass
-
-    if not target_dir:
-        target_dir = os.path.abspath(os.path.join("outputs", "RUN", "default"))
+        target_dir = _resolve_repo_output_dir(
+            repo_id=repo_id,
+            remote_files=remote_files,
+            prefix=prefix,
+            token=hf_token,
+        )
 
     ckpt_target_dir = os.path.join(target_dir, "checkpoints")
     os.makedirs(ckpt_target_dir, exist_ok=True)
 
     # 4. Determine which files to download
-    # Check if a specific version is requested
-    prefix = ""
-    if version and version.lower() not in ("latest", "default"):
-        prefix = f"versions/{version}/"
 
     files_to_download = []
     if checkpoint_name:
@@ -876,23 +940,13 @@ def pull_checkpoint(
         if base_name in ("config.yaml", "effective_config.yaml"):
             shutil.copy2(cached_file, os.path.join(target_dir, base_name))
 
-    # Also synchronize convenience directory outputs/RUN/default so auto_resume finds it everywhere
-    legacy_run_dir = os.path.abspath(os.path.join("outputs", "RUN", "default", "checkpoints"))
-    if os.path.abspath(ckpt_target_dir) != legacy_run_dir:
-        os.makedirs(legacy_run_dir, exist_ok=True)
-        for fname, fpath in downloaded_paths.items():
-            if fname.endswith(".pt"):
-                shutil.copy2(fpath, os.path.join(legacy_run_dir, fname))
-
     print(f"✅ Successfully pulled {len(downloaded_paths)} file(s) into: {ckpt_target_dir}")
     for fname, fpath in downloaded_paths.items():
         print(f"   ✓ {fname} ({os.path.getsize(fpath) / (1024 * 1024):.1f} MB)")
 
     # Suggest resume command
-    resume_cmd = (
-        f"sid-train --config configs/experiments/diffusion_diff_minimized/default.yaml"
-        f" --override training.epochs=40"
-    )
+    best_or_latest = downloaded_paths.get("checkpoint_latest.pt") or downloaded_paths.get("checkpoint_best.pt") or next(iter(downloaded_paths.values()))
+    resume_cmd = f"sid-train --resume {best_or_latest}"
     print(f"\n💡 Resume training with:\n   {resume_cmd}\n")
 
     return {

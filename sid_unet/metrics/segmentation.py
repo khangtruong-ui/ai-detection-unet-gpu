@@ -278,6 +278,7 @@ def compute_binary_metrics_batch(
     is_logit: Optional[bool] = None,
     score_masks: Optional[torch.Tensor] = None,
     score_is_logit: Optional[bool] = None,
+    precomputed_auroc: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute binary segmentation metrics (IoU, Dice/F1, AUROC, Accuracy, Precision, Recall, Specificity)
@@ -291,6 +292,8 @@ def compute_binary_metrics_batch(
         score_masks: Optional continuous score tensor (e.g. raw model logits) for threshold-free AUROC
             even when ``pred_masks`` are binarized (e.g. after mask post-processing).
         score_is_logit: Optional bool indicating if ``score_masks`` are raw logits.
+        precomputed_auroc: Optional per-sample AUROC tensor of shape ``(B,)`` already computed on the same
+            underlying continuous score masks (avoids redundant threshold-free AUROC sorting).
 
     Returns:
         Dict mapping metric name to 1D Tensor of shape (B,) on same device.
@@ -367,7 +370,9 @@ def compute_binary_metrics_batch(
     else:
         binary_auroc = compute_binary_auroc_batch(p_probs, t_raw, is_logit=False)
 
-    if score_masks is not None:
+    if precomputed_auroc is not None:
+        auroc = precomputed_auroc.to(device=p_raw.device, dtype=torch.float32).reshape(-1)
+    elif score_masks is not None:
         s_raw = score_masks.reshape(score_masks.size(0), -1).float() if score_masks.dim() > 2 else score_masks.float()
         auroc = compute_binary_auroc_batch(s_raw, t_raw, is_logit=score_is_logit)
     else:
@@ -527,7 +532,8 @@ class SegmentationMetricTracker:
         datasets: Optional[Union[List[str], Sequence[str]]] = None,
         score_masks: Optional[torch.Tensor] = None,
         score_is_logit: Optional[bool] = None,
-    ):
+        precomputed_auroc: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """
         Update tracker with batch predictions and ground truth.
         pred_masks: (B, 1, H, W) or (B, H, W)
@@ -538,6 +544,11 @@ class SegmentationMetricTracker:
         score_masks: Optional continuous logits/probabilities for threshold-free AUROC when ``pred_masks``
             are post-processed/binarized.
         score_is_logit: Optional bool indicating if ``score_masks`` are raw logits.
+        precomputed_auroc: Optional ``(B,)`` tensor of precomputed continuous AUROC values to reuse
+            instead of recomputing ``compute_binary_auroc_batch``.
+
+        Returns:
+            Per-sample AUROC tensor of shape ``(B,)`` (or ``None`` if batch is empty).
         """
         if pred_masks.dim() == 4 and pred_masks.size(1) == 1:
             pred_masks = pred_masks.squeeze(1)
@@ -549,7 +560,7 @@ class SegmentationMetricTracker:
 
         b = pred_masks.size(0)
         if b == 0:
-            return
+            return None
 
         batch_metrics = compute_binary_metrics_batch(
             pred_masks,
@@ -558,6 +569,7 @@ class SegmentationMetricTracker:
             is_logit=is_logit,
             score_masks=score_masks,
             score_is_logit=score_is_logit,
+            precomputed_auroc=precomputed_auroc,
         )
 
         has_pos = batch_metrics["has_positive"]
@@ -566,7 +578,7 @@ class SegmentationMetricTracker:
         self.total_samples += b
         self.positive_samples += num_pos
         self.zero_positive_samples += (b - num_pos)
-        if score_masks is not None:
+        if score_masks is not None or precomputed_auroc is not None:
             self._used_continuous_score_masks = True
         self.binary_auroc_sum += float(batch_metrics["binary_auroc"].sum().item())
 
@@ -640,6 +652,8 @@ class SegmentationMetricTracker:
                     for k in ("iou", "dice", "f1", "macro_f1", "precision", "recall"):
                         ds_stat[f"{k}_pos_sum"] += row_map[k]
                     ds_stat["_var_pos"].update_single(row_map)
+
+        return batch_metrics["auroc"]
 
     def compute_per_dataset(self) -> Dict[str, Dict[str, float]]:
         """

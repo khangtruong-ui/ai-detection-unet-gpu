@@ -116,7 +116,7 @@ def parse_args():
         "--batch-size",
         type=int,
         default=None,
-        help="Batch size per training/validation step (overrides config data.batch_size)",
+        help="Batch size per training/validation step (overrides config data.batch_size; use -1 for automatic GPU-saturating inference)",
     )
     parser.add_argument(
         "--auto_batch_size",
@@ -508,6 +508,9 @@ def train_single_run(
     """Execute a single training experiment with its given config."""
     logger = logging.getLogger("sid_unet.train")
     config = load_config(config_path, overrides=overrides or [])
+    from sid_unet.utils.memory import is_auto_batch_size_config
+    if is_auto_batch_size_config(config):
+        config.data._auto_infer_batch_size = True
 
     model_name = str(config.model.get("name", "")).lower()
     is_noise_rag = any(k in model_name for k in ("noise-rag", "noise_rag", "noiserag"))

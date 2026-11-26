@@ -424,4 +424,53 @@ def test_compute_binary_auroc_batch_ties_and_extremes():
     assert aurocs[2].item() == 1.0
 
 
+def test_precomputed_auroc_matches_score_masks_and_skips_recomputation(monkeypatch):
+    from sid_unet.metrics import segmentation as seg_mod
+
+    targets = torch.zeros((2, 1, 16, 16), dtype=torch.float32)
+    targets[0, 0, :8, :] = 1.0
+    targets[1, 0, 8:, :] = 1.0
+
+    raw_logits = torch.full((2, 1, 16, 16), -2.0, dtype=torch.float32)
+    raw_logits[0, 0, :6, :] = 2.0
+    raw_logits[0, 0, 6:8, :] = 0.3
+    raw_logits[1, 0, 8:12, :] = 1.5
+
+    bin_preds = (torch.sigmoid(raw_logits) >= 0.7).float()
+    labels = torch.tensor([2, 2])
+    datasets = ["DS1", "DS2"]
+
+    ref_raw = seg_mod.SegmentationMetricTracker(threshold=0.5)
+    ref_post = seg_mod.SegmentationMetricTracker(threshold=0.5)
+    fast_raw = seg_mod.SegmentationMetricTracker(threshold=0.5)
+    fast_post = seg_mod.SegmentationMetricTracker(threshold=0.5)
+
+    ref_raw.update(raw_logits, targets, labels, is_logit=True, datasets=datasets)
+    ref_post.update(bin_preds, targets, labels, is_logit=False, datasets=datasets, score_masks=raw_logits, score_is_logit=True)
+
+    call_count = 0
+    orig_auroc_fn = seg_mod.compute_binary_auroc_batch
+
+    def counted_auroc(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return orig_auroc_fn(*args, **kwargs)
+
+    monkeypatch.setattr(seg_mod, "compute_binary_auroc_batch", counted_auroc)
+
+    precomputed = fast_raw.update(raw_logits, targets, labels, is_logit=True, datasets=datasets)
+    assert precomputed is not None and precomputed.shape == (2,)
+    assert call_count == 1
+
+    # Passing precomputed_auroc for binary masks must NOT call compute_binary_auroc_batch again
+    fast_post.update(bin_preds, targets, labels, is_logit=False, datasets=datasets, precomputed_auroc=precomputed)
+    assert call_count == 1
+    assert fast_post._used_continuous_score_masks is True
+
+    ref_m, _ = ref_post.compute()
+    fast_m, _ = fast_post.compute()
+    for key in ("iou", "dice", "f1", "auroc", "pixel_auroc", "binary_auroc", "pixel_acc"):
+        assert fast_m[key] == pytest.approx(ref_m[key], abs=1e-6)
+
+
 

@@ -113,7 +113,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "dataset_name": "KhangTruong/IMD2020",
         "streaming": False,
         "image_size": [256, 256],
-        "batch_size": 16,
+        "batch_size": 16,             # Set to -1 (or 'auto') to automatically infer GPU-saturating batch size
         "num_workers": -1,            # Default to -1 (automatically uses all available CPU cores)
         "pin_memory": True,
         "shuffle_buffer_size": 1000,

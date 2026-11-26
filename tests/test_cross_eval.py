@@ -947,6 +947,148 @@ def test_evaluate_checkpoint_on_config_from_config_spec(monkeypatch):
     assert res["total_evaluated_samples"] == 2
 
 
+def test_cross_eval_and_eval_auto_batch_size_minus_one(monkeypatch):
+    from sid_unet.cross_eval import evaluate_checkpoint_on_config
+    from sid_unet.evaluate import evaluate_single_checkpoint
+    from sid_unet.models.unet import UNet
+
+    inferred_calls = []
+
+    def fake_infer(**kwargs):
+        inferred_calls.append((kwargs["mode"], kwargs["max_batch_size"], kwargs["sample_shape"]))
+        return 3
+
+    monkeypatch.setattr("sid_unet.cross_eval.infer_optimal_batch_size", fake_infer)
+    monkeypatch.setattr("sid_unet.evaluate.infer_optimal_batch_size", fake_infer)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = UNet(features=[8, 16], dropout=0.0, aux_classifier=False)
+        ckpt_path = os.path.join(tmpdir, "checkpoint_best.pt")
+        torch.save({
+            "epoch": 1,
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "project": {"name": "tiny_unet", "device": "cpu"},
+                "model": {"name": "unet", "features": [8, 16], "dropout": 0.0, "aux_classifier": False},
+                "data": {"dataset_name": "mock", "image_size": [32, 32], "batch_size": 4},
+            },
+        }, ckpt_path)
+
+        res_ce = evaluate_checkpoint_on_config(
+            checkpoint_path=ckpt_path,
+            config_path="configs/cross-eval/MVSS-v1-protocol.yaml",
+            split="cross_test",
+            samples=4,
+            batch_size=-1,
+            overrides=["data.dataset_name=mock", "data.num_workers=0", "project.device=cpu", "data.image_size=[32,32]"],
+            save_illustrations=False,
+            master_output_dir=tmpdir,
+        )
+        assert res_ce["overall_metrics"]["batch_size"] == 3
+        assert res_ce["overall_metrics"]["auto_batch_size_inferred"] is True
+        assert res_ce["eval_config"]["data"]["batch_size"] == 3
+
+        res_ev = evaluate_single_checkpoint(
+            checkpoint_path=ckpt_path,
+            split="test",
+            samples=4,
+            batch_size=-1,
+            overrides=["data.dataset_name=mock", "data.num_workers=0", "project.device=cpu", "data.image_size=[32,32]"],
+            output_dir=os.path.join(tmpdir, "eval_out"),
+            save_illustrations=False,
+            skip_collision=False,
+        )
+        assert res_ev["overall_metrics"]["batch_size"] == 3
+        assert res_ev["overall_metrics"]["auto_batch_size_inferred"] is True
+
+    assert len(inferred_calls) == 2
+    assert all(mode == "eval" and max_bs == 4 for mode, max_bs, _ in inferred_calls)
+
+
+def test_sid_map_dataset_close_forwards_to_underlying_data():
+    from unittest.mock import MagicMock
+    from sid_unet.dataset.loader import SIDMapDataset
+
+    ds = SIDMapDataset.__new__(SIDMapDataset)
+    inner = MagicMock()
+    ds.data = inner
+    ds.close()
+    inner.close.assert_called_once()
+
+
+def test_eval_single_batch_async_post_pipeline_matches_sync():
+    import numpy as np
+    from sid_unet.cross_eval import eval_single_batch as ce_eval_batch
+    from sid_unet.evaluate import eval_single_batch as ev_eval_batch
+    from sid_unet.losses.auxiliary import build_loss
+    from sid_unet.metrics.classification import ClassificationMetricTracker
+    from sid_unet.metrics.segmentation import SegmentationMetricTracker
+    from sid_unet.models.unet import UNet
+    from sid_unet.postprocessing import AsyncPostProcessPipeline, MaskPostProcessor
+
+    torch.manual_seed(7)
+    model = UNet(features=[8, 16], dropout=0.0, aux_classifier=False).eval()
+    loss_fn = build_loss({"loss": {"type": "bce_dice"}})
+    postproc = MaskPostProcessor(enabled=True, min_area=8, fill_holes=True, morphology="open_close", morph_kernel_size=3)
+
+    batches = [
+        {
+            "image": torch.randn(3, 3, 32, 32),
+            "mask": torch.randint(0, 2, (3, 1, 32, 32)).float(),
+            "label": torch.tensor([0, 2, 1]),
+            "dataset": ["D1", "D2", "D1"],
+            "img_id": ["a", "b", "c"],
+        },
+        {
+            "image": torch.randn(2, 3, 32, 32),
+            "mask": torch.randint(0, 2, (2, 1, 32, 32)).float(),
+            "label": torch.tensor([2, 0]),
+            "dataset": ["D2", "D1"],
+            "img_id": ["d", "e"],
+        },
+    ]
+
+    for fn in (ce_eval_batch, ev_eval_batch):
+        sync_raw = SegmentationMetricTracker(threshold=0.5)
+        sync_post = SegmentationMetricTracker(threshold=0.5)
+        sync_cls = ClassificationMetricTracker(num_classes=3)
+        sync_collect = []
+
+        async_raw = SegmentationMetricTracker(threshold=0.5)
+        async_post = SegmentationMetricTracker(threshold=0.5)
+        async_cls = ClassificationMetricTracker(num_classes=3)
+        async_collect = []
+
+        with torch.inference_mode():
+            for b in batches:
+                fn(
+                    b, model, loss_fn, torch.device("cpu"),
+                    sync_raw, sync_cls, threshold=0.5,
+                    post_seg_tracker=sync_post, postprocessor=postproc,
+                    collect_samples=sync_collect, max_collect=4,
+                )
+
+            with AsyncPostProcessPipeline(postproc, async_post, collect_samples=async_collect, max_collect=4) as pipe:
+                for b in batches:
+                    fn(
+                        b, model, loss_fn, torch.device("cpu"),
+                        async_raw, async_cls, threshold=0.5,
+                        post_seg_tracker=async_post, postprocessor=postproc,
+                        collect_samples=async_collect, max_collect=4,
+                        async_post_pipeline=pipe,
+                    )
+
+        sync_m, _ = sync_post.compute()
+        async_m, _ = async_post.compute()
+        for key in ("iou", "dice", "f1", "auroc", "binary_auroc", "pixel_acc"):
+            assert async_m[key] == pytest.approx(sync_m[key], abs=1e-6)
+        assert async_post.compute_per_dataset().keys() == sync_post.compute_per_dataset().keys()
+        assert len(async_collect) == len(sync_collect) == 4
+        assert [s["img_id"] for s in async_collect] == [s["img_id"] for s in sync_collect]
+        for s_item, a_item in zip(sync_collect, async_collect):
+            np.testing.assert_array_equal(a_item["post_mask"], s_item["post_mask"])
+
+
 
 
 
