@@ -666,11 +666,9 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
+    def _forward_tokens(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
-            # Interpolate pos_embed if spatial dimensions differ
             if self.pos_embed.shape[1:3] != x.shape[1:3]:
                 pe = self.pos_embed.permute(0, 3, 1, 2)
                 pe = F.interpolate(pe, size=x.shape[1:3], mode="bicubic", align_corners=False)
@@ -678,12 +676,36 @@ class ImageEncoderViT(nn.Module):
                 x = x + pe
             else:
                 x = x + self.pos_embed
+        return x, len(self.blocks)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self._forward_tokens(x)
         for blk in self.blocks:
             x = blk(x)
 
         x = self.neck(x.permute(0, 3, 1, 2))  # [B, out_chans, H // 16, W // 16]
         return x
+
+    def forward_with_taps(
+        self, x: torch.Tensor, tap_indices: Sequence[int]
+    ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+        """Run encoder once and return `(neck_out, {block_idx: [B, embed_dim, H/16, W/16]})`."""
+        x, depth = self._forward_tokens(x)
+        normalized_taps: Dict[int, int] = {}
+        for raw_idx in tap_indices:
+            idx = int(raw_idx) if int(raw_idx) >= 0 else depth + int(raw_idx)
+            if idx < 0 or idx >= depth:
+                raise ValueError(f"ViT tap index {raw_idx} out of range [0, {depth - 1}].")
+            normalized_taps[idx] = int(raw_idx)
+
+        taps: Dict[int, torch.Tensor] = {}
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            if idx in normalized_taps:
+                taps[normalized_taps[idx]] = x.permute(0, 3, 1, 2).contiguous()
+
+        neck_out = self.neck(x.permute(0, 3, 1, 2))
+        return neck_out, taps
 
 
 class LayerNorm2d(nn.Module):
@@ -737,6 +759,12 @@ class FOCALViTNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.image_encoder(x)
+
+    def forward_with_taps(
+        self, x: torch.Tensor, tap_indices: Sequence[int]
+    ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+        """Forward pass returning both neck output and intermediate block taps."""
+        return self.image_encoder.forward_with_taps(x, tap_indices)
 
 
 # ------------------------------------------------------------------------------
@@ -884,6 +912,127 @@ class SpatialCrossScaleAdapter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.dw_dilated(self.dw_local(self.proj_in(x)))
         return x + self.proj_out(h)
+
+
+class BranchBalancedSpatialAdapter(nn.Module):
+    """
+    Branch-balanced zero-initialized spatial adapter for dual-backbone concatenation.
+
+    Applies independent `SpatialCrossScaleAdapter` modules to primary (ViT) and
+    secondary (HRNet) feature slices before concatenation so low-dimensional branches
+    cannot suffer asymmetric perturbation from higher-dimensional branches.
+    """
+
+    def __init__(self, primary_dim: int, secondary_dim: int) -> None:
+        super().__init__()
+        self.primary_dim = int(primary_dim)
+        self.secondary_dim = int(secondary_dim)
+        self.primary_adapter = SpatialCrossScaleAdapter(channels=self.primary_dim)
+        self.secondary_adapter = SpatialCrossScaleAdapter(channels=self.secondary_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f_p = self.primary_adapter(x[:, : self.primary_dim])
+        f_s = self.secondary_adapter(x[:, self.primary_dim : self.primary_dim + self.secondary_dim])
+        return torch.cat([f_p, f_s], dim=1)
+
+
+class ClusterPolarityHead(nn.Module):
+    """
+    Antisymmetric, rotation- & flip-invariant cluster polarity disambiguation head.
+
+    Scores each 2-means cluster using spatial geometry and feature dispersion descriptors
+    `[area, border_frac, corner_frac, center_dist, spatial_std, intra_disp]` via a shared
+    zero-initialized MLP residual over a border-aware geometric prior.
+    """
+
+    NUM_FEATURES = 6
+
+    def __init__(self, hidden_dim: int = 32) -> None:
+        super().__init__()
+        h_dim = max(16, int(hidden_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(self.NUM_FEATURES, h_dim),
+            nn.GELU(),
+            nn.Linear(h_dim, h_dim),
+            nn.GELU(),
+            nn.Linear(h_dim, 1),
+        )
+        last_linear = self.mlp[-1]
+        if isinstance(last_linear, nn.Linear):
+            nn.init.zeros_(last_linear.weight)
+            if last_linear.bias is not None:
+                nn.init.zeros_(last_linear.bias)
+
+    @staticmethod
+    @torch.no_grad()
+    def extract_cluster_descriptors(
+        labels: torch.Tensor,
+        f_img: torch.Tensor,
+        centroids: torch.Tensor,
+        h_f: int,
+        w_f: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract `[B, 6]` flip/rotation-invariant descriptors `(g_0, g_1)` for clusters 0 and 1.
+        """
+        b, n_px, _ = f_img.shape
+        device = f_img.device
+        dtype = torch.float32
+
+        grid = labels.view(b, h_f, w_f)
+        bmask = torch.zeros((h_f, w_f), dtype=torch.bool, device=device)
+        bmask[0, :] = True
+        bmask[-1, :] = True
+        bmask[:, 0] = True
+        bmask[:, -1] = True
+        b_flat = bmask.view(1, n_px).expand(b, -1)
+        n_border = max(1.0, float(bmask.sum().item()))
+
+        cw = max(1, min(h_f, w_f) // 16)
+        cmask = torch.zeros((h_f, w_f), dtype=torch.bool, device=device)
+        cmask[:cw, :cw] = True
+        cmask[:cw, -cw:] = True
+        cmask[-cw:, :cw] = True
+        cmask[-cw:, -cw:] = True
+        c_flat = cmask.view(1, n_px).expand(b, -1)
+        n_corner = max(1.0, float(cmask.sum().item()))
+
+        ys = torch.linspace(-1.0, 1.0, steps=h_f, device=device, dtype=dtype).view(1, h_f, 1).expand(b, h_f, w_f).reshape(b, n_px)
+        xs = torch.linspace(-1.0, 1.0, steps=w_f, device=device, dtype=dtype).view(1, 1, w_f).expand(b, h_f, w_f).reshape(b, n_px)
+        sqrt2 = math.sqrt(2.0)
+
+        sim_0 = (f_img * centroids[:, 0:1, :]).sum(dim=-1)
+        sim_1 = (f_img * centroids[:, 1:2, :]).sum(dim=-1)
+
+        descs: List[torch.Tensor] = []
+        for k, sim_k in ((0, sim_0), (1, sim_1)):
+            mk = (labels == k).to(dtype)
+            cnt = mk.sum(dim=1, keepdim=True).clamp(min=1.0)
+            area = mk.mean(dim=1, keepdim=True)
+            border_frac = ((labels == k) & b_flat).to(dtype).sum(dim=1, keepdim=True) / n_border
+            corner_frac = ((labels == k) & c_flat).to(dtype).sum(dim=1, keepdim=True) / n_corner
+            cy = (mk * ys).sum(dim=1, keepdim=True) / cnt
+            cx = (mk * xs).sum(dim=1, keepdim=True) / cnt
+            center_dist = torch.sqrt(cy.pow(2) + cx.pow(2) + 1e-8) / sqrt2
+            var_y = (mk * (ys - cy).pow(2)).sum(dim=1, keepdim=True) / cnt
+            var_x = (mk * (xs - cx).pow(2)).sum(dim=1, keepdim=True) / cnt
+            spatial_std = torch.sqrt(var_y + var_x + 1e-8) / sqrt2
+            intra_disp = (mk * (1.0 - sim_k)).sum(dim=1, keepdim=True) / cnt
+            descs.append(torch.cat([area, border_frac, corner_frac, center_dist, spatial_std, intra_disp], dim=-1))
+
+        return descs[0], descs[1]
+
+    def forward(
+        self,
+        g0: torch.Tensor,
+        g1: torch.Tensor,
+        z_base: torch.Tensor,
+        margin_scale: float = 5.0,
+    ) -> torch.Tensor:
+        """Return antisymmetric polarity logit (>0 means cluster 0 is tampered)."""
+        phi0 = self.mlp(g0.float())
+        phi1 = self.mlp(g1.float())
+        return float(margin_scale) * z_base.float() + (phi1 - phi0)
 
 
 class SecondaryTimmBackbone(nn.Module):
@@ -1040,6 +1189,26 @@ class _DilatedResBlock(nn.Module):
         return self.act(x + self.block(x))
 
 
+class PreNeckForensicProjector(nn.Module):
+    """
+    Zero-bias orthogonal subspace projector over pre-neck ViT intermediate taps.
+
+    Compresses concatenated multi-tap ViT block features (`[B, C_in, H_t, W_t]`)
+    into a compact `proj_dim`-channel L2-normalized forensic embedding without any
+    static bias vector (preventing `cone_cos` collapse).
+    """
+
+    def __init__(self, in_dim: int, proj_dim: int = 256) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.proj_dim = int(proj_dim)
+        self.proj = nn.Conv2d(self.in_dim, self.proj_dim, kernel_size=1, bias=False)
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.proj(x.float()), p=2, dim=1).to(dtype=x.dtype)
+
+
 class ImageRelativeClusterRefiner(nn.Module):
     """
     Domain-invariant, rotation-invariant residual refiner for clustering-anchored FOCAL.
@@ -1047,23 +1216,52 @@ class ImageRelativeClusterRefiner(nn.Module):
     Operates exclusively on image-relative geometric & clustering descriptors (never raw
     backbone feature channels) so adaptation on a single source domain (e.g. CASIA-v2.0)
     cannot memorize domain-specific semantic embeddings and cause OOD forgetting.
+    Optionally augments descriptors with fixed SRM high-frequency residual maps (`+2` ch)
+    and a zero-initialized non-local affinity-graph propagation block (`P @ h`).
     Outputs zero-initialized `(raw_bias, raw_scale)` maps at full image resolution.
     """
 
     BASE_DESC_CHANNELS = 10
     MULTI_BRANCH_DESC_CHANNELS = 24
+    SRM_DESC_CHANNELS = 2
+    BORDER_KNN_DESC_CHANNELS = 2
 
     def __init__(
         self,
         num_upsample_stages: int = 2,
         mid_dim: int = 48,
         multi_branch: bool = True,
+        use_affinity_prop: bool = False,
+        use_srm_desc: bool = False,
+        use_border_knn_desc: bool = False,
     ) -> None:
         super().__init__()
         self.multi_branch = bool(multi_branch)
+        self.use_affinity_prop = bool(use_affinity_prop)
+        self.use_srm_desc = bool(use_srm_desc)
+        self.use_border_knn_desc = bool(use_border_knn_desc)
         in_ch = self.MULTI_BRANCH_DESC_CHANNELS if self.multi_branch else self.BASE_DESC_CHANNELS
+        if self.use_srm_desc:
+            in_ch += self.SRM_DESC_CHANNELS
+        if self.use_border_knn_desc:
+            in_ch += self.BORDER_KNN_DESC_CHANNELS
         mid = max(32, int(mid_dim))
         groups_mid = _select_num_groups(mid)
+
+        # Eagerly register fixed 3-filter SRM residual kernels for DDP buffer safety
+        k1 = torch.tensor(
+            [[0, 0, 0, 0, 0], [0, -1, 2, -1, 0], [0, 2, -4, 2, 0], [0, -1, 2, -1, 0], [0, 0, 0, 0, 0]],
+            dtype=torch.float32,
+        ) / 4.0
+        k2 = torch.tensor(
+            [[-1, 2, -2, 2, -1], [2, -6, 8, -6, 2], [-2, 8, -12, 8, -2], [2, -6, 8, -6, 2], [-1, 2, -2, 2, -1]],
+            dtype=torch.float32,
+        ) / 12.0
+        k3 = torch.tensor(
+            [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 1, -2, 1, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+            dtype=torch.float32,
+        ) / 2.0
+        self.register_buffer("_srm_kernels", torch.stack([k1, k2, k3], dim=0).unsqueeze(1), persistent=False)
 
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, mid, kernel_size=3, padding=1, bias=False),
@@ -1075,6 +1273,16 @@ class ImageRelativeClusterRefiner(nn.Module):
             _DilatedResBlock(mid, dilation=2),
             _DilatedResBlock(mid, dilation=4),
         )
+        if self.use_affinity_prop:
+            self.aff_norm = nn.GroupNorm(groups_mid, mid)
+            self.aff_proj = nn.Conv2d(mid, mid, kernel_size=1, bias=True)
+            nn.init.zeros_(self.aff_proj.weight)
+            if self.aff_proj.bias is not None:
+                nn.init.zeros_(self.aff_proj.bias)
+        else:
+            self.aff_norm = None
+            self.aff_proj = None
+
         stages = []
         cur_dim = mid
         for _ in range(max(1, num_upsample_stages)):
@@ -1114,6 +1322,58 @@ class ImageRelativeClusterRefiner(nn.Module):
         d_loc25 = (1.0 - (f_hat * ctx25).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
         return d_mean_z, d_loc3, d_loc9, d_loc25
 
+    @staticmethod
+    @torch.no_grad()
+    def _border_knn_descriptors(
+        feats: torch.Tensor,
+        grid_size: int = 48,
+        k_local: int = 32,
+        k_broad: int = 160,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-image rotation/flip-invariant Self-Border k-NN anomaly maps (`[B, 1, H_f, W_f]`)."""
+        b, _, h_f, w_f = feats.shape
+        g = min(int(grid_size), h_f, w_f)
+        f_cur = feats.float()
+        if (h_f, w_f) != (g, g):
+            f_cur = F.interpolate(f_cur, size=(g, g), mode="bilinear", align_corners=False)
+        h_g, w_g = f_cur.shape[2:]
+        f_hat = F.normalize(f_cur, p=2, dim=1)
+
+        bw = 2 if min(h_g, w_g) >= 12 else 1
+        bmask = torch.zeros((h_g, w_g), dtype=torch.bool, device=feats.device)
+        bmask[:bw, :] = True
+        bmask[-bw:, :] = True
+        bmask[:, :bw] = True
+        bmask[:, -bw:] = True
+        bidx = bmask.flatten().nonzero(as_tuple=False).squeeze(1)
+        n_b = max(1, int(bidx.numel()))
+
+        x_flat = f_hat.flatten(2)  # [B, C, N]
+        x_border = x_flat[:, :, bidx]  # [B, C, n_b]
+        sim = torch.bmm(x_flat.transpose(1, 2), x_border)  # [B, N, n_b]
+
+        # Exact k=32 / k=160 on 48x48 (n_b=368), proportional scaling on smaller test grids
+        if n_b >= 368:
+            k1 = max(1, min(int(k_local), n_b))
+            k2 = max(1, min(int(k_broad), n_b))
+        else:
+            k1 = max(1, min(n_b, int(round(n_b * float(k_local) / 368.0))))
+            k2 = max(1, min(n_b, int(round(n_b * float(k_broad) / 368.0))))
+
+        top_broad = torch.topk(sim, k=k2, dim=-1).values  # descending along border keys
+        d_loc = (1.0 - top_broad[:, :, :k1].mean(dim=-1)).view(b, 1, h_g, w_g)
+        d_brd = (1.0 - top_broad.mean(dim=-1)).view(b, 1, h_g, w_g)
+
+        outs: List[torch.Tensor] = []
+        for d_map in (d_loc, d_brd):
+            mu = d_map.mean(dim=(2, 3), keepdim=True)
+            sd = d_map.std(dim=(2, 3), keepdim=True, unbiased=False).clamp(min=1e-4)
+            z_map = torch.tanh((d_map - mu) / sd)
+            if (h_g, w_g) != (h_f, w_f):
+                z_map = F.interpolate(z_map, size=(h_f, w_f), mode="bilinear", align_corners=False)
+            outs.append(z_map)
+        return outs[0], outs[1]
+
     @classmethod
     @torch.no_grad()
     def build_descriptors(
@@ -1125,8 +1385,12 @@ class ImageRelativeClusterRefiner(nn.Module):
         primary_branch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         secondary_branch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         multi_branch: bool = True,
+        srm_kernels: Optional[torch.Tensor] = None,
+        raw_rgb: Optional[torch.Tensor] = None,
+        use_srm_desc: bool = False,
+        use_border_knn_desc: bool = False,
     ) -> torch.Tensor:
-        """Build `[B, 10|24, H_f, W_f]` rotation-invariant image-relative forensic descriptors."""
+        """Build `[B, 10|24(+2 SRM)(+2 Border-kNN), H_f, W_f]` rotation-invariant image-relative forensic descriptors."""
         b, _, h_f, w_f = feats.shape
 
         def _grid(t: torch.Tensor) -> torch.Tensor:
@@ -1199,10 +1463,61 @@ class ImageRelativeClusterRefiner(nn.Module):
                 zeros_mb = torch.zeros(b, cls.MULTI_BRANCH_DESC_CHANNELS - cls.BASE_DESC_CHANNELS, h_f, w_f, device=feats.device, dtype=torch.float32)
                 desc_list.append(zeros_mb)
 
+        if use_srm_desc:
+            if raw_rgb is not None and srm_kernels is not None:
+                gray = raw_rgb.float().mean(dim=1, keepdim=True)
+                res = F.conv2d(gray, srm_kernels.to(device=gray.device, dtype=torch.float32), padding=2).clamp(-2.0, 2.0)
+                e_map = F.interpolate(res.pow(2).mean(dim=1, keepdim=True), size=(h_f, w_f), mode="area")
+                e_log = torch.log1p(e_map * 100.0)
+                mu_e = e_log.mean(dim=(2, 3), keepdim=True)
+                sd_e = e_log.std(dim=(2, 3), keepdim=True, unbiased=False).clamp(min=1e-4)
+                srm_z = torch.tanh((e_log - mu_e) / sd_e)
+                srm_loc = torch.tanh((e_log - F.avg_pool2d(e_log, kernel_size=9, stride=1, padding=4)) / sd_e)
+                desc_list.extend([srm_z, srm_loc])
+            else:
+                desc_list.append(torch.zeros(b, cls.SRM_DESC_CHANNELS, h_f, w_f, device=feats.device, dtype=torch.float32))
+
+        if use_border_knn_desc:
+            b_loc_f, b_brd_f = cls._border_knn_descriptors(feats)
+            if secondary_branch is not None:
+                sec_f = _grid(secondary_branch[0])
+                b_loc_s, b_brd_s = cls._border_knn_descriptors(sec_f)
+                b_loc = 0.5 * (b_loc_f + b_loc_s)
+                b_brd = 0.5 * (b_brd_f + b_brd_s)
+            else:
+                b_loc, b_brd = b_loc_f, b_brd_f
+            desc_list.extend([b_loc, b_brd])
+
         return torch.cat(desc_list, dim=1).to(dtype=feats.dtype)
 
-    def forward(self, descriptors: torch.Tensor, orig_h: int, orig_w: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        descriptors: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+        affinity_P: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.blocks(self.stem(descriptors))
+        if self.use_affinity_prop and self.aff_proj is not None and affinity_P is not None:
+            b, c, h_x, w_x = x.shape
+            n_aff = affinity_P.shape[1]
+            aff_side = int(round(math.sqrt(n_aff)))
+            if aff_side * aff_side == n_aff and aff_side > 0:
+                x_g = (
+                    F.interpolate(x.float(), size=(aff_side, aff_side), mode="bilinear", align_corners=False)
+                    if (h_x, w_x) != (aff_side, aff_side)
+                    else x.float()
+                )
+                x_flat = x_g.permute(0, 2, 3, 1).reshape(b, n_aff, c)
+                x_prop = torch.bmm(affinity_P.float(), x_flat).reshape(b, aff_side, aff_side, c).permute(0, 3, 1, 2)
+                if (h_x, w_x) != (aff_side, aff_side):
+                    x_prop = F.interpolate(x_prop, size=(h_x, w_x), mode="bilinear", align_corners=False)
+                x = x + self.aff_proj(self.aff_norm(x_prop.to(dtype=x.dtype)))
+            else:
+                x = x + self.aff_proj(self.aff_norm(x)) * 0.0
+        elif self.use_affinity_prop and self.aff_proj is not None:
+            x = x + self.aff_proj(self.aff_norm(x)) * 0.0
+
         for stage in self.upsample_stages:
             x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
             x = stage(x)
@@ -1399,6 +1714,38 @@ class FOCAL(nn.Module):
         cluster_residual_scale_gain: float = 0.5,
         multi_branch_logit_fusion: bool = False,
         contrastive_boundary_ratio: float = 0.0,
+        # FOCAL v3 upgrades (multi-tap pre-neck ViT, flip-equivariant k-means, polarity & gated refiner)
+        vit_feature_taps: Optional[Sequence[int]] = None,
+        vit_tap_fusion_mode: str = "dual_logit",
+        vit_tap_cluster_size: Optional[int] = 48,
+        learnable_tap_weights: bool = False,
+        feature_centering_alpha: float = 0.0,
+        cluster_polarity_mode: str = "minority",
+        polarity_border_weight: float = 0.75,
+        polarity_area_gate: float = 0.25,
+        polarity_margin_scale: float = 5.0,
+        polarity_loss_weight: float = 0.0,
+        refiner_sep_gate_tau: float = 0.0,
+        refiner_zero_mean_bias_weight: float = 0.0,
+        refiner_ortho_weight: float = 0.0,
+        # FOCAL v4 upgrades (HRNet AdaBN-Mix, graph diffusion, Otsu calibration, pre-neck projector & manifold refiner)
+        hrnet_adabn_lambda: float = 0.0,
+        hrnet_adabn_stages: Sequence[str] = ("stage4",),
+        hrnet_adabn_shift_floor: float = 0.0,
+        hrnet_adabn_shift_scale: float = 0.35,
+        affinity_diff_beta: float = 0.0,
+        affinity_diff_tau: float = 0.08,
+        affinity_diff_steps: int = 2,
+        feat_smooth_gamma: float = 0.0,
+        otsu_cal_alpha: float = 0.0,
+        use_preneck_projector: bool = False,
+        preneck_proj_dim: int = 256,
+        preneck_ortho_weight: float = 0.1,
+        preneck_contrastive_weight: float = 0.5,
+        refiner_use_affinity_prop: bool = False,
+        refiner_use_srm_desc: bool = False,
+        refiner_use_border_knn_desc: bool = False,
+        adapter_ortho_weight: float = 0.0,
         **kwargs: Any,
     ):
         super().__init__()
@@ -1415,9 +1762,10 @@ class FOCAL(nn.Module):
         )
         self.tta_hflip = bool(tta_hflip)
         self.clustering_mode = str(clustering_mode).lower().strip()
-        if self.clustering_mode not in ("kmeans", "soft_kmeans"):
+        if self.clustering_mode not in ("kmeans", "kmeans_robust", "soft_kmeans"):
             raise ValueError(
-                f"Unsupported clustering_mode '{clustering_mode}'. Supported: 'kmeans', 'soft_kmeans'."
+                f"Unsupported clustering_mode '{clustering_mode}'. "
+                "Supported: 'kmeans', 'kmeans_robust', 'soft_kmeans'."
             )
         self.cluster_separability_threshold = max(0.0, float(cluster_separability_threshold))
         self.aux_pristine_gate = bool(aux_pristine_gate)
@@ -1475,9 +1823,10 @@ class FOCAL(nn.Module):
         self.cluster_refiner_l2_weight = max(0.0, float(cluster_refiner_l2_weight))
         self.detach_refiner_feats = bool(detach_refiner_feats)
         self.feature_adapter_type = str(feature_adapter_type).lower().strip()
-        if self.feature_adapter_type not in ("mlp", "spatial"):
+        if self.feature_adapter_type not in ("mlp", "spatial", "branch_balanced"):
             raise ValueError(
-                f"Unsupported feature_adapter_type '{feature_adapter_type}'. Supported: 'mlp', 'spatial'."
+                f"Unsupported feature_adapter_type '{feature_adapter_type}'. "
+                "Supported: 'mlp', 'spatial', 'branch_balanced'."
             )
         self.cluster_refiner_type = str(cluster_refiner_type).lower().strip()
         if self.cluster_refiner_type not in ("legacy", "image_relative"):
@@ -1485,6 +1834,62 @@ class FOCAL(nn.Module):
                 f"Unsupported cluster_refiner_type '{cluster_refiner_type}'. Supported: 'legacy', 'image_relative'."
             )
         self.multi_branch_logit_fusion = bool(multi_branch_logit_fusion)
+
+        # FOCAL v3 multi-tap, polarity disambiguation, and gated refiner configuration
+        self.vit_feature_taps: List[int] = (
+            [int(t) for t in vit_feature_taps]
+            if vit_feature_taps not in (None, "", "none", "null")
+            else []
+        )
+        self.vit_tap_fusion_mode = str(vit_tap_fusion_mode).lower().strip()
+        if self.vit_tap_fusion_mode not in ("dual_logit", "logit"):
+            raise ValueError(
+                f"Unsupported vit_tap_fusion_mode '{vit_tap_fusion_mode}'. Supported: 'dual_logit', 'logit'."
+            )
+        self.vit_tap_cluster_size: Optional[int] = (
+            int(vit_tap_cluster_size)
+            if vit_tap_cluster_size not in (None, "", "none", "null", 0)
+            else None
+        )
+        self.learnable_tap_weights = bool(learnable_tap_weights)
+        self.feature_centering_alpha = max(0.0, min(1.0, float(feature_centering_alpha)))
+        self.cluster_polarity_mode = str(cluster_polarity_mode).lower().strip()
+        if self.cluster_polarity_mode not in ("minority", "border_aware", "learned"):
+            raise ValueError(
+                f"Unsupported cluster_polarity_mode '{cluster_polarity_mode}'. "
+                "Supported: 'minority', 'border_aware', 'learned'."
+            )
+        self.polarity_border_weight = float(polarity_border_weight)
+        self.polarity_area_gate = max(0.0, min(0.5, float(polarity_area_gate)))
+        self.polarity_margin_scale = float(polarity_margin_scale)
+        self.polarity_loss_weight = max(0.0, float(polarity_loss_weight))
+        self.refiner_sep_gate_tau = max(0.0, float(refiner_sep_gate_tau))
+        self.refiner_zero_mean_bias_weight = max(0.0, float(refiner_zero_mean_bias_weight))
+        self.refiner_ortho_weight = max(0.0, float(refiner_ortho_weight))
+
+        # FOCAL v4 configuration
+        self.hrnet_adabn_lambda = max(0.0, min(1.0, float(hrnet_adabn_lambda)))
+        self.hrnet_adabn_shift_floor = max(0.0, float(hrnet_adabn_shift_floor))
+        self.hrnet_adabn_shift_scale = max(1e-4, float(hrnet_adabn_shift_scale))
+        if isinstance(hrnet_adabn_stages, str):
+            self.hrnet_adabn_stages: Tuple[str, ...] = tuple(
+                s.strip() for s in hrnet_adabn_stages.split(",") if s.strip()
+            ) or ("stage4",)
+        else:
+            self.hrnet_adabn_stages = tuple(str(s).strip() for s in hrnet_adabn_stages if str(s).strip()) or ("stage4",)
+        self.affinity_diff_beta = max(0.0, min(1.0, float(affinity_diff_beta)))
+        self.affinity_diff_tau = max(1e-3, float(affinity_diff_tau))
+        self.affinity_diff_steps = max(1, int(affinity_diff_steps))
+        self.feat_smooth_gamma = max(0.0, min(1.0, float(feat_smooth_gamma)))
+        self.otsu_cal_alpha = max(0.0, min(2.0, float(otsu_cal_alpha)))
+        self.use_preneck_projector = bool(use_preneck_projector)
+        self.preneck_proj_dim = max(32, int(preneck_proj_dim))
+        self.preneck_ortho_weight = max(0.0, float(preneck_ortho_weight))
+        self.preneck_contrastive_weight = max(0.0, float(preneck_contrastive_weight))
+        self.refiner_use_affinity_prop = bool(refiner_use_affinity_prop)
+        self.refiner_use_srm_desc = bool(refiner_use_srm_desc)
+        self.refiner_use_border_knn_desc = bool(refiner_use_border_knn_desc)
+        self.adapter_ortho_weight = max(0.0, float(adapter_ortho_weight))
 
         # Strategy B configuration
         if "use_peft" in kwargs and not peft_enabled:
@@ -1613,10 +2018,15 @@ class FOCAL(nn.Module):
             else None
         )
 
-        # Optional zero-initialized residual forensic adapter (Strategy B / SpatialCrossScaleAdapter)
+        # Optional zero-initialized residual forensic adapter (Strategy B / SpatialCrossScaleAdapter / BranchBalanced)
         if self.use_feature_adapter:
-            if self.feature_adapter_type == "spatial":
-                self.feature_adapter: Optional[nn.Module] = SpatialCrossScaleAdapter(channels=in_dim)
+            if self.feature_adapter_type == "branch_balanced" and self.secondary_net is not None and self.fusion_mode == "concat":
+                self.feature_adapter: Optional[nn.Module] = BranchBalancedSpatialAdapter(
+                    primary_dim=primary_in_dim,
+                    secondary_dim=secondary_in_dim,
+                )
+            elif self.feature_adapter_type in ("spatial", "branch_balanced"):
+                self.feature_adapter = SpatialCrossScaleAdapter(channels=in_dim)
             else:
                 self.feature_adapter = FeatureAdapter(channels=in_dim)
         else:
@@ -1629,6 +2039,9 @@ class FOCAL(nn.Module):
                     num_upsample_stages=num_upsample_stages,
                     mid_dim=self.cluster_refiner_dim,
                     multi_branch=(self.secondary_net is not None),
+                    use_affinity_prop=self.refiner_use_affinity_prop,
+                    use_srm_desc=self.refiner_use_srm_desc,
+                    use_border_knn_desc=self.refiner_use_border_knn_desc,
                 )
             else:
                 self.cluster_refiner = ClusterResidualRefiner(
@@ -1644,6 +2057,41 @@ class FOCAL(nn.Module):
             if (self.finetune_mode == "hybrid" and self.multi_branch_logit_fusion and self.secondary_net is not None)
             else None
         )
+
+        # Optional Orthogonal Zero-Bias Pre-Neck ViT Subspace Projector (FOCAL v4)
+        vit_embed_dim = 1024
+        if self._canonical_backbone_kind(self.backbone_name) == "vit":
+            vit_embed_dim = int(self.net.image_encoder.patch_embed.proj.out_channels)
+        if self.use_preneck_projector and self.vit_feature_taps and self._canonical_backbone_kind(self.backbone_name) == "vit":
+            self.preneck_projector: Optional[PreNeckForensicProjector] = PreNeckForensicProjector(
+                in_dim=vit_embed_dim * len(self.vit_feature_taps),
+                proj_dim=self.preneck_proj_dim,
+            )
+            if self.finetune_mode != "hybrid":
+                for p in self.preneck_projector.parameters():
+                    p.requires_grad_(False)
+        else:
+            self.preneck_projector = None
+
+        # Optional learnable multi-tap logit blend & learned cluster polarity head (FOCAL v3/v4)
+        if self.learnable_tap_weights and self.vit_feature_taps and self._canonical_backbone_kind(self.backbone_name) == "vit":
+            n_taps = 2 if self.vit_tap_fusion_mode == "dual_logit" else (1 + len(self.vit_feature_taps))
+            if self.preneck_projector is not None:
+                n_taps += 1
+            init_tw = torch.zeros(n_taps)
+            if self.preneck_projector is not None:
+                # Start preneck projector softly gated so step-0 preserves zero-shot v4 floor
+                init_tw[-1] = -2.0
+            self.tap_logit_weights: Optional[nn.Parameter] = nn.Parameter(init_tw)
+        else:
+            self.tap_logit_weights = None
+
+        self.polarity_head: Optional[ClusterPolarityHead] = (
+            ClusterPolarityHead(hidden_dim=32) if self.cluster_polarity_mode == "learned" else None
+        )
+        if self.polarity_head is not None and self.finetune_mode != "hybrid":
+            for p in self.polarity_head.parameters():
+                p.requires_grad_(False)
 
         # Freeze unused legacy conv heads so DDP never complains about unused parameters
         if (
@@ -2466,6 +2914,12 @@ class FOCAL(nn.Module):
             exempt_prefixes.append("cluster_refiner.")
         if self.branch_logit_weights is not None:
             exempt_prefixes.append("branch_logit_weights")
+        if self.tap_logit_weights is not None:
+            exempt_prefixes.append("tap_logit_weights")
+        if self.preneck_projector is not None:
+            exempt_prefixes.append("preneck_projector.")
+        if self.polarity_head is not None:
+            exempt_prefixes.append("polarity_head.")
         if self.domain_split_mode:
             exempt_prefixes.extend(["domain_prototypes", "domain_fc."])
         if self.secondary_net is not None:
@@ -2561,6 +3015,63 @@ class FOCAL(nn.Module):
                 )
         return x
 
+    def _forward_hrnet_maybe_adabn(self, hrnet_net: nn.Module, x_in: torch.Tensor) -> torch.Tensor:
+        """
+        Run HRNet with optional per-image dead-channel-guarded AdaBN-Mix (`hrnet_adabn_lambda > 0`).
+        When `hrnet_adabn_shift_floor > 0`, blending is gated smoothly per image by mean active
+        log-variance shift from running stats so low-shift domains keep clean stats while shifted
+        OOD domains receive up to `hrnet_adabn_lambda` recalibration.
+        Strictly non-destructive to running_mean/running_var buffers and independent per image.
+        """
+        lam = self.hrnet_adabn_lambda
+        if lam <= 0.0:
+            return hrnet_net(x_in)
+
+        shift_floor = self.hrnet_adabn_shift_floor
+        shift_scale = self.hrnet_adabn_shift_scale
+        stages = self.hrnet_adabn_stages
+        hooks = []
+
+        def _make_adabn_hook(blend_lam: float, floor: float, scale: float):
+            def _hook(mod: nn.BatchNorm2d, inp: Tuple[torch.Tensor, ...], out: torch.Tensor) -> torch.Tensor:
+                x = inp[0]
+                if x.ndim != 4 or mod.running_mean is None or mod.running_var is None:
+                    return out
+                rm = mod.running_mean.float()
+                rv = mod.running_var.float()
+                active = rv > 1e-5
+                if not active.any():
+                    return out
+                xf = x.float()
+                img_mean = xf.mean(dim=(2, 3), keepdim=True)
+                img_var = xf.var(dim=(2, 3), keepdim=True, unbiased=False)
+                rm_v = rm.view(1, -1, 1, 1)
+                rv_v = rv.view(1, -1, 1, 1)
+                act_v = active.view(1, -1, 1, 1)
+                if floor > 0.0:
+                    img_shift = (
+                        torch.log((img_var + mod.eps) / (rv_v + mod.eps)).abs() * act_v
+                    ).sum(dim=1, keepdim=True) / act_v.sum(dim=1, keepdim=True).clamp(min=1.0)
+                    eff_lam = blend_lam * ((img_shift - floor) / scale).clamp(0.0, 1.0)
+                else:
+                    eff_lam = blend_lam
+                mix_mean = torch.where(act_v, (1.0 - eff_lam) * rm_v + eff_lam * img_mean, rm_v)
+                mix_var = torch.where(act_v, (1.0 - eff_lam) * rv_v + eff_lam * img_var, rv_v)
+                w = mod.weight.float().view(1, -1, 1, 1) if mod.weight is not None else 1.0
+                b = mod.bias.float().view(1, -1, 1, 1) if mod.bias is not None else 0.0
+                normed = (xf - mix_mean) / torch.sqrt(mix_var + mod.eps)
+                return (normed * w + b).to(dtype=out.dtype)
+            return _hook
+
+        for mod_name, mod in hrnet_net.named_modules():
+            if isinstance(mod, nn.BatchNorm2d) and any(mod_name.startswith(st) for st in stages):
+                hooks.append(mod.register_forward_hook(_make_adabn_hook(lam, shift_floor, shift_scale)))
+        try:
+            return hrnet_net(x_in)
+        finally:
+            for h in hooks:
+                h.remove()
+
     def _extract_secondary_features(self, x_raw: torch.Tensor) -> torch.Tensor:
         """Extract features from the optional secondary backbone."""
         assert self.secondary_net is not None
@@ -2575,24 +3086,48 @@ class FOCAL(nn.Module):
                 )
         if not self.secondary_trainable and not any(p.requires_grad for p in self.secondary_net.parameters()):
             with torch.no_grad():
+                if self.secondary_kind == "hrnet":
+                    return self._forward_hrnet_maybe_adabn(self.secondary_net, x_sec)
                 return self.secondary_net(x_sec)
+        if self.secondary_kind == "hrnet":
+            return self._forward_hrnet_maybe_adabn(self.secondary_net, x_sec)
         return self.secondary_net(x_sec)
 
-    def _extract_all_branch_features_single(
+    def _extract_all_branch_features_with_taps_single(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Run primary (and optional secondary + fusion) backbones and optional FeatureAdapter."""
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Dict[int, torch.Tensor],
+    ]:
+        """Run primary (with optional ViT taps), optional secondary, fusion, and FeatureAdapter."""
         x_raw = self._ensure_raw_rgb(x)
         x_in = self._prepare_backbone_input(x_raw)
 
+        vit_taps: Dict[int, torch.Tensor] = {}
+        use_taps = bool(self.vit_feature_taps) and self._canonical_backbone_kind(self.backbone_name) == "vit"
+        is_primary_hrnet = self._canonical_backbone_kind(self.backbone_name) == "hrnet"
         primary_frozen = self.freeze_primary_backbone and not any(
             p.requires_grad for p in self.net.parameters()
         )
         if primary_frozen:
             with torch.no_grad():
-                f_primary = self.net(x_in)
+                if use_taps:
+                    f_primary, vit_taps = self.net.forward_with_taps(x_in, self.vit_feature_taps)
+                elif is_primary_hrnet:
+                    f_primary = self._forward_hrnet_maybe_adabn(self.net, x_in)
+                else:
+                    f_primary = self.net(x_in)
         else:
-            f_primary = self.net(x_in)
+            if use_taps:
+                f_primary, vit_taps = self.net.forward_with_taps(x_in, self.vit_feature_taps)
+            elif is_primary_hrnet:
+                f_primary = self._forward_hrnet_maybe_adabn(self.net, x_in)
+            else:
+                f_primary = self.net(x_in)
 
         f_secondary: Optional[torch.Tensor] = None
         if self.secondary_net is not None and self.fusion_module is not None:
@@ -2617,15 +3152,24 @@ class FOCAL(nn.Module):
             feats_backbone = f_primary
 
         feats = self.feature_adapter(feats_backbone) if self.feature_adapter is not None else feats_backbone
-        return x_in, f_primary, f_secondary, feats_backbone, feats
+        return x_in, f_primary, f_secondary, feats_backbone, feats, vit_taps
 
-    def _extract_all_branch_features(
+    def _extract_all_branch_features_with_taps(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Extract branch and fused features, applying horizontal-flip eval TTA when enabled."""
-        x_in, f_p, f_s, feats_bb, feats = self._extract_all_branch_features_single(x)
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Dict[int, torch.Tensor],
+    ]:
+        """Extract branch, fused, and ViT tap features with optional horizontal-flip eval TTA."""
+        x_in, f_p, f_s, feats_bb, feats, vit_taps = self._extract_all_branch_features_with_taps_single(x)
         if not self.training and self.tta_hflip:
-            _, f_p2, f_s2, feats_bb2, feats2 = self._extract_all_branch_features_single(torch.flip(x, dims=[-1]))
+            _, f_p2, f_s2, feats_bb2, feats2, vit_taps2 = self._extract_all_branch_features_with_taps_single(
+                torch.flip(x, dims=[-1])
+            )
 
             def _avg_l2(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
                 if a is None or b is None:
@@ -2639,6 +3183,23 @@ class FOCAL(nn.Module):
             f_s = _avg_l2(f_s, f_s2)
             feats_bb = _avg_l2(feats_bb, feats_bb2)  # type: ignore[assignment]
             feats = _avg_l2(feats, feats2)  # type: ignore[assignment]
+            for k in list(vit_taps.keys()):
+                if k in vit_taps2:
+                    vit_taps[k] = _avg_l2(vit_taps[k], vit_taps2[k])  # type: ignore[assignment]
+        return x_in, f_p, f_s, feats_bb, feats, vit_taps
+
+    def _extract_all_branch_features_single(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Run primary (and optional secondary + fusion) backbones and optional FeatureAdapter."""
+        x_in, f_p, f_s, feats_bb, feats, _ = self._extract_all_branch_features_with_taps_single(x)
+        return x_in, f_p, f_s, feats_bb, feats
+
+    def _extract_all_branch_features(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Extract branch and fused features, applying horizontal-flip eval TTA when enabled."""
+        x_in, f_p, f_s, feats_bb, feats, _ = self._extract_all_branch_features_with_taps(x)
         return x_in, f_p, f_s, feats_bb, feats
 
     def _extract_primary_and_fused_features(
@@ -2811,9 +3372,19 @@ class FOCAL(nn.Module):
                     feats_base = F.interpolate(
                         feats_base, size=feats.shape[2:], mode="bilinear", align_corners=False
                     )
-                f_ad = F.normalize(feats.float(), p=2, dim=1)
-                f_ba = F.normalize(feats_base.detach().float(), p=2, dim=1)
-                raw_cos_loss = (1.0 - (f_ad * f_ba).sum(dim=1)).mean()
+                if isinstance(self.feature_adapter, BranchBalancedSpatialAdapter):
+                    p_dim = self.feature_adapter.primary_dim
+                    f_p_ad = F.normalize(feats[:, :p_dim].float(), p=2, dim=1)
+                    f_p_ba = F.normalize(feats_base[:, :p_dim].detach().float(), p=2, dim=1)
+                    f_s_ad = F.normalize(feats[:, p_dim:].float(), p=2, dim=1)
+                    f_s_ba = F.normalize(feats_base[:, p_dim:].detach().float(), p=2, dim=1)
+                    drift_p = (1.0 - (f_p_ad * f_p_ba).sum(dim=1)).mean()
+                    drift_s = (1.0 - (f_s_ad * f_s_ba).sum(dim=1)).mean()
+                    raw_cos_loss = 0.5 * (drift_p + drift_s)
+                else:
+                    f_ad = F.normalize(feats.float(), p=2, dim=1)
+                    f_ba = F.normalize(feats_base.detach().float(), p=2, dim=1)
+                    raw_cos_loss = (1.0 - (f_ad * f_ba).sum(dim=1)).mean()
                 weighted_penalty = self.prior_anchor_weight * raw_cos_loss
 
         if self.neck_l2_anchor_weight > 0.0 and self._neck_init_params:
@@ -2854,6 +3425,41 @@ class FOCAL(nn.Module):
                 weighted_ref = self.cluster_refiner_l2_weight * ref_l2
                 weighted_penalty = weighted_ref if weighted_penalty is None else (weighted_penalty + weighted_ref)
 
+        if self.refiner_ortho_weight > 0.0 and isinstance(self.cluster_refiner, ImageRelativeClusterRefiner):
+            w_out = self.cluster_refiner.out_conv.weight.float().view(2, -1)
+            n0 = w_out[0].norm()
+            n1 = w_out[1].norm()
+            if float(n0.item()) > 1e-6 and float(n1.item()) > 1e-6:
+                cos_01 = F.cosine_similarity(w_out[0], w_out[1], dim=0)
+                ortho_pen = self.refiner_ortho_weight * cos_01.pow(2)
+            else:
+                ortho_pen = w_out.sum() * 0.0
+            weighted_penalty = ortho_pen if weighted_penalty is None else (weighted_penalty + ortho_pen)
+
+        if self.adapter_ortho_weight > 0.0 and isinstance(self.feature_adapter, BranchBalancedSpatialAdapter):
+            w_sec = self.feature_adapter.secondary_adapter.proj_out.weight.float()
+            c_sec = w_sec.shape[0]
+            w_flat = w_sec.view(c_sec, -1)
+            norms = w_flat.norm(dim=1, keepdim=True)
+            if float(norms.max().item()) > 1e-6:
+                w_norm = w_flat / norms.clamp(min=1e-6)
+                gram = torch.matmul(w_norm, w_norm.t())
+                off_diag = gram - torch.eye(c_sec, device=gram.device, dtype=gram.dtype)
+                ad_ortho = self.adapter_ortho_weight * off_diag.pow(2).mean()
+            else:
+                ad_ortho = w_sec.sum() * 0.0
+            weighted_penalty = ad_ortho if weighted_penalty is None else (weighted_penalty + ad_ortho)
+
+        if self.preneck_ortho_weight > 0.0 and self.preneck_projector is not None:
+            w_pn = self.preneck_projector.proj.weight.float()
+            c_pn = w_pn.shape[0]
+            w_pn_flat = w_pn.view(c_pn, -1)
+            w_pn_norm = F.normalize(w_pn_flat, p=2, dim=1)
+            gram_pn = torch.matmul(w_pn_norm, w_pn_norm.t())
+            off_pn = gram_pn - torch.eye(c_pn, device=gram_pn.device, dtype=gram_pn.dtype)
+            pn_ortho = self.preneck_ortho_weight * off_pn.pow(2).mean()
+            weighted_penalty = pn_ortho if weighted_penalty is None else (weighted_penalty + pn_ortho)
+
         return raw_cos_loss, weighted_penalty
 
     def _apply_pristine_gate(
@@ -2868,6 +3474,218 @@ class FOCAL(nn.Module):
         shifted = diff - (max_pos + 2.0)
         return torch.where(pristine_mask.view(-1, 1), shifted, diff)
 
+    def _resolve_cluster_polarity(
+        self,
+        labels: torch.Tensor,
+        f_img: torch.Tensor,
+        centroids: torch.Tensor,
+        c0_count: torch.Tensor,
+        c1_count: torch.Tensor,
+        h_f: int,
+        w_f: int,
+        gt_masks: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Determine which cluster index (`0` vs `1`) represents tampered pixels.
+
+        Returns `(cond, polarity_loss)` where `cond` (`[B, 1]` bool) is True when cluster 0 is tampered.
+        """
+        n_px = h_f * w_f
+        cond_min = c1_count > c0_count
+        if self.cluster_polarity_mode == "minority":
+            return cond_min, None
+
+        b = f_img.shape[0]
+        with torch.no_grad():
+            area0 = c0_count / float(max(1, n_px))
+            area1 = c1_count / float(max(1, n_px))
+            grid = labels.view(b, h_f, w_f)
+            bmask = torch.zeros((h_f, w_f), dtype=torch.bool, device=f_img.device)
+            bmask[0, :] = True
+            bmask[-1, :] = True
+            bmask[:, 0] = True
+            bmask[:, -1] = True
+            b_flat = bmask.view(1, n_px).expand(b, -1)
+            n_border = max(1.0, float(bmask.sum().item()))
+            bf1 = ((labels == 1) & b_flat).float().sum(dim=-1, keepdim=True) / n_border
+            bf0 = 1.0 - bf1
+            z_border = (area1 + self.polarity_border_weight * bf1) - (area0 + self.polarity_border_weight * bf0)
+            z_min = area1 - area0
+            if self.polarity_area_gate > 0.0:
+                min_area = torch.minimum(area0, area1)
+                z_base = torch.where(min_area > self.polarity_area_gate, z_border, z_min)
+            else:
+                z_base = z_border
+
+        if self.cluster_polarity_mode == "border_aware" or self.polarity_head is None:
+            return (z_base > 0.0), None
+
+        with torch.no_grad():
+            g0, g1 = ClusterPolarityHead.extract_cluster_descriptors(labels, f_img, centroids, h_f, w_f)
+        polarity_logit = self.polarity_head(g0, g1, z_base, margin_scale=self.polarity_margin_scale)
+        cond = polarity_logit.detach() > 0.0
+
+        pol_loss: Optional[torch.Tensor] = None
+        if self.training:
+            # Always keep polarity_head connected to autograd for DDP unused-parameter safety.
+            pol_anchor = polarity_logit.sum() * 0.0
+            if gt_masks is not None:
+                with torch.no_grad():
+                    gt_f = gt_masks.float()
+                    if gt_f.ndim == 3:
+                        gt_f = gt_f.unsqueeze(1)
+                    if gt_f.shape[2:] != (h_f, w_f):
+                        gt_f = F.interpolate(gt_f, size=(h_f, w_f), mode="area")
+                    gt_bin = (gt_f[:, 0].reshape(b, n_px) >= 0.5).float()
+                    m0 = (labels == 0).float()
+                    m1 = (labels == 1).float()
+                    iou0 = (m0 * gt_bin).sum(dim=1) / ((m0 + gt_bin - m0 * gt_bin).sum(dim=1) + 1e-6)
+                    iou1 = (m1 * gt_bin).sum(dim=1) / ((m1 + gt_bin - m1 * gt_bin).sum(dim=1) + 1e-6)
+                    valid = (gt_bin.sum(dim=1) > 0.0) & ((iou0 - iou1).abs() > 0.02)
+                    y_pol = (iou0 > iou1).float()
+                if valid.any():
+                    pol_loss = F.binary_cross_entropy_with_logits(
+                        polarity_logit.squeeze(-1)[valid], y_pol[valid]
+                    ) + pol_anchor
+                else:
+                    pol_loss = pol_anchor
+            else:
+                pol_loss = pol_anchor
+
+        return cond, pol_loss
+
+    def _cluster_features_with_polarity(
+        self,
+        feats: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+        aux_pristine_flags: Optional[torch.Tensor] = None,
+        gt_masks: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        On-the-fly unsupervised clustering (`"kmeans"`, `"kmeans_robust"`, or `"soft_kmeans"`)
+        with configurable cluster polarity resolution and optional supervised polarity loss.
+        """
+        b, c, h_f, w_f = feats.shape
+        n_px = h_f * w_f
+        with torch.no_grad():
+            feats_norm = F.normalize(feats.float(), p=2, dim=1)
+            if self.feature_centering_alpha > 0.0:
+                mu_f = feats_norm.mean(dim=(2, 3), keepdim=True)
+                feats_norm = F.normalize(feats_norm - self.feature_centering_alpha * mu_f, p=2, dim=1)
+            f_img = feats_norm.permute(0, 2, 3, 1).reshape(b, n_px, c)
+
+            if self.clustering_mode == "soft_kmeans":
+                # Global mean anchor + top-2% farthest-point initialization (immune to corner/outlier pixels)
+                c1 = F.normalize(f_img.mean(dim=1, keepdim=True), p=2, dim=-1)
+                dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
+                k_far = max(1, n_px // 50)
+                far_idx = torch.topk(dists1, k=k_far, dim=-1).indices
+                far_vecs = torch.gather(f_img, dim=1, index=far_idx.unsqueeze(-1).expand(-1, -1, c))
+                c2 = F.normalize(far_vecs.mean(dim=1, keepdim=True), p=2, dim=-1)
+                centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
+
+                for step in range(10):
+                    em_temp = 0.15 if step < 5 else 0.08
+                    sims = torch.bmm(f_img, centroids.transpose(1, 2))
+                    probs = torch.softmax(sims / em_temp, dim=-1)
+                    w0 = probs[:, :, 0:1]
+                    w1 = probs[:, :, 1:2]
+                    mass0 = w0.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                    mass1 = w1.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                    new_c0 = F.normalize(torch.bmm(w0.transpose(1, 2), f_img) / mass0, p=2, dim=-1)
+                    new_c1 = F.normalize(torch.bmm(w1.transpose(1, 2), f_img) / mass1, p=2, dim=-1)
+                    centroids = torch.cat([new_c0, new_c1], dim=1)
+
+                sims = torch.bmm(f_img, centroids.transpose(1, 2))
+                probs = torch.softmax(sims / 0.08, dim=-1)
+                labels = torch.argmax(probs, dim=-1)
+                c0_count = probs[:, :, 0].sum(dim=-1, keepdim=True)
+                c1_count = probs[:, :, 1].sum(dim=-1, keepdim=True)
+            else:
+                if self.clustering_mode == "kmeans_robust":
+                    # Flip/rotation-equivariant global mean + top-2% farthest-point initialization
+                    c_mean = F.normalize(f_img.mean(dim=1, keepdim=True), p=2, dim=-1)
+                    k_far = max(1, n_px // 50)
+                    dists1 = 1.0 - torch.bmm(f_img, c_mean.transpose(1, 2)).squeeze(-1)
+                    far1 = torch.topk(dists1, k=k_far, dim=-1).indices
+                    c2 = F.normalize(
+                        torch.gather(f_img, 1, far1.unsqueeze(-1).expand(-1, -1, c)).mean(dim=1, keepdim=True),
+                        p=2,
+                        dim=-1,
+                    )
+                    dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
+                    far2 = torch.topk(dists2, k=k_far, dim=-1).indices
+                    c1 = F.normalize(
+                        torch.gather(f_img, 1, far2.unsqueeze(-1).expand(-1, -1, c)).mean(dim=1, keepdim=True),
+                        p=2,
+                        dim=-1,
+                    )
+                else:
+                    # Legacy double farthest-point initialization (k-means++ style)
+                    c1 = f_img[:, 0:1, :]
+                    dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
+                    idx_max1 = torch.argmax(dists1, dim=-1, keepdim=True)
+                    c2 = torch.gather(f_img, dim=1, index=idx_max1.unsqueeze(-1).expand(-1, 1, c))
+
+                    dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
+                    idx_max2 = torch.argmax(dists2, dim=-1, keepdim=True)
+                    c1 = torch.gather(f_img, dim=1, index=idx_max2.unsqueeze(-1).expand(-1, 1, c))
+
+                centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
+
+                for _ in range(8):
+                    sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
+                    assign = torch.argmax(sims, dim=-1)  # [B, N]
+                    w0 = (assign == 0).unsqueeze(-1).to(f_img.dtype)
+                    w1 = (assign == 1).unsqueeze(-1).to(f_img.dtype)
+                    count0 = w0.sum(dim=1, keepdim=True)
+                    count1 = w1.sum(dim=1, keepdim=True)
+                    sum0 = torch.bmm(w0.transpose(1, 2), f_img)
+                    sum1 = torch.bmm(w1.transpose(1, 2), f_img)
+                    new_c0 = torch.where(count0 > 0, sum0 / count0.clamp(min=1.0), centroids[:, 0:1, :])
+                    new_c0 = F.normalize(new_c0, p=2, dim=-1)
+                    new_c1 = torch.where(count1 > 0, sum1 / count1.clamp(min=1.0), centroids[:, 1:2, :])
+                    new_c1 = F.normalize(new_c1, p=2, dim=-1)
+                    centroids = torch.cat([new_c0, new_c1], dim=1)
+
+                sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
+                labels = torch.argmax(sims, dim=-1)  # [B, N]
+                c1_count = labels.sum(dim=-1, keepdim=True).to(f_img.dtype)  # [B, 1]
+                c0_count = float(n_px) - c1_count  # [B, 1]
+
+            cos_sim = (centroids[:, 0] * centroids[:, 1]).sum(dim=-1)  # [B]
+            separability = (1.0 - cos_sim).clamp(min=0.0)
+
+        cond, pol_loss = self._resolve_cluster_polarity(
+            labels=labels,
+            f_img=f_img,
+            centroids=centroids,
+            c0_count=c0_count,
+            c1_count=c1_count,
+            h_f=h_f,
+            w_f=w_f,
+            gt_masks=gt_masks,
+        )
+
+        with torch.no_grad():
+            sim_tampered = torch.where(cond, sims[:, :, 0], sims[:, :, 1])  # [B, N]
+            sim_pristine = torch.where(cond, sims[:, :, 1], sims[:, :, 0])  # [B, N]
+            tampered_ratio = (torch.where(cond, c0_count, c1_count).squeeze(-1) / float(max(1, n_px))).clamp(0.0, 1.0)
+
+            diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [B, N]
+
+            pristine_mask = separability < self.cluster_separability_threshold
+            if aux_pristine_flags is not None:
+                pristine_mask = pristine_mask | aux_pristine_flags.to(device=separability.device, dtype=torch.bool)
+            diff = self._apply_pristine_gate(diff, pristine_mask)
+
+            logit_grid = diff.view(b, 1, h_f, w_f)
+            logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+            prob_full = torch.sigmoid(logit_full)
+
+        return logit_full, prob_full, separability, tampered_ratio, pol_loss
+
     def _cluster_features_with_full_stats(
         self,
         feats: torch.Tensor,
@@ -2876,95 +3694,222 @@ class FOCAL(nn.Module):
         aux_pristine_flags: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        On-the-fly unsupervised clustering mask and logit prediction (`"kmeans"` or `"soft_kmeans"`).
+        On-the-fly unsupervised clustering mask and logit prediction.
         Returns `(logit_full, prob_full, cluster_separability, minority_ratio)`.
         """
+        logit_full, prob_full, separability, tampered_ratio, _ = self._cluster_features_with_polarity(
+            feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=None
+        )
+        return logit_full, prob_full, separability, tampered_ratio
+
+    @staticmethod
+    @torch.no_grad()
+    def _build_affinity_matrix(feats: torch.Tensor, tau: float = 0.08, grid_size: Optional[int] = 48) -> torch.Tensor:
+        """Build per-image row-stochastic forensic affinity matrix `P` (`[B, N, N]`) at compact grid size."""
+        f_cur = feats.float()
+        if grid_size is not None and f_cur.shape[2:] != (grid_size, grid_size):
+            f_cur = F.interpolate(f_cur, size=(grid_size, grid_size), mode="bilinear", align_corners=False)
+        b, c, h_g, w_g = f_cur.shape
+        f_img = F.normalize(f_cur, p=2, dim=1).permute(0, 2, 3, 1).reshape(b, h_g * w_g, c)
+        sim = torch.bmm(f_img, f_img.transpose(1, 2))
+        w_aff = torch.exp(((sim - 1.0) / max(1e-3, float(tau))).clamp(min=-40.0, max=0.0))
+        return w_aff / w_aff.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    @staticmethod
+    @torch.no_grad()
+    def _smooth_features_on_graph(feats: torch.Tensor, affinity_P: torch.Tensor, gamma: float) -> torch.Tensor:
+        """Apply one-step spherical manifold feature smoothing `(1-g)*F + g*(P@F)` at `affinity_P`'s grid."""
         b, c, h_f, w_f = feats.shape
-        n_px = h_f * w_f
-        feats_norm = F.normalize(feats.float(), p=2, dim=1)
-        f_img = feats_norm.permute(0, 2, 3, 1).reshape(b, n_px, c)
+        n_aff = affinity_P.shape[1]
+        side = int(round(math.sqrt(n_aff)))
+        f_cur = feats.float()
+        if (h_f, w_f) != (side, side):
+            f_cur = F.interpolate(f_cur, size=(side, side), mode="bilinear", align_corners=False)
+        f_flat = F.normalize(f_cur, p=2, dim=1).permute(0, 2, 3, 1).reshape(b, n_aff, c)
+        f_smooth = F.normalize((1.0 - gamma) * f_flat + gamma * torch.bmm(affinity_P, f_flat), p=2, dim=-1)
+        out = f_smooth.reshape(b, side, side, c).permute(0, 3, 1, 2)
+        if (h_f, w_f) != (side, side):
+            out = F.interpolate(out, size=(h_f, w_f), mode="bilinear", align_corners=False)
+        return out.to(dtype=feats.dtype)
 
-        if self.clustering_mode == "soft_kmeans":
-            # Global mean anchor + top-2% farthest-point initialization (immune to corner/outlier pixels)
-            c1 = F.normalize(f_img.mean(dim=1, keepdim=True), p=2, dim=-1)
-            dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
-            k_far = max(1, n_px // 50)
-            far_idx = torch.topk(dists1, k=k_far, dim=-1).indices
-            far_vecs = torch.gather(f_img, dim=1, index=far_idx.unsqueeze(-1).expand(-1, -1, c))
-            c2 = F.normalize(far_vecs.mean(dim=1, keepdim=True), p=2, dim=-1)
-            centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
+    @staticmethod
+    def _diffuse_logits_on_graph(
+        logits_full: torch.Tensor,
+        affinity_P: torch.Tensor,
+        beta: float,
+        steps: int = 2,
+    ) -> torch.Tensor:
+        """Apply differentiable Markov affinity diffusion over detached `affinity_P` and upsample back."""
+        b, _, orig_h, orig_w = logits_full.shape
+        n_aff = affinity_P.shape[1]
+        side = int(round(math.sqrt(n_aff)))
+        aff_det = affinity_P.detach().float()
+        l0 = F.interpolate(logits_full.float(), size=(side, side), mode="bilinear", align_corners=False).reshape(b, n_aff, 1)
+        l_cur = l0
+        for _ in range(max(1, int(steps))):
+            l_cur = (1.0 - beta) * l0 + beta * torch.bmm(aff_det, l_cur)
+        l_grid = l_cur.reshape(b, 1, side, side)
+        return F.interpolate(l_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False).to(dtype=logits_full.dtype)
 
-            for step in range(10):
-                em_temp = 0.15 if step < 5 else 0.08
-                sims = torch.bmm(f_img, centroids.transpose(1, 2))
-                probs = torch.softmax(sims / em_temp, dim=-1)
-                w0 = probs[:, :, 0:1]
-                w1 = probs[:, :, 1:2]
-                mass0 = w0.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                mass1 = w1.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                new_c0 = F.normalize(torch.bmm(w0.transpose(1, 2), f_img) / mass0, p=2, dim=-1)
-                new_c1 = F.normalize(torch.bmm(w1.transpose(1, 2), f_img) / mass1, p=2, dim=-1)
-                centroids = torch.cat([new_c0, new_c1], dim=1)
+    @staticmethod
+    def _apply_otsu_calibration(logits: torch.Tensor, alpha: float, n_bins: int = 64) -> torch.Tensor:
+        """Recenter logits per image toward the detached 1D Otsu valley threshold `t_otsu`."""
+        if alpha <= 0.0:
+            return logits
+        b = logits.shape[0]
+        with torch.no_grad():
+            probs = torch.sigmoid(logits.float())
+            p_flat = probs.view(b, -1).clamp(1e-4, 1.0 - 1e-4)
+            centers = (torch.arange(n_bins, device=logits.device, dtype=torch.float32) + 0.5) / float(n_bins)
+            idx = torch.clamp((p_flat * n_bins).long(), 0, n_bins - 1)
+            hist = torch.zeros((b, n_bins), device=logits.device, dtype=torch.float32)
+            hist.scatter_add_(1, idx, torch.ones_like(p_flat))
+            w1 = torch.cumsum(hist, dim=1)
+            w2 = hist.sum(dim=1, keepdim=True) - w1
+            m_cum = torch.cumsum(hist * centers.unsqueeze(0), dim=1)
+            m_tot = m_cum[:, -1:]
+            valid = (w1 > 0) & (w2 > 0)
+            mu1 = m_cum / w1.clamp(min=1.0)
+            mu2 = (m_tot - m_cum) / w2.clamp(min=1.0)
+            var_between = torch.where(valid, w1 * w2 * (mu1 - mu2).pow(2), torch.zeros_like(w1))
+            best_bin = torch.argmax(var_between, dim=1)
+            t_ot = centers[best_bin].clamp(0.05, 0.95).view(b, 1, 1, 1)
+            logit_ot = torch.log(t_ot / (1.0 - t_ot))
+        return (logits.float() - float(alpha) * logit_ot.detach()).to(dtype=logits.dtype)
 
-            sims = torch.bmm(f_img, centroids.transpose(1, 2))
-            probs = torch.softmax(sims / 0.08, dim=-1)
-            c0_count = probs[:, :, 0].sum(dim=-1, keepdim=True)
-            c1_count = probs[:, :, 1].sum(dim=-1, keepdim=True)
+    def _build_preneck_tap_tensor(self, vit_taps: Dict[int, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Concatenate L2-normalized pre-neck ViT taps at compact `vit_tap_cluster_size`."""
+        ordered_taps = [vit_taps[k] for k in self.vit_feature_taps if k in vit_taps]
+        if not ordered_taps:
+            return None
+        target_hw = (
+            (self.vit_tap_cluster_size, self.vit_tap_cluster_size)
+            if self.vit_tap_cluster_size is not None
+            else ordered_taps[0].shape[2:]
+        )
+        parts: List[torch.Tensor] = []
+        for t in ordered_taps:
+            t_cur = t
+            if t_cur.shape[2:] != target_hw:
+                t_cur = F.interpolate(t_cur, size=target_hw, mode="bilinear", align_corners=False)
+            parts.append(F.normalize(t_cur.float(), p=2, dim=1))
+        return torch.cat(parts, dim=1)
+
+    def _build_multitap_cluster_tensor(
+        self,
+        f_primary: torch.Tensor,
+        f_secondary: Optional[torch.Tensor],
+        vit_taps: Dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        """Build L2-normalized concatenated multi-tap feature map at compact `vit_tap_cluster_size`."""
+        ordered_taps = [vit_taps[k] for k in self.vit_feature_taps if k in vit_taps]
+        first_ref = ordered_taps[0] if ordered_taps else f_primary
+        if self.vit_tap_cluster_size is not None:
+            target_hw = (self.vit_tap_cluster_size, self.vit_tap_cluster_size)
         else:
-            # Double farthest-point initialization (k-means++ style) across entire batch
-            c1 = f_img[:, 0:1, :]
-            dists1 = 1.0 - torch.bmm(f_img, c1.transpose(1, 2)).squeeze(-1)
-            idx_max1 = torch.argmax(dists1, dim=-1, keepdim=True)
-            c2 = torch.gather(f_img, dim=1, index=idx_max1.unsqueeze(-1).expand(-1, 1, c))
+            target_hw = first_ref.shape[2:]
 
-            dists2 = 1.0 - torch.bmm(f_img, c2.transpose(1, 2)).squeeze(-1)
-            idx_max2 = torch.argmax(dists2, dim=-1, keepdim=True)
-            c1 = torch.gather(f_img, dim=1, index=idx_max2.unsqueeze(-1).expand(-1, 1, c))
+        parts: List[torch.Tensor] = []
+        for t in [f_primary] + ordered_taps + ([f_secondary] if f_secondary is not None else []):
+            t_cur = t
+            if t_cur.shape[2:] != target_hw:
+                t_cur = F.interpolate(t_cur, size=target_hw, mode="bilinear", align_corners=False)
+            parts.append(F.normalize(t_cur.float(), p=2, dim=1))
+        return torch.cat(parts, dim=1)
 
-            centroids = torch.cat([c1, c2], dim=1)  # [B, 2, C]
+    def _fuse_multitap_clustering(
+        self,
+        base_logits: torch.Tensor,
+        base_sep: torch.Tensor,
+        base_area: torch.Tensor,
+        f_primary: torch.Tensor,
+        f_secondary: Optional[torch.Tensor],
+        vit_taps: Dict[int, torch.Tensor],
+        orig_h: int,
+        orig_w: int,
+        aux_pristine_flags: Optional[torch.Tensor] = None,
+        gt_masks: Optional[torch.Tensor] = None,
+        preneck_feats: Optional[torch.Tensor] = None,
+        affinity_P: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Combine base fused-feature cluster logits with pre-neck ViT multi-tap cluster logits."""
+        if not vit_taps:
+            return base_logits, base_sep, base_area, None, affinity_P
 
-            # EM iterations with cosine similarity (vectorized without CPU synchronization)
-            for _ in range(8):
-                sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
-                assign = torch.argmax(sims, dim=-1)  # [B, N]
-                w0 = (assign == 0).unsqueeze(-1).to(f_img.dtype)
-                w1 = (assign == 1).unsqueeze(-1).to(f_img.dtype)
-                count0 = w0.sum(dim=1, keepdim=True)
-                count1 = w1.sum(dim=1, keepdim=True)
-                sum0 = torch.bmm(w0.transpose(1, 2), f_img)
-                sum1 = torch.bmm(w1.transpose(1, 2), f_img)
-                new_c0 = torch.where(count0 > 0, sum0 / count0.clamp(min=1.0), centroids[:, 0:1, :])
-                new_c0 = F.normalize(new_c0, p=2, dim=-1)
-                new_c1 = torch.where(count1 > 0, sum1 / count1.clamp(min=1.0), centroids[:, 1:2, :])
-                new_c1 = F.normalize(new_c1, p=2, dim=-1)
-                centroids = torch.cat([new_c0, new_c1], dim=1)
+        branch_logits: List[torch.Tensor] = [base_logits]
+        branch_seps: List[torch.Tensor] = [base_sep]
+        branch_areas: List[torch.Tensor] = [base_area]
+        pol_losses: List[torch.Tensor] = []
 
-            sims = torch.bmm(f_img, centroids.transpose(1, 2))  # [B, N, 2]
-            labels = torch.argmax(sims, dim=-1)  # [B, N]
-            c1_count = labels.sum(dim=-1, keepdim=True).to(f_img.dtype)  # [B, 1]
-            c0_count = float(n_px) - c1_count  # [B, 1]
+        if self.vit_tap_fusion_mode == "dual_logit":
+            mt_feats = self._build_multitap_cluster_tensor(
+                f_primary.detach(),
+                f_secondary.detach() if f_secondary is not None else None,
+                {k: v.detach() for k, v in vit_taps.items()},
+            )
+            if affinity_P is None and (self.feat_smooth_gamma > 0.0 or self.affinity_diff_beta > 0.0 or self.refiner_use_affinity_prop):
+                affinity_P = self._build_affinity_matrix(
+                    mt_feats,
+                    tau=self.affinity_diff_tau,
+                    grid_size=self.vit_tap_cluster_size or 48,
+                )
+            if self.feat_smooth_gamma > 0.0 and affinity_P is not None:
+                mt_feats = self._smooth_features_on_graph(mt_feats, affinity_P, self.feat_smooth_gamma)
 
-        cos_sim = (centroids[:, 0] * centroids[:, 1]).sum(dim=-1)  # [B]
-        separability = (1.0 - cos_sim).clamp(min=0.0)
+            mt_l, _, mt_sep, mt_area, mt_pl = self._cluster_features_with_polarity(
+                mt_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
+            )
+            branch_logits.append(mt_l)
+            branch_seps.append(mt_sep)
+            branch_areas.append(mt_area)
+            if mt_pl is not None:
+                pol_losses.append(mt_pl)
+        else:
+            for k in self.vit_feature_taps:
+                if k not in vit_taps:
+                    continue
+                t_feats = vit_taps[k].detach()
+                if self.vit_tap_cluster_size is not None and t_feats.shape[2:] != (
+                    self.vit_tap_cluster_size,
+                    self.vit_tap_cluster_size,
+                ):
+                    t_feats = F.interpolate(
+                        t_feats,
+                        size=(self.vit_tap_cluster_size, self.vit_tap_cluster_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                tl, _, ts, ta, tpl = self._cluster_features_with_polarity(
+                    t_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
+                )
+                branch_logits.append(tl)
+                branch_seps.append(ts)
+                branch_areas.append(ta)
+                if tpl is not None:
+                    pol_losses.append(tpl)
 
-        # Tampered regions typically occupy the minority portion of an image.
-        cond = (c1_count > c0_count)  # [B, 1]
-        sim_tampered = torch.where(cond, sims[:, :, 0], sims[:, :, 1])  # [B, N]
-        sim_pristine = torch.where(cond, sims[:, :, 1], sims[:, :, 0])  # [B, N]
-        minority_ratio = (torch.where(cond, c0_count, c1_count).squeeze(-1) / float(max(1, n_px))).clamp(0.0, 1.0)
+        if preneck_feats is not None:
+            pn_l, _, pn_sep, pn_area, pn_pl = self._cluster_features_with_polarity(
+                preneck_feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
+            )
+            branch_logits.append(pn_l)
+            branch_seps.append(pn_sep)
+            branch_areas.append(pn_area)
+            if pn_pl is not None:
+                pol_losses.append(pn_pl)
 
-        diff = (sim_tampered - sim_pristine) / self.cluster_temperature  # [B, N]
+        n_b = len(branch_logits)
+        if self.tap_logit_weights is not None and self.tap_logit_weights.numel() == n_b:
+            weights = F.softmax(self.tap_logit_weights.float(), dim=0)
+        else:
+            weights = torch.full((n_b,), 1.0 / float(n_b), device=base_logits.device, dtype=torch.float32)
 
-        pristine_mask = separability < self.cluster_separability_threshold
-        if aux_pristine_flags is not None:
-            pristine_mask = pristine_mask | aux_pristine_flags.to(device=separability.device, dtype=torch.bool)
-        diff = self._apply_pristine_gate(diff, pristine_mask)
-
-        logit_grid = diff.view(b, 1, h_f, w_f)
-        logit_full = F.interpolate(logit_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-        prob_full = torch.sigmoid(logit_full)
-
-        return logit_full, prob_full, separability, minority_ratio
+        fused_logits = sum(weights[i] * branch_logits[i].float() for i in range(n_b))
+        w_det = weights.detach()
+        fused_sep = sum(w_det[i] * branch_seps[i] for i in range(n_b))
+        fused_area = sum(w_det[i] * branch_areas[i] for i in range(n_b))
+        pol_loss = torch.stack(pol_losses).mean() if pol_losses else None
+        return fused_logits, fused_sep, fused_area, pol_loss, affinity_P
 
     def _cluster_features_with_stats(
         self,
@@ -3370,7 +4315,22 @@ class FOCAL(nn.Module):
                 - `cluster_separability`: Inter-centroid distance `1 - cos(c0, c1)` (if clustering)
         """
         orig_h, orig_w = x.shape[2], x.shape[3]
-        x_in, f_primary, f_secondary, feats_backbone, feats = self._extract_all_branch_features(x)
+        x_in, f_primary, f_secondary, feats_backbone, feats, vit_taps = self._extract_all_branch_features_with_taps(x)
+
+        preneck_feats: Optional[torch.Tensor] = None
+        if self.preneck_projector is not None and vit_taps:
+            taps_cat = self._build_preneck_tap_tensor({k: v.detach() for k, v in vit_taps.items()})
+            if taps_cat is not None:
+                pn_emb = self.preneck_projector(taps_cat)
+                if f_secondary is not None:
+                    fs_pn = (
+                        F.interpolate(f_secondary.detach(), size=pn_emb.shape[2:], mode="bilinear", align_corners=False)
+                        if f_secondary.shape[2:] != pn_emb.shape[2:]
+                        else f_secondary.detach()
+                    )
+                    preneck_feats = torch.cat([pn_emb, F.normalize(fs_pn.float(), p=2, dim=1).to(dtype=pn_emb.dtype)], dim=1)
+                else:
+                    preneck_feats = pn_emb
 
         resolved_domain_ids = domain_ids
         if resolved_domain_ids is None and dataset_sources is not None:
@@ -3388,6 +4348,9 @@ class FOCAL(nn.Module):
             self.prior_anchor_weight > 0.0
             or self.neck_l2_anchor_weight > 0.0
             or self.cluster_refiner_l2_weight > 0.0
+            or self.refiner_ortho_weight > 0.0
+            or self.adapter_ortho_weight > 0.0
+            or self.preneck_ortho_weight > 0.0
         ):
             prior_anchor_loss, prior_anchor_penalty = self._compute_prior_anchor_terms(
                 x_in=x_in, feats=feats, feats_backbone=feats_backbone, f_primary=f_primary
@@ -3474,16 +4437,83 @@ class FOCAL(nn.Module):
                     align_loss = self.compute_domain_contrastive_loss(feats, gt_masks, resolved_domain_ids)
                 else:
                     align_loss = self.compute_contrastive_loss(feats, gt_masks)
-            with torch.no_grad():
-                if self.domain_split_mode:
+                if preneck_feats is not None and self.preneck_contrastive_weight > 0.0:
+                    pn_nce = self.compute_contrastive_loss(preneck_feats, gt_masks)
+                    weighted_pn = self.preneck_contrastive_weight * pn_nce
+                    align_loss = weighted_pn if align_loss is None else (align_loss + weighted_pn)
+
+            pol_loss_terms: List[torch.Tensor] = []
+            affinity_P: Optional[torch.Tensor] = None
+            need_affinity = (
+                self.feat_smooth_gamma > 0.0
+                or self.affinity_diff_beta > 0.0
+                or self.refiner_use_affinity_prop
+            )
+            if need_affinity:
+                aff_src = (
+                    self._build_multitap_cluster_tensor(
+                        f_primary.detach(),
+                        f_secondary.detach() if f_secondary is not None else None,
+                        {k: v.detach() for k, v in vit_taps.items()},
+                    )
+                    if vit_taps
+                    else feats.detach()
+                )
+                affinity_P = self._build_affinity_matrix(
+                    aff_src,
+                    tau=self.affinity_diff_tau,
+                    grid_size=self.vit_tap_cluster_size or 48,
+                )
+
+            if self.domain_split_mode:
+                with torch.no_grad():
                     cluster_logits, _, separability, _ = self._cluster_domain_features(
                         feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
                     area_fused = (cluster_logits > 0).float().mean(dim=(1, 2, 3))
-                else:
-                    cluster_logits, _, separability, area_fused = self._cluster_features_with_full_stats(
-                        feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+            else:
+                base_cluster_feats = (
+                    self._smooth_features_on_graph(feats.detach(), affinity_P, self.feat_smooth_gamma)
+                    if (self.feat_smooth_gamma > 0.0 and affinity_P is not None)
+                    else feats.detach()
+                )
+                cluster_logits, _, separability, area_fused, pol_loss_main = self._cluster_features_with_polarity(
+                    base_cluster_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
+                )
+                if pol_loss_main is not None:
+                    pol_loss_terms.append(pol_loss_main)
+                if vit_taps:
+                    cluster_logits, separability, area_fused, pol_loss_mt, affinity_P = self._fuse_multitap_clustering(
+                        base_logits=cluster_logits,
+                        base_sep=separability,
+                        base_area=area_fused,
+                        f_primary=f_primary,
+                        f_secondary=f_secondary,
+                        vit_taps=vit_taps,
+                        orig_h=orig_h,
+                        orig_w=orig_w,
+                        aux_pristine_flags=aux_pristine_flags,
+                        gt_masks=gt_masks,
+                        preneck_feats=preneck_feats,
+                        affinity_P=affinity_P,
                     )
+                    if pol_loss_mt is not None:
+                        pol_loss_terms.append(pol_loss_mt)
+
+            if self.affinity_diff_beta > 0.0 and affinity_P is not None:
+                cluster_logits = self._diffuse_logits_on_graph(
+                    cluster_logits, affinity_P, beta=self.affinity_diff_beta, steps=self.affinity_diff_steps
+                )
+            if self.otsu_cal_alpha > 0.0:
+                cluster_logits = self._apply_otsu_calibration(cluster_logits, self.otsu_cal_alpha)
+
+            if self.training and pol_loss_terms:
+                mean_pol_loss = torch.stack(pol_loss_terms).mean()
+                pol_weight = self.polarity_loss_weight if self.polarity_loss_weight > 0.0 else 0.0
+                weighted_pol = pol_weight * mean_pol_loss
+                align_loss = weighted_pol if align_loss is None else (align_loss + weighted_pol)
+
+            with torch.no_grad():
                 primary_branch_stats = None
                 secondary_branch_stats = None
                 if (
@@ -3512,6 +4542,7 @@ class FOCAL(nn.Module):
 
             if self.cluster_refiner is not None:
                 if isinstance(self.cluster_refiner, ImageRelativeClusterRefiner):
+                    x_raw_img = self._ensure_raw_rgb(x) if self.cluster_refiner.use_srm_desc else None
                     desc = ImageRelativeClusterRefiner.build_descriptors(
                         feats=feats.detach(),
                         c_fused_logits=cluster_logits.detach(),
@@ -3520,13 +4551,30 @@ class FOCAL(nn.Module):
                         primary_branch=primary_branch_stats,
                         secondary_branch=secondary_branch_stats,
                         multi_branch=self.cluster_refiner.multi_branch,
+                        srm_kernels=getattr(self.cluster_refiner, "_srm_kernels", None),
+                        raw_rgb=x_raw_img,
+                        use_srm_desc=self.cluster_refiner.use_srm_desc,
+                        use_border_knn_desc=self.cluster_refiner.use_border_knn_desc,
                     )
-                    raw_bias, raw_scale = self.cluster_refiner(desc, orig_h, orig_w)
-                    scale = 1.0 + self.cluster_residual_scale_gain * torch.tanh(raw_scale)
+                    raw_bias, raw_scale = self.cluster_refiner(desc, orig_h, orig_w, affinity_P=affinity_P)
+                    sep_gate: Union[float, torch.Tensor] = 1.0
+                    if self.refiner_sep_gate_tau > 0.0:
+                        sep_gate = (
+                            (separability.detach() / self.refiner_sep_gate_tau)
+                            .clamp(0.0, 1.0)
+                            .view(-1, 1, 1, 1)
+                            .to(dtype=raw_bias.dtype)
+                        )
+                    scale = 1.0 + sep_gate * self.cluster_residual_scale_gain * torch.tanh(raw_scale)
                     if self.cluster_residual_max_scale > 0.0:
-                        bias = self.cluster_residual_max_scale * torch.tanh(raw_bias)
+                        bias = sep_gate * self.cluster_residual_max_scale * torch.tanh(raw_bias)
                     else:
-                        bias = raw_bias
+                        bias = sep_gate * raw_bias
+                    if self.training and self.refiner_zero_mean_bias_weight > 0.0:
+                        dc_bias_pen = self.refiner_zero_mean_bias_weight * bias.float().mean(dim=(2, 3)).pow(2).mean()
+                        prior_anchor_penalty = (
+                            dc_bias_pen if prior_anchor_penalty is None else (prior_anchor_penalty + dc_bias_pen)
+                        )
                     mask_logits = scale * base_logits.to(dtype=bias.dtype) + bias
                 else:
                     ref_feats = feats.detach() if self.detach_refiner_feats else feats
@@ -3549,9 +4597,52 @@ class FOCAL(nn.Module):
                         feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
                 else:
-                    mask_logits, pred_mask, separability = self._cluster_features_with_stats(
-                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    affinity_P = None
+                    need_affinity = self.feat_smooth_gamma > 0.0 or self.affinity_diff_beta > 0.0
+                    if need_affinity:
+                        aff_src = (
+                            self._build_multitap_cluster_tensor(
+                                f_primary,
+                                f_secondary,
+                                vit_taps,
+                            )
+                            if vit_taps
+                            else feats
+                        )
+                        affinity_P = self._build_affinity_matrix(
+                            aff_src,
+                            tau=self.affinity_diff_tau,
+                            grid_size=self.vit_tap_cluster_size or 48,
+                        )
+                    base_cluster_feats = (
+                        self._smooth_features_on_graph(feats, affinity_P, self.feat_smooth_gamma)
+                        if (self.feat_smooth_gamma > 0.0 and affinity_P is not None)
+                        else feats
                     )
+                    mask_logits, pred_mask, separability, area_fused, _ = self._cluster_features_with_polarity(
+                        base_cluster_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                    )
+                    if vit_taps:
+                        mask_logits, separability, _, _, affinity_P = self._fuse_multitap_clustering(
+                            base_logits=mask_logits,
+                            base_sep=separability,
+                            base_area=area_fused,
+                            f_primary=f_primary,
+                            f_secondary=f_secondary,
+                            vit_taps=vit_taps,
+                            orig_h=orig_h,
+                            orig_w=orig_w,
+                            aux_pristine_flags=aux_pristine_flags,
+                            preneck_feats=preneck_feats,
+                            affinity_P=affinity_P,
+                        )
+                    if self.affinity_diff_beta > 0.0 and affinity_P is not None:
+                        mask_logits = self._diffuse_logits_on_graph(
+                            mask_logits, affinity_P, beta=self.affinity_diff_beta, steps=self.affinity_diff_steps
+                        )
+                    if self.otsu_cal_alpha > 0.0:
+                        mask_logits = self._apply_otsu_calibration(mask_logits, self.otsu_cal_alpha)
+                    pred_mask = torch.sigmoid(mask_logits)
                     logits_full = mask_logits
             else:
                 mask_logits, logits_full, _ = self._run_supervised_head(feats, orig_h, orig_w)
