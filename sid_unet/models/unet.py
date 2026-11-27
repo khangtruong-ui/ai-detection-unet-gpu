@@ -1138,6 +1138,19 @@ def build_model(config: Any) -> nn.Module:
             cluster_residual_scale_gain=float(model_cfg.get("cluster_residual_scale_gain", 0.5)),
             multi_branch_logit_fusion=bool(model_cfg.get("multi_branch_logit_fusion", False)),
             contrastive_boundary_ratio=float(model_cfg.get("contrastive_boundary_ratio", 0.0)),
+            vit_feature_taps=model_cfg.get("vit_feature_taps", None),
+            vit_tap_fusion_mode=str(model_cfg.get("vit_tap_fusion_mode", "dual_logit")),
+            vit_tap_cluster_size=model_cfg.get("vit_tap_cluster_size", 48),
+            learnable_tap_weights=bool(model_cfg.get("learnable_tap_weights", False)),
+            feature_centering_alpha=float(model_cfg.get("feature_centering_alpha", 0.0)),
+            cluster_polarity_mode=str(model_cfg.get("cluster_polarity_mode", "minority")),
+            polarity_border_weight=float(model_cfg.get("polarity_border_weight", 0.75)),
+            polarity_area_gate=float(model_cfg.get("polarity_area_gate", 0.25)),
+            polarity_margin_scale=float(model_cfg.get("polarity_margin_scale", 5.0)),
+            polarity_loss_weight=float(model_cfg.get("polarity_loss_weight", 0.0)),
+            refiner_sep_gate_tau=float(model_cfg.get("refiner_sep_gate_tau", 0.0)),
+            refiner_zero_mean_bias_weight=float(model_cfg.get("refiner_zero_mean_bias_weight", 0.0)),
+            refiner_ortho_weight=float(model_cfg.get("refiner_ortho_weight", 0.0)),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(

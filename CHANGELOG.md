@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-27
+
+### Added
+- **FOCAL v3 Multi-Tap Pre-Neck, Polarity-Aware & Separability-Gated CASIA-v2.0 Adaptation (`sid_unet/models/focal.py`, `sid_unet/models/unet.py`, `configs/experiments/focal/focal_v3_multitap_casia.yaml`, `docs/focal_v3_multitap_casia_adaptation.md`, `tests/test_focal_v3_multitap_polarity.py`)**:
+  - Added `ImageEncoderViT.forward_with_taps()` / `FOCALViTNet.forward_with_taps()` and `vit_feature_taps` (`[22, 23]`) with `dual_logit` clustering at compact `vit_tap_cluster_size=48` and learnable `tap_logit_weights`.
+  - Added flip-equivariant `clustering_mode="kmeans_robust"`, `cluster_polarity_mode` (`"minority"`, `"border_aware"`, `"learned"` via antisymmetric `ClusterPolarityHead`), `BranchBalancedSpatialAdapter` (`feature_adapter_type="branch_balanced"`) with `0.5/0.5` per-branch prior drift anchoring, and `refiner_sep_gate_tau`, `refiner_zero_mean_bias_weight`, and `refiner_ortho_weight` regularization for `ImageRelativeClusterRefiner`.
+  - Trained `focal_v3_multitap_casia` for 4 epochs on `KhangTruong/Casia-v2.0-Fake` (`222,872 / 337,046,492 = 0.07%` trainable params, `0` trainable backbone params), lifting `MVSS-v1-protocol.yaml` (`1,676` samples, `--samples-per-dataset 120`) from `0.3503` IoU / `0.4155` F1 / `0.7759` AUROC (`KhangTruong/FOCAL`) and `0.4131` IoU / `0.4647` F1 / `0.8049` AUROC (PR #35) to **`0.4304` IoU / `0.4856` F1 / `0.8248` AUROC** (`HiFi_IFDL +0.1221` IoU, `CocoGlide +0.0599` IoU, `OpenSDID_SD1.5 +0.0330` IoU over PR #35) without catastrophic forgetting, and published weights + reports to [`KhangTruong/focal-v3-multitap-casia`](https://huggingface.co/KhangTruong/focal-v3-multitap-casia).
+  - Added 5 unit/integration tests in `tests/test_focal_v3_multitap_polarity.py` and companion `clustering_polarity_diagnostic` in `nn-toolbox`.
+
 ## [Unreleased] - 2026-11-26
 
 ### Added
