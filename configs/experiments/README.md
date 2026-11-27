@@ -13,7 +13,7 @@ Directory Layout:
 - **`diffusion_diff_v2/`**: Diffusion multi-noise feature decoder V2 with frozen encoder by default, no encoder skips, parallel frozen decoder, and perpendicular skip injection into trainable decoder.
 - **`diffusion_diff_minimized/`**: Minimized ultra-fast diffusion-diff architecture using Segmind Tiny-SD (`segmind/tiny-sd`) in FP16 on CUDA with only 2 lines of computation (1 real latent, 1 chosen noisy latent from the diffusion model).
 - **`mask_clip/`**: OpenSDI MaskCLIP (Synergizing Pretrained Models: CLIP ViT-L/14 + MAE ViT-B/16) with VCA cross-attention, FPN + TVCA mask decoder, VSA CLS aggregator, PromptLearner, edge-weighted loss, and Model Surgery hooks.
-- **`focal/`**: FOCAL (HRNet-W32 & SAM ViT-Large) Strategy 1 & Strategy B (Prior-Preserving PEFT Surgery) finetuning configs at `512x512` with `data.normalize: false`, `precision: "auto"`, and L4-tuned batch sizes (`focal_vit.yaml`, `focal_vit_peft.yaml`, `focal_vit_contrastive.yaml`, `focal_vit_contrastive_peft.yaml`, `focal_hrnet.yaml`, `focal_hrnet_peft.yaml`, `focal_hrnet_contrastive.yaml`, `focal_hrnet_contrastive_peft.yaml`), plus **Domain-Split 4-Class/4-Cluster** joint CASIA+IMD2020 configs (`focal_hrnet_domain_split.yaml`, `focal_hrnet_contrastive_domain_split.yaml`, `focal_vit_domain_split.yaml`, `focal_vit_contrastive_domain_split.yaml`) and **Dual-Backbone Fusion, Hybrid, Image-Relative & Multi-Tap Polarity-Aware Adaptation** configs (`focal_hrnet_vit_fusion.yaml`, `focal_vit_hrnet_fusion_contrastive.yaml`, `focal_vit_hrnet_hybrid_casia.yaml`, `focal_vit_hrnet_image_relative_casia.yaml`, `focal_v3_multitap_casia.yaml`).
+- **`focal/`**: FOCAL (HRNet-W32 & SAM ViT-Large) Strategy 1 & Strategy B (Prior-Preserving PEFT Surgery) finetuning configs at `512x512` with `data.normalize: false`, `precision: "auto"`, and L4-tuned batch sizes (`focal_vit.yaml`, `focal_vit_peft.yaml`, `focal_vit_contrastive.yaml`, `focal_vit_contrastive_peft.yaml`, `focal_hrnet.yaml`, `focal_hrnet_peft.yaml`, `focal_hrnet_contrastive.yaml`, `focal_hrnet_contrastive_peft.yaml`), plus **Domain-Split 4-Class/4-Cluster** joint CASIA+IMD2020 configs (`focal_hrnet_domain_split.yaml`, `focal_hrnet_contrastive_domain_split.yaml`, `focal_vit_domain_split.yaml`, `focal_vit_contrastive_domain_split.yaml`) and **Dual-Backbone Fusion, Hybrid, Image-Relative, Multi-Tap Polarity-Aware & v4 Manifold Adaptation** configs (`focal_hrnet_vit_fusion.yaml`, `focal_vit_hrnet_fusion_contrastive.yaml`, `focal_vit_hrnet_hybrid_casia.yaml`, `focal_vit_hrnet_image_relative_casia.yaml`, `focal_v3_multitap_casia.yaml`, `focal_v4_manifold_casia.yaml`).
 - **`msccnet/`**: MSCCNet (ACM TOMM 2025) dilated ResNet-50/101 (`outstride=8`) with Multi-Spectral Class Center (2D DCT + GCN) localization and image-level classification (`default.yaml`, `msccnet_resnet101.yaml`).
 - **`omnifd/`**: OmniFD (arXiv:2512.01128) unified SwinTransformer3D + Perceiver Interaction neck with image classification and spatial localization heads (`default.yaml`, `omnifd_swin_s_forgerynet.yaml`, `omnifd_swin_s_ff_spatial.yaml`, `omnifd_swin_s_fmld_spatial.yaml`).
 - **`moe/`**: `ForensicMoE` Prototype v1 (`forensic_moe_v1.yaml`, `415,725` trainable params) and **`ForensicMoE v2`** (`forensic_moe_v2.yaml`, `6,656,561` trainable params, `<3.5%` of the `194.4M` ensemble) combining 3 strictly frozen open-weight experts (`SparseViT`, `TruFor NP++`, `TruFor-DiffusionPrint`) with balanced domain sampling (`balance_domains: true`) on `KhangTruong/IMD2020-CASIAv2-Joint`. `v2` upgrades the gate to a Multi-Scale Cross-Expert Attention Router + Uncertainty-Gated Top-Down Residual FPN Decoder with random JPEG compression (`QF 65–100`) and `0.4*BCE + 0.4*Dice + 0.2*Focal`.
@@ -268,6 +268,18 @@ sid-train --config configs/experiments/focal/focal_v3_multitap_casia.yaml
 sid-cross-eval \
   --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
   --checkpoints outputs/RUN/focal_v3_multitap_casia/checkpoints/checkpoint_best.pt \
+  --samples-per-dataset 120
+```
+
+### 18. FOCAL v4 Manifold Adaptation + Native 1024×1024 ViT + Border-kNN Memory Bank on CASIA-v2.0
+```bash
+# Train 0.22% trainable parameters (native 1024x1024 window-exact ViT taps [22, 23] + PreNeckForensicProjector + ShiftGatedAdaBN + Markov affinity diffusion + Otsu calibration + affinity-propagating Border-kNN ImageRelativeClusterRefiner)
+sid-train --config configs/experiments/focal/focal_v4_manifold_casia.yaml
+
+# Cross-evaluate against MVSS-v1-protocol
+sid-cross-eval \
+  --cross-configs configs/cross-eval/MVSS-v1-protocol.yaml \
+  --checkpoints outputs/RUN/focal_v4_manifold_casia/checkpoints/checkpoint_best.pt \
   --samples-per-dataset 120
 ```
 

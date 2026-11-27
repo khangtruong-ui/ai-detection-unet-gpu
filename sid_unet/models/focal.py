@@ -1189,6 +1189,26 @@ class _DilatedResBlock(nn.Module):
         return self.act(x + self.block(x))
 
 
+class PreNeckForensicProjector(nn.Module):
+    """
+    Zero-bias orthogonal subspace projector over pre-neck ViT intermediate taps.
+
+    Compresses concatenated multi-tap ViT block features (`[B, C_in, H_t, W_t]`)
+    into a compact `proj_dim`-channel L2-normalized forensic embedding without any
+    static bias vector (preventing `cone_cos` collapse).
+    """
+
+    def __init__(self, in_dim: int, proj_dim: int = 256) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.proj_dim = int(proj_dim)
+        self.proj = nn.Conv2d(self.in_dim, self.proj_dim, kernel_size=1, bias=False)
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.proj(x.float()), p=2, dim=1).to(dtype=x.dtype)
+
+
 class ImageRelativeClusterRefiner(nn.Module):
     """
     Domain-invariant, rotation-invariant residual refiner for clustering-anchored FOCAL.
@@ -1196,23 +1216,52 @@ class ImageRelativeClusterRefiner(nn.Module):
     Operates exclusively on image-relative geometric & clustering descriptors (never raw
     backbone feature channels) so adaptation on a single source domain (e.g. CASIA-v2.0)
     cannot memorize domain-specific semantic embeddings and cause OOD forgetting.
+    Optionally augments descriptors with fixed SRM high-frequency residual maps (`+2` ch)
+    and a zero-initialized non-local affinity-graph propagation block (`P @ h`).
     Outputs zero-initialized `(raw_bias, raw_scale)` maps at full image resolution.
     """
 
     BASE_DESC_CHANNELS = 10
     MULTI_BRANCH_DESC_CHANNELS = 24
+    SRM_DESC_CHANNELS = 2
+    BORDER_KNN_DESC_CHANNELS = 2
 
     def __init__(
         self,
         num_upsample_stages: int = 2,
         mid_dim: int = 48,
         multi_branch: bool = True,
+        use_affinity_prop: bool = False,
+        use_srm_desc: bool = False,
+        use_border_knn_desc: bool = False,
     ) -> None:
         super().__init__()
         self.multi_branch = bool(multi_branch)
+        self.use_affinity_prop = bool(use_affinity_prop)
+        self.use_srm_desc = bool(use_srm_desc)
+        self.use_border_knn_desc = bool(use_border_knn_desc)
         in_ch = self.MULTI_BRANCH_DESC_CHANNELS if self.multi_branch else self.BASE_DESC_CHANNELS
+        if self.use_srm_desc:
+            in_ch += self.SRM_DESC_CHANNELS
+        if self.use_border_knn_desc:
+            in_ch += self.BORDER_KNN_DESC_CHANNELS
         mid = max(32, int(mid_dim))
         groups_mid = _select_num_groups(mid)
+
+        # Eagerly register fixed 3-filter SRM residual kernels for DDP buffer safety
+        k1 = torch.tensor(
+            [[0, 0, 0, 0, 0], [0, -1, 2, -1, 0], [0, 2, -4, 2, 0], [0, -1, 2, -1, 0], [0, 0, 0, 0, 0]],
+            dtype=torch.float32,
+        ) / 4.0
+        k2 = torch.tensor(
+            [[-1, 2, -2, 2, -1], [2, -6, 8, -6, 2], [-2, 8, -12, 8, -2], [2, -6, 8, -6, 2], [-1, 2, -2, 2, -1]],
+            dtype=torch.float32,
+        ) / 12.0
+        k3 = torch.tensor(
+            [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 1, -2, 1, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+            dtype=torch.float32,
+        ) / 2.0
+        self.register_buffer("_srm_kernels", torch.stack([k1, k2, k3], dim=0).unsqueeze(1), persistent=False)
 
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, mid, kernel_size=3, padding=1, bias=False),
@@ -1224,6 +1273,16 @@ class ImageRelativeClusterRefiner(nn.Module):
             _DilatedResBlock(mid, dilation=2),
             _DilatedResBlock(mid, dilation=4),
         )
+        if self.use_affinity_prop:
+            self.aff_norm = nn.GroupNorm(groups_mid, mid)
+            self.aff_proj = nn.Conv2d(mid, mid, kernel_size=1, bias=True)
+            nn.init.zeros_(self.aff_proj.weight)
+            if self.aff_proj.bias is not None:
+                nn.init.zeros_(self.aff_proj.bias)
+        else:
+            self.aff_norm = None
+            self.aff_proj = None
+
         stages = []
         cur_dim = mid
         for _ in range(max(1, num_upsample_stages)):
@@ -1263,6 +1322,58 @@ class ImageRelativeClusterRefiner(nn.Module):
         d_loc25 = (1.0 - (f_hat * ctx25).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
         return d_mean_z, d_loc3, d_loc9, d_loc25
 
+    @staticmethod
+    @torch.no_grad()
+    def _border_knn_descriptors(
+        feats: torch.Tensor,
+        grid_size: int = 48,
+        k_local: int = 32,
+        k_broad: int = 160,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-image rotation/flip-invariant Self-Border k-NN anomaly maps (`[B, 1, H_f, W_f]`)."""
+        b, _, h_f, w_f = feats.shape
+        g = min(int(grid_size), h_f, w_f)
+        f_cur = feats.float()
+        if (h_f, w_f) != (g, g):
+            f_cur = F.interpolate(f_cur, size=(g, g), mode="bilinear", align_corners=False)
+        h_g, w_g = f_cur.shape[2:]
+        f_hat = F.normalize(f_cur, p=2, dim=1)
+
+        bw = 2 if min(h_g, w_g) >= 12 else 1
+        bmask = torch.zeros((h_g, w_g), dtype=torch.bool, device=feats.device)
+        bmask[:bw, :] = True
+        bmask[-bw:, :] = True
+        bmask[:, :bw] = True
+        bmask[:, -bw:] = True
+        bidx = bmask.flatten().nonzero(as_tuple=False).squeeze(1)
+        n_b = max(1, int(bidx.numel()))
+
+        x_flat = f_hat.flatten(2)  # [B, C, N]
+        x_border = x_flat[:, :, bidx]  # [B, C, n_b]
+        sim = torch.bmm(x_flat.transpose(1, 2), x_border)  # [B, N, n_b]
+
+        # Exact k=32 / k=160 on 48x48 (n_b=368), proportional scaling on smaller test grids
+        if n_b >= 368:
+            k1 = max(1, min(int(k_local), n_b))
+            k2 = max(1, min(int(k_broad), n_b))
+        else:
+            k1 = max(1, min(n_b, int(round(n_b * float(k_local) / 368.0))))
+            k2 = max(1, min(n_b, int(round(n_b * float(k_broad) / 368.0))))
+
+        top_broad = torch.topk(sim, k=k2, dim=-1).values  # descending along border keys
+        d_loc = (1.0 - top_broad[:, :, :k1].mean(dim=-1)).view(b, 1, h_g, w_g)
+        d_brd = (1.0 - top_broad.mean(dim=-1)).view(b, 1, h_g, w_g)
+
+        outs: List[torch.Tensor] = []
+        for d_map in (d_loc, d_brd):
+            mu = d_map.mean(dim=(2, 3), keepdim=True)
+            sd = d_map.std(dim=(2, 3), keepdim=True, unbiased=False).clamp(min=1e-4)
+            z_map = torch.tanh((d_map - mu) / sd)
+            if (h_g, w_g) != (h_f, w_f):
+                z_map = F.interpolate(z_map, size=(h_f, w_f), mode="bilinear", align_corners=False)
+            outs.append(z_map)
+        return outs[0], outs[1]
+
     @classmethod
     @torch.no_grad()
     def build_descriptors(
@@ -1274,8 +1385,12 @@ class ImageRelativeClusterRefiner(nn.Module):
         primary_branch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         secondary_branch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         multi_branch: bool = True,
+        srm_kernels: Optional[torch.Tensor] = None,
+        raw_rgb: Optional[torch.Tensor] = None,
+        use_srm_desc: bool = False,
+        use_border_knn_desc: bool = False,
     ) -> torch.Tensor:
-        """Build `[B, 10|24, H_f, W_f]` rotation-invariant image-relative forensic descriptors."""
+        """Build `[B, 10|24(+2 SRM)(+2 Border-kNN), H_f, W_f]` rotation-invariant image-relative forensic descriptors."""
         b, _, h_f, w_f = feats.shape
 
         def _grid(t: torch.Tensor) -> torch.Tensor:
@@ -1348,10 +1463,61 @@ class ImageRelativeClusterRefiner(nn.Module):
                 zeros_mb = torch.zeros(b, cls.MULTI_BRANCH_DESC_CHANNELS - cls.BASE_DESC_CHANNELS, h_f, w_f, device=feats.device, dtype=torch.float32)
                 desc_list.append(zeros_mb)
 
+        if use_srm_desc:
+            if raw_rgb is not None and srm_kernels is not None:
+                gray = raw_rgb.float().mean(dim=1, keepdim=True)
+                res = F.conv2d(gray, srm_kernels.to(device=gray.device, dtype=torch.float32), padding=2).clamp(-2.0, 2.0)
+                e_map = F.interpolate(res.pow(2).mean(dim=1, keepdim=True), size=(h_f, w_f), mode="area")
+                e_log = torch.log1p(e_map * 100.0)
+                mu_e = e_log.mean(dim=(2, 3), keepdim=True)
+                sd_e = e_log.std(dim=(2, 3), keepdim=True, unbiased=False).clamp(min=1e-4)
+                srm_z = torch.tanh((e_log - mu_e) / sd_e)
+                srm_loc = torch.tanh((e_log - F.avg_pool2d(e_log, kernel_size=9, stride=1, padding=4)) / sd_e)
+                desc_list.extend([srm_z, srm_loc])
+            else:
+                desc_list.append(torch.zeros(b, cls.SRM_DESC_CHANNELS, h_f, w_f, device=feats.device, dtype=torch.float32))
+
+        if use_border_knn_desc:
+            b_loc_f, b_brd_f = cls._border_knn_descriptors(feats)
+            if secondary_branch is not None:
+                sec_f = _grid(secondary_branch[0])
+                b_loc_s, b_brd_s = cls._border_knn_descriptors(sec_f)
+                b_loc = 0.5 * (b_loc_f + b_loc_s)
+                b_brd = 0.5 * (b_brd_f + b_brd_s)
+            else:
+                b_loc, b_brd = b_loc_f, b_brd_f
+            desc_list.extend([b_loc, b_brd])
+
         return torch.cat(desc_list, dim=1).to(dtype=feats.dtype)
 
-    def forward(self, descriptors: torch.Tensor, orig_h: int, orig_w: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        descriptors: torch.Tensor,
+        orig_h: int,
+        orig_w: int,
+        affinity_P: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.blocks(self.stem(descriptors))
+        if self.use_affinity_prop and self.aff_proj is not None and affinity_P is not None:
+            b, c, h_x, w_x = x.shape
+            n_aff = affinity_P.shape[1]
+            aff_side = int(round(math.sqrt(n_aff)))
+            if aff_side * aff_side == n_aff and aff_side > 0:
+                x_g = (
+                    F.interpolate(x.float(), size=(aff_side, aff_side), mode="bilinear", align_corners=False)
+                    if (h_x, w_x) != (aff_side, aff_side)
+                    else x.float()
+                )
+                x_flat = x_g.permute(0, 2, 3, 1).reshape(b, n_aff, c)
+                x_prop = torch.bmm(affinity_P.float(), x_flat).reshape(b, aff_side, aff_side, c).permute(0, 3, 1, 2)
+                if (h_x, w_x) != (aff_side, aff_side):
+                    x_prop = F.interpolate(x_prop, size=(h_x, w_x), mode="bilinear", align_corners=False)
+                x = x + self.aff_proj(self.aff_norm(x_prop.to(dtype=x.dtype)))
+            else:
+                x = x + self.aff_proj(self.aff_norm(x)) * 0.0
+        elif self.use_affinity_prop and self.aff_proj is not None:
+            x = x + self.aff_proj(self.aff_norm(x)) * 0.0
+
         for stage in self.upsample_stages:
             x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
             x = stage(x)
@@ -1562,6 +1728,24 @@ class FOCAL(nn.Module):
         refiner_sep_gate_tau: float = 0.0,
         refiner_zero_mean_bias_weight: float = 0.0,
         refiner_ortho_weight: float = 0.0,
+        # FOCAL v4 upgrades (HRNet AdaBN-Mix, graph diffusion, Otsu calibration, pre-neck projector & manifold refiner)
+        hrnet_adabn_lambda: float = 0.0,
+        hrnet_adabn_stages: Sequence[str] = ("stage4",),
+        hrnet_adabn_shift_floor: float = 0.0,
+        hrnet_adabn_shift_scale: float = 0.35,
+        affinity_diff_beta: float = 0.0,
+        affinity_diff_tau: float = 0.08,
+        affinity_diff_steps: int = 2,
+        feat_smooth_gamma: float = 0.0,
+        otsu_cal_alpha: float = 0.0,
+        use_preneck_projector: bool = False,
+        preneck_proj_dim: int = 256,
+        preneck_ortho_weight: float = 0.1,
+        preneck_contrastive_weight: float = 0.5,
+        refiner_use_affinity_prop: bool = False,
+        refiner_use_srm_desc: bool = False,
+        refiner_use_border_knn_desc: bool = False,
+        adapter_ortho_weight: float = 0.0,
         **kwargs: Any,
     ):
         super().__init__()
@@ -1682,6 +1866,30 @@ class FOCAL(nn.Module):
         self.refiner_sep_gate_tau = max(0.0, float(refiner_sep_gate_tau))
         self.refiner_zero_mean_bias_weight = max(0.0, float(refiner_zero_mean_bias_weight))
         self.refiner_ortho_weight = max(0.0, float(refiner_ortho_weight))
+
+        # FOCAL v4 configuration
+        self.hrnet_adabn_lambda = max(0.0, min(1.0, float(hrnet_adabn_lambda)))
+        self.hrnet_adabn_shift_floor = max(0.0, float(hrnet_adabn_shift_floor))
+        self.hrnet_adabn_shift_scale = max(1e-4, float(hrnet_adabn_shift_scale))
+        if isinstance(hrnet_adabn_stages, str):
+            self.hrnet_adabn_stages: Tuple[str, ...] = tuple(
+                s.strip() for s in hrnet_adabn_stages.split(",") if s.strip()
+            ) or ("stage4",)
+        else:
+            self.hrnet_adabn_stages = tuple(str(s).strip() for s in hrnet_adabn_stages if str(s).strip()) or ("stage4",)
+        self.affinity_diff_beta = max(0.0, min(1.0, float(affinity_diff_beta)))
+        self.affinity_diff_tau = max(1e-3, float(affinity_diff_tau))
+        self.affinity_diff_steps = max(1, int(affinity_diff_steps))
+        self.feat_smooth_gamma = max(0.0, min(1.0, float(feat_smooth_gamma)))
+        self.otsu_cal_alpha = max(0.0, min(2.0, float(otsu_cal_alpha)))
+        self.use_preneck_projector = bool(use_preneck_projector)
+        self.preneck_proj_dim = max(32, int(preneck_proj_dim))
+        self.preneck_ortho_weight = max(0.0, float(preneck_ortho_weight))
+        self.preneck_contrastive_weight = max(0.0, float(preneck_contrastive_weight))
+        self.refiner_use_affinity_prop = bool(refiner_use_affinity_prop)
+        self.refiner_use_srm_desc = bool(refiner_use_srm_desc)
+        self.refiner_use_border_knn_desc = bool(refiner_use_border_knn_desc)
+        self.adapter_ortho_weight = max(0.0, float(adapter_ortho_weight))
 
         # Strategy B configuration
         if "use_peft" in kwargs and not peft_enabled:
@@ -1831,6 +2039,9 @@ class FOCAL(nn.Module):
                     num_upsample_stages=num_upsample_stages,
                     mid_dim=self.cluster_refiner_dim,
                     multi_branch=(self.secondary_net is not None),
+                    use_affinity_prop=self.refiner_use_affinity_prop,
+                    use_srm_desc=self.refiner_use_srm_desc,
+                    use_border_knn_desc=self.refiner_use_border_knn_desc,
                 )
             else:
                 self.cluster_refiner = ClusterResidualRefiner(
@@ -1847,10 +2058,31 @@ class FOCAL(nn.Module):
             else None
         )
 
-        # Optional learnable multi-tap logit blend & learned cluster polarity head (FOCAL v3)
+        # Optional Orthogonal Zero-Bias Pre-Neck ViT Subspace Projector (FOCAL v4)
+        vit_embed_dim = 1024
+        if self._canonical_backbone_kind(self.backbone_name) == "vit":
+            vit_embed_dim = int(self.net.image_encoder.patch_embed.proj.out_channels)
+        if self.use_preneck_projector and self.vit_feature_taps and self._canonical_backbone_kind(self.backbone_name) == "vit":
+            self.preneck_projector: Optional[PreNeckForensicProjector] = PreNeckForensicProjector(
+                in_dim=vit_embed_dim * len(self.vit_feature_taps),
+                proj_dim=self.preneck_proj_dim,
+            )
+            if self.finetune_mode != "hybrid":
+                for p in self.preneck_projector.parameters():
+                    p.requires_grad_(False)
+        else:
+            self.preneck_projector = None
+
+        # Optional learnable multi-tap logit blend & learned cluster polarity head (FOCAL v3/v4)
         if self.learnable_tap_weights and self.vit_feature_taps and self._canonical_backbone_kind(self.backbone_name) == "vit":
             n_taps = 2 if self.vit_tap_fusion_mode == "dual_logit" else (1 + len(self.vit_feature_taps))
-            self.tap_logit_weights: Optional[nn.Parameter] = nn.Parameter(torch.zeros(n_taps))
+            if self.preneck_projector is not None:
+                n_taps += 1
+            init_tw = torch.zeros(n_taps)
+            if self.preneck_projector is not None:
+                # Start preneck projector softly gated so step-0 preserves zero-shot v4 floor
+                init_tw[-1] = -2.0
+            self.tap_logit_weights: Optional[nn.Parameter] = nn.Parameter(init_tw)
         else:
             self.tap_logit_weights = None
 
@@ -2684,6 +2916,8 @@ class FOCAL(nn.Module):
             exempt_prefixes.append("branch_logit_weights")
         if self.tap_logit_weights is not None:
             exempt_prefixes.append("tap_logit_weights")
+        if self.preneck_projector is not None:
+            exempt_prefixes.append("preneck_projector.")
         if self.polarity_head is not None:
             exempt_prefixes.append("polarity_head.")
         if self.domain_split_mode:
@@ -2781,6 +3015,63 @@ class FOCAL(nn.Module):
                 )
         return x
 
+    def _forward_hrnet_maybe_adabn(self, hrnet_net: nn.Module, x_in: torch.Tensor) -> torch.Tensor:
+        """
+        Run HRNet with optional per-image dead-channel-guarded AdaBN-Mix (`hrnet_adabn_lambda > 0`).
+        When `hrnet_adabn_shift_floor > 0`, blending is gated smoothly per image by mean active
+        log-variance shift from running stats so low-shift domains keep clean stats while shifted
+        OOD domains receive up to `hrnet_adabn_lambda` recalibration.
+        Strictly non-destructive to running_mean/running_var buffers and independent per image.
+        """
+        lam = self.hrnet_adabn_lambda
+        if lam <= 0.0:
+            return hrnet_net(x_in)
+
+        shift_floor = self.hrnet_adabn_shift_floor
+        shift_scale = self.hrnet_adabn_shift_scale
+        stages = self.hrnet_adabn_stages
+        hooks = []
+
+        def _make_adabn_hook(blend_lam: float, floor: float, scale: float):
+            def _hook(mod: nn.BatchNorm2d, inp: Tuple[torch.Tensor, ...], out: torch.Tensor) -> torch.Tensor:
+                x = inp[0]
+                if x.ndim != 4 or mod.running_mean is None or mod.running_var is None:
+                    return out
+                rm = mod.running_mean.float()
+                rv = mod.running_var.float()
+                active = rv > 1e-5
+                if not active.any():
+                    return out
+                xf = x.float()
+                img_mean = xf.mean(dim=(2, 3), keepdim=True)
+                img_var = xf.var(dim=(2, 3), keepdim=True, unbiased=False)
+                rm_v = rm.view(1, -1, 1, 1)
+                rv_v = rv.view(1, -1, 1, 1)
+                act_v = active.view(1, -1, 1, 1)
+                if floor > 0.0:
+                    img_shift = (
+                        torch.log((img_var + mod.eps) / (rv_v + mod.eps)).abs() * act_v
+                    ).sum(dim=1, keepdim=True) / act_v.sum(dim=1, keepdim=True).clamp(min=1.0)
+                    eff_lam = blend_lam * ((img_shift - floor) / scale).clamp(0.0, 1.0)
+                else:
+                    eff_lam = blend_lam
+                mix_mean = torch.where(act_v, (1.0 - eff_lam) * rm_v + eff_lam * img_mean, rm_v)
+                mix_var = torch.where(act_v, (1.0 - eff_lam) * rv_v + eff_lam * img_var, rv_v)
+                w = mod.weight.float().view(1, -1, 1, 1) if mod.weight is not None else 1.0
+                b = mod.bias.float().view(1, -1, 1, 1) if mod.bias is not None else 0.0
+                normed = (xf - mix_mean) / torch.sqrt(mix_var + mod.eps)
+                return (normed * w + b).to(dtype=out.dtype)
+            return _hook
+
+        for mod_name, mod in hrnet_net.named_modules():
+            if isinstance(mod, nn.BatchNorm2d) and any(mod_name.startswith(st) for st in stages):
+                hooks.append(mod.register_forward_hook(_make_adabn_hook(lam, shift_floor, shift_scale)))
+        try:
+            return hrnet_net(x_in)
+        finally:
+            for h in hooks:
+                h.remove()
+
     def _extract_secondary_features(self, x_raw: torch.Tensor) -> torch.Tensor:
         """Extract features from the optional secondary backbone."""
         assert self.secondary_net is not None
@@ -2795,7 +3086,11 @@ class FOCAL(nn.Module):
                 )
         if not self.secondary_trainable and not any(p.requires_grad for p in self.secondary_net.parameters()):
             with torch.no_grad():
+                if self.secondary_kind == "hrnet":
+                    return self._forward_hrnet_maybe_adabn(self.secondary_net, x_sec)
                 return self.secondary_net(x_sec)
+        if self.secondary_kind == "hrnet":
+            return self._forward_hrnet_maybe_adabn(self.secondary_net, x_sec)
         return self.secondary_net(x_sec)
 
     def _extract_all_branch_features_with_taps_single(
@@ -2814,6 +3109,7 @@ class FOCAL(nn.Module):
 
         vit_taps: Dict[int, torch.Tensor] = {}
         use_taps = bool(self.vit_feature_taps) and self._canonical_backbone_kind(self.backbone_name) == "vit"
+        is_primary_hrnet = self._canonical_backbone_kind(self.backbone_name) == "hrnet"
         primary_frozen = self.freeze_primary_backbone and not any(
             p.requires_grad for p in self.net.parameters()
         )
@@ -2821,11 +3117,15 @@ class FOCAL(nn.Module):
             with torch.no_grad():
                 if use_taps:
                     f_primary, vit_taps = self.net.forward_with_taps(x_in, self.vit_feature_taps)
+                elif is_primary_hrnet:
+                    f_primary = self._forward_hrnet_maybe_adabn(self.net, x_in)
                 else:
                     f_primary = self.net(x_in)
         else:
             if use_taps:
                 f_primary, vit_taps = self.net.forward_with_taps(x_in, self.vit_feature_taps)
+            elif is_primary_hrnet:
+                f_primary = self._forward_hrnet_maybe_adabn(self.net, x_in)
             else:
                 f_primary = self.net(x_in)
 
@@ -3136,6 +3436,30 @@ class FOCAL(nn.Module):
                 ortho_pen = w_out.sum() * 0.0
             weighted_penalty = ortho_pen if weighted_penalty is None else (weighted_penalty + ortho_pen)
 
+        if self.adapter_ortho_weight > 0.0 and isinstance(self.feature_adapter, BranchBalancedSpatialAdapter):
+            w_sec = self.feature_adapter.secondary_adapter.proj_out.weight.float()
+            c_sec = w_sec.shape[0]
+            w_flat = w_sec.view(c_sec, -1)
+            norms = w_flat.norm(dim=1, keepdim=True)
+            if float(norms.max().item()) > 1e-6:
+                w_norm = w_flat / norms.clamp(min=1e-6)
+                gram = torch.matmul(w_norm, w_norm.t())
+                off_diag = gram - torch.eye(c_sec, device=gram.device, dtype=gram.dtype)
+                ad_ortho = self.adapter_ortho_weight * off_diag.pow(2).mean()
+            else:
+                ad_ortho = w_sec.sum() * 0.0
+            weighted_penalty = ad_ortho if weighted_penalty is None else (weighted_penalty + ad_ortho)
+
+        if self.preneck_ortho_weight > 0.0 and self.preneck_projector is not None:
+            w_pn = self.preneck_projector.proj.weight.float()
+            c_pn = w_pn.shape[0]
+            w_pn_flat = w_pn.view(c_pn, -1)
+            w_pn_norm = F.normalize(w_pn_flat, p=2, dim=1)
+            gram_pn = torch.matmul(w_pn_norm, w_pn_norm.t())
+            off_pn = gram_pn - torch.eye(c_pn, device=gram_pn.device, dtype=gram_pn.dtype)
+            pn_ortho = self.preneck_ortho_weight * off_pn.pow(2).mean()
+            weighted_penalty = pn_ortho if weighted_penalty is None else (weighted_penalty + pn_ortho)
+
         return raw_cos_loss, weighted_penalty
 
     def _apply_pristine_gate(
@@ -3378,6 +3702,99 @@ class FOCAL(nn.Module):
         )
         return logit_full, prob_full, separability, tampered_ratio
 
+    @staticmethod
+    @torch.no_grad()
+    def _build_affinity_matrix(feats: torch.Tensor, tau: float = 0.08, grid_size: Optional[int] = 48) -> torch.Tensor:
+        """Build per-image row-stochastic forensic affinity matrix `P` (`[B, N, N]`) at compact grid size."""
+        f_cur = feats.float()
+        if grid_size is not None and f_cur.shape[2:] != (grid_size, grid_size):
+            f_cur = F.interpolate(f_cur, size=(grid_size, grid_size), mode="bilinear", align_corners=False)
+        b, c, h_g, w_g = f_cur.shape
+        f_img = F.normalize(f_cur, p=2, dim=1).permute(0, 2, 3, 1).reshape(b, h_g * w_g, c)
+        sim = torch.bmm(f_img, f_img.transpose(1, 2))
+        w_aff = torch.exp(((sim - 1.0) / max(1e-3, float(tau))).clamp(min=-40.0, max=0.0))
+        return w_aff / w_aff.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    @staticmethod
+    @torch.no_grad()
+    def _smooth_features_on_graph(feats: torch.Tensor, affinity_P: torch.Tensor, gamma: float) -> torch.Tensor:
+        """Apply one-step spherical manifold feature smoothing `(1-g)*F + g*(P@F)` at `affinity_P`'s grid."""
+        b, c, h_f, w_f = feats.shape
+        n_aff = affinity_P.shape[1]
+        side = int(round(math.sqrt(n_aff)))
+        f_cur = feats.float()
+        if (h_f, w_f) != (side, side):
+            f_cur = F.interpolate(f_cur, size=(side, side), mode="bilinear", align_corners=False)
+        f_flat = F.normalize(f_cur, p=2, dim=1).permute(0, 2, 3, 1).reshape(b, n_aff, c)
+        f_smooth = F.normalize((1.0 - gamma) * f_flat + gamma * torch.bmm(affinity_P, f_flat), p=2, dim=-1)
+        out = f_smooth.reshape(b, side, side, c).permute(0, 3, 1, 2)
+        if (h_f, w_f) != (side, side):
+            out = F.interpolate(out, size=(h_f, w_f), mode="bilinear", align_corners=False)
+        return out.to(dtype=feats.dtype)
+
+    @staticmethod
+    def _diffuse_logits_on_graph(
+        logits_full: torch.Tensor,
+        affinity_P: torch.Tensor,
+        beta: float,
+        steps: int = 2,
+    ) -> torch.Tensor:
+        """Apply differentiable Markov affinity diffusion over detached `affinity_P` and upsample back."""
+        b, _, orig_h, orig_w = logits_full.shape
+        n_aff = affinity_P.shape[1]
+        side = int(round(math.sqrt(n_aff)))
+        aff_det = affinity_P.detach().float()
+        l0 = F.interpolate(logits_full.float(), size=(side, side), mode="bilinear", align_corners=False).reshape(b, n_aff, 1)
+        l_cur = l0
+        for _ in range(max(1, int(steps))):
+            l_cur = (1.0 - beta) * l0 + beta * torch.bmm(aff_det, l_cur)
+        l_grid = l_cur.reshape(b, 1, side, side)
+        return F.interpolate(l_grid, size=(orig_h, orig_w), mode="bilinear", align_corners=False).to(dtype=logits_full.dtype)
+
+    @staticmethod
+    def _apply_otsu_calibration(logits: torch.Tensor, alpha: float, n_bins: int = 64) -> torch.Tensor:
+        """Recenter logits per image toward the detached 1D Otsu valley threshold `t_otsu`."""
+        if alpha <= 0.0:
+            return logits
+        b = logits.shape[0]
+        with torch.no_grad():
+            probs = torch.sigmoid(logits.float())
+            p_flat = probs.view(b, -1).clamp(1e-4, 1.0 - 1e-4)
+            centers = (torch.arange(n_bins, device=logits.device, dtype=torch.float32) + 0.5) / float(n_bins)
+            idx = torch.clamp((p_flat * n_bins).long(), 0, n_bins - 1)
+            hist = torch.zeros((b, n_bins), device=logits.device, dtype=torch.float32)
+            hist.scatter_add_(1, idx, torch.ones_like(p_flat))
+            w1 = torch.cumsum(hist, dim=1)
+            w2 = hist.sum(dim=1, keepdim=True) - w1
+            m_cum = torch.cumsum(hist * centers.unsqueeze(0), dim=1)
+            m_tot = m_cum[:, -1:]
+            valid = (w1 > 0) & (w2 > 0)
+            mu1 = m_cum / w1.clamp(min=1.0)
+            mu2 = (m_tot - m_cum) / w2.clamp(min=1.0)
+            var_between = torch.where(valid, w1 * w2 * (mu1 - mu2).pow(2), torch.zeros_like(w1))
+            best_bin = torch.argmax(var_between, dim=1)
+            t_ot = centers[best_bin].clamp(0.05, 0.95).view(b, 1, 1, 1)
+            logit_ot = torch.log(t_ot / (1.0 - t_ot))
+        return (logits.float() - float(alpha) * logit_ot.detach()).to(dtype=logits.dtype)
+
+    def _build_preneck_tap_tensor(self, vit_taps: Dict[int, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Concatenate L2-normalized pre-neck ViT taps at compact `vit_tap_cluster_size`."""
+        ordered_taps = [vit_taps[k] for k in self.vit_feature_taps if k in vit_taps]
+        if not ordered_taps:
+            return None
+        target_hw = (
+            (self.vit_tap_cluster_size, self.vit_tap_cluster_size)
+            if self.vit_tap_cluster_size is not None
+            else ordered_taps[0].shape[2:]
+        )
+        parts: List[torch.Tensor] = []
+        for t in ordered_taps:
+            t_cur = t
+            if t_cur.shape[2:] != target_hw:
+                t_cur = F.interpolate(t_cur, size=target_hw, mode="bilinear", align_corners=False)
+            parts.append(F.normalize(t_cur.float(), p=2, dim=1))
+        return torch.cat(parts, dim=1)
+
     def _build_multitap_cluster_tensor(
         self,
         f_primary: torch.Tensor,
@@ -3412,10 +3829,12 @@ class FOCAL(nn.Module):
         orig_w: int,
         aux_pristine_flags: Optional[torch.Tensor] = None,
         gt_masks: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        preneck_feats: Optional[torch.Tensor] = None,
+        affinity_P: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Combine base fused-feature cluster logits with pre-neck ViT multi-tap cluster logits."""
         if not vit_taps:
-            return base_logits, base_sep, base_area, None
+            return base_logits, base_sep, base_area, None, affinity_P
 
         branch_logits: List[torch.Tensor] = [base_logits]
         branch_seps: List[torch.Tensor] = [base_sep]
@@ -3428,6 +3847,15 @@ class FOCAL(nn.Module):
                 f_secondary.detach() if f_secondary is not None else None,
                 {k: v.detach() for k, v in vit_taps.items()},
             )
+            if affinity_P is None and (self.feat_smooth_gamma > 0.0 or self.affinity_diff_beta > 0.0 or self.refiner_use_affinity_prop):
+                affinity_P = self._build_affinity_matrix(
+                    mt_feats,
+                    tau=self.affinity_diff_tau,
+                    grid_size=self.vit_tap_cluster_size or 48,
+                )
+            if self.feat_smooth_gamma > 0.0 and affinity_P is not None:
+                mt_feats = self._smooth_features_on_graph(mt_feats, affinity_P, self.feat_smooth_gamma)
+
             mt_l, _, mt_sep, mt_area, mt_pl = self._cluster_features_with_polarity(
                 mt_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
             )
@@ -3460,6 +3888,16 @@ class FOCAL(nn.Module):
                 if tpl is not None:
                     pol_losses.append(tpl)
 
+        if preneck_feats is not None:
+            pn_l, _, pn_sep, pn_area, pn_pl = self._cluster_features_with_polarity(
+                preneck_feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
+            )
+            branch_logits.append(pn_l)
+            branch_seps.append(pn_sep)
+            branch_areas.append(pn_area)
+            if pn_pl is not None:
+                pol_losses.append(pn_pl)
+
         n_b = len(branch_logits)
         if self.tap_logit_weights is not None and self.tap_logit_weights.numel() == n_b:
             weights = F.softmax(self.tap_logit_weights.float(), dim=0)
@@ -3471,7 +3909,7 @@ class FOCAL(nn.Module):
         fused_sep = sum(w_det[i] * branch_seps[i] for i in range(n_b))
         fused_area = sum(w_det[i] * branch_areas[i] for i in range(n_b))
         pol_loss = torch.stack(pol_losses).mean() if pol_losses else None
-        return fused_logits, fused_sep, fused_area, pol_loss
+        return fused_logits, fused_sep, fused_area, pol_loss, affinity_P
 
     def _cluster_features_with_stats(
         self,
@@ -3879,6 +4317,21 @@ class FOCAL(nn.Module):
         orig_h, orig_w = x.shape[2], x.shape[3]
         x_in, f_primary, f_secondary, feats_backbone, feats, vit_taps = self._extract_all_branch_features_with_taps(x)
 
+        preneck_feats: Optional[torch.Tensor] = None
+        if self.preneck_projector is not None and vit_taps:
+            taps_cat = self._build_preneck_tap_tensor({k: v.detach() for k, v in vit_taps.items()})
+            if taps_cat is not None:
+                pn_emb = self.preneck_projector(taps_cat)
+                if f_secondary is not None:
+                    fs_pn = (
+                        F.interpolate(f_secondary.detach(), size=pn_emb.shape[2:], mode="bilinear", align_corners=False)
+                        if f_secondary.shape[2:] != pn_emb.shape[2:]
+                        else f_secondary.detach()
+                    )
+                    preneck_feats = torch.cat([pn_emb, F.normalize(fs_pn.float(), p=2, dim=1).to(dtype=pn_emb.dtype)], dim=1)
+                else:
+                    preneck_feats = pn_emb
+
         resolved_domain_ids = domain_ids
         if resolved_domain_ids is None and dataset_sources is not None:
             resolved_domain_ids = encode_domain_sources(
@@ -3896,6 +4349,8 @@ class FOCAL(nn.Module):
             or self.neck_l2_anchor_weight > 0.0
             or self.cluster_refiner_l2_weight > 0.0
             or self.refiner_ortho_weight > 0.0
+            or self.adapter_ortho_weight > 0.0
+            or self.preneck_ortho_weight > 0.0
         ):
             prior_anchor_loss, prior_anchor_penalty = self._compute_prior_anchor_terms(
                 x_in=x_in, feats=feats, feats_backbone=feats_backbone, f_primary=f_primary
@@ -3982,8 +4437,34 @@ class FOCAL(nn.Module):
                     align_loss = self.compute_domain_contrastive_loss(feats, gt_masks, resolved_domain_ids)
                 else:
                     align_loss = self.compute_contrastive_loss(feats, gt_masks)
+                if preneck_feats is not None and self.preneck_contrastive_weight > 0.0:
+                    pn_nce = self.compute_contrastive_loss(preneck_feats, gt_masks)
+                    weighted_pn = self.preneck_contrastive_weight * pn_nce
+                    align_loss = weighted_pn if align_loss is None else (align_loss + weighted_pn)
 
             pol_loss_terms: List[torch.Tensor] = []
+            affinity_P: Optional[torch.Tensor] = None
+            need_affinity = (
+                self.feat_smooth_gamma > 0.0
+                or self.affinity_diff_beta > 0.0
+                or self.refiner_use_affinity_prop
+            )
+            if need_affinity:
+                aff_src = (
+                    self._build_multitap_cluster_tensor(
+                        f_primary.detach(),
+                        f_secondary.detach() if f_secondary is not None else None,
+                        {k: v.detach() for k, v in vit_taps.items()},
+                    )
+                    if vit_taps
+                    else feats.detach()
+                )
+                affinity_P = self._build_affinity_matrix(
+                    aff_src,
+                    tau=self.affinity_diff_tau,
+                    grid_size=self.vit_tap_cluster_size or 48,
+                )
+
             if self.domain_split_mode:
                 with torch.no_grad():
                     cluster_logits, _, separability, _ = self._cluster_domain_features(
@@ -3991,13 +4472,18 @@ class FOCAL(nn.Module):
                     )
                     area_fused = (cluster_logits > 0).float().mean(dim=(1, 2, 3))
             else:
+                base_cluster_feats = (
+                    self._smooth_features_on_graph(feats.detach(), affinity_P, self.feat_smooth_gamma)
+                    if (self.feat_smooth_gamma > 0.0 and affinity_P is not None)
+                    else feats.detach()
+                )
                 cluster_logits, _, separability, area_fused, pol_loss_main = self._cluster_features_with_polarity(
-                    feats.detach(), orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
+                    base_cluster_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags, gt_masks=gt_masks
                 )
                 if pol_loss_main is not None:
                     pol_loss_terms.append(pol_loss_main)
                 if vit_taps:
-                    cluster_logits, separability, area_fused, pol_loss_mt = self._fuse_multitap_clustering(
+                    cluster_logits, separability, area_fused, pol_loss_mt, affinity_P = self._fuse_multitap_clustering(
                         base_logits=cluster_logits,
                         base_sep=separability,
                         base_area=area_fused,
@@ -4008,9 +4494,18 @@ class FOCAL(nn.Module):
                         orig_w=orig_w,
                         aux_pristine_flags=aux_pristine_flags,
                         gt_masks=gt_masks,
+                        preneck_feats=preneck_feats,
+                        affinity_P=affinity_P,
                     )
                     if pol_loss_mt is not None:
                         pol_loss_terms.append(pol_loss_mt)
+
+            if self.affinity_diff_beta > 0.0 and affinity_P is not None:
+                cluster_logits = self._diffuse_logits_on_graph(
+                    cluster_logits, affinity_P, beta=self.affinity_diff_beta, steps=self.affinity_diff_steps
+                )
+            if self.otsu_cal_alpha > 0.0:
+                cluster_logits = self._apply_otsu_calibration(cluster_logits, self.otsu_cal_alpha)
 
             if self.training and pol_loss_terms:
                 mean_pol_loss = torch.stack(pol_loss_terms).mean()
@@ -4047,6 +4542,7 @@ class FOCAL(nn.Module):
 
             if self.cluster_refiner is not None:
                 if isinstance(self.cluster_refiner, ImageRelativeClusterRefiner):
+                    x_raw_img = self._ensure_raw_rgb(x) if self.cluster_refiner.use_srm_desc else None
                     desc = ImageRelativeClusterRefiner.build_descriptors(
                         feats=feats.detach(),
                         c_fused_logits=cluster_logits.detach(),
@@ -4055,8 +4551,12 @@ class FOCAL(nn.Module):
                         primary_branch=primary_branch_stats,
                         secondary_branch=secondary_branch_stats,
                         multi_branch=self.cluster_refiner.multi_branch,
+                        srm_kernels=getattr(self.cluster_refiner, "_srm_kernels", None),
+                        raw_rgb=x_raw_img,
+                        use_srm_desc=self.cluster_refiner.use_srm_desc,
+                        use_border_knn_desc=self.cluster_refiner.use_border_knn_desc,
                     )
-                    raw_bias, raw_scale = self.cluster_refiner(desc, orig_h, orig_w)
+                    raw_bias, raw_scale = self.cluster_refiner(desc, orig_h, orig_w, affinity_P=affinity_P)
                     sep_gate: Union[float, torch.Tensor] = 1.0
                     if self.refiner_sep_gate_tau > 0.0:
                         sep_gate = (
@@ -4097,11 +4597,33 @@ class FOCAL(nn.Module):
                         feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
                 else:
+                    affinity_P = None
+                    need_affinity = self.feat_smooth_gamma > 0.0 or self.affinity_diff_beta > 0.0
+                    if need_affinity:
+                        aff_src = (
+                            self._build_multitap_cluster_tensor(
+                                f_primary,
+                                f_secondary,
+                                vit_taps,
+                            )
+                            if vit_taps
+                            else feats
+                        )
+                        affinity_P = self._build_affinity_matrix(
+                            aff_src,
+                            tau=self.affinity_diff_tau,
+                            grid_size=self.vit_tap_cluster_size or 48,
+                        )
+                    base_cluster_feats = (
+                        self._smooth_features_on_graph(feats, affinity_P, self.feat_smooth_gamma)
+                        if (self.feat_smooth_gamma > 0.0 and affinity_P is not None)
+                        else feats
+                    )
                     mask_logits, pred_mask, separability, area_fused, _ = self._cluster_features_with_polarity(
-                        feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
+                        base_cluster_feats, orig_h, orig_w, aux_pristine_flags=aux_pristine_flags
                     )
                     if vit_taps:
-                        mask_logits, separability, _, _ = self._fuse_multitap_clustering(
+                        mask_logits, separability, _, _, affinity_P = self._fuse_multitap_clustering(
                             base_logits=mask_logits,
                             base_sep=separability,
                             base_area=area_fused,
@@ -4111,8 +4633,16 @@ class FOCAL(nn.Module):
                             orig_h=orig_h,
                             orig_w=orig_w,
                             aux_pristine_flags=aux_pristine_flags,
+                            preneck_feats=preneck_feats,
+                            affinity_P=affinity_P,
                         )
-                        pred_mask = torch.sigmoid(mask_logits)
+                    if self.affinity_diff_beta > 0.0 and affinity_P is not None:
+                        mask_logits = self._diffuse_logits_on_graph(
+                            mask_logits, affinity_P, beta=self.affinity_diff_beta, steps=self.affinity_diff_steps
+                        )
+                    if self.otsu_cal_alpha > 0.0:
+                        mask_logits = self._apply_otsu_calibration(mask_logits, self.otsu_cal_alpha)
+                    pred_mask = torch.sigmoid(mask_logits)
                     logits_full = mask_logits
             else:
                 mask_logits, logits_full, _ = self._run_supervised_head(feats, orig_h, orig_w)

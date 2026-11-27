@@ -1151,6 +1151,23 @@ def build_model(config: Any) -> nn.Module:
             refiner_sep_gate_tau=float(model_cfg.get("refiner_sep_gate_tau", 0.0)),
             refiner_zero_mean_bias_weight=float(model_cfg.get("refiner_zero_mean_bias_weight", 0.0)),
             refiner_ortho_weight=float(model_cfg.get("refiner_ortho_weight", 0.0)),
+            hrnet_adabn_lambda=float(model_cfg.get("hrnet_adabn_lambda", 0.0)),
+            hrnet_adabn_stages=model_cfg.get("hrnet_adabn_stages", ("stage4",)),
+            hrnet_adabn_shift_floor=float(model_cfg.get("hrnet_adabn_shift_floor", 0.0)),
+            hrnet_adabn_shift_scale=float(model_cfg.get("hrnet_adabn_shift_scale", 0.35)),
+            affinity_diff_beta=float(model_cfg.get("affinity_diff_beta", 0.0)),
+            affinity_diff_tau=float(model_cfg.get("affinity_diff_tau", 0.08)),
+            affinity_diff_steps=int(model_cfg.get("affinity_diff_steps", 2)),
+            feat_smooth_gamma=float(model_cfg.get("feat_smooth_gamma", 0.0)),
+            otsu_cal_alpha=float(model_cfg.get("otsu_cal_alpha", 0.0)),
+            use_preneck_projector=bool(model_cfg.get("use_preneck_projector", False)),
+            preneck_proj_dim=int(model_cfg.get("preneck_proj_dim", 256)),
+            preneck_ortho_weight=float(model_cfg.get("preneck_ortho_weight", 0.1)),
+            preneck_contrastive_weight=float(model_cfg.get("preneck_contrastive_weight", 0.5)),
+            refiner_use_affinity_prop=bool(model_cfg.get("refiner_use_affinity_prop", False)),
+            refiner_use_srm_desc=bool(model_cfg.get("refiner_use_srm_desc", False)),
+            refiner_use_border_knn_desc=bool(model_cfg.get("refiner_use_border_knn_desc", False)),
+            adapter_ortho_weight=float(model_cfg.get("adapter_ortho_weight", 0.0)),
         )
 
     if any(k in model_name for k in ["pim", "seg_swin", "segswin"]) or any(
